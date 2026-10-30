@@ -1,3 +1,26 @@
-*.csv
+# MacのシステムファイルとPythonキャッシュ
+.DS_Store
+__pycache__/
 
+# 超巨大なSQLiteデータベース関連（最優先で除外）
+*.db
+*.db-shm
+*.db-wal
+
+# 蓄積されるCSVファイルと各データフォルダをすべて除外
+*.csv
+csv_files/
+entries_in/
+entries_out/
+foragg_csv/
+replace_csv/
 置換前CSV/
+
+# --- 除外の例外（AIに構造を教えるサンプルCSVだけは追跡する） ---
+!entries_in/
+entries_in/*
+!entries_in/shisu_20260531_1.csv
+
+!entries_out/
+entries_out/*
+!entries_out/entries_merged_hensachi.csv

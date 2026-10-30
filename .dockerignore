@@ -1,0 +1,25 @@
+# ===== データディレクトリはビルドに入れない（run時マウント） =====
+csv_files/
+entries_in/
+entries_out/
+foragg_csv/
+replace_csv/
+
+# （保険）CSV全般を除外
+*.csv
+
+# DB（巨大なのでbuildに入れない）
+# SQLite DB（巨大・build不要）
+racing.db
+racing.db-wal
+racing.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# --- よくある不要物 ---
+.DS_Store
+.git/
+__pycache__/
+*.pyc
+*.log
