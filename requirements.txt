@@ -1,0 +1,15 @@
+# 実行環境（Docker イメージと同じ版で固定。テスト済み: Python 3.11 / 3.13）
+pandas==2.3.3
+numpy==2.3.5
+scipy==1.16.3
+Flask==3.1.2
+# 以下は上記の依存（固定）
+blinker==1.9.0
+click==8.5.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+python-dateutil==4.0.0
+pytz==2026.6
+tzdata==2026.6
+Werkzeug==3.1.9
