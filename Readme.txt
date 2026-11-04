@@ -8,104 +8,54 @@
 （５）Macでdocker_shisu_replaceの処理を実行
 
 docker_shisu_replace/
-├─ csv_files/       入力（元CSV）
-├─ replace_csv/     置換確認用（processed_*）
-├─ foragg_csv/      集計素材→集計後の最終成果物（foragg_* 上書き）
-├─ entries_in/      エントリー用入力（偏差値帯付与ユーティリティ）
-├─ entries_out/     同出力
-├─ Dockerfile       実行環境（Python3.11 + pandas/numpy/flask + ja_JP.UTF-8）
-├─ replace_csv_ver3.py  置換/正規化 + 結合キー生成 + foragg素材 + 帯展開 + per-row回収寄与
-├─ aggregate_stats_ver2.py  foragg_* をグループ集計＆ベイズ推定で上書き保存
-├─ build_db.py      foragg_* を各1テーブル化→unified_all 構築（*_val 付与・インデックス）
-├─ app.py           横断検索UI（family×indicator×条件、`*_val`でソート）
-└─calc_entry_hensachi.py  エントリーCSVに各指数の「偏差値帯」を追記（独立ユーティリティ）
-
+├─ csv_files/       入力: 過去レース（TARGET 出力、{地域}_{指数名}.csv）
+├─ foragg_csv/      集計素材（foragg_*.csv.gz。replace_csv_ver3.py が出力）
+├─ agg_csv/         成績表（aggregate_stats_ver2.py が出力。build_db の入力）
+├─ master_csv/      正規化済み 1頭1行（master_*.csv.gz。WEDGE・組合せ分析用）
+├─ replace_csv/     processed_*（--processed を付けたときだけ。結合データ確認・TARGET 取込用）
+├─ entries_in/      入力: 出馬表（shisu_YYYYMMDD_N.csv）
+├─ entries_out/     偏差値付き出馬表
+├─ shisu/           共通パッケージ（正規化・キー・偏差値・分類。キーの変更は必ずここ）
+├─ replace_csv_ver3.py / aggregate_stats_ver2.py / calc_entry_hensachi.py / build_db.py / app.py
+└─ tests/           pytest
+詳しい仕様は CLAUDE.md（コードが正）。
 
 
 
 # 0) プロジェクト直下へ
 cd Downloads/self-dev/docker/shisu/docker_shisu_replace
 
-# 1) 置換対象の元CSVを置く（Shift_JIS 推奨）
-#    - foragg 用：csv_files/ に配置
-#    - エントリー用：entries_in/ に配置（出馬表→偏差値計算）
+# 1) 入力CSVを置く
+#    - 過去レース：csv_files/
+#    - 出馬表    ：entries_in/
 
-# 2) ビルド（初回/更新時だけ）
+# 2) ビルド（初回 / requirements*.txt・Dockerfile を変えたときだけ。コードの変更は再ビルド不要）
 docker build -t csv_processor_shisu .
 
-# 3) 置換/正規化＋foragg素材生成（foragg_* → foragg_csv/、processed_* → replace_csv/）
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/replace_csv_ver3.py
+# 3) 過去レース → 集計素材（foragg_csv/ と master_csv/ を作り直す）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python replace_csv_ver3.py --clean
+#    並列にするなら末尾に --workers 4、TARGET 取込用の processed_* も欲しければ --processed
 
-# 4) （任意/推奨）foragg_* をベイズ集計で上書き保存
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/aggregate_stats_ver2.py
+# 4) 素材 → 成績表（agg_csv/ を作り直す。オッズ帯 通常/10倍未満/10〜50倍/50倍以上 の4本ずつ）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean
+#    集計条件だけ変えたときは 3) は不要（素材は上書きされない）
 
+# 5) 出馬表 → 偏差値付き出馬表（個別＋統合）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --merge-only --clean
+#    統合ファイルだけを作る（推奨。DB の照合結果が1本で済む）。個別ファイルも欲しければ --merge-one
 
-# 5) DB 作成（CSV → SQLite /app/racing.db）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu \
-  python /app/build_db.py
+# 6) DB 作成（成績表＋出馬表＋照合結果）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
+#    出馬表だけ入れ替えるとき（unified_all はそのまま）:
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --mode entries --prune
+#    --prune は「今回作り直した種類」の古いテーブルだけを消す（--mode entries なら entries_* だけ。foragg_* は消えない）
+#    ※ unified_all は agg_csv/ にある成績表だけで作る（例: ローカル5場の成績表しか無ければ、主5場のレースは照合されない）
 
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/build_db.py
+# 7) Web UI（http://localhost:8000）
+docker run --rm -p 8000:8000 -v "$(pwd)":/app csv_processor_shisu python app.py
 
-# -> /app/racing.db が生成されます
-
-※foragg_csv/ にローカル5場しか無い状態で実行すると、unified_all から主5場のデータは“見えなくなります”（DBから物理削除ではないが、ビュー/検索の母集団から外れる）。
-
-
-※DB を作り直すのは、
-①CSVを更新した、
-②build_db.py を更新してスキーマ/加工を変えた、
-③DB を消してしまった、
-のいずれかだけでOK。ビルドし直しても、上記に該当しないなら作り直ししなくても大丈夫
-
-# 完全作り直し（DB初期化）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu \
-  python /app/build_db.py --mode both --fresh
-
-# 今回作らなかった古いテーブルを掃除（整理用）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu \
-  python /app/build_db.py --mode entries --prune
-
-
-
-# 6-1) エントリー偏差値（entries_in → entries_out）
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py
-
-	•	これまで通り：個別出力のみ
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py
-
-	•	個別＋統合の両方を出力
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py \
-  --merge-one
-
-	•	統合のみ出力
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py \
-  --merge-only
-
-	•	統合の出力名を変更
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py \
-  --merge-one --merge-name entries_20251012_merged_hensachi.csv
-
-
-# 6-2)
-# entries だけ再構築（unified_all は触らない）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu \
-  python /app/build_db.py --mode entries
-
-
-
-
-# 7) Web UI 起動（http://localhost:8000）
-docker run --rm -p 8000:8000 -v "$(pwd)":/app \
-  -e DB_PATH=/app/racing.db \
-  csv_processor_shisu python /app/app.py
+# 8) テスト（任意）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 
 
 DB をブラウザで確認（任意）

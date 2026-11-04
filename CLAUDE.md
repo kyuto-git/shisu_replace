@@ -1,400 +1,382 @@
 # CLAUDE.md — shisu_replace（競馬 外部指数の集計・照合システム）
 
-最終更新: 2026-11-04（全ファイル精読＋サンプルCSV・合成データでの実測に基づく。コード改修は未実施）
+最終更新: 2026-11-04（Phase 1 バグ修正・リファクタリング／Phase 2 オッズ4区分・抽出条件変更を反映）
 
 ## この文書の扱い
 
-- **コードが正**。`README_RECAP.md`（2025-10-11版）と `Readme.txt` は運用手順として有用だが、現行コードと食い違う箇所がある（→ §6）。
-- 本番データ（`csv_files/` `foragg_csv/` `replace_csv/` `racing.db` など）は `.gitignore` で除外されている。リポジトリにあるデータは **出馬表側サンプル2本だけ**:
-  `entries_in/shisu_20260531_1.csv`（入力）／`entries_out/entries_merged_hensachi.csv`（統合出力）。
-  過去レース側（csv_files / foragg）のサンプルは無いので、その列仕様は**コードからの推定**。
-- §5 は「コード上で確認した不整合・リスク」の一覧で、改修候補。**まだ一つも直していない。**
+- **コードが正**。この文書はコードに合わせて更新する。`README_RECAP.md` は要約、`Readme.txt` は TARGET 操作を含む運用メモ。
+- 本番データ（`csv_files/` `foragg_csv/` `agg_csv/` `master_csv/` `replace_csv/` `racing.db` など）は `.gitignore` で除外。
+  リポジトリにあるデータは出馬表側サンプル2本だけ: `entries_in/shisu_20260531_1.csv`（入力）／`entries_out/entries_merged_hensachi.csv`（旧版の統合出力）。
+  過去レース側の CSV サンプルは無いので、その列仕様は**コードからの推定**（§4.1）。
+- **キー（結合データ）に関わる処理は `shisu/` パッケージだけで変更する**。過去側と出馬表側が同じ関数を通ることで一致を保証している。
 
 ---
 
 ## 0. 概要
 
 TARGET frontier JV で出力した「過去レース×外部指数」CSVを、条件文字列 `結合データ`（例: `東京×芝×16-18×定量×1・2_勝×3`）ごとに集計して成績表（勝率・複勝率・掲示板率・回収値・ベイズ推定値）を作る。
-当日の「出馬表×外部指数」CSVの各馬について同じ形式のキーを組み立てて成績表と突き合わせ、Flask UI で「絶対軸／軸候補／消し候補／相手候補」を表示する。
+当日の「出馬表×外部指数」CSVの各馬について同じ規則でキーを組み立てて成績表と突き合わせ、Flask UI で「絶対軸／軸候補／消し候補／相手候補」を表示する。
+
+将来は別リポジトリ（`docker-lasthalon-calculate`、`docker-keiba-omega` / `docker-keibaAI-scraping` / `docker-kichiuma-scraping` / `docker-kayochin-get` / `docker-ittai-scraper`）と統合する予定。統合時は `shisu/` を中核ライブラリとして使い、新しい指数は `shisu/indicators.py` の台帳に1行足して取り込む想定。
 
 ---
 
-## 1. システム全体の処理フロー
+## 1. 構成と処理フロー
 
-### 1.1 前工程（手作業。Readme.txt 冒頭）
+### 1.1 ディレクトリ
+
+```
+shisu_replace/
+├─ shisu/                     共通パッケージ（正規化・キー・偏差値・分類・照合・WEDGE）
+├─ replace_csv_ver3.py        [A1] 過去レース → 集計素材
+├─ aggregate_stats_ver2.py    [A2] 素材 → 成績表
+├─ calc_entry_hensachi.py     [B1] 出馬表 → 偏差値・順位・帯
+├─ build_db.py                [A3/B2] CSV → racing.db（照合の事前計算 xjoin を含む）
+├─ app.py                     [C] Flask UI
+├─ tests/                     pytest（合成データで全段を通す）
+├─ requirements*.txt          固定版の依存（Dockerfile が使う）
+├─ csv_files/   入力: 過去レース（TARGET）     ├─ entries_in/   入力: 出馬表（TARGET）
+├─ foragg_csv/  素材（1行=1頭×1キー、.csv.gz）  ├─ entries_out/  偏差値付き出馬表
+├─ agg_csv/     成績表（1行=1結合データ）       ├─ racing.db     SQLite
+├─ master_csv/  正規化済み 1頭1行（.csv.gz。WEDGE・組合せ分析用）
+└─ replace_csv/ processed_*（結合データ確認・TARGET 取込用。--processed のときだけ）
+```
+
+### 1.2 前工程（手作業。Readme.txt 冒頭）
 
 - **過去データ**: TARGET ★8タブ → 外部指数読込 → 「レース一覧★画面イメージ(CSV)」で出力（頭数10以上・障害除外で抽出）→ `csv_files/{地域}_{指数名}.csv`
-  - 地域: `主５場（中山、東京、中京、京都、阪神）` / `ローカル５場（札幌、函館、福島、新潟、小倉）` / 各場名（`札幌` など）
-  - 指数名: カツラキ, Gold, BC, ZI, オメガ指数, かよちん指数, keibaAI指数, 吉馬_SP能力値, 吉馬_先行力, 吉馬_SP信頼, 吉馬_SP調整, 吉馬_SP最大, 吉馬_末脚力, SAV, ST指数, 合計値, 展開, 仕上り, 先行, 追走, 持久, 持続, 瞬発, 想定前半, 想定後半, タイムM, 対戦M
-  - **ファイル名で処理が切り替わる**（ZI特例・符号反転・新馬除外はファイル名で判定。DB上の指数名もファイル名から取る）。
-- **出馬表**: TARGET 出馬表分析 ★4タブ → 外部指数1〜4＋マイニングを読込 → 全選択 → CSV出力 → `entries_in/shisu_YYYYMMDD_N.csv`（N=1〜5。5 はマイニング・カツラキ・持久）
-
-### 1.2 実行順（Docker。イメージ名は Readme.txt に合わせて `csv_processor_shisu`）
-
-```bash
-docker build -t csv_processor_shisu .
-# [A] 過去データ系
-docker run --rm -v "$(pwd)":/app --entrypoint python csv_processor_shisu /app/replace_csv_ver3.py
-docker run --rm -v "$(pwd)":/app --entrypoint python csv_processor_shisu /app/aggregate_stats_ver2.py
-docker run --rm -v "$(pwd)":/app csv_processor_shisu python /app/build_db.py --mode foragg   # 既定は both
-# [B] 出馬表系（[A] の unified_all が DB にあること）
-docker run --rm -v "$(pwd)":/app --entrypoint python csv_processor_shisu /app/calc_entry_hensachi.py --merge-one
-docker run --rm -v "$(pwd)":/app csv_processor_shisu python /app/build_db.py --mode entries
-# [C] UI（http://localhost:8000）
-docker run --rm -p 8000:8000 -v "$(pwd)":/app -e DB_PATH=/app/racing.db csv_processor_shisu python /app/app.py
-```
+  - 地域: `主５場（中山、東京、中京、京都、阪神）` / `ローカル５場（札幌、函館、福島、新潟、小倉）` / 各場名
+  - **ファイル名の指数名で処理が切り替わる**（符号反転・ZI 特例・新馬除外）。指数名は `shisu/indicators.py` の台帳で正式名に変換される
+- **出馬表**: TARGET 出馬表分析 ★4タブ → 外部指数1〜4＋マイニング読込 → 全選択 → CSV → `entries_in/shisu_YYYYMMDD_N.csv`
 
 ### 1.3 データの流れ
 
 ```
 [A] 過去レース
-csv_files/*.csv (SJIS, 1行=1頭)
-  └─ replace_csv_ver3.py ─┬─> replace_csv/processed_*.csv   確認用: レースID(新), 結合データ[, 指数順位帯]
-                          └─> foragg_csv/foragg_{tag}_{元名}.csv   素材版: 1行=1頭 (入力1本→80本)
-  └─ aggregate_stats_ver2.py  foragg_csv/foragg_*.csv を【上書き】→ 集計版: 1行=1結合データ (件数≥5)
+csv_files/*.csv
+  └─ replace_csv_ver3.py ─┬─> foragg_csv/foragg_{tag}_{元名}.csv.gz  素材（入力1本→20本。オッズでは絞らない）
+                          ├─> master_csv/master_{元名}.csv.gz        正規化済み 1頭1行
+                          └─> replace_csv/processed_*.csv            確認用（--processed のときだけ）
+  └─ aggregate_stats_ver2.py  素材1本 → オッズ帯4区分の成績表4本（agg_csv/）。素材は上書きしない
   └─ build_db.py --mode foragg|both
-        racing.db: foragg_foragg_*（CSV1本=1テーブル）, unified_all（全foragg縦結合）, __tables_meta__
+        foragg_*（成績表1本=1テーブル）, unified_all（縦結合＋family/odds_mode/rank_scheme/indicator/region 列）,
+        __tables_meta__（テーブルの属性）, __facets__（画面の選択肢）
 
 [B] 出馬表
-entries_in/shisu_YYYYMMDD_N.csv (cp932)
-  └─ calc_entry_hensachi.py ─> entries_out/{stem}_hensachi.csv（個別） / entries_merged_hensachi.csv（--merge-*）
-  └─ build_db.py --mode entries|both（unified_all を参照）
-        racing.db: entries_{stem}, entries_all, entries_xjoin_{stem}（各馬×指数×family×キー と unified_all の突合結果）
+entries_in/*.csv
+  └─ calc_entry_hensachi.py ─> entries_out/{元名}_hensachi.csv / entries_merged_hensachi.csv（--merge-*）
+  └─ build_db.py --mode entries|both（unified_all が必要）
+        entries_{元名}（キー部品を正規化）, entries_all, entries_xjoin_{元名}（照合結果）
 
-[C] app.py (Flask :8000)
-  /              横断検索 … foragg_* テーブルを直接読む（unified_all ではない）
-  /entries       出馬表のレース一覧 … entries_*（xjoin除く）
-  /entries/race  出馬表詳細
-  /entries/key   unified_all を 結合データ 完全一致で表示
-  /entries/hits  条件ヒット馬 … entries_xjoin_* があれば高速パス、無ければ entries_* × unified_all をその場で照合
+[C] app.py
+  /              横断検索（__tables_meta__ で集計表を選び、各 foragg_* を表示）
+  /entries       出馬表のレース一覧（日付・場所）
+  /entries/race  出馬表（各馬の順位・偏差値・帯）
+  /entries/key   結合データの前方一致で unified_all を表示
+  /entries/hits  条件ヒット馬（xjoin があれば読む。無ければ同じ関数でその場照合）
 ```
 
-### 1.4 依存関係と再実行ルール
+### 1.4 実行コマンド（Docker。イメージ名 `csv_processor_shisu`）
 
-- **replace と aggregate はペアで回す**。aggregate は foragg を上書きするので、集計済みファイルに再実行しても `[SKIP]`（着順列が無い）になるだけ。集計条件を変えたら replace からやり直す。
-- aggregate の前に build_db を回すと素材版（1行=1頭）がDBに入り、unified_all の成績列が NULL になる。
-- `結合データ` の構成・距離レンジ・正規化を変えたら **[A][B] とも全段再実行**（キーは両側で一字一句同じ文字列でないと当たらない）。
-- `build_db --mode foragg|both` は unified_all を「**今回 foragg_csv/ にあるCSVだけ**」で作り直す。古い `foragg_*` テーブルは DB に残る（`--prune` / `--fresh` で消える）。このため `/`（foragg_* を直接読む）と `/entries/hits`（unified_all）で母集団がずれることがある。
-- foragg_csv/ に古いCSVが残っていれば、それも取り込まれる。
-- entries_xjoin_* は作成時点の unified_all のスナップショット。foragg を作り直したら entries も再構築する。
+```bash
+docker build -t csv_processor_shisu .
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python replace_csv_ver3.py --clean
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --merge-only --clean
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
+docker run --rm -p 8000:8000 -v "$(pwd)":/app csv_processor_shisu python app.py
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
+```
 
----
+### 1.5 再実行ルール
 
-## 2. 各Pythonファイルの役割と主要ロジック
+| 変えたもの | 再実行 |
+|---|---|
+| csv_files（過去データ）・キーの規則（`shisu/`） | replace → aggregate → build_db --mode both |
+| 集計の条件（推定方法・MIN_SAMPLE・オッズ帯の定義など） | aggregate → build_db --mode both（素材はそのまま使える） |
+| 出馬表 | calc_entry_hensachi --merge-only --clean → build_db --mode entries --prune |
+| 画面（app.py・`shisu/classify.py`） | app の再起動だけ |
 
-### 2.1 replace_csv_ver3.py — 置換・正規化・偏差値・結合キー生成（素材出力）
-
-- 入出力: `./csv_files/*.csv`（**相対パス**。cwd=/app 前提）→ `./replace_csv/processed_*.csv`, `./foragg_csv/foragg_*.csv`（Shift_JIS）
-- `process_one_file` の処理順:
-  1. `smart_read_csv`: cp932→shift_jis→utf-8-sig→utf-8→latin1 を、通常／errors=ignore／不正行スキップの3段で試す。`dtype=str`
-  2. `basic_clean`: 全列文字列化＋空白除去、重量種別 `別定→定量`、クラス名のグループ化、`馬齢×(1・2_勝|準OP・OP)→1勝・OP`、コース区分 A〜D を空に、指数順位を整数文字列化（`5.0→5`）、`枠番グループ` 生成（§3.8）
-  3. `apply_place_distance_rules`: 距離レンジ統合（§3.8）
-  4. `apply_index_missing_policy`: 同一レース（`レースID(新/馬番無)`。無ければ `レースID(新)` の末尾2桁を落とす）で指数欠損が **2頭以上ならレースごと除外**、**1頭なら**その馬の指数順位を空にする
-  5. `add_hensachi`: レース内で偏差値 = (x−平均)/母標準偏差×10+50 を四捨五入 → 偏差値帯
-     - ファイル名に `ZI`: 0/欠損 → 同レース非ゼロ平均で置換、反転しない、新馬は NaN
-     - ファイル名に `タイムM/想定前半/想定後半/展開`（`3F` を除去して判定、ZI以外）: 符号反転
-     - 有効値<2 または std=0 → NaN
-     - ファイル名に ZI か吉馬6指数（`_SHINBA_EXCLUDE_KEYS`）: 新馬は NaN
-  6. **頭数≥10 のレースだけ残す**（偏差値は除外前の全頭で計算済み）
-  7. `add_return_contrib`: 単勝的中/複勝的中/単勝回収寄与/複勝回収寄与 を作るが、**foragg には出力されない**（§5）
-  8. 出力（`build_joined` → `export_foragg` / `export_processed`）
-     - 非band 10 family（§3.9）× {全件, `odds10u_`, `odds5p_`, `odds10_50_`} = 40本
-     - band 5 family × 帯スキーム {`rankband_s1`, `rankband_s2`}（環境変数 `RANKBAND_SCHEMES`、既定 `s1,s2`）× 同4種 = 40本
-     - → **入力1本あたり foragg 80本、processed 81本**（代表の `processed_{元名}` = normal を追加）
-     - ファイル名: `foragg_{tag}_{元名}`。tag 例: `normal`, `odds10u_rankB`, `rankband_s1_normal_band`, `odds5p_rankband_s2_rankJ_band`
-- オッズフィルタは**過去レースの確定単勝オッズ**で抽出: `odds10u_` <10.0 / `odds5p_` ≥5.0 / `odds10_50_` 10以上50未満
-- `export_foragg`: ZI・吉馬ファイルは新馬行を除外 → `レースID(新)`（band時は＋`指数順位帯`）で元データと merge → NaN→"" → `sanitize_df_for_sjis`（NFKC正規化・ダッシュ/チルダ統一・SJIS非対応文字の削除）→ Shift_JIS 保存
-- 帯スキーム（1頭1帯、行は増えない `assign_fixed_rankband`）:
-  - s1: `1~3位 / 4~6位 / 7~9位 / 10位~`
-  - s2: `1~5位 / 6~10位 / 11位~`
-  - 旧方式（`RANK_BANDS` で行を増殖させる `make_rankband_df`）はコメントアウト済みで未使用
-
-### 2.2 aggregate_stats_ver2.py — 集計＋ベイズ推定（foragg を上書き）
-
-- 入力: `/app/foragg_csv/foragg_*.csv`（**絶対パス固定**、引数なし）。`レースID(新)`（代替 `レースID(新/馬番無)`, `場 R`）・`結合データ`・`着順` が無いファイルは SKIP（＝集計済み）
-- 重複排除: `[レースID, 結合データ, (指数順位帯), 馬番|馬名|馬名S の最初に存在する1列]`。馬識別列が無ければ `枠番,騎手,着順,単勝オッズ,複勝配当` で代用
-- 着順: `取消|除外` → 分母から除外。`失格|中止` → 分母に含め、着順=頭数（無ければ18。1〜18にクリップ）。数値化できない値は NaN（分母には残る）
-- 集計単位: `結合データ` のみで groupby
-  - 件数 n、勝/2着/3着/複勝(≤3着)/掲示板(≤5着) の頻度%
-  - **推定値（括弧内・`提案*`）**: 既定 `AGG_PROP_MODE=lower` → 事後分布 Beta(k+0.5, n−k+0.5) の**下側10%点**（片側90%下限）。
-    **複勝率だけは頻度≤20%（`PLC_SWITCH_THRESHOLD_PCT`）なら上側90%点**を使う。`mean` にすると Jeffreys 事後平均 (k+0.5)/(n+1)
-  - scipy が無ければ（Docker既定は無い）正規近似＋[0,1]クリップで代用
-  - 平均着順: 失格/中止=頭数 を含めた平均
-  - 単勝回収値 = Σ(1着の単勝配当)/n、複勝回収値 = Σ(3着内の複勝配当)/n（100円均等買い）
-  - 単勝適正回収値 = 100×Σ(w×単勝配当/100×的中)/Σw、w=1/単勝オッズ（オッズ≤0やNaNは重み無し）。実質「実勝利数 ÷ オッズから見た期待勝利数 ×100」
-  - 掲示板率は頻度のみ（推定なし）
-  - `件数 < MIN_SAMPLE(5)` の行は出力しない
-- 出力: 入力ファイルを**上書き**（Shift_JIS。失敗時は無指定=UTF-8 で書く）
-- 環境変数: `AGG_PROP_MODE`(lower|mean), `AGG_LOWER_Q`(0.10), `AGG_UPPER_Q`(0.90), `AGG_PRIOR_ALPHA/BETA`(0.5), `PLC_SWITCH_THRESHOLD_PCT`(20), `AGG_RANKBAND_SCHEMES`(s1/s2 の選別。空=全件), `AGG_FORCE_APPEND_BAND_TO_KEY`(0/1、古いforagg互換)
-
-### 2.3 build_db.py — SQLite 構築＋出馬表の事前突合（xjoin）
-
-- CLI: `--mode both|foragg|entries`（既定 both）, `--fresh`（DBファイル削除）, `--prune`, `--no-xjoin`, `--foragg-dir`, `--entries-dir`, `--db-path`（既定 `/app/racing.db`。**環境変数 DB_PATH は読まない**）
-- 環境変数: `XJOIN_PAGE_SIZE`(800), `XJOIN_BATCH_SIZE`(2000), `XJOIN_FAMILIES`(カンマ区切りで family 限定), `XJOIN_ONE_PER_BASE_FAM`(1でヒット上位1件のみ), `XJOIN_STRICT`(読むが未使用)
-- 開始時に `PRAGMA journal_mode=WAL; synchronous=NORMAL`、`__tables_meta__` を作成し**全行削除**
-- foragg 取込（`load_foragg_tables`）: `foragg_csv/*.csv` を全件（ファイル名は問わない）
-  - `勝率/連対率/複勝率/2着率/3着率` から `*_val` を**作り直す**: 括弧内の数値（＝推定値）を優先、括弧が無ければ先頭の数値（`extract_bayes_percent`）。`掲示板率_val` は既にあればそのまま
-  - テーブル名 = `"foragg_" + sanitize(ファイル名)` → 実際は **`foragg_foragg_{tag}_...`（接頭辞が二重）**。`sanitize` は `\w` 以外を `_` にする（日本語・全角数字は残る）。例: `foragg_foragg_rankband_s1_normal_band_主５場_中山_東京_中京_京都_阪神__カツラキ`
-  - 索引: 場所, 芝・ダ, 距離, 芝(内・外), 芝(内外), 結合データ, 各 `*_val`, 指数順位帯
-- `unified_all`: 毎回 DROP→CREATE（28列、§3.7）→ 各 foragg テーブルから `INSERT … SELECT`（無い列は NULL）＋索引
-- entries 取込（`load_entries_tables`）: `entries_out/*.csv` → `normalize_entries_df`（§3.8）→ テーブル `entries_{sanitize(ファイル名)}`
-- `entries_all`: 全 entries の主要14列を縦結合（app.py では未使用）
-- `build_entries_xjoin_tables`（`--no-xjoin` でなければ）: entries テーブルごとに `entries_xjoin_{同名}` を作成
-  - 指数 base = `X_偏差値` と `X_順位` が両方ある列名 X
-  - 各行×base×15 family で `_build_key_candidates`（§3.9）のキー候補を作り、unified_all を**完全一致のみ**で検索
-  - 対象テーブルは `instr(テーブル名, "_{family}_") > 0 AND instr(テーブル名, 指数名候補) > 0`（部分一致）。`ORDER BY 複勝率_val DESC, 連対率_val DESC LIMIT 50`
-  - `INSERT OR IGNORE`（一意索引: source_table, レースID(新/馬番無), 場 R, 馬番, base, family, key, テーブル名）。`*_val` の NULL は 0.0 で保存
-- `--prune`（`drop_stale_tables`）: `foragg_%`/`entries_%` のうち**今回作らなかったもの**を DROP（xjoin は対象外）。**`--mode entries --prune` だと foragg_* が全部消える**（§5）
-
-### 2.4 calc_entry_hensachi.py — 出馬表に偏差値・順位・帯を付与
-
-- 入出力: 既定 `/app/entries_in` → `/app/entries_out`（`--in-dir/--out-dir`、旧 `--in_dir/--out_dir` も可）
-  - 既定: 個別出力 `{stem}_hensachi.csv`
-  - `--merge-one`: 個別＋統合（`entries_merged_hensachi.csv`、`--merge-name` で変更可）
-  - `--merge-only`: 統合のみ
-- 読込: `cp932→shift_jis→utf-8-sig→utf-8`、`dtype=str, keep_default_na=False`（空欄は "" のまま）
-- 互換補完: `芝ダ→芝・ダ`、`クラス→クラス名`、`外回り→芝(内・外)`（外/外回り/True/1→外、内/0/False→内、他は空）を列追加
-- 指数列の検出（`INDEX_PATTERNS`、NFKC＋大文字小文字無視）と base 名（`ALIASES`）:
-  `GoldAirplane/Gold指数→Gold`, `マイニング値→タイムM`, `対戦型マイニング値→対戦M`、他は列名のまま（ZI, オメガ指数, かよちん指数, keibaAI指数, 吉馬_*, 先行力, 持久力 …）
-- 偏差値 `hensachi_numeric`: レース単位（`レースID(新/馬番無)` → `レースID(新)` 末尾2桁除去 → `場 R`）、母標準偏差、round(0)
-  - 反転: タイムM, 展開(力), 想定前半/後半(3F), マイニング値
-  - ZI: 0→非ゼロ平均、新馬 NaN
-  - **std=0 なら全頭 50**（replace 側は NaN）。有効値<2 は NaN
-- 順位 `X_順位`: 元ファイルの順位列を優先（明示列 `マイニング順位` 等 → `指数順位N` を指数列の出現順に位置対応 → 指数1種類のときのみ無印 `指数順位`）。無ければ再計算（同値同順位 `method=min`）
-- 帯: `X_偏差値帯`（§3.8 と同じ6区分）、`X_順位帯` = `1~2位 / 3~5位 / 6~9位 / 10位~`（**過去側の s1/s2 と区切りが違う** §5）
-- 出力列の並び: 各指数列の直後に `X_偏差値, X_偏差値帯, X_順位, X_順位帯` を挿入。Shift_JIS（サニタイズなし）
-- 統合 `merge_on_key`: 先頭ファイルの `レースID(新)`（→ `レースID(新/馬番無)` → `場 R`）を index にして後続ファイルの列を足す。**先頭ファイルにある列は NaN のときだけ後続で埋める**（"" は埋めない §5）。後続にしか無い行は落ちる
-
-### 2.5 app.py — Flask UI
-
-- `DB_PATH`（既定 `/app/racing.db`）、`PORT`（既定 8000）、`0.0.0.0` で起動。テンプレートは全て `render_template_string` のインライン HTML
-- **`/` 横断検索**: `foragg_%` テーブルを1本ずつ直接 SELECT（各200行まで）
-  - 絞込: 場所・芝・ダ・距離・芝(内・外)（選択肢は全foraggテーブルを DISTINCT 走査して作る＝テーブル数が多いと重い）
-  - family（`detect_family_and_flags`）／指数（`detect_indicator` = テーブル名の最後の `__` 以降）／オッズ（`_mode_label_from_tname`: both/normal/odds5p/odds10_50/odds10u）
-  - プリセット: 軸候補 = `複勝率_val≥80 OR 連対率_val≥60`、消し候補 = `複勝率_val<5`（**件数条件なし**）
-  - `*_val` 列見出しクリックでソート（既定 `複勝率_val DESC`）
-- **`/entries`**: entries テーブル選択（xjoin を除く `entries_%`。名前順の先頭＝**`entries_all` が既定になる**）、日付列（日付/開催日/RaceDate/年月日。無ければ非表示。あれば最新日を既定）、場所。各レースの先頭行を `COALESCE("場 R","レースID(新)","レースID(新/馬番無)")` 単位で表示
-- **`/entries/race`**: 1レースの全馬。各指数の順位/偏差値と、base キー `結合データ`（場所×芝・ダ×距離×内外）へのリンク
-- **`/entries/key`**: unified_all を `結合データ` 完全一致で最大200行表示（base キーは集計キーより短いので、通常は該当なし）
-- **`/entries/hits`**（条件ヒット馬）:
-  - 高速パス: `entries_xjoin_{…}` があれば `"場 R" = ridn`（→空白除去→末尾R除去 の順で再試行）で取得
-  - 通常パス（xjoin無し）: entries の行から `_build_key_candidates` → `_query_unified_for_key`。①完全一致 → ②帯記号ゆらぎ置換で完全一致 → ③ `結合データ LIKE key%` → ④ `LIKE 場所×芝・ダ×距離%`（**緩いフォールバック** §5）
-  - 分類 `classify`（keshi → abs → axis → opp の順で最初に該当したもの1つ。% 閾値は `_detect_scale` で 0–1 格納なら×0.01）:
-
-    | 区分 | 条件（`fv`=複勝率_val, `rv`=連対率_val, `top5`=掲示板率_val） |
-    |---|---|
-    | (3) 消し | (件数≥20 かつ fv<5 かつ 掲示板率あり かつ top5<10) または (odds10u かつ 件数≥20 かつ fv<20) |
-    | (1) 絶対軸 | 件数≥10 かつ **連対率文字列の先頭数値（＝頻度）**≥80 かつ (複勝回収値≥100 または 単勝適正回収値≥100) |
-    | (2) 軸候補 | 件数≥10 かつ 掲示板率あり かつ [fv≥80&top5≥90 / rv≥60&top5≥90 / fv≥70&top5≥80&複勝回収≥100 / rv≥50&top5≥80&複勝回収≥100] のいずれか |
-    | (4) 相手 | 件数≥30 かつ 掲示板率あり かつ [fv≥60&top5≥70 / rv≥50&top5≥70 / fv≥33&複勝回収≥150&top5≥50] のいずれか |
-
-  - fv/rv は DB の `*_val` ＝**推定値**（下側10%点。複勝率は頻度≤20%なら上側90%点）。つまり軸は保守側の下限、消しは上限で判定している。top5 と絶対軸の連対率は**頻度**
-  - 表示順: オッズモード（通常→odds10u→odds5p→odds10_50）→ 馬番昇順 → 複勝率（消しは昇順、他は降順）
-  - オッズモードは「過去にその確定オッズ帯だった馬の成績」。当日の馬のオッズとは無関係に全馬へ表示される
-- `/healthz`: DB 接続確認
-- 定数のうち `AXIS_CNT_MIN_C`, `AXIS_FV_C`, `KESHI_CNT_MIN` は未使用（README_RECAP の「件数20 & 複勝67%」は現行では効いていない）
-
-### 2.6 旧版（参照のみ。現行フローでは使わない）
-
-- `replace_csv.py`（ver1）: `/app` 絶対パス、processed_* 10種のみ。キー順が `場所×重量種別×クラス名×(内外)×芝・ダ×距離×…` で **ver3 と非互換**。重量種別 `別定/ハンデ→別ハ`
-- `aggregate_stats.py`（旧集計。docstring の名前は ver2 だが中身は旧版）: Jeffreys 事後平均、提案* = Laplace(Beta(1,1))、単勝≥3.0 の `foragg_odds3p_*` を別出力
-- `replace_csv_ver2.py` は Readme.txt に説明があるが、リポジトリには無い
+- `build_db --mode foragg` だけ回すと xjoin（照合結果）が古いまま残るので、警告が出る。続けて `--mode entries` を回す。
+- `--prune` は「今回作り直した種類」の古いテーブルだけを消す（`--mode entries --prune` で foragg_* は消えない）。
+- 画面は `__tables_meta__` に載っている集計表だけを使う。古い foragg_* テーブルが DB に残っていても表示・照合には出ない。
 
 ---
 
-## 3. データ仕様
+## 2. 共通パッケージ `shisu/`
 
-### 3.1 `csv_files/*.csv`（過去レース入力。サンプル無し、コードからの推定）
+| モジュール | 役割 |
+|---|---|
+| `config.py` | パス。ルートは `SHISU_BASE_DIR`（既定はリポジトリ直下）、DB は `DB_PATH`（既定 `racing.db`） |
+| `csvio.py` | `norm_text`（NFKC・空白除去・欠損表記→""）、CSV 読み書き（読込 cp932→utf-8-sig→utf-8、**書出し cp932**） |
+| `normalize.py` | クラス名・重量種別・距離レンジ・枠番グループ・芝(内・外)・レースID/日付 |
+| `indicators.py` | 指数の台帳（正式名・別名・符号反転・ZI 特例・新馬除外）、ファイル名から地域/指数名の取り出し |
+| `hensachi.py` | レース内の偏差値・順位・偏差値帯・順位帯（s1/s2） |
+| `keys.py` | 結合データの組み立て（15 family）。過去側のベクトル版と出馬表側の候補生成 |
+| `odds.py` | オッズ4区分（normal / odds10u / odds10_50 / odds50p） |
+| `naming.py` | 素材ファイル名の規約と解析、テーブル名 |
+| `finish.py` | 着順の正規化（取消・除外・失格・中止、1文字表記対応） |
+| `estimates.py` | ベイズ推定（Beta 分位点・事後平均） |
+| `classify.py` | 条件ヒット馬の分類（Python 版と SQL 版。両者の一致はテストで確認） |
+| `matching.py` | 出馬表1頭 × unified_all の完全一致照合（xjoin 構築と画面のその場照合で共通） |
+| `wedge.py` | WEDGE・EDGE 判定・年度加重（Phase 3 の下準備。まだ集計には組み込んでいない） |
+
+---
+
+## 3. 各スクリプト
+
+### 3.1 replace_csv_ver3.py（過去レース → 素材）
+
+1. `read_csv_any`（全列文字列、空欄は ""）→ `normalize_history`: 列名ゆれ（芝ダ/芝・ダ、芝(内外)/芝(内・外)、頭/頭数、馬名S など）を吸収し、キー部品を `shisu.normalize` で正規化
+2. `compute_indicator`（§5.4）で偏差値・順位・帯。元の `指数順位` 列があれば順位はそれを使う
+3. 頭数10以上（頭数列が無ければ警告して絞らない）、かつ「除外レース」（欠損2頭以上・全頭同値・有効2頭未満）と新馬除外（ZI・吉馬6種）を除いた行を素材にする
+4. 非band 10 family ＋ 帯スキーム（s1, s2）× band 5 family ＝ 20本を gzip で書く。キーが作れない行（部品が空）は入れない。**オッズ帯では絞らない**（aggregate で絞る。素材の容量が1/4になり、オッズ帯の定義変更が aggregate の再実行だけで済む）
+- オプション: `--clean`（出力先を空に）, `--workers N`（並列）, `--processed`（processed_* も出す）, `--no-master`, 環境変数 `RANKBAND_SCHEMES`（例 `s1`）
+- 目安（合成データ30万行の入力1本、検証環境で計測）: 51秒、素材 83MB・master 6MB。オッズ帯ごとに素材を書く旧来の方式で素材を残すと約2GB になる（旧版は aggregate が素材を上書きして縮めていた）
+
+### 3.2 aggregate_stats_ver2.py（素材 → 成績表）
+
+- 入力 `foragg_csv/foragg_*.csv.gz`。素材1本からオッズ帯4区分（§5.5）の成績表を `agg_csv/foragg_{オッズ接頭辞}{tag}_{元名}.csv` に書く。ファイル名が規約外は SKIP
+- 重複排除: レースID × 結合データ（× 指数順位帯）× 馬番
+- 着順: 取消・除外は分母外、失格・中止は分母に入れて着順=頭数（不明なら18）
+- 率: 頻度と推定値。推定値は既定で事後分布 Beta(k+0.5, n−k+0.5) の下側10%点。**複勝率だけは頻度≤20%なら上側90%点**（消し判定を保守的にするため。`AGG_PROP_MODE=mean` でも複勝率はこの切替のまま）。scipy で厳密計算
+- 回収値: 単勝・複勝は 100円均等買い。単勝適正回収値 = 100×Σ(1/オッズ×配当/100×的中)/Σ(1/オッズ)
+- 件数 < 5 のグループは計算前に除く（出力しない）
+- 集計できた素材が0本なら終了コード2（replace を先に実行）
+- 環境変数: `AGG_PROP_MODE`(lower|mean), `AGG_LOWER_Q`, `AGG_UPPER_Q`, `AGG_PRIOR_ALPHA/BETA`, `PLC_SWITCH_THRESHOLD_PCT`, `AGG_MIN_SAMPLE`, `AGG_RANKBAND_SCHEMES`。オプション `--clean`, `--workers N`
+
+### 3.3 calc_entry_hensachi.py（出馬表 → 偏差値付き出馬表）
+
+- 指数列は台帳で検出し正式名にする（`GoldAirplane→Gold`、`マイニング値→タイムM`、`対戦型マイニング値→対戦M`、`先行力→先行` など）
+- 各指数列の直後に `X_偏差値, X_偏差値帯, X_順位, X_順位帯_s1, X_順位帯_s2` を挿入。計算は過去側と同じ `compute_indicator`
+- 順位は元ファイルの順位列を優先する。対応の付け方: ①明示列（`マイニング順位`・`対戦型マイニング順位`・`{列}順位`）→ ②指数列の**すぐ右**にある `指数順位N`（TARGET の並び）→ ③N 番目の枠（指数を読み込んでいない枠の見出し `指数N` も1枠と数える）→ ④指数が1種類なら無印 `指数順位`。どれも無ければ同値同順位で計算し `[INFO]` を出す
+- `--merge-one` / `--merge-only`: レースID(新) で横結合。**空欄は後続ファイルの値で埋め、行は和集合**。DB に入れるのは統合ファイルだけにするのが推奨（`--merge-only`。個別ファイルも入れると xjoin が二重に作られる）
+- `--clean`: entries_out の CSV を消してから出力（古い出馬表が DB に入らないように）
+
+### 3.4 build_db.py（CSV → racing.db）
+
+- `--mode both|foragg|entries`, `--fresh`, `--prune`, `--no-xjoin`, `--agg-dir`, `--allow-empty`, `--entries-dir`, `--db-path`（既定は `DB_PATH` か `racing.db`）
+- foragg: 成績表を読み、5つの率の `*_val` を文字列の括弧内（推定値）で作り直す → テーブル（名前はファイル名そのまま。接頭辞 `foragg_` は1つ）→ unified_all → __facets__
+  - 読める成績表が0本なら DB に触らず終了コード2（空にしたいときだけ `--allow-empty`）
+- entries: `normalize_entries_df`（§5）→ テーブル → entries_all → xjoin（各馬 × 指数 × 15 family × キー候補を unified_all と完全一致照合。照合結果のキャッシュは2万件で空にする）
+  - unified_all が無い・旧形式（family/indicator 列が無い）なら xjoin を作らず終了コード1
+  - レースID(新) が無い出馬表は「日付_場 R」をレースの識別子にする。旧形式の出馬表（`X_順位帯_s1` が無い）は警告。順位 `13.0` は `13` として扱う
+
+### 3.5 app.py（Flask）
+
+- `/`: 条件（場所・芝・ダ・距離・芝(内・外)・地域）、family、指数、オッズ帯、プリセット（絶対軸・軸候補・相手候補・消し候補。判定は `classify` と同じ SQL）で集計表を表示。一度に最大100表・各200行
+- `/entries`: 日付（最新が既定）・場所でレース一覧。リンクは `レースID(新/馬番無)`（旧リンク `ridn=場 R` も開ける）
+- `/entries/hits`: 馬ごとの該当数の要約と、区分ごとの表。照合経路（xjoin / on-the-fly）を表示。並びは オッズ帯（通常→10倍未満→10〜50倍→50倍以上）→ 馬番 → 複勝率（消しは昇順）
+- DB が未構築・旧形式なら各画面の上部に作り直しの案内を出す（旧形式の DB でもエラーにしない）
+
+---
+
+## 4. データ仕様
+
+### 4.1 csv_files/*.csv（過去レース。サンプル無し・推定）
 
 | 区分 | 列 |
 |---|---|
-| 必須相当 | `レースID(新)`, `場所`, `芝・ダ`, `距離`, `頭数`, `指数`, `指数順位`, `着順`, `単勝オッズ`, `単勝配当`, `複勝配当` |
-| 任意 | `レースID(新/馬番無)`, `重量種別`, `クラス名`, `芝(内・外)` または `芝(内外)`, `コース区分`, `枠番`, `騎手`, `馬名`/`馬名S` |
+| 必須 | `レースID(新)`（18桁: YYYYMMDD+場2+回2+日2+R2+馬番2）, `場所`, `芝・ダ`, `距離`, `頭数`, `指数`, `着順`, `単勝オッズ`, `単勝配当`, `複勝配当` |
+| 任意 | `レースID(新/馬番無)`, `指数順位`, `重量種別`, `クラス名`, `芝(内・外)`/`芝(内外)`, `枠番`, `馬番`, `騎手`, `馬名`/`馬名S` |
 
-- 1ファイル=1指数。指数名はファイル名末尾から判定（列は常に `指数` / `指数順位`）
-- `レースID(新)`: 18桁 `YYYYMMDD`+場コード2+回2+日2+R2+馬番2（出馬表サンプルと同形式と推定。例 `202605310502120101`）
+### 4.2 foragg_csv（素材、1行=1頭×1キー、cp932 の CSV を gzip）
 
-### 3.2 foragg 素材版（replace 直後、1行=1頭）
+`レースID(新), 結合データ, [指数順位帯], 着順, 単勝オッズ, 単勝配当, 複勝配当, 場所, 芝・ダ, 距離, 芝(内・外), 馬番, 馬名, 頭数, 日付, year`
+（ファイル名にオッズ接頭辞は付かない。中身を見るときは `gzcat` か pandas の `read_csv`）
 
-`レースID(新), 結合データ, [指数順位帯], 着順, 単勝オッズ, 単勝配当, 複勝配当,` ＋存在すれば `場所, 芝・ダ, 距離, 芝(内・外), 馬名, 馬名S, 頭数, 頭`
-（`馬番` と `芝(内外)` はカンマ抜けで入らない §5）
+### 4.3 agg_csv（成績表、1行=1結合データ）
 
-### 3.3 foragg 集計版（aggregate 後、1行=1結合データ）
-
-| 列 | 型・形式 |
+| 列 | 内容 |
 |---|---|
-| 結合データ | 文字列（§3.9） |
-| 件数 | int（≥5） |
-| 勝率, 連対率, 複勝率, 2着率, 3着率 | `"45.00%（47.10%）"`＝頻度%（推定%）。括弧は全角 |
+| 結合データ, 件数 | キーと件数（≥5） |
+| 勝率, 連対率, 複勝率, 2着率, 3着率 | `"45.00%（47.10%）"` ＝ 頻度%（推定%） |
+| *_val（上の5つ）, 掲示板率_val | **CSV では頻度%**（0–100） |
 | 掲示板率 | `"80.00%"`（頻度のみ） |
-| 勝率_val, 連対率_val, 複勝率_val, 2着率_val, 3着率_val, 掲示板率_val | float（0–100）。**CSVでは頻度** |
-| 平均着順, 単勝回収値, 複勝回収値, 単勝適正回収値 | float（小数2桁） |
-| 提案勝率, 提案連対率, 提案複勝率, 提案2着率, 提案3着率 | `"47.10%"`（推定値のみ） |
-| 場所, 芝・ダ, 距離, 芝(内・外), 芝(内外) | グループ内で最初の非空値 |
+| 平均着順, 単勝回収値, 複勝回収値, 単勝適正回収値 | 数値 |
+| 提案勝率〜提案3着率 | 推定%のみ |
+| 場所, 芝・ダ, 距離, 芝(内・外) | グループ内で最初の非空値 |
 
-列順は `結合データ, 件数, 勝率_val, 勝率, 連対率_val, 連対率, 複勝率_val, 複勝率, 2着率_val, 掲示板率_val, 掲示板率, 2着率, 3着率_val, 3着率, 平均着順, …`
+### 4.4 master_csv（1頭1行）
 
-### 3.4 `processed_*.csv`
+`レースID(新), レースID(新/馬番無), 日付, year, 地域, 指数名, 場所, 芝・ダ, 距離_raw, 距離, 芝(内・外), 重量種別, クラス名, 頭数, 枠番, 枠番グループ, 馬番, 馬名, 騎手, 指数, 指数順位_元, 順位, 偏差値, 偏差値帯, 順位帯_s1, 順位帯_s2, 指数有効(0/1), 着順, 単勝オッズ, オッズ帯, 単勝配当, 複勝配当`
+（頭数10以上の全馬。除外レースの馬も `指数有効=0` で残す）
 
-`レースID(新), 結合データ[, 指数順位帯]`（確認用。下流では未使用）
+### 4.5 entries_in / entries_out
 
-### 3.5 `entries_in/shisu_YYYYMMDD_N.csv`（サンプル: 348行×27列、2026-05-31 東京12R＋京都12R）
+- 入力（サンプル 348行×27列）: `レースID(新), 場 R, Ｒ, 場所, 芝ダ, 距離, 外回り, クラス, レース名, 年限定, 頭, 枠番, 馬番, 馬名S, 騎手,` ＋指数ブロック（`GoldAirplane, 指数順位1, ZI, 指数順位2, …, マイニング値, マイニング順位, 対戦型マイニング値, 対戦型マイニング順位`）
+- 出力: 入力列 ＋ 各指数の `X_偏差値, X_偏差値帯, X_順位, X_順位帯_s1, X_順位帯_s2`（X は正式名）
+- 同梱の `entries_out/entries_merged_hensachi.csv` は**旧版の出力**（列名・帯の定義が新版と違う）
 
-`レースID(新), 場 R, Ｒ, 場所, 芝ダ, 距離, 外回り, クラス, レース名, 年限定, 頭, 枠番, 馬番, 馬名S, 騎手,` ＋指数ブロック
-（サンプル _1: `GoldAirplane, 指数順位1, ZI, 指数順位2, オメガ指数, 指数順位3, かよちん指数, 指数順位4, マイニング値, マイニング順位, 対戦型マイニング値, 対戦型マイニング順位`）
+### 4.6 DB（racing.db）
 
-- cp932。`場 R` は `東1` `京12` 形式。`外回り` は `外` か空。`年限定` は `３歳` `４歳以上`（全角）。`クラス` は `未勝利, 1勝, 2勝, 3勝, OP(L), ｵｰﾌﾟﾝ, Ｇ１, Ｇ２` など
-- 過去側と列名が違う: `芝ダ`/`頭`/`クラス`（過去側は `芝・ダ`/`頭数`/`クラス名`）。重量種別・芝(内・外) の列は無い
-- サンプル _1 ではマイニング値・対戦型マイニング値が全行空
+| テーブル | 内容 |
+|---|---|
+| `__tables_meta__` | table_name, source_file, kind(foragg/entries/xjoin), family, odds_mode, rank_scheme, indicator, region, n_rows |
+| `foragg_*` | 成績表1本=1テーブル（§4.3 の列。5つの率の *_val は推定値に置換） |
+| `unified_all` | 全 foragg_* の縦結合（場所, 芝・ダ, 距離, 芝(内・外), 結合データ, 成績列, *_val, family, odds_mode, rank_scheme, indicator, region, テーブル名）。索引 (結合データ, family, indicator) |
+| `__facets__` | 画面の選択肢（col, val） |
+| `entries_*` | 出馬表（元の列 ＋ 正規化したキー部品 `場所/芝・ダ/距離/芝(内・外)/重量種別/クラス名/枠番グループ/騎手`、`日付`、`レースID(新/馬番無)`、`距離_raw`、`クラス名_raw`） |
+| `entries_all` | 全出馬表の主要列の縦結合（画面では使わない） |
+| `entries_xjoin_*` | 照合結果: source_table, 日付, レースID(新), レースID(新/馬番無), 場 R, 馬番, 枠番, 枠番グループ, 騎手, 馬名, base(指数), key, テーブル名, family, odds_mode, rank_scheme, indicator, region, 成績列 |
 
-### 3.6 `entries_out/*_hensachi.csv`（サンプル: 統合版 348行×92列）
+`*_val` の意味:
 
-入力列＋各指数の `X_偏差値`（float）, `X_偏差値帯`, `X_順位`, `X_順位帯` ＋末尾に `芝・ダ, クラス名, 芝(内・外)`。統合版は全ファイルの列の和集合（例: keibaAI指数, 吉馬_先行力, 吉馬_末脚力, 吉馬_SP能力値/信頼/調整/最大, 判別できない `指数2/3/4`（全空））。
-サンプルでの実測:
-- `タイムM_偏差値` 348件・`対戦M_偏差値` 338件は埋まっているが、`タイムM_偏差値帯`・`タイムM_順位帯`・`対戦M_偏差値帯`・`対戦M_順位帯`・`マイニング値` は**0件**（統合の埋め漏れ §5）
-- `keibaAI指数` が全行 `0.00` → 全頭 `偏差値50 / 41~50 / 順位1 / 1~2位`
-
-### 3.7 DB（racing.db）テーブル
-
-| テーブル | 作成元 | 内容 |
+| 列 | agg_csv | DB・画面の判定 |
 |---|---|---|
-| `__tables_meta__` | build_db | table_name(PK), source_file。実行のたびに全削除して今回分だけ入れる |
-| `foragg_foragg_*` | build_db（foragg CSV 1本=1テーブル） | §3.3 の列。`*_val`（5率）は**推定値で上書き**、掲示板率_val は頻度のまま |
-| `unified_all` | build_db | 場所, 芝・ダ, 距離, 芝(内・外), 結合データ, 件数(INT), 勝率, 連対率, 複勝率, 2着率, 3着率, 掲示板率, 平均着順, 単勝回収値, 複勝回収値, 単勝適正回収値(REAL), 提案勝率〜提案3着率, 勝率_val〜3着率_val, 掲示板率_val(REAL), テーブル名 の28列。`芝(内外)` と `指数順位帯` は持たない |
-| `entries_{stem}` | build_db（entries_out CSV 1本=1テーブル） | §3.6 の列（全て文字列化）＋ `距離_raw, 重量種別, 枠番グループ, 結合データ(base)`。`芝ダ/頭/クラス` は `芝・ダ/頭数/クラス名` に統合 |
-| `entries_all` | build_db | レースID(新/馬番無), レースID(新), 場 R, 場所, 芝・ダ, 距離, 芝(内・外), クラス名, 重量種別, 頭数, 馬番, 馬名, 騎手, 結合データ |
-| `entries_xjoin_{stem}` | build_db | source_table, レースID(新/馬番無), 場 R, 馬番, 枠番, 枠番グループ, 騎手, 馬名, base, family, key, like_prefix, テーブル名, 件数, 勝率_val, 勝率, 連対率_val, 連対率, 複勝率_val, 複勝率, 2着率_val, 2着率, 3着率_val, 3着率, 掲示板率_val, 掲示板率, 平均着順, 単勝回収値, 複勝回収値, 単勝適正回収値, hit_key(=一致した結合データ), odds_tag(normal/odds10u/odds5p/odds10_50) |
+| 勝率_val〜3着率_val | 頻度% | 推定%（括弧内） |
+| 掲示板率_val | 頻度% | 頻度% |
 
-`*_val` の意味の違い（取り違えやすい）:
+率はすべて 0–100。画面側で 0–1 への換算はしない。
 
-| 列 | foragg CSV（aggregate 出力） | DB（build_db 後）・UI判定 |
-|---|---|---|
-| 勝率_val〜3着率_val | 頻度% | 括弧内の推定%（括弧が無ければ頻度%） |
-| 掲示板率_val | 頻度% | 頻度%（そのまま） |
+---
 
-### 3.8 正規化ルール（過去側 replace_csv_ver3 ／ 出馬表側 build_db.normalize_entries_df）
+## 5. キーの規則（`shisu/`）
 
-- **クラス名**（両側共通）: `500万,1000万,1勝,2勝→1・2_勝` / `1600万,3勝,ｵｰﾌﾟﾝ,OP(L)→準OP・OP` / `Ｇ２,Ｇ３→重賞` / `馬齢×(1・2_勝|準OP・OP)→1勝・OP`。未勝利・新馬・Ｇ１ はそのまま。
-  過去側は出力時に NFKC がかかるので `Ｇ１→G1`、出馬表側は `Ｇ１` のまま（§5）
-- **重量種別**: 過去側＝TARGETの列（`別定→定量`。値は 馬齢/定量/ハンデ）。出馬表側＝推定（`レース名` に `Ｈ`/`H` → ハンデ、それ以外で `年限定` に `上` が無い → 馬齢、ある → 定量）
-- **芝(内・外)**: 過去側＝TARGETの列をそのまま（京都芝2000 は `内外` に統合）。出馬表側＝**京都・新潟だけ** `外回り=="外"→外`、それ以外は `内`（ダートも `内`）。他場は空
-- **距離レンジ**（両側同一。replace_csv_ver3 と build_db に二重定義）:
-  福島芝1700/1800→17-18、新潟芝 内1200/1400→12-14・外1600/1800→16-18・内2000/2200/2400→20-24・外3000/3200→30-32、中山ダ2400/2500→24-25、東京芝1600/1800→16-18・2300/2400→23-24・ダ1300/1400→13-14、中京ダ1800/1900→18-19、京都芝 内1400/1600→14-16・外1400/1600/1800→14-18・2000(内/外)→2000×`内外`・外2200/2400→22-24・外3000/3200→30-32・ダ1800/1900→18-19、阪神芝1600/1800→16-18・2400/2600→24-26・3000/3200→30-32、小倉芝1700/1800→17-18（札幌芝・中京芝はコメントアウト）。出馬表側は先に `m` を除去
-- **枠番グループ**: 10–13頭 枠1–5内/6–8外、14–16頭 1–4内/5–8外、17–18頭 1–3内/4–6中/7–8外。過去側は9頭以下を空、出馬表側は9頭以下・不明で 1–2内/3–6中/7–8外
-- **偏差値帯**（両側同一ラベル、ASCII `~`）: `71以上 / 66~70 / 61~65 / 51~60 / 41~50 / 40以下`
-- **順位帯**: 過去側 s1 `1~3位/4~6位/7~9位/10位~`、s2 `1~5位/6~10位/11位~`。出馬表側 `1~2位/3~5位/6~9位/10位~`
-- **新馬**: 過去側は ZI・吉馬6指数のファイルで新馬行を foragg から除外。出馬表側は ZI のみ偏差値/順位を NaN
-- **頭数**: 過去側は10頭以上のみ。出馬表側は制限なし
+### 5.1 構成
 
-### 3.9 結合データ（family 別キー構成）
-
-共通の先頭: `場所×芝・ダ×距離×芝(内・外)`（空要素は詰める。区切りは `×`）
+`場所×芝・ダ×距離×[芝(内・外)]×（family の後続部品）`。芝(内・外) は空なら省く。**それ以外の部品が1つでも空ならキーを作らない**。
 
 | family | 後続 | family | 後続 |
 |---|---|---|---|
-| normal | 重量種別×クラス名×指数順位 | normal_band | 重量種別×クラス名×指数順位帯 |
-| rankB | 枠番グループ×指数順位 | rankB_band | 枠番グループ×指数順位帯 |
-| rankJ | 騎手×指数順位 | rankJ_band | 騎手×指数順位帯 |
-| rankBJ | 枠番グループ×騎手×指数順位 | rankBJ_band | 枠番グループ×騎手×指数順位帯 |
-| normalJ | 重量種別×クラス名×騎手×指数順位 | normalJ_band | 重量種別×クラス名×騎手×指数順位帯 |
+| normal | 重量種別×クラス名×指数順位 | normal_band | 重量種別×クラス名×順位帯 |
+| rankB | 枠番グループ×指数順位 | rankB_band | 枠番グループ×順位帯 |
+| rankJ | 騎手×指数順位 | rankJ_band | 騎手×順位帯 |
+| rankBJ | 枠番グループ×騎手×指数順位 | rankBJ_band | 枠番グループ×騎手×順位帯 |
+| normalJ | 重量種別×クラス名×騎手×指数順位 | normalJ_band | 重量種別×クラス名×騎手×順位帯 |
 | hensachiA | 重量種別×クラス名×偏差値帯 | hensachiB | 枠番グループ×偏差値帯 |
 | hensachiJ | 騎手×偏差値帯 | hensachiBJ | 枠番グループ×騎手×偏差値帯 |
 | hensachiAJ | 重量種別×クラス名×騎手×偏差値帯 | | |
 
-- 過去側の生成は `replace_csv_ver3.build_joined`。出馬表側の候補生成は `build_db._build_key_candidates` と `app._build_key_candidates`（**同じ処理が2か所にある**）
-  - 順位: `13`, `13位`（元が小数なら `13.0` も）
-  - 偏差値帯・順位帯: `~` `-` `〜` の3表記（順位帯は `位` の有無も）
-  - 内外: 値があれば `[値, 空]`、無ければ `[空, 内, 外, 内外]` を全部試す
-- 例（サンプル 東1 ZI 13位）: `東京×ダ×1600×馬齢×未勝利×13`（normal）、`東京×ダ×1600×内枠×13`（rankB）、`東京×ダ×1600×馬齢×未勝利×40以下`（hensachiA）
+出馬表側は 芝(内・外) が分かれば `[値, 空]`、分からなければ `[空, 内, 外, 内外]` を試す。band family は s1・s2 両方の帯で試す。
+
+### 5.2 正規化
+
+- **文字**: すべて NFKC ＋ 空白除去（`Ｇ１→G1`、`Ｃ．ルメール→C.ルメール`、`ｵｰﾌﾟﾝ→オープン`）。書き出しは cp932（`髙` などを保持）
+- **クラス名**: `500万/1000万/1勝/2勝→1・2_勝`、`1600万/3勝/オープン/OP/OP(L)/L→準OP・OP`、`G2/G3/重賞→重賞`、`G1/GI→G1`、未勝利・新馬はそのまま。`馬齢×(1・2_勝|準OP・OP)→1勝・OP`
+- **重量種別**: 過去側は TARGET の列（`別定→定量`。値は 馬齢/定量/ハンデ）。出馬表側は `重量種別` 列があればそれ、無ければ推定:
+  レース名のハンデ記号（`むらさＨ･3勝`・`目黒記念ＨG2`・`安土城Ｈ(L)`。`NHKマイルC`・`HTB賞` は対象外）→ハンデ、年限定に「上」→定量、3歳限定G1→定量、その他の2・3歳限定→馬齢、年限定が空→不明（重量種別を含むキーは作らない）
+- **距離**: `1600m`・`1600.0`→`1600`。レンジ統合（福島芝1700/1800→17-18、新潟芝 内1200/1400→12-14・外1600/1800→16-18・内2000/2200/2400→20-24・外3000/3200→30-32、中山ダ2400/2500→24-25、東京芝1600/1800→16-18・2300/2400→23-24・ダ1300/1400→13-14、中京ダ1800/1900→18-19、京都芝 内1400/1600→14-16・外1400/1600/1800→14-18・2000→2000×`内外`・外2200/2400→22-24・外3000/3200→30-32・ダ1800/1900→18-19、阪神芝1600/1800→16-18・2400/2600→24-26・3000/3200→30-32、小倉芝1700/1800→17-18）
+- **芝(内・外)**: 過去側は TARGET の列。出馬表側は `外回り` 列が外→`外`、京都・新潟の芝でそれ以外→`内`、他は不明（空）
+- **枠番グループ**: 10–13頭 枠1–5内/6–8外、14–16頭 1–4内/5–8外、17–18頭 1–3内/4–6中/7–8外、それ以外は空（両側共通）
+
+### 5.3 指数の台帳（`shisu/indicators.py`）
+
+| 正式名 | 別名 | 特例 |
+|---|---|---|
+| Gold | GoldAirplane, Gold指数 | |
+| BC | BCindex | |
+| ZI | ZI指数 | 0/欠損→同レース非ゼロ平均、新馬除外 |
+| 吉馬_SP能力値・吉馬_先行力・吉馬_SP信頼・吉馬_SP調整・吉馬_SP最大・吉馬_末脚力 | | 新馬除外 |
+| 展開 | 展開力 | 符号反転 |
+| 先行・追走・持久・持続・瞬発 | 先行力・追走力・持久力・持続力・瞬発力 | |
+| 想定前半・想定後半 | 想定前半3F・想定後半3F | 符号反転 |
+| タイムM | マイニング値, タイム指数, TimeM | 符号反転 |
+| 対戦M | 対戦型マイニング値, MatchM | |
+| ほか | カツラキ, オメガ指数(Ω指数), かよちん指数, keibaAI指数, SAV, ST指数(ST), 合計値, 仕上り(仕上がり), 圧勝力 | |
+
+照合は DB の `indicator` 列の**完全一致**（`先行` と `吉馬_先行力` は別物）。
+
+### 5.4 偏差値・順位・帯（`compute_indicator`、両側共通）
+
+1. 同一レースで指数欠損2頭以上 → このレースはこの指数で使わない。1頭 → その馬の順位は空
+2. ZI: 0/欠損を同レース非ゼロ平均で埋める
+3. 符号反転・新馬除外（台帳どおり）
+4. 有効2頭未満、または全頭同値（全頭0の未取得など）→ このレースは使わない
+5. 偏差値 = (x−平均)/母標準偏差×10+50 を四捨五入。帯: `71以上 / 66~70 / 61~65 / 51~60 / 41~50 / 40以下`
+6. 順位は元の順位列を優先（無ければ同値同順位。同梱サンプルの TARGET の順位も ZI・オメガ指数で同値同順位だった）。順位帯: s1 `1~3位/4~6位/7~9位/10位~`、s2 `1~5位/6~10位/11位~`
+- 指数値・順位は NFKC・空白除去してから数値化する（全角数字を欠損にしない）
+
+### 5.5 オッズ帯（`shisu/odds.py`）
+
+aggregate が素材を過去レースの**確定単勝オッズ**で絞って集計する: `normal`（なし）/ `odds10u`（10倍未満）/ `odds10_50`（10以上50未満）/ `odds50p`（50倍以上）。成績表のファイル名の接頭辞は `odds10u_` / `odds10_50_` / `odds50p_`。オッズ欠損の馬は normal にだけ入る。
+画面の「オッズ帯」は「過去にそのオッズ帯だった馬の成績」で、当日の馬のオッズとは無関係に全馬へ表示される。
 
 ---
 
-## 4. Dockerfile と実行環境
+## 6. 条件ヒット馬の分類（`shisu/classify.py`）
 
-- ベース `python:3.11-slim`。`locales`（ja_JP.UTF-8）＋ `sqlite3` CLI。`pip install pandas numpy flask`（**バージョン未固定**、scipy なし）
-- `COPY . .` するが `.dockerignore` でデータ・DB・CSV は除外。`/app/csv_files, replace_csv, foragg_csv` を mkdir（entries_in は作らない＝マウント前提）
-- `EXPOSE 8000`、`CMD ["python","app.py"]`（ENTRYPOINT ではないので `docker run IMAGE python /app/x.py` でも `--entrypoint python IMAGE /app/x.py` でも動く）。Dockerfile 後半はコメントアウトされた旧版
-- 運用は `-v "$(pwd)":/app` でホストのディレクトリを丸ごとマウント → **コード変更は再ビルド不要**、依存ライブラリ変更時のみ再ビルド
-- ホストは Mac（Readme の `cd Downloads/self-dev/docker/shisu/docker_shisu_replace`。Datasette を `--platform linux/amd64` で起動している点から Apple Silicon と推定）
+値: `fv`=複勝率_val（推定）, `rv`=連対率_val（推定）, `top5`=掲示板率_val（頻度）, `frc`=複勝回収値, `tra`=単勝適正回収値, `cnt`=件数。欠損は「満たさない」。
+判定順 **消し → 絶対軸 → 軸候補 → 相手** で、最初に当てはまった区分を1つだけ付ける。
 
-注意点:
-- **パス前提が混在**: replace_csv_ver3 は `./`（cwd=/app 前提）、aggregate_stats_ver2・calc_entry_hensachi（既定）・build_db（既定）・app（既定）は `/app` 絶対パス。Docker 外で動かすなら build_db/calc は引数、aggregate はコード修正が必要
-- **pandas のバージョンで結果が変わる**（実測: pandas 2.3.3 / 3.0.5）。再ビルドすると最新版（現在 3.x）が入る。空欄セルの扱いが変わり、`結合データ` が `…×nan×…` から空文字に変わる（§5-1）。固定するのが安全
-- scipy が無いので aggregate の推定値は正規近似（小標本では Beta 分位点とずれる）
-- Python 3.10 以上が必要（calc_entry_hensachi が `int | None` 型注釈を使う）
-- SQLite の「存在しない列名をダブルクォートで書くと文字列リテラル扱い」（DQS）に依存している SQL がある（xjoin 高速パスの `COALESCE("レースID(新)",…)`、`/entries` の `"レース名"` など）。DQS を無効にした SQLite ビルドではエラーになる
-- データ量: Readme の実績で unified_all ≈ 577万行。xjoin 構築は 行×指数×15family×キー候補 回のクエリになり重い
-- 補助ツール: Datasette（:8001）でDB閲覧可（Readme.txt 参照）。テーブル削除用ワンライナーも Readme.txt にある
-
----
-
-## 5. 既知の不整合・リスク（未修正。改修時の候補）
-
-根拠: [実測]＝本セッションで実行して確認、[サンプル]＝同梱CSVで確認、[コード]＝コード読解、[要実データ]＝本番データで要確認
-
-**照合結果に直接効くもの**
-1. **欠損セルで結合データが壊れる** [実測]。replace の `basic_clean` が `astype(str)` するため、pandas 2.x では空欄が `nan` 文字列になりキーに混入（`東京×ダ×1600×nan×定量×1・2_勝×1`）、pandas 3.x ではキー全体が空文字になる。出馬表側のキーに `nan` は出ないので、該当行は二度とヒットしない。ダートなど `芝(内・外)` が空の行がどれだけあるかは [要実データ]（§7 の確認クエリ）
-2. **順位帯の区切りが過去側と出馬表側で違う** [コード]。出馬表 `1~2/3~5/6~9/10位~` に対して、過去側は s1 `1~3/4~6/7~9/10位~`、s2 `1~5/6~10/11位~`。一致するのは s1 の `10位~` だけなので、band 系5 family は実質「10位以下」しかヒットしない
-3. **`--merge-one/--merge-only` の統合で帯が抜ける** [サンプル]。`merge_on_key` は先頭ファイルの値が NaN のときだけ後続で埋めるが、帯列は空でも `""`（NaN ではない）なので埋まらない。サンプルではタイムM・対戦M の `_偏差値` は埋まって `_偏差値帯` は0件 → hensachi 系 family のキーが作られない
-4. **全頭0の指数がそのまま照合される** [サンプル]。keibaAI指数が全行0.00 → std=0 で全頭偏差値50・順位1 → 「1位」「41~50」の過去成績が全馬に付く
-5. **クラス名 `Ｇ１` の全角/半角不一致** [実測]。過去側は出力時の NFKC で `G1`、出馬表側は `Ｇ１` のまま → クラスを含む family（normal / normalJ / hensachiA / hensachiAJ / *_band）で G1 は当たらない
-6. **重量種別の推定ずれ** [サンプル]。出馬表側は レース名・年限定 から推定するので、例えば東京優駿（3歳G1・定量）が `馬齢` になる。3歳の別定戦なども過去側（定量）と食い違う
-7. **指数名の対応が部分一致で、表記も揃っていない** [コード／要実データ]。xjoin は `instr`、通常パスは `LIKE %指数名%` でテーブルを選ぶ。出馬表側の指数列検出（`INDEX_PATTERNS`）は `先行力/追走力/持久力/持続力/瞬発力`（力付き）だけで、過去側ファイル名は `先行/追走/持久/持続/瞬発`。列名が力付きなら `先行力` は `吉馬_先行力` のテーブルに誤って当たり、`持久力` は `持久` に当たらない。力無しなら列が検出されない。family も `_normal_` が `_normal_band_` を含む（キー形式が違うので実害は小さい）
-8. **xjoin 無しの通常パスは前方一致で誤ヒットする** [コード]。`LIKE key%` だと順位1が10〜18位にも一致し、最後の `場所×芝・ダ×距離%` は条件が全く違う行の上位50件を返す。xjoin 高速パスは完全一致だけなので、**2つのパスで結果が変わる**
-
-**機能・運用面**
-9. **テーブル名の接頭辞が二重（`foragg_foragg_…`）** [実測]。app の `detect_family_and_flags` は全テーブルを family=`foragg` と判定 → `/` の family フィルタが機能しない。会場別ファイル（`札幌_ZI` など）は `__` が無いので指数名が「不明」
-10. **`build_db.py --mode entries --prune` で foragg_* が全部消える** [コード]。Readme.txt に「古いテーブル掃除」として載っているコマンド。unified_all は残るので hits は動くが、`/` は空になる。entries_all も消える
-11. **`AGG_OPTIONAL_COLS` のカンマ抜け** [実測]。`"芝(内外)" "馬番"` が `"芝(内外)馬番"` に連結され、foragg に `馬番`・`芝(内外)` が入らない。aggregate の重複排除は `馬名` 頼りになる
-12. `add_return_contrib` が作る的中・回収寄与列は foragg に出力されない（docstring と食い違い）[コード]
-13. 着順の1文字表記（`取`/`除`/`中`/`失`）は ver2 の正規表現（`取消|除外`, `失格|中止`）に当たらない。TARGET がこの表記なら取消馬が分母に残る [要実データ]
-14. `/entries` の既定テーブルが `entries_all`（名前順で先頭）。`レース名` 列が無いので DQS によりレース名欄に文字列「レース名」が出る [コード]
-15. entries_xjoin_* に日付列が無い。1テーブルに複数日が入っていると、同じ `場 R` の馬が混ざる [コード]
-16. `/entries/key` は base キー（場所×芝・ダ×距離×内外）で完全一致検索するので、通常は該当なし [コード]
-17. 偏差値計算の差: std=0 は過去側 NaN／出馬表側 50、吉馬の新馬除外は過去側のみ、指数欠損ポリシーは過去側のみ [コード]
-18. `/` の初期表示で全 foragg テーブル×4列を DISTINCT 走査して重い。オッズ選択のラジオボタンが2段重複している [コード]
-19. `sanitize_df_for_sjis` は `〜`(U+301C) を `～`(U+FF5E) に変換するが shift_jis で書けないため削除される（帯ラベルは ASCII `~` なので現状は影響なし）[実測]
-20. app.py の `classify` で odds10u 用に計算している `f_pct_10u` は未使用 [コード]
-
----
-
-## 6. README_RECAP.md / Readme.txt との差分（コードが正）
-
-| ドキュメントの記述 | 現行コード |
+| 区分 | 条件 |
 |---|---|
-| 推定値は Jeffreys 事後平均 (k+0.5)/(n+1) | 既定は事後分布の下側10%点。複勝率は頻度≤20%なら上側90%点（`AGG_PROP_MODE=mean` で事後平均） |
-| `*_val` はベイズ値 | CSV では頻度、DB では推定値（掲示板率_val は両方頻度） |
-| オッズ派生は odds3p / `both/normal/odds3p/odds10u` | odds10u（<10）/ odds5p（≥5）/ odds10_50（10–50）。odds3p は旧 aggregate_stats.py のみ |
-| 条件ヒット馬は 軸=複勝≥80 or 連対≥60 or (件数≥20&複勝≥67)、消し=件数≥20&複勝<5 | abs/axis/keshi/opp の4区分（§2.5の表）。件数20&67% の条件は未使用 |
-| 並び順 通常→odds10u→odds3p | 通常→odds10u→odds5p→odds10_50 |
-| calc_entry_hensachi が `66-70/66~70/66〜70` の3表記を出力 | 出力は `~` のみ。3表記はキー照合時に生成 |
-| 重量種別 別定/ハンデ→別ハ（Readme.txt の ver1 説明） | ver3 は 別定→定量、ハンデはそのまま |
-| キー順 場所×重量種別×クラス名×(内外)×芝ダ×距離×… | ver3 は 場所×芝・ダ×距離×(内外)×… |
-| unified_all の代表列に 芝(内外) | unified_all は 芝(内・外) のみ。掲示板率・掲示板率_val が追加 |
-| テーブル名は英数とアンダースコアのみ | 日本語も残る（`\w` 判定）。接頭辞は二重 |
-| Docker イメージ名 `csv_processor`（README_RECAP） | Readme.txt の実運用は `csv_processor_shisu` |
+| 消し候補 | (cnt≥20 かつ fv<5 かつ top5<10) または (odds10u かつ cnt≥20 かつ fv<20) |
+| 絶対軸 | cnt≥10 かつ rv≥80 かつ (frc≥100 または tra≥100) |
+| 軸候補 | cnt≥10 かつ [fv≥80&top5≥90 / rv≥60&top5≥90 / fv≥70&top5≥80&frc≥100 / rv≥50&top5≥80&frc≥100] のいずれか |
+| 相手候補 | cnt≥30 かつ [fv≥60&top5≥70 / rv≥50&top5≥70 / fv≥33&frc≥150&top5≥50] のいずれか |
+
+推定値は「軸は下限、消しは上限」で判定する設計（複勝率の推定は頻度20%以下なら上側90%点）。閾値は `classify.py` の定数で変える。`/` のプリセットも同じ定義の SQL を使う。
 
 ---
 
-## 7. 今後の作業ルール・確認方法
+## 7. Docker・実行環境
 
-- 改修時は**両側を同時に**直す。キー関連のロジックは次に分散している:
-  - 過去側: `replace_csv_ver3.py`（`basic_clean`, `apply_place_distance_rules`, `add_hensachi`, `build_joined`, `RANKBAND_SCHEMES`）
-  - 出馬表側: `calc_entry_hensachi.py`（偏差値・順位・帯）、`build_db.py`（`normalize_entries_df`, `apply_place_distance_rules_inplace`, `_build_key_candidates`, `IND_ALIASES`）、`app.py`（`_build_key_candidates`, `IND_ALIASES`, `_query_unified_for_key`）
-  - `IND_ALIASES` は build_db と app で微妙に違う（app の Gold に `Gold_Airplane` が無い）
-- キー仕様を変えたら全段再実行（replace → aggregate → build_db --mode both）。既存 DB と混ぜない（`--fresh` 推奨）
-- 文字コード: 出力はすべて Shift_JIS。読込は cp932 優先。SJIS で書けない文字は replace 側では削除、calc 側では例外になる
-- このクラウド環境には本番データも Flask も無い。サンプル2本と合成データで関数単位に検証する（flask はスタブで import 可能）
-- 確認用クエリ（ホストのプロジェクト直下で）:
+- `Dockerfile`: `python:3.11.18-slim-bookworm`（`--build-arg PYTHON_IMAGE=...` で差し替え可）、ja_JP.UTF-8、sqlite3 CLI、`requirements-dev.txt`（実行用＋pytest）を固定版でインストール
+- `requirements.txt`: pandas 2.3.3 / numpy 2.3.5 / scipy 1.16.3 / Flask 3.1.2（依存も固定）。テストは pandas 2.3.3 と 3.0.5 の両方で通ることを確認済み
+- パス: 全スクリプトが `shisu/config.py` を使う（既定はリポジトリ直下。Docker では /app）。`SHISU_BASE_DIR`・`DB_PATH` で変更可。Docker 外でもそのまま動く
+- 運用は `-v "$(pwd)":/app` でホストを丸ごとマウント。コード変更は再ビルド不要、`requirements*.txt` を変えたら再ビルド
+- SQLite 3.30 以上（`NULLS LAST` を使用）。bookworm は 3.40
 
-```bash
-docker run --rm -v "$(pwd)":/app csv_processor_shisu sqlite3 /app/racing.db "SELECT COUNT(*) FROM unified_all WHERE \"結合データ\" LIKE '%nan%' OR \"結合データ\" = '';"
-```
+---
 
-```bash
-docker run --rm -v "$(pwd)":/app csv_processor_shisu sqlite3 /app/racing.db "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'foragg_%' LIMIT 5;"
-```
+## 8. テスト
 
-```bash
-docker run --rm -v "$(pwd)":/app csv_processor_shisu python -c "import pandas, numpy, flask; print(pandas.__version__, numpy.__version__, flask.__version__)"
-```
+`python -m pytest`（Docker: `docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest`）
+
+- `tests/test_core.py`: 正規化・台帳・偏差値の規則・キー（ベクトル版と1件版の一致、**過去側キーが出馬表側の候補に必ず含まれる**こと）・ファイル名・オッズ・着順・分類（境界値、Python 版と SQL 版の一致）・WEDGE
+- `tests/test_scripts.py`: 各スクリプトの関数単位（指数順位N の対応付け、旧形式の順位 `13.0`、頭数列なし、mean モード、--clean など）
+- `tests/test_pipeline.py`: 合成データ（`tests/synth.py`。空欄の内外・髙・Ｇ１・全頭0・欠損2頭を含む）で replace → aggregate → calc → build_db → app を通し、旧版の不具合が再発しないこと、xjoin とその場照合の分類結果が一致すること、`--mode entries --prune` で foragg_* が消えないことを確認
+
+---
+
+## 9. 既知の制約・要確認事項
+
+1. **重量種別の推定**（出馬表側）: 3歳限定の別定重賞などは過去側（定量）とずれる。TARGET の出馬表出力に `重量種別` 列を追加できれば、その列が優先されて解消する
+2. **芝(内・外)**: 出馬表から分かるのは京都・新潟の内外（外回り列）だけ。他場は候補を全部試すので、過去側に「空」と「内/外」の両方のグループがあると同じ馬に2行ヒットすることがある [要実データ]
+3. **9頭以下の出馬表**: 過去側は10頭以上だけを集計している。出馬表側は頭数で絞らないので、少頭数レースの順位・偏差値は多頭数の成績と照合される（枠番グループ系は付かない）
+4. 着順の1文字表記（取/除/中/失）に対応したが、TARGET の実際の表記は [要実データ]
+5. 地域の重複: 主5場ファイルと各場ファイルの両方があれば、同じキーが両方の表でヒットする（地域列で区別して表示）
+6. 同梱の `entries_out/entries_merged_hensachi.csv` は旧版の出力で、新版の列（`X_順位帯_s1` など）は無い。再生成して使う（build_db は旧形式として警告する）
+7. **xjoin の容量とメモリ**: 1頭×1指数あたり最大 15 family × キー候補 × 50 行を保存するので、1日分（約550頭×15指数）で数百MB規模になる。統合ファイルだけを DB に入れ（`--merge-only`）、古い日の出馬表は entries_out から外す（`--clean`）。構築中のメモリは照合キャッシュに上限（2万件）を設けたので数百MB程度
+8. 過去 CSV に `頭数`（`頭`）列が無いと、警告を出して頭数で絞らずに処理する（TARGET 側で10頭以上に抽出済みの前提）
+
+---
+
+## 10. 今後（Phase 3・4 の設計メモ）
+
+### Phase 3: WEDGE
+- 素材に `日付`・`year` を持たせた（済）。EDGE の成功判定は**素材には焼き込まず、集計時に `着順`＋`単勝オッズ` から計算**する（判定表を変えても aggregate の再実行だけで済むため）
+- 関数は `shisu/wedge.py` に実装済み（`edge_threshold`・`edge_success`・`win_score`・`edge_score`・`year_weights`・`adjusted_wedge`・`wedge_from_frame`）
+- 次の実装: aggregate で (結合データ, year) ごとの WIN/EDGE/WEDGE と件数を出し、`adjusted_WEDGE`（直近最大5年の加重平均）を成績表の列に追加 → build_db → 画面の並べ替え・抽出条件へ
+- 決めること: 年の件数が少ない場合の除外閾値（`adjusted_wedge(min_year_count=...)`。騎手版は30）、odds 帯別テーブルでも同じ EDGE 表を使うか
+
+### Phase 4: 指数の組み合わせ・傾向分析
+- `master_csv`（1頭1行、全頭・着順・オッズ・順位・偏差値付き）を入力に、レース単位で「指数1位が3着内のとき残り2頭の順位帯/偏差値帯」などを集計する想定。master を DB に取り込むテーブルを追加する
+
+---
+
+## 11. 変更履歴
+
+### 2026-11-04 Phase 1・2（旧 CLAUDE.md §5 の課題への対応）
+- キー生成を `shisu/` に一本化（過去側・出馬表側が同じ関数を使用）
+  - 空欄で `nan` 混入・空キーになる不具合を解消（部品が空ならキーを作らない）
+  - 順位帯を過去側の s1/s2 に統一（出馬表側も両方を計算）
+  - `--merge-one` で帯が抜ける不具合を解消（空欄も後続で埋める、行は和集合）
+  - 全頭同値（全頭0）・欠損2頭以上のレースは両側とも除外
+  - NFKC を両側に適用（`Ｇ１`/`G1` 不一致を解消）。出力を cp932 にして `髙` などの消失を解消
+  - 重量種別の推定を改善（NHKマイルC 等の誤ハンデ判定、3歳G1）
+  - 指数名を台帳で正式名に統一し、DB の indicator 列で完全一致（`先行力`→`先行`、`吉馬_先行力` と区別）
+- DB・画面
+  - テーブル名の二重接頭辞を解消。family・オッズ帯・指数などは __tables_meta__/unified_all の列で管理し、`/` の絞り込みが機能するように
+  - 通常パスの前方一致フォールバックを廃止。xjoin とその場照合は同じ関数（完全一致）で、分類結果が一致
+  - xjoin に日付・レースIDを持たせ、レースIDで絞り込み（存在しない列への参照を解消）
+  - `--prune` を今回作り直した種類に限定（`--mode entries --prune` で foragg_* が消えない）。古い xjoin も掃除
+  - 0〜1 スケールの自動判定を廃止（0.8% を 80% と誤読する可能性を排除）。率は 0–100 で統一
+  - `/entries` の既定テーブルが entries_all になる問題、ラジオボタン重複を解消
+- 集計素材は上書きせず `agg_csv/` に出力。`AGG_OPTIONAL_COLS` のカンマ抜け（馬番が入らない）を解消
+- オッズ帯を normal / odds10u / odds10_50 / odds50p に変更（odds5p 廃止）。絞り込みは aggregate で行い、素材は20本・gzip に（30万行の入力で約2GB→83MB）。processed_* は `--processed` のときだけ
+- 分類を `classify()` に一本化。絶対軸は 連対率_val を使用。`/` のプリセットも同じ判定
+- 旧版スクリプト（replace_csv.py・aggregate_stats.py）を削除。Dockerfile の版固定・scipy 追加・パス統一
+- Phase 3 準備: 素材に 日付・year、master_csv、`shisu/wedge.py`
+- 多視点レビュー（キー一致・集計・DB/画面・要件・規模）での指摘を反映: 指数順位N の対応付け（すぐ右／枠番号）、出馬表側の値の NFKC、旧形式の出馬表（順位 `13.0`）と旧形式 DB の検出、成績表0本で DB を消さない、レースID 無しの出馬表、並べ替えリンクの予約引数、xjoin キャッシュの上限、aggregate の早期絞り込み、頭数列なしの扱い、`AGG_PROP_MODE=mean` でも複勝率は分位点切替（旧挙動）

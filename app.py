@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 
 from flask import Flask, redirect, render_template_string, request, url_for
 
@@ -24,8 +25,8 @@ from shisu import config
 from shisu.classify import CATEGORIES, CATEGORY_LABELS, classify, description_lines, sql_condition
 from shisu.indicators import INDICATOR_ORDER
 from shisu.keys import ALL_FAMILIES, FAMILY_LABELS
-from shisu.matching import UNIFIED, indicator_bases, match_entry_row
-from shisu.naming import ENTRIES_ALL, ENTRIES_PREFIX, XJOIN_PREFIX, xjoin_table_for
+from shisu.matching import UNIFIED, indicator_bases, match_entry_row, unified_status
+from shisu.naming import ENTRIES_ALL, XJOIN_PREFIX, xjoin_table_for
 from shisu.odds import ODDS_LABELS, ODDS_MODES, ODDS_RANK
 
 DB_PATH = str(config.db_path())
@@ -40,16 +41,21 @@ DISPLAY_ORDER = ("結合データ", "件数", "勝率_val", "勝率", "連対率
                  "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値",
                  "提案勝率", "提案連対率", "提案複勝率", "提案2着率", "提案3着率",
                  "場所", "芝・ダ", "距離", "芝(内・外)")
-PRESETS = ("none",) + tuple(c for c in ("abs", "axis", "opp", "keshi"))
+PRESETS = ("none", "abs", "axis", "opp", "keshi")
 
 app = Flask(__name__)
 
 
 # ========================= 共通 =========================
-def connect() -> sqlite3.Connection:
+@contextmanager
+def connect():
+    """読み取り用の接続（with を抜けたら閉じる）。"""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
-    return con
+    try:
+        yield con
+    finally:
+        con.close()
 
 
 def q(name: str) -> str:
@@ -58,6 +64,22 @@ def q(name: str) -> str:
 
 def table_exists(con, name: str) -> bool:
     return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def db_status(con) -> str:
+    """'ok' / 'empty'（未構築）/ 'old'（旧版の build_db で作った DB）。"""
+    u = unified_status(con)
+    if u == "old":
+        return "old"
+    if table_exists(con, META) and "kind" not in table_columns(con, META):
+        return "old"
+    return "ok" if u == "ok" and table_exists(con, META) else "empty"
+
+
+DB_WARNINGS = {
+    "old": "DB が旧形式です。replace → aggregate → build_db.py --fresh で作り直してください。",
+    "empty": "DB にデータがありません。build_db.py を実行してください。",
+}
 
 
 def table_columns(con, name: str) -> list[str]:
@@ -118,11 +140,13 @@ a{color:#2563eb;text-decoration:none} a:hover{text-decoration:underline}
 .cat-abs h1{color:#7c2d12} .cat-axis h1{color:#1d4ed8} .cat-keshi h1{color:#6b7280} .cat-opp h1{color:#047857}
 </style></head><body><header>{{ title }}</header><div class="container">
 <div class="nav"><a href="{{ url_for('index') }}">横断検索</a><a href="{{ url_for('entries_index') }}">出馬表</a></div>
+{% if db_warning %}<div class="card warn">{{ db_warning }}</div>{% endif %}
 {BODY}
 </div></body></html>"""
 
 
 def render(title: str, body: str, **ctx):
+    ctx.setdefault("db_warning", "")
     return render_template_string(LAYOUT.replace("{BODY}", body), title=title, **ctx)
 
 
@@ -155,7 +179,6 @@ INDEX_BODY = """
   <input type="hidden" name="sort" value="{{ q_sort }}"><input type="hidden" name="sortdir" value="{{ q_dir }}">
   <input type="hidden" name="submitted" value="1">
 </form></div>
-{% if not has_db %}<div class="card warn">DB にテーブルがありません。build_db.py を実行してください。</div>{% endif %}
 {% if submitted %}
   {% if truncated %}<div class="card warn">該当する集計表が {{ n_tables }} 個あります。先頭 {{ max_tables }} 個だけ表示しています。条件を絞ってください。</div>{% endif %}
   {% for r in results %}
@@ -180,7 +203,7 @@ def _facets(con) -> dict[str, list[str]]:
 
 
 def _meta_values(con, col: str) -> list[str]:
-    if not table_exists(con, META):
+    if not table_exists(con, META) or col not in table_columns(con, META) or "kind" not in table_columns(con, META):
         return []
     return [r[0] for r in con.execute(
         f"SELECT DISTINCT {q(col)} FROM {META} WHERE kind='foragg' AND {q(col)} IS NOT NULL AND {q(col)} <> ''")]
@@ -205,7 +228,8 @@ def index():
     q_dir = "ASC" if a.get("sortdir", "DESC").upper() == "ASC" else "DESC"
 
     with connect() as con:
-        has_db = table_exists(con, META) and table_exists(con, UNIFIED)
+        status = db_status(con)
+        has_db = status == "ok"
         facets = _facets(con)
         families = [f for f in ALL_FAMILIES if f in set(_meta_values(con, "family"))]
         inds_all = set(_meta_values(con, "indicator"))
@@ -267,12 +291,15 @@ def index():
     return render("指数集計 横断検索", INDEX_BODY, selects=selects, families=families, indicators=indicators,
                   odds_modes=ODDS_MODES, presets=PRESETS, q_families=q_families, q_inds=q_inds,
                   q_odds=q_odds, q_preset=q_preset, q_sort=q_sort, q_dir=q_dir, submitted=submitted,
-                  results=results, sortable=SORTABLE, has_db=has_db, n_tables=n_tables,
-                  truncated=truncated, max_tables=MAX_TABLES)
+                  results=results, sortable=SORTABLE, n_tables=n_tables,
+                  truncated=truncated, max_tables=MAX_TABLES, db_warning=DB_WARNINGS.get(status, ""))
+
+
+QUERY_KEYS = ("place", "sd", "dist", "inout", "region", "family", "ind", "odds_mode", "preset")
 
 
 def _sort_link(col: str, cur: str, cur_dir: str) -> str:
-    args = request.args.to_dict(flat=False)
+    args = {k: request.args.getlist(k) for k in QUERY_KEYS if k in request.args}
     args["sort"] = [col]
     args["sortdir"] = ["ASC" if (col == cur and cur_dir == "DESC") else "DESC"]
     args["submitted"] = ["1"]
@@ -281,7 +308,7 @@ def _sort_link(col: str, cur: str, cur_dir: str) -> str:
 
 # ========================= 出馬表 =========================
 def entries_tables(con) -> list[str]:
-    if table_exists(con, META):
+    if table_exists(con, META) and "kind" in table_columns(con, META):
         names = [r[0] for r in con.execute(f"SELECT table_name FROM {META} WHERE kind='entries' ORDER BY table_name")]
         names = [n for n in names if table_exists(con, n)]
         if names:
@@ -345,13 +372,16 @@ def entries_index():
                        MIN("クラス名_raw") AS cls, MIN("芝・ダ") AS sd, MIN("距離_raw") AS dist, COUNT(*) AS heads
                 FROM {q(q_table)} {"WHERE " + " AND ".join(cond) if cond else ""}
                 GROUP BY "レースID(新/馬番無)" ORDER BY "レースID(新/馬番無)" """, params)]
+        warning = DB_WARNINGS.get(db_status(con), "")
     return render("出馬表", ENTRIES_BODY, tables=tables, q_table=q_table, dates=dates, q_date=q_date,
-                  places=places, q_place=q_place, races=races)
+                  places=places, q_place=q_place, races=races, db_warning=warning)
 
 
 def _race_rows(con, table: str, rid: str, legacy_ridn: str = "", date: str = "") -> list[dict]:
-    rows = [dict(r) for r in con.execute(
-        f'SELECT * FROM {q(table)} WHERE "レースID(新/馬番無)" = ? ORDER BY CAST("馬番" AS INTEGER)', (rid,))]
+    rows = []
+    if rid:
+        rows = [dict(r) for r in con.execute(
+            f'SELECT * FROM {q(table)} WHERE "レースID(新/馬番無)" = ? ORDER BY CAST("馬番" AS INTEGER)', (rid,))]
     if rows or not legacy_ridn:
         return rows
     # 旧リンク（ridn=場 R）互換
@@ -436,12 +466,15 @@ def collect_hits(con, table: str, race_rows: list[dict]) -> tuple[list[dict], st
     if not race_rows:
         return [], ""
     rid = race_rows[0].get("レースID(新/馬番無)", "")
+    status = unified_status(con)
+    if status != "ok":
+        return [], f"unified_all {'が旧形式' if status == 'old' else 'なし'}（build_db.py --fresh で作り直してください）"
+    if not rid:
+        return [], "レースIDなし"
     xname = xjoin_table_for(table)
     if table_exists(con, xname):
         hits = [dict(r) for r in con.execute(f'SELECT * FROM {q(xname)} WHERE "レースID(新/馬番無)" = ?', (rid,))]
         return hits, "xjoin"
-    if not table_exists(con, UNIFIED):
-        return [], "unified_all なし"
     bases = indicator_bases(race_rows[0].keys())
     cache: dict = {}
     hits: list[dict] = []

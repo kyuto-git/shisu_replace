@@ -23,6 +23,15 @@ HORSE_COLUMNS = ("日付", "レースID(新)", "レースID(新/馬番無)", "�
 HIT_COLUMNS = ("source_table",) + HORSE_COLUMNS + ("base", "key") + META_COLUMNS + STAT_COLUMNS
 
 DEFAULT_LIMIT = 50
+REQUIRED_UNIFIED_COLUMNS = ("結合データ", "family", "indicator", "odds_mode", "rank_scheme", "テーブル名")
+
+
+def unified_status(conn: sqlite3.Connection) -> str:
+    """unified_all の状態: 'ok' / 'missing'（無い）/ 'old'（旧版の build_db で作った列構成）。"""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (UNIFIED,)).fetchone() is None:
+        return "missing"
+    cols = {r[1] for r in conn.execute(f'PRAGMA table_info("{UNIFIED}")')}
+    return "ok" if set(REQUIRED_UNIFIED_COLUMNS) <= cols else "old"
 
 
 def indicator_bases(columns: Iterable[str]) -> list[str]:
@@ -30,6 +39,16 @@ def indicator_bases(columns: Iterable[str]) -> list[str]:
     cols = set(columns)
     return sorted({c[: -len("_偏差値")] for c in cols
                    if c.endswith("_偏差値") and (c[: -len("_偏差値")] + "_順位") in cols})
+
+
+def rank_text(v) -> str:
+    """順位を '13' の形に（旧形式の '13.0' も受ける）。数値でなければ ''。"""
+    t = norm_text(v)
+    try:
+        f = float(t)
+    except ValueError:
+        return ""
+    return str(int(f)) if f == f and f >= 1 else ""
 
 
 def entry_fields(row: Mapping, base: str) -> dict:
@@ -43,7 +62,7 @@ def entry_fields(row: Mapping, base: str) -> dict:
         "クラス名": norm_text(row.get("クラス名")),
         "枠番グループ": norm_text(row.get("枠番グループ")),
         "騎手": norm_text(row.get("騎手")),
-        "順位": norm_text(row.get(f"{base}_順位")),
+        "順位": rank_text(row.get(f"{base}_順位")),
         "偏差値帯": norm_text(row.get(f"{base}_偏差値帯")),
     }
 

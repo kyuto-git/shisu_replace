@@ -4,9 +4,11 @@
   過去側・出馬表側とも、結合データの部品は必ずこれを通す。
 - 書き出しは cp932。shift_jis だと「髙」「①」「～」などが書けず、
   過去側だけ文字が消えて出馬表側と一致しなくなるため（旧版の不具合）。
+- パスが .gz で終わるときは gzip 圧縮して書く（読込は pandas が拡張子から自動判定）。
 """
 from __future__ import annotations
 
+import gzip
 import math
 import re
 import sys
@@ -60,7 +62,8 @@ def read_csv_any(path, encodings=READ_ENCODINGS) -> pd.DataFrame:
     # どの符号化でも厳密には読めない場合だけ、置換して読む（警告を出す）
     print(f"[WARN] {Path(path).name}: {READ_ENCODINGS} で厳密に読めないため置換読み込みします ({last})",
           file=sys.stderr)
-    with open(path, "r", encoding="cp932", errors="replace", newline="") as f:
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", encoding="cp932", errors="replace", newline="") as f:
         return pd.read_csv(f, dtype=str, keep_default_na=False)
 
 
@@ -76,6 +79,8 @@ def write_csv(df: pd.DataFrame, path) -> None:
         print(f"[WARN] {path.name}: cp932 で書けない文字を削除しました: {''.join(bad)[:40]}",
               file=sys.stderr)
         data = text.encode(WRITE_ENCODING, errors="ignore")
+    if path.name.endswith(".gz"):
+        data = gzip.compress(data, compresslevel=6, mtime=0)
     path.write_bytes(data)
 
 

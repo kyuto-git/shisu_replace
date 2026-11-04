@@ -20,12 +20,15 @@ def base(tmp_path_factory, monkeypatch_module):
     monkeypatch_module.delenv("DB_PATH", raising=False)
     synth.make_history(b)
     synth.make_entries(b)
-    # 旧仕様のファイル（odds5p）が foragg_csv に残っていても取り込まれないこと
     import aggregate_stats_ver2, build_db, calc_entry_hensachi, replace_csv_ver3
-    assert replace_csv_ver3.main(["--clean"]) == 0
-    legacy = b / "foragg_csv" / "foragg_odds5p_normal_主５場（中山、東京、中京、京都、阪神）_カツラキ.csv"
-    shutil.copy(next((b / "foragg_csv").glob("foragg_normal_*カツラキ.csv")), legacy)
+    assert replace_csv_ver3.main(["--clean", "--processed"]) == 0
+    # 旧仕様のファイルが残っていても使われないこと:
+    #   素材に旧形式（オッズ接頭辞付き・非圧縮）、成績表に odds5p
+    src = next((b / "foragg_csv").glob("foragg_normal_*カツラキ.csv.gz"))
+    shutil.copy(src, b / "foragg_csv" / ("foragg_odds10u_" + src.name[len("foragg_"):]))
     assert aggregate_stats_ver2.main(["--clean"]) == 0
+    agg = next((b / "agg_csv").glob("foragg_normal_*カツラキ.csv"))
+    shutil.copy(agg, b / "agg_csv" / ("foragg_odds5p_" + agg.name[len("foragg_"):]))
     assert calc_entry_hensachi.main(["--merge-one"]) == 0
     assert build_db.main(["--fresh"]) == 0
     return b
@@ -43,16 +46,19 @@ def db(base):
 
 
 def test_outputs_exist(base):
-    assert len(list((base / "foragg_csv").glob("foragg_*.csv"))) == 3 * 80 + 1   # +1 は旧仕様のダミー
-    assert not list((base / "agg_csv").glob("foragg_odds5p_*"))                  # 旧仕様は集計しない
-    m = pd.read_csv(next((base / "master_csv").glob("master_*ZI.csv")), encoding="cp932", dtype=str,
+    assert len(list((base / "foragg_csv").glob("foragg_*.csv.gz"))) == 3 * 20 + 1   # +1 は旧形式のダミー
+    agg = list((base / "agg_csv").glob("foragg_*.csv"))
+    assert len(agg) == 3 * 80 + 1                                                     # +1 は odds5p のダミー
+    assert not list((base / "agg_csv").glob("foragg_odds10u_odds10u_*"))
+    assert len(list((base / "replace_csv").glob("processed_*.csv"))) == 3 * 21
+    m = pd.read_csv(next((base / "master_csv").glob("master_*ZI.csv.gz")), encoding="cp932", dtype=str,
                     keep_default_na=False)
     assert {"year", "日付", "指数有効", "オッズ帯", "順位帯_s1", "順位帯_s2"} <= set(m.columns)
     assert set(m["year"]) == {"2022", "2023", "2024", "2025"}
 
 
 def test_foragg_material_columns(base):
-    f = next((base / "foragg_csv").glob("foragg_rankband_s1_normal_band_*カツラキ.csv"))
+    f = next((base / "foragg_csv").glob("foragg_rankband_s1_normal_band_*カツラキ.csv.gz"))
     df = pd.read_csv(f, encoding="cp932", dtype=str, keep_default_na=False)
     assert {"馬番", "日付", "year", "指数順位帯"} <= set(df.columns)
     assert set(df["指数順位帯"]) <= {"1~3位", "4~6位", "7~9位", "10位~"}
@@ -60,12 +66,22 @@ def test_foragg_material_columns(base):
 
 def test_aggregate_does_not_overwrite_material_and_is_rerunnable(base):
     import aggregate_stats_ver2
-    src = next((base / "foragg_csv").glob("foragg_normal_*カツラキ.csv"))
+    src = next((base / "foragg_csv").glob("foragg_normal_*カツラキ.csv.gz"))
     before = src.read_bytes()
-    out = base / "agg_csv" / src.name
-    first = out.read_bytes()
+    outs = sorted(p for p in (base / "agg_csv").glob("foragg_*normal_主*カツラキ.csv") if "odds5p" not in p.name)
+    assert len(outs) == 4                               # 通常 + odds10u + odds10_50 + odds50p
+    first = [o.read_bytes() for o in outs]
     assert aggregate_stats_ver2.main([]) == 0
-    assert src.read_bytes() == before and out.read_bytes() == first
+    assert src.read_bytes() == before and [o.read_bytes() for o in outs] == first
+
+
+def test_odds_split_counts(base):
+    """オッズ帯3区分の件数の合計は、オッズ欠損が無ければ通常と一致する。"""
+    def total(mode):
+        prefix = "" if mode == "normal" else mode + "_"
+        f = base / "agg_csv" / f"foragg_{prefix}normal_主５場（中山、東京、中京、京都、阪神）_カツラキ.csv"
+        return pd.read_csv(f, encoding="cp932")["件数"].sum()
+    assert total("odds10u") + total("odds10_50") + total("odds50p") <= total("normal")
 
 
 def test_no_broken_keys(base):
@@ -209,3 +225,62 @@ def test_real_entries_sample(tmp_path):
     assert (df["タイムM_偏差値"] == "").all()             # マイニング値が全空 → 空欄
     assert (df["Gold_順位"] == df["指数順位1"]).all()        # 元の順位列を使う
     assert (df["ZI_順位"] != "").sum() > 300
+
+
+# ---------------------------------------------------------------- レビュー指摘の回帰防止
+def _old_schema_db(path):
+    """旧版の build_db が作った形（meta は2列、unified_all に family/indicator 列が無い）。"""
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE __tables_meta__ (table_name TEXT PRIMARY KEY, source_file TEXT)")
+    con.execute('CREATE TABLE unified_all ("結合データ" TEXT, "テーブル名" TEXT, "件数" INT)')
+    con.commit()
+    con.close()
+
+
+def test_old_schema_db_is_detected(base, monkeypatch, tmp_path, capsys):
+    import build_db
+    old = tmp_path / "old.db"
+    _old_schema_db(old)
+    assert build_db.main(["--mode", "entries", "--db-path", str(old)]) == 1
+    assert "旧形式" in capsys.readouterr().err
+    am = _app(base, monkeypatch, old)
+    c = am.app.test_client()
+    for u in ("/", "/?submitted=1&family=normal", "/entries"):
+        r = c.get(u)
+        assert r.status_code == 200 and "旧形式" in r.get_data(as_text=True), u
+
+
+def test_empty_agg_dir_does_not_wipe_db(base, tmp_path):
+    import build_db
+    p = tmp_path / "keep.db"
+    shutil.copy(base / "racing.db", p)
+    empty = tmp_path / "empty_agg"
+    empty.mkdir()
+    assert build_db.main(["--mode", "foragg", "--agg-dir", str(empty), "--db-path", str(p)]) == 2
+    with sqlite3.connect(p) as con:
+        assert con.execute("SELECT COUNT(*) FROM unified_all").fetchone()[0] > 0
+    # 素材のディレクトリを指定しても同じ（素材は .csv.gz なので成績表として読まない）
+    assert build_db.main(["--mode", "foragg", "--agg-dir", str(base / "foragg_csv"), "--db-path", str(p)]) == 2
+
+
+def test_entries_without_race_id_are_split_by_race(base, monkeypatch, tmp_path):
+    import build_db
+    src = pd.read_csv(base / "entries_out" / "shisu_20260531_1_hensachi.csv", encoding="cp932", dtype=str,
+                      keep_default_na=False).drop(columns=["レースID(新)"])
+    d = tmp_path / "entries_norid"
+    synth.write_cp932(src, d / "norid_hensachi.csv")
+    p = tmp_path / "norid.db"
+    shutil.copy(base / "racing.db", p)
+    assert build_db.main(["--mode", "entries", "--entries-dir", str(d), "--db-path", str(p)]) == 0
+    with sqlite3.connect(p) as con:
+        races = con.execute('SELECT "レースID(新/馬番無)", COUNT(*) FROM entries_norid_hensachi GROUP BY 1').fetchall()
+    assert len(races) == 3 and all(n == 16 for _, n in races)
+
+
+def test_sort_link_ignores_reserved_args(base, monkeypatch):
+    am = _app(base, monkeypatch)
+    c = am.app.test_client()
+    for extra in ("_scheme=x", "endpoint=x", "_anchor=x", "_external=1"):
+        r = c.get(f"/?submitted=1&ind=カツラキ&{extra}")
+        assert r.status_code == 200, extra
+        assert "http://" not in r.get_data(as_text=True).split("<table>")[-1][:2000]

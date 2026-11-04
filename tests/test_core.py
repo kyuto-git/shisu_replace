@@ -216,11 +216,20 @@ def test_unknown_inner_tries_all():
 def test_foragg_name_roundtrip():
     for fam, mode in itertools.product(keys.ALL_FAMILIES, odds.ODDS_MODES):
         for s in (keys.SCHEMES if keys.is_band_family(fam) else ("",)):
-            fn = naming.foragg_filename(fam, mode, s, "ローカル５場（札幌、函館、福島、新潟、小倉）_吉馬_先行力.csv")
-            p = naming.parse_foragg_stem(fn[:-4])
+            fn = naming.agg_filename(fam, mode, s, "ローカル５場（札幌、函館、福島、新潟、小倉）_吉馬_先行力")
+            p = naming.parse_foragg_stem(naming.file_stem(fn))
             assert (p["family"], p["mode"], p["scheme"], p["indicator"]) == (fam, mode, s, "吉馬_先行力")
             t = naming.table_name_for_foragg(fn)
             assert t.startswith("foragg_") and not t.startswith("foragg_foragg_")
+
+
+def test_material_name_roundtrip():
+    for fam in keys.ALL_FAMILIES:
+        for s in (keys.SCHEMES if keys.is_band_family(fam) else ("",)):
+            fn = naming.material_filename(fam, s, "札幌_先行")
+            assert fn.endswith(".csv.gz")
+            p = naming.parse_foragg_stem(naming.file_stem(fn))
+            assert (p["family"], p["mode"], p["scheme"], p["indicator"], p["source"]) == (fam, "normal", s, "先行", "札幌_先行")
 
 
 @pytest.mark.parametrize("stem", ["foragg_odds5p_normal_札幌_ZI", "foragg_normal_band_札幌_ZI",
@@ -337,8 +346,22 @@ def test_year_weights():
 
 
 # ---------------------------------------------------------------- CSV 入出力
-def test_cp932_roundtrip(tmp_path):
+@pytest.mark.parametrize("name", ["a.csv", "a.csv.gz"])
+def test_cp932_roundtrip(tmp_path, name):
     df = pd.DataFrame({"騎手": ["髙杉吏麒", "①"], "x": ["～", ""]})
-    write_csv(df, tmp_path / "a.csv")
-    back = read_csv_any(tmp_path / "a.csv")
+    write_csv(df, tmp_path / name)
+    back = read_csv_any(tmp_path / name)
     assert back["騎手"].tolist() == ["髙杉吏麒", "①"] and back["x"].tolist() == ["～", ""]
+    if name.endswith(".gz"):
+        assert (tmp_path / name).read_bytes()[:2] == b"\x1f\x8b"
+
+
+def test_fullwidth_values_are_numbers():
+    r = _ci(["８５", "－12.5", "　85", "100"], ["a"] * 4)
+    assert r["偏差値"].notna().all()
+
+
+def test_recomputed_rank_ties_share_rank():
+    """順位列が無いときの再計算は同値同順位（TARGET の 指数順位 と同じ。サンプルの ZI・オメガ指数で確認済み）。"""
+    r = _ci([30, 50, 30, 10], ["a"] * 4)
+    assert r["順位"].tolist() == [2, 1, 2, 4]

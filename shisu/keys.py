@@ -149,6 +149,6 @@ def entry_key_candidates(fields: Mapping, families: Iterable[str] = ALL_FAMILIES
 
 def _as_int(v):
     try:
-        return int(str(v))
+        return int(float(str(v)))
     except (TypeError, ValueError):
         return None

@@ -11,7 +11,8 @@
 
   python calc_entry_hensachi.py               # 個別出力 {元名}_hensachi.csv
   python calc_entry_hensachi.py --merge-one   # 個別＋統合 entries_merged_hensachi.csv
-  python calc_entry_hensachi.py --merge-only  # 統合のみ
+  python calc_entry_hensachi.py --merge-only  # 統合のみ（推奨。DB の xjoin が1本で済む）
+  --clean を付けると entries_out の古い CSV を消してから出力する
 統合は レースID(新) で全ファイルを横に結合する（空欄は後続ファイルの値で埋める。行は和集合）。
 """
 from __future__ import annotations
@@ -19,6 +20,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -35,6 +37,7 @@ DERIVED_SUFFIXES = ("_偏差値", "_偏差値帯", "_順位") + tuple(f"_順位�
 # 元ファイルの順位列（明示）: 正式名 → 列名候補
 EXPLICIT_RANK_COLUMNS = {"タイムM": ("マイニング順位",), "対戦M": ("対戦型マイニング順位",)}
 _NUMBERED_RANK = re.compile(r"^指数順位([0-9０-９]+)$")
+_UNNAMED_SLOT = re.compile(r"^指数[0-9０-９]+$")   # 指数を読み込んでいない枠の見出し
 
 
 def find_indicator_columns(df: pd.DataFrame) -> list[str]:
@@ -49,11 +52,16 @@ def find_indicator_columns(df: pd.DataFrame) -> list[str]:
 
 
 def build_rank_source_map(df: pd.DataFrame, idx_cols: list[str]) -> dict[str, str]:
-    """列名 → 元順位の列名。
+    """指数列 → 元順位の列名。
+
     1) 明示列（マイニング順位 / {列}順位 / {正式名}順位 / {正式名}_順位 / {列}_順位）
-    2) 番号付き「指数順位N」を、明示列の無い指数列に出現順で対応させる
-    3) 無印「指数順位」は指数が1種類のときだけ対応させる
+    2) 「指数順位N」が指数列のすぐ右にあれば、その指数列の順位（TARGET の出力は 指数列, 指数順位N の並び）
+    3) 2 で決まらないものは、N 番目の「枠」に対応させる。枠 = 台帳にある指数列（1 で専用の順位列が
+       見つかったものを除く）と、指数を読み込んでいない枠の見出し「指数N」を出現順に並べたもの
+    4) 指数が1種類で無印「指数順位」があれば、それを使う
+    どれにも当たらなければ未対応（順位は指数から計算し直す）。
     """
+    cols = [str(c) for c in df.columns]
     rank_map: dict[str, str] = {}
     for col in idx_cols:
         canon = canonical_indicator(col)
@@ -61,10 +69,25 @@ def build_rank_source_map(df: pd.DataFrame, idx_cols: list[str]) -> dict[str, st
         hit = next((c for c in cands if c in df.columns), None)
         if hit:
             rank_map[col] = hit
-    remaining = [c for c in idx_cols if c not in rank_map]
-    numbered = [c for c in df.columns if _NUMBERED_RANK.match(str(c))]
-    for col, rcol in zip(remaining, numbered):
-        rank_map[col] = rcol
+    explicit = set(rank_map)
+    used = set(rank_map.values())
+    for i, c in enumerate(cols):
+        if _NUMBERED_RANK.match(c) and c not in used and i > 0:
+            left = cols[i - 1]
+            if left in idx_cols and left not in rank_map:
+                rank_map[left] = c
+                used.add(c)
+    slots = [c for c in cols if (c in idx_cols and c not in explicit) or _UNNAMED_SLOT.match(c)]
+    for c in cols:
+        m = _NUMBERED_RANK.match(c)
+        if not m or c in used:
+            continue
+        n = int(unicodedata.normalize("NFKC", m.group(1)))
+        if 1 <= n <= len(slots):
+            slot = slots[n - 1]
+            if slot in idx_cols and slot not in rank_map:
+                rank_map[slot] = c
+                used.add(c)
     still = [c for c in idx_cols if c not in rank_map]
     if "指数順位" in df.columns and len(idx_cols) == 1 and still:
         rank_map[still[0]] = "指数順位"
@@ -100,6 +123,8 @@ def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True) -> pd
             continue
         seen.add(canon)
         given = df[rank_map[col]] if col in rank_map else None
+        if given is None and verbose:
+            print(f"[INFO] {name}: {canon} の順位列が無いため、指数から順位を計算します")
         r = compute_indicator(df[col], rk, spec_for(canon), shin, given)
         derived = {
             f"{canon}_偏差値": int_text_series(r["偏差値"]),
@@ -157,6 +182,7 @@ def main(argv=None) -> int:
     ap.add_argument("--merge-one", action="store_true", help="個別出力に加えて統合1ファイルも出力")
     ap.add_argument("--merge-only", action="store_true", help="統合1ファイルだけ出力")
     ap.add_argument("--merge-name", default=DEFAULT_MERGED_NAME)
+    ap.add_argument("--clean", action="store_true", help="出力先 entries_out の CSV を消してから実行（古い出馬表を DB に入れないため）")
     args = ap.parse_args(argv)
 
     files = sorted(Path(args.in_dir).glob("*.csv"))
@@ -165,6 +191,9 @@ def main(argv=None) -> int:
         return 0
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.clean:
+        for old in out_dir.glob("*.csv"):
+            old.unlink()
 
     processed, rc = [], 0
     for p in files:

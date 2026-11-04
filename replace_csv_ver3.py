@@ -2,13 +2,14 @@
 """過去レース CSV → 正規化・偏差値・結合データ → 集計素材（foragg_*）を出力する。
 
 入力 : csv_files/{地域}_{指数名}.csv（TARGET「レース一覧★画面イメージ」、1行=1頭、1ファイル=1指数）
-出力 : foragg_csv/foragg_{tag}_{元名}.csv   集計素材（1行=1頭×1キー）。aggregate_stats_ver2.py の入力
-       replace_csv/processed_*.csv          結合データの確認用（TARGET 取込用。--no-processed で省略）
-       master_csv/master_{元名}.csv          正規化済み 1頭1行（WEDGE・組合せ分析用。--no-master で省略）
+出力 : foragg_csv/foragg_{tag}_{元名}.csv.gz  集計素材（1行=1頭×1キー、gzip）。aggregate_stats_ver2.py の入力
+       master_csv/master_{元名}.csv.gz        正規化済み 1頭1行（WEDGE・組合せ分析用。--no-master で省略）
+       replace_csv/processed_*.csv            結合データの確認・TARGET 取込用（--processed のときだけ）
 
-tag = オッズ帯（なし/odds10u_/odds10_50_/odds50p_）× family（10種）
-    + オッズ帯 × 順位帯スキーム（rankband_s1_/rankband_s2_）× band family（5種）
-    → 入力1本あたり 80 本。行が0件でもヘッダのみで書き出す（古いファイルが残らないように）。
+tag = family（10種）＋ 順位帯スキーム（rankband_s1_/rankband_s2_）× band family（5種）→ 入力1本あたり 20 本。
+オッズ帯（通常/10倍未満/10〜50倍/50倍以上）では絞らない。絞り込みは aggregate_stats_ver2.py が行う
+（素材の容量を1/4にし、オッズ帯の定義を変えても aggregate の再実行だけで済むようにするため）。
+行が0件でもヘッダのみで書き出す（古いファイルが残らないように）。
 
 正規化・偏差値・キーの規則はすべて shisu パッケージにある（出馬表側と共通）。
 """
@@ -28,11 +29,11 @@ from shisu.csvio import norm_series, read_csv_any, write_csv
 from shisu.hensachi import compute_indicator, int_text_series
 from shisu.indicators import parse_source_name, spec_for
 from shisu.keys import BAND_FAMILIES, BASE_FAMILIES, SCHEMES, build_key_series
-from shisu.naming import foragg_filename, foragg_tag
+from shisu.naming import foragg_tag, material_filename
 from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_series, distance_series,
                              frame_group_series, int_series, race_date, race_id_without_horse, race_year,
                              shinba_mask, weight_series)
-from shisu.odds import ODDS_MODES, odds_bucket, odds_mask
+from shisu.odds import odds_bucket
 
 MIN_HEADS = 10   # 頭数10頭以上のレースだけ使う（TARGET 側の抽出条件と同じ）
 
@@ -115,7 +116,11 @@ def process_file(path: str, foragg_dir: str, processed_dir: str | None, master_d
         df[f"順位帯_{s}"] = ind[f"順位帯_{s}"]
     df["指数有効"] = ind["usable"].astype(int)
 
-    heads_ok = (df["頭数_num"] >= MIN_HEADS).fillna(False).astype(bool)
+    if "頭数" in raw.columns or "頭" in raw.columns:
+        heads_ok = (df["頭数_num"] >= MIN_HEADS).fillna(False).astype(bool)
+    else:  # 旧版と同じく、頭数列が無ければ絞らない（TARGET 側で10頭以上に抽出済みの前提）
+        print(f"[WARN] {base}: 頭数 列が無いため頭数{MIN_HEADS}以上の絞り込みをしません", file=sys.stderr)
+        heads_ok = pd.Series(True, index=df.index)
     work = df[heads_ok & ~ind["race_excluded"] & ~ind["shinba_excluded"]]
 
     if master_dir:
@@ -123,42 +128,41 @@ def process_file(path: str, foragg_dir: str, processed_dir: str | None, master_d
         m["地域"] = region
         m["指数名"] = indicator
         m["オッズ帯"] = odds_bucket(m["単勝オッズ"])
-        write_csv(m[MASTER_COLUMNS], Path(master_dir) / f"master_{base}")
+        write_csv(m[MASTER_COLUMNS], Path(master_dir) / f"master_{path.stem}.csv.gz")
 
     n_files = 0
-    for mode in ODDS_MODES:
-        sub = work[odds_mask(work["単勝オッズ"], mode)]
-        for fam in BASE_FAMILIES:
-            _export(sub, fam, mode, "", base, foragg_dir, processed_dir)
+    for fam in BASE_FAMILIES:
+        _export(work, fam, "", path.stem, base, foragg_dir, processed_dir)
+        n_files += 1
+    for scheme in schemes:
+        for fam in BAND_FAMILIES:
+            _export(work, fam, scheme, path.stem, base, foragg_dir, processed_dir)
             n_files += 1
-        for scheme in schemes:
-            for fam in BAND_FAMILIES:
-                _export(sub, fam, mode, scheme, base, foragg_dir, processed_dir)
-                n_files += 1
-    if processed_dir:  # 代表（normal・絞り込みなし）
+    if processed_dir:  # 代表（normal）
         key = build_key_series(work, "normal")
         rep = work.loc[key != "", ["レースID(新)"]].assign(結合データ=key[key != ""])
         write_csv(rep, Path(processed_dir) / f"processed_{base}")
-    used = int(len(work))
-    return (f"[OK] {base}: 指数={indicator} 地域={region} 行={len(df)} 使用={used} "
+    if len(work) == 0:
+        print(f"[WARN] {base}: 使える行が0件です（列名・頭数・指数の欠損を確認してください）", file=sys.stderr)
+    return (f"[OK] {base}: 指数={indicator} 地域={region} 行={len(df)} 使用={len(work)} "
             f"(頭数<{MIN_HEADS}・除外レース・新馬除外を除く) → {n_files} files")
 
 
-def _export(sub: pd.DataFrame, family: str, mode: str, scheme: str, base: str,
+def _export(work: pd.DataFrame, family: str, scheme: str, stem: str, base: str,
             foragg_dir: str, processed_dir: str | None) -> None:
     rband_col = f"順位帯_{scheme}" if scheme else None
-    key = build_key_series(sub, family, rband_col)
+    key = build_key_series(work, family, rband_col)
     keep = key != ""
-    out = sub.loc[keep].copy()
+    out = work.loc[keep].copy()
     out["結合データ"] = key[keep]
     cols = list(FORAGG_COLUMNS)
     if scheme:
-        out[BAND_COL] = sub.loc[keep, rband_col]
+        out[BAND_COL] = work.loc[keep, rband_col]
         cols.insert(2, BAND_COL)
-    write_csv(out[cols], Path(foragg_dir) / foragg_filename(family, mode, scheme, base))
+    write_csv(out[cols], Path(foragg_dir) / material_filename(family, scheme, stem))
     if processed_dir:
         pcols = ["レースID(新)", "結合データ"] + ([BAND_COL] if scheme else [])
-        write_csv(out[pcols], Path(processed_dir) / f"processed_{foragg_tag(family, mode, scheme)}_{base}")
+        write_csv(out[pcols], Path(processed_dir) / f"processed_{foragg_tag(family, 'normal', scheme)}_{base}")
 
 
 def _active_schemes() -> tuple[str, ...]:
@@ -173,9 +177,9 @@ def main(argv=None) -> int:
     ap.add_argument("--foragg-dir", default=str(config.foragg_dir()))
     ap.add_argument("--processed-dir", default=str(config.processed_dir()))
     ap.add_argument("--master-dir", default=str(config.master_dir()))
-    ap.add_argument("--no-processed", action="store_true", help="processed_* を出力しない")
+    ap.add_argument("--processed", action="store_true", help="processed_*（確認・TARGET 取込用）も出力する")
     ap.add_argument("--no-master", action="store_true", help="master_* を出力しない")
-    ap.add_argument("--clean", action="store_true", help="出力先（foragg/processed/master）を空にしてから実行")
+    ap.add_argument("--clean", action="store_true", help="出力先（foragg/master と、--processed なら processed）を空にしてから実行")
     ap.add_argument("--workers", type=int, default=1, help="並列数（既定1。メモリに余裕があれば 2〜4）")
     args = ap.parse_args(argv)
 
@@ -183,7 +187,7 @@ def main(argv=None) -> int:
     if not files:
         print(f"[INFO] 入力CSVがありません: {args.csv_dir}")
         return 0
-    processed_dir = None if args.no_processed else args.processed_dir
+    processed_dir = args.processed_dir if args.processed else None
     master_dir = None if args.no_master else args.master_dir
     if args.clean:
         for d in (args.foragg_dir, processed_dir, master_dir):

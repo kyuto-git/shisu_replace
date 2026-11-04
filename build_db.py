@@ -30,8 +30,8 @@ import pandas as pd
 
 from shisu import config
 from shisu.csvio import norm_series, read_csv_any
-from shisu.matching import HIT_COLUMNS, STAT_COLUMNS, UNIFIED, indicator_bases, match_entry_row
-from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, FORAGG_PREFIX, XJOIN_PREFIX, parse_foragg_stem,
+from shisu.matching import HIT_COLUMNS, STAT_COLUMNS, UNIFIED, indicator_bases, match_entry_row, unified_status
+from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, FORAGG_PREFIX, file_stem, parse_foragg_stem,
                           table_name_for_entries, table_name_for_foragg, xjoin_table_for)
 from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_series, distance_series,
                              entry_inner_outer, frame_group_series, infer_entry_weight, race_date,
@@ -50,6 +50,7 @@ UNIFIED_STATS = ("件数", "勝率", "連対率", "複勝率", "2着率", "3着�
                  "勝率_val", "連対率_val", "複勝率_val", "2着率_val", "3着率_val", "掲示板率_val")
 UNIFIED_META = ("family", "odds_mode", "rank_scheme", "indicator", "region", "テーブル名")
 FACET_COLUMNS = ("場所", "芝・ダ", "距離", "芝(内・外)")
+XJOIN_CACHE_LIMIT = 20_000
 ENTRIES_ALL_COLUMNS = ("日付", "レースID(新)", "レースID(新/馬番無)", "場 R", "場所", "芝・ダ", "距離",
                        "芝(内・外)", "クラス名", "重量種別", "頭数", "枠番", "枠番グループ", "馬番", "馬名",
                        "騎手", "source_table")
@@ -118,7 +119,7 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> list[dict]:
         return []
     loaded, skipped, empty = [], 0, 0
     for p in files:
-        info = parse_foragg_stem(p.stem)
+        info = parse_foragg_stem(file_stem(p.name))
         if info is None:
             print(f"[foragg] SKIP（ファイル名が規約外・旧仕様）: {p.name}", file=sys.stderr)
             skipped += 1
@@ -189,9 +190,12 @@ def normalize_entries_df(raw: pd.DataFrame) -> pd.DataFrame:
     rid = norm_series(df["レースID(新)"]) if "レースID(新)" in df.columns else pd.Series("", index=df.index)
     given = df["レースID(新/馬番無)"] if "レースID(新/馬番無)" in df.columns else None
     df["レースID(新)"] = rid
-    df["レースID(新/馬番無)"] = race_id_without_horse(rid, given)
     df["日付"] = _first_nonempty(df, ("日付",)).where(lambda s: s != "", race_date(rid))
     df["場 R"] = _first_nonempty(df, ("場 R", "場R"))
+    rid_nh = race_id_without_horse(rid, given)
+    # レースIDが無い出馬表は「日付_場 R」でレースを識別する（全馬が1レースにまとまらないように）
+    fallback = (df["日付"].astype(str) + "_" + df["場 R"].astype(str)).where(df["場 R"] != "", "")
+    df["レースID(新/馬番無)"] = rid_nh.where(rid_nh != "", fallback)
     df["レース名"] = _first_nonempty(df, ("レース名",))
     df["場所"] = _first_nonempty(df, ("場所",))
     df["芝・ダ"] = _first_nonempty(df, ("芝・ダ", "芝ダ"))
@@ -243,6 +247,10 @@ def load_entries_tables(con: sqlite3.Connection, entries_dir: Path) -> list[dict
         con.execute(f'CREATE INDEX IF NOT EXISTS {q("idx_" + tname + "_race")} ON {q(tname)}("レースID(新/馬番無)")')
         con.execute(f'CREATE INDEX IF NOT EXISTS {q("idx_" + tname + "_date")} ON {q(tname)}("日付", "場所")')
         bases = indicator_bases(df.columns)
+        old_format = [b for b in bases if f"{b}_順位帯_s1" not in df.columns]
+        if old_format:
+            print(f"[WARN] {p.name}: 旧形式の出馬表です（{', '.join(old_format)} に 順位帯_s1/s2 が無い）。"
+                  "calc_entry_hensachi.py で作り直してください", file=sys.stderr)
         loaded.append({"table_name": tname, "source_file": p.name, "kind": "entries", "n_rows": int(len(df)),
                        "indicator": ",".join(bases)})
         print(f"[entries] loaded: {p.name} -> {tname} ({len(df)} rows, 指数 {len(bases)})")
@@ -272,10 +280,13 @@ def build_xjoin(con: sqlite3.Connection, entries_table: str, families=None) -> d
     bases = indicator_bases(names)
     ins = (f"INSERT INTO {q(xname)} ({', '.join(q(c) for c in HIT_COLUMNS)}) "
            f"VALUES ({', '.join('?' * len(HIT_COLUMNS))})")
+    # 照合結果のキャッシュは上限付き（上限なしだと大きい出馬表で数GBになる。2万件で空にしても速度は同じ）
     cache: dict = {}
     total = 0
     batch = []
     for i, row in enumerate(rows, 1):
+        if len(cache) > XJOIN_CACHE_LIMIT:
+            cache.clear()
         for h in match_entry_row(con, row, bases, entries_table, families, cache):
             batch.append(tuple(h.get(c) for c in HIT_COLUMNS))
         if len(batch) >= 5000 or i == len(rows):
@@ -312,8 +323,9 @@ def parse_cli(argv=None):
     p.add_argument("--fresh", action="store_true", help="DBファイルを削除して作り直す")
     p.add_argument("--prune", action="store_true", help="今回作り直した種類の古いテーブルを削除する")
     p.add_argument("--no-xjoin", action="store_true", help="entries_xjoin_* を作らない（画面はその場で照合する）")
-    p.add_argument("--agg-dir", "--foragg-dir", dest="agg_dir", default=str(config.agg_dir()),
-                   help="集計CSVのディレクトリ（既定 agg_csv/）")
+    p.add_argument("--agg-dir", dest="agg_dir", default=str(config.agg_dir()),
+                   help="成績表（aggregate_stats_ver2.py の出力）のディレクトリ（既定 agg_csv/）")
+    p.add_argument("--allow-empty", action="store_true", help="成績表が0本でも unified_all を空で作り直す")
     p.add_argument("--entries-dir", default=str(config.entries_out_dir()))
     p.add_argument("--db-path", default=str(config.db_path()), help="既定は環境変数 DB_PATH か racing.db")
     return p.parse_args(argv)
@@ -334,16 +346,24 @@ def main(argv=None) -> int:
     ensure_meta(con)
     keep: set[str] = set()
     kinds: set[str] = set()
+    rc = 0
 
     if args.mode in ("both", "foragg"):
         kinds.add("foragg")
         loaded = load_agg_tables(con, Path(args.agg_dir))
+        if not loaded and not args.allow_empty:
+            print(f"[ERROR] 読み込める成績表がありません（{args.agg_dir}）。unified_all は変更しません。"
+                  "aggregate_stats_ver2.py の実行と --agg-dir を確認してください（空にしたいときは --allow-empty）",
+                  file=sys.stderr)
+            con.close()
+            return 2
         rebuild_unified_all(con, loaded)
         rebuild_facets(con)
         replace_meta(con, ("foragg",), loaded)
         keep |= {t["table_name"] for t in loaded}
         con.commit()
-        if args.mode == "foragg" and con.execute(f"SELECT 1 FROM {META} WHERE kind='xjoin' LIMIT 1").fetchone():
+        if args.mode == "foragg" and con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name LIKE 'entries\\_xjoin\\_%' ESCAPE '\\' LIMIT 1").fetchone():
             print("[WARN] unified_all を作り直しました。entries_xjoin_* は古い照合結果のままなので "
                   "--mode entries も実行してください", file=sys.stderr)
 
@@ -353,26 +373,31 @@ def main(argv=None) -> int:
         build_entries_all(con, entries)
         keep |= {t["table_name"] for t in entries} | {ENTRIES_ALL}
         meta_rows = list(entries)
-        has_unified = table_exists(con, UNIFIED)
+        status = unified_status(con)
         for t in entries:
             xname = xjoin_table_for(t["table_name"])
-            if args.no_xjoin or not has_unified:
+            if args.no_xjoin or status != "ok":
                 con.execute(f"DROP TABLE IF EXISTS {q(xname)}")   # 古い照合結果を残さない
                 continue
             meta_rows.append(build_xjoin(con, t["table_name"]))
             keep.add(xname)
             con.commit()
-        if not has_unified:
-            print("[WARN] unified_all がありません。--mode foragg を先に実行してください（xjoin は作りません）",
-                  file=sys.stderr)
         replace_meta(con, ("entries", "xjoin"), meta_rows)
+        if status == "missing":
+            print("[WARN] unified_all がありません。--mode foragg（または both）を先に実行してください（xjoin は作りません）",
+                  file=sys.stderr)
+            rc = 1
+        elif status == "old":
+            print("[ERROR] unified_all が旧形式です（family/indicator 列が無い）。"
+                  "replace → aggregate → build_db.py --fresh で作り直してください（xjoin は作りません）", file=sys.stderr)
+            rc = 1
 
     if args.prune:
         prune(con, kinds, keep)
     con.commit()
     con.close()
-    print(f"OK: {db} (mode={args.mode}, prune={args.prune}, xjoin={not args.no_xjoin})")
-    return 0
+    print(f"{'OK' if rc == 0 else 'DONE(警告あり)'}: {db} (mode={args.mode}, prune={args.prune}, xjoin={not args.no_xjoin})")
+    return rc
 
 
 if __name__ == "__main__":

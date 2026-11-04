@@ -1,9 +1,13 @@
-"""foragg 素材・集計ファイルの名前と DB テーブル名の規約。
+"""素材・成績表ファイルの名前と DB テーブル名の規約。
 
-ファイル名: foragg_{オッズ接頭辞}{rankband_スキーム_}{family}_{元ファイル名}
-  例: foragg_normal_主５場（中山、東京、中京、京都、阪神）_カツラキ.csv
-      foragg_odds50p_rankband_s1_normal_band_札幌_ZI.csv
-テーブル名: ファイル名（拡張子なし）を SQLite 用に安全化したもの。接頭辞 foragg_ は1つだけ。
+素材（replace_csv_ver3.py の出力。オッズでは絞らない。gzip 圧縮）:
+  foragg_csv/foragg_{rankband_スキーム_}{family}_{元ファイル名(拡張子なし)}.csv.gz
+  例: foragg_normal_主５場（中山、東京、中京、京都、阪神）_カツラキ.csv.gz
+      foragg_rankband_s1_normal_band_札幌_ZI.csv.gz
+成績表（aggregate_stats_ver2.py の出力。オッズ帯ごとに1本）:
+  agg_csv/foragg_{オッズ接頭辞}{rankband_スキーム_}{family}_{元ファイル名}.csv
+  例: foragg_odds50p_rankband_s1_normal_band_札幌_ZI.csv
+テーブル名: 成績表のファイル名（拡張子なし）を SQLite 用に安全化したもの。接頭辞 foragg_ は1つだけ。
   （旧版は "foragg_" + ファイル名 で foragg_foragg_... になり、画面の family 判定が壊れていた）
 family・オッズ帯・指数名などはテーブル名から推測せず、__tables_meta__ と unified_all の列に持たせる。
 """
@@ -17,21 +21,35 @@ from .keys import ALL_FAMILIES, BAND_FAMILIES, SCHEMES
 from .odds import LEGACY_MODES, ODDS_MODES, mode_prefix
 
 FORAGG_PREFIX = "foragg_"
+MATERIAL_SUFFIX = ".csv.gz"
 _FAMILIES_LONGEST_FIRST = sorted(ALL_FAMILIES, key=len, reverse=True)
 
 
-def foragg_tag(family: str, mode: str, scheme: str = "") -> str:
+def file_stem(path: str) -> str:
+    """拡張子（.csv / .csv.gz）を除いたファイル名。"""
+    name = os.path.basename(str(path))
+    for ext in (".csv.gz", ".csv"):
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return os.path.splitext(name)[0]
+
+
+def foragg_tag(family: str, mode: str = "normal", scheme: str = "") -> str:
     return f"{mode_prefix(mode)}{('rankband_' + scheme + '_') if scheme else ''}{family}"
 
 
-def foragg_filename(family: str, mode: str, scheme: str, source_basename: str) -> str:
-    return f"{FORAGG_PREFIX}{foragg_tag(family, mode, scheme)}_{source_basename}"
+def material_filename(family: str, scheme: str, source_stem: str) -> str:
+    return f"{FORAGG_PREFIX}{foragg_tag(family, 'normal', scheme)}_{source_stem}{MATERIAL_SUFFIX}"
+
+
+def agg_filename(family: str, mode: str, scheme: str, source_stem: str) -> str:
+    return f"{FORAGG_PREFIX}{foragg_tag(family, mode, scheme)}_{source_stem}.csv"
 
 
 def parse_foragg_stem(stem: str) -> dict | None:
     """ファイル名（拡張子なし）→ {mode, scheme, family, source, region, indicator}。
 
-    規約に合わない名前・旧仕様（odds5p など）は None。
+    オッズ接頭辞が無ければ mode='normal'。規約に合わない名前・旧仕様（odds5p など）は None。
     """
     s = stem
     if not s.startswith(FORAGG_PREFIX):
@@ -74,8 +92,7 @@ def sanitize_identifier(name: str) -> str:
 
 
 def table_name_for_foragg(path_or_stem: str) -> str:
-    stem = os.path.splitext(os.path.basename(path_or_stem))[0]
-    t = sanitize_identifier(stem)
+    t = sanitize_identifier(file_stem(path_or_stem))
     return t if t.startswith(FORAGG_PREFIX) else FORAGG_PREFIX + t
 
 
@@ -86,8 +103,7 @@ _RESERVED_ENTRY_STEMS = {"all"}
 
 
 def table_name_for_entries(path_or_stem: str) -> str:
-    stem = os.path.splitext(os.path.basename(path_or_stem))[0]
-    t = sanitize_identifier(stem)
+    t = sanitize_identifier(file_stem(path_or_stem))
     if t.startswith(ENTRIES_PREFIX):
         t = t[len(ENTRIES_PREFIX):]
     if t in _RESERVED_ENTRY_STEMS or t.startswith("xjoin_"):

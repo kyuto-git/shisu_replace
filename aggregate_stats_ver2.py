@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
-"""集計素材（foragg_csv/foragg_*.csv、1行=1頭）→ 結合データごとの成績表（agg_csv/ に同名で出力）。
+"""集計素材（foragg_csv/foragg_*.csv.gz、1行=1頭）→ 結合データごとの成績表（agg_csv/）。
 
-素材は上書きしないので、集計条件を変えたときは aggregate → build_db だけ再実行すればよい。
+素材1本から、オッズ帯（過去レースの確定単勝オッズ）ごとに4本の成績表を作る:
+  通常（絞り込みなし）/ odds10u（10倍未満）/ odds10_50（10以上50未満）/ odds50p（50倍以上）
+  出力名: agg_csv/foragg_{オッズ接頭辞}{tag}_{元名}.csv（命名は shisu/naming.py）
+素材は上書きしないので、集計条件やオッズ帯を変えたときは aggregate → build_db だけ再実行すればよい。
 
 出力列:
   結合データ, 件数, 勝率_val, 勝率, 連対率_val, 連対率, 複勝率_val, 複勝率, 2着率_val, 2着率,
@@ -10,6 +13,7 @@
   - 「勝率」などの文字列は '頻度%（推定%）'。*_val はこの CSV では頻度%。
     （build_db が DB に取り込むとき、5つの率の *_val は括弧内の推定値に置き換わる）
   - 推定値は shisu/estimates.py（既定: 事後分布の下側10%点、複勝率は頻度20%以下なら上側90%点）
+    AGG_PROP_MODE=mean にすると勝率・連対率・2着率・3着率は事後平均になる（複勝率は常に上の分位点の切替）
 
 環境変数: AGG_PROP_MODE(lower|mean), AGG_LOWER_Q(0.10), AGG_UPPER_Q(0.90), AGG_PRIOR_ALPHA/BETA(0.5),
           PLC_SWITCH_THRESHOLD_PCT(20), AGG_MIN_SAMPLE(5), AGG_RANKBAND_SCHEMES(例 "s1")
@@ -30,7 +34,8 @@ from shisu import config
 from shisu.csvio import read_csv_any, write_csv
 from shisu.estimates import beta_quantile, has_scipy, posterior_mean
 from shisu.finish import parse_finish
-from shisu.naming import parse_foragg_stem
+from shisu.naming import agg_filename, file_stem, parse_foragg_stem
+from shisu.odds import ODDS_MODES, odds_mask
 
 KEY = "結合データ"
 RID = "レースID(新)"
@@ -64,7 +69,9 @@ def _pair(freq, est) -> str:
 
 
 def _estimate(k: pd.Series, n: pd.Series, upper: pd.Series | None = None) -> pd.Series:
-    if PROP_MODE == "mean":
+    """推定値（%）。upper を渡したとき（複勝率）は、旧版どおり AGG_PROP_MODE に関係なく
+    頻度≤閾値なら上側 q 点・それ以外は下側 q 点を使う（消し判定を保守的にするため）。"""
+    if upper is None and PROP_MODE == "mean":
         return posterior_mean(k, n, PRIOR_A, PRIOR_B) * 100.0
     lo = beta_quantile(k, n, LOWER_Q, PRIOR_A, PRIOR_B) * 100.0
     if upper is None:
@@ -90,6 +97,10 @@ def aggregate_frame(df: pd.DataFrame) -> pd.DataFrame:
     fl = parse_finish(df["着順"], df["頭数"] if "頭数" in df.columns else None)
     use = fl["denom"]
     d, f = df[use], fl[use]
+    # 件数 < MIN_SAMPLE のグループは出力しないので、先に除いてから計算する（推定値・文字列整形の無駄を省く）
+    sizes = d[KEY].map(d[KEY].value_counts())
+    keep = sizes >= MIN_SAMPLE
+    d, f = d[keep], f[keep]
     if d.empty:
         return pd.DataFrame(columns=OUT_COLUMNS)
 
@@ -138,27 +149,31 @@ def aggregate_frame(df: pd.DataFrame) -> pd.DataFrame:
             out[c] = first.fillna("").values
         else:
             out[c] = ""
-    out = out[out["件数"] >= MIN_SAMPLE].reset_index(drop=True)
-    return out[OUT_COLUMNS]
+    return out.reset_index(drop=True)[OUT_COLUMNS]
 
 
 def aggregate_file(src: str, out_dir: str) -> str:
     src = Path(src)
-    if parse_foragg_stem(src.stem) is None:
-        return f"[SKIP] {src.name}: ファイル名が規約外（旧仕様の odds5p など）"
+    info = parse_foragg_stem(file_stem(src))
+    if info is None or info["mode"] != "normal":
+        return f"[SKIP] {src.name}: 素材のファイル名が規約外（旧仕様のファイルは --clean で消してから replace をやり直す）"
     df = read_csv_any(src)
-    try:
-        out = aggregate_frame(df)
-    except KeyError as e:
-        return f"[SKIP] {src.name}: 列 {e} がありません（集計済みファイルの可能性）"
-    write_csv(out, Path(out_dir) / src.name)
-    return f"[OK] {src.name}: {len(out)} groups"
+    counts = []
+    for mode in ODDS_MODES:
+        sub = df[odds_mask(df["単勝オッズ"], mode)] if "単勝オッズ" in df.columns else df.iloc[0:0]
+        try:
+            out = aggregate_frame(sub)
+        except KeyError as e:
+            return f"[SKIP] {src.name}: 列 {e} がありません（素材ではない可能性）"
+        write_csv(out, Path(out_dir) / agg_filename(info["family"], mode, info["scheme"], info["source"]))
+        counts.append(f"{mode}={len(out)}")
+    return f"[OK] {src.name}: groups " + " ".join(counts)
 
 
 def _selected(path: Path, schemes: set[str]) -> bool:
     if not schemes:
         return True
-    p = parse_foragg_stem(path.stem)
+    p = parse_foragg_stem(file_stem(path))
     return p is None or not p["scheme"] or p["scheme"] in schemes
 
 
@@ -170,12 +185,13 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=1, help="並列数（既定1）")
     args = ap.parse_args(argv)
 
-    files = sorted(Path(args.in_dir).glob("foragg_*.csv"))
+    files = sorted(Path(args.in_dir).glob("foragg_*.csv.gz"))
     schemes = {s.strip() for s in os.getenv("AGG_RANKBAND_SCHEMES", "").split(",") if s.strip()}
     files = [p for p in files if _selected(p, schemes)]
     if not files:
-        print(f"[INFO] 素材がありません: {args.in_dir}")
-        return 0
+        print(f"[ERROR] 素材（foragg_*.csv.gz）がありません: {args.in_dir}。replace_csv_ver3.py を先に実行してください",
+              file=sys.stderr)
+        return 2
     if args.clean and Path(args.out_dir).exists():
         shutil.rmtree(args.out_dir)
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -190,7 +206,11 @@ def main(argv=None) -> int:
     for r in results:
         if not r.startswith("[OK]"):
             print(r)
-    print(f"[DONE] OK={sum(r.startswith('[OK]') for r in results)} SKIP={sum(r.startswith('[SKIP]') for r in results)} ERROR={len(errors)}")
+    n_ok = sum(r.startswith("[OK]") for r in results)
+    print(f"[DONE] OK={n_ok} SKIP={sum(r.startswith('[SKIP]') for r in results)} ERROR={len(errors)}")
+    if n_ok == 0:
+        print("[ERROR] 集計できた素材がありません。replace_csv_ver3.py を先に実行してください", file=sys.stderr)
+        return 2
     return 1 if errors else 0
 
 

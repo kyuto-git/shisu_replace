@@ -9,13 +9,16 @@ compute_indicator() の規則:
   5. 有効値が2頭未満、または全頭が同じ値（標準偏差0。未取得で全頭0のときなど）
      → そのレースはこの指数では使わない（旧版の出馬表側は全頭50にしていた）
   6. 偏差値 = (x − レース平均) / 母標準偏差 × 10 + 50 を四捨五入（numpy の丸め）
-  7. 順位は元データの順位列を優先。無ければ同値同順位（method=min）で計算
+  7. 順位は元データの順位列を優先。無ければ同値同順位（method=min）で計算する
+     （同梱サンプルで TARGET の 指数順位 と照合すると、ZI・オメガ指数は min と100%一致した）
+  値は NFKC・空白除去してから数値化する（全角数字・全角マイナスを欠損にしない）
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
+from .csvio import norm_series
 from .indicators import IndicatorSpec
 
 HENSACHI_BANDS = ((71, "71以上"), (66, "66~70"), (61, "61~65"), (51, "51~60"), (41, "41~50"))
@@ -61,7 +64,7 @@ def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpe
     """
     idx = values.index
     key = race_key.astype(str)
-    x = pd.to_numeric(values, errors="coerce").astype(float)
+    x = pd.to_numeric(norm_series(values), errors="coerce").astype(float)
 
     miss = x.isna()
     miss_cnt = miss.groupby(key).transform("sum")
@@ -93,7 +96,7 @@ def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpe
     hensachi = ((x - mean) / std * 10.0 + 50.0).where(ok).round(0)
 
     if given_rank is not None:
-        rank = pd.to_numeric(given_rank, errors="coerce")
+        rank = pd.to_numeric(norm_series(given_rank), errors="coerce")
     else:
         rank = x.groupby(key).rank(ascending=False, method="min")
     rank = rank.where(ok & ~single_missing)
