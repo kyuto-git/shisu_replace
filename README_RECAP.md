@@ -34,4 +34,5 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 - オッズ帯: 通常 / 10倍未満（odds10u）/ 10〜50倍（odds10_50）/ 50倍以上（odds50p）
 - 推定値: Jeffreys 事前の事後分布の下側10%点（複勝率は頻度20%以下なら上側90%点）。DB の 勝率_val〜3着率_val は推定値、掲示板率_val は頻度。率はすべて 0–100
 - 条件ヒット馬: 消し → 絶対軸 → 軸候補 → 相手 の順で最初に当てはまった区分（閾値は `shisu/classify.py`）
+- WEDGE = WIN（決定力）+ EDGE（オッズから見た期待着順を上回った割合）。adjusted_WEDGE は直近5年・年30件以上の年だけで年度加重。横断検索の「まとめて」表示で全集計表を adjusted_WEDGE 順に並べられる
 - 集計条件だけ変えたときは aggregate → build_db だけでよい（素材は上書きしない）

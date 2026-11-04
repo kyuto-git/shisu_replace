@@ -1,6 +1,6 @@
 # CLAUDE.md — shisu_replace（競馬 外部指数の集計・照合システム）
 
-最終更新: 2026-11-04（Phase 1 バグ修正・リファクタリング／Phase 2 オッズ4区分・抽出条件変更を反映）
+最終更新: 2026-11-04（Phase 1 バグ修正・リファクタリング／Phase 2 オッズ4区分・抽出条件変更／Phase 3 WEDGE を反映）
 
 ## この文書の扱い
 
@@ -16,6 +16,7 @@
 
 TARGET frontier JV で出力した「過去レース×外部指数」CSVを、条件文字列 `結合データ`（例: `東京×芝×16-18×定量×1・2_勝×3`）ごとに集計して成績表（勝率・複勝率・掲示板率・回収値・ベイズ推定値）を作る。
 当日の「出馬表×外部指数」CSVの各馬について同じ規則でキーを組み立てて成績表と突き合わせ、Flask UI で「絶対軸／軸候補／消し候補／相手候補」を表示する。
+成績表には合成指標 WEDGE（決定力 WIN ＋ 市場の期待を超える力 EDGE）と、その直近5年の年度加重 adjusted_WEDGE も持たせ、「今まさに旬の指数条件」を横断検索で並べられる（§6.2）。
 
 将来は別リポジトリ（`docker-lasthalon-calculate`、`docker-keiba-omega` / `docker-keibaAI-scraping` / `docker-kichiuma-scraping` / `docker-kayochin-get` / `docker-ittai-scraper`）と統合する予定。統合時は `shisu/` を中核ライブラリとして使い、新しい指数は `shisu/indicators.py` の台帳に1行足して取り込む想定。
 
@@ -93,7 +94,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 | 変えたもの | 再実行 |
 |---|---|
 | csv_files（過去データ）・キーの規則（`shisu/`） | replace → aggregate → build_db --mode both |
-| 集計の条件（推定方法・MIN_SAMPLE・オッズ帯の定義など） | aggregate → build_db --mode both（素材はそのまま使える） |
+| 集計の条件（推定方法・MIN_SAMPLE・オッズ帯の定義・WEDGE の年の最低件数や窓など） | aggregate → build_db --mode both（素材はそのまま使える） |
 | 出馬表 | calc_entry_hensachi --merge-only --clean → build_db --mode entries --prune |
 | 画面（app.py・`shisu/classify.py`） | app の再起動だけ |
 
@@ -119,7 +120,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 | `estimates.py` | ベイズ推定（Beta 分位点・事後平均） |
 | `classify.py` | 条件ヒット馬の分類（Python 版と SQL 版。両者の一致はテストで確認） |
 | `matching.py` | 出馬表1頭 × unified_all の完全一致照合（xjoin 構築と画面のその場照合で共通） |
-| `wedge.py` | WEDGE・EDGE 判定・年度加重（Phase 3 の下準備。まだ集計には組み込んでいない） |
+| `wedge.py` | WIN・EDGE・WEDGE・年度加重 adjusted_WEDGE（成績表用のベクトル版 `wedge_columns` と、照合用の素直な1グループ版） |
 
 ---
 
@@ -141,9 +142,13 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 - 着順: 取消・除外は分母外、失格・中止は分母に入れて着順=頭数（不明なら18）
 - 率: 頻度と推定値。推定値は既定で事後分布 Beta(k+0.5, n−k+0.5) の下側10%点。**複勝率だけは頻度≤20%なら上側90%点**（消し判定を保守的にするため。`AGG_PROP_MODE=mean` でも複勝率はこの切替のまま）。scipy で厳密計算
 - 回収値: 単勝・複勝は 100円均等買い。単勝適正回収値 = 100×Σ(1/オッズ×配当/100×的中)/Σ(1/オッズ)
+- WIN / EDGE / WEDGE / adjusted_WEDGE（＋年数・件数・最終年）を `shisu.wedge.wedge_columns` で付ける（§6.2）。年度の窓の終わりは、オッズ帯で絞る前の素材ファイル全体の最終年
+  - `--wedge-min-year-count N`（既定30、環境変数 `AGG_WEDGE_MIN_YEAR_COUNT`）、`--wedge-window data|key`（既定 data、`AGG_WEDGE_WINDOW`）
+  - 実行の最後に「adjusted_WEDGE が付いたグループ: x/y」を出す（年30件の条件は細かいキーほど満たしにくいので、本番データで割合を確認する）
 - 件数 < 5 のグループは計算前に除く（出力しない）
 - 集計できた素材が0本なら終了コード2（replace を先に実行）
-- 環境変数: `AGG_PROP_MODE`(lower|mean), `AGG_LOWER_Q`, `AGG_UPPER_Q`, `AGG_PRIOR_ALPHA/BETA`, `PLC_SWITCH_THRESHOLD_PCT`, `AGG_MIN_SAMPLE`, `AGG_RANKBAND_SCHEMES`。オプション `--clean`, `--workers N`
+- 環境変数: `AGG_PROP_MODE`(lower|mean), `AGG_LOWER_Q`, `AGG_UPPER_Q`, `AGG_PRIOR_ALPHA/BETA`, `PLC_SWITCH_THRESHOLD_PCT`, `AGG_MIN_SAMPLE`, `AGG_RANKBAND_SCHEMES`, `AGG_WEDGE_MIN_YEAR_COUNT`, `AGG_WEDGE_WINDOW`。オプション `--clean`, `--workers N`, `--wedge-min-year-count`, `--wedge-window`
+- 目安（合成データ30万行の入力1本＝素材20本）: 54秒（WEDGE 追加前は44秒）
 
 ### 3.3 calc_entry_hensachi.py（出馬表 → 偏差値付き出馬表）
 
@@ -156,17 +161,20 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 ### 3.4 build_db.py（CSV → racing.db）
 
 - `--mode both|foragg|entries`, `--fresh`, `--prune`, `--no-xjoin`, `--agg-dir`, `--allow-empty`, `--entries-dir`, `--db-path`（既定は `DB_PATH` か `racing.db`）
-- foragg: 成績表を読み、5つの率の `*_val` を文字列の括弧内（推定値）で作り直す → テーブル（名前はファイル名そのまま。接頭辞 `foragg_` は1つ）→ unified_all → __facets__
+- foragg: 成績表を読み、5つの率の `*_val` を文字列の括弧内（推定値）で作り直す（WEDGE 系の列は数値化してそのまま）→ テーブル（名前はファイル名そのまま。接頭辞 `foragg_` は1つ）→ unified_all（索引: 照合用 (結合データ, family, indicator)、テーブル名、WEDGE、adjusted_WEDGE）→ __facets__
   - 読める成績表が0本なら DB に触らず終了コード2（空にしたいときだけ `--allow-empty`）
 - entries: `normalize_entries_df`（§5）→ テーブル → entries_all → xjoin（各馬 × 指数 × 15 family × キー候補を unified_all と完全一致照合。照合結果のキャッシュは2万件で空にする）
-  - unified_all が無い・旧形式（family/indicator 列が無い）なら xjoin を作らず終了コード1
+  - unified_all が無い・旧形式（family/indicator/WEDGE などの列が無い。Phase 2 で作った DB も含む）なら xjoin を作らず終了コード1
   - レースID(新) が無い出馬表は「日付_場 R」をレースの識別子にする。旧形式の出馬表（`X_順位帯_s1` が無い）は警告。順位 `13.0` は `13` として扱う
 
 ### 3.5 app.py（Flask）
 
-- `/`: 条件（場所・芝・ダ・距離・芝(内・外)・地域）、family、指数、オッズ帯、プリセット（絶対軸・軸候補・相手候補・消し候補。判定は `classify` と同じ SQL）で集計表を表示。一度に最大100表・各200行
+- `/`: 条件（場所・芝・ダ・距離・芝(内・外)・地域）、family、指数、オッズ帯、プリセット（絶対軸・軸候補・相手候補・消し候補。判定は `classify` と同じ SQL）、下限（件数・WEDGE・adjusted_WEDGE）で絞り込む
+  - 表示は2通り: 「集計表ごと」（最大100表・各200行）と「まとめて」（unified_all の横断ランキング、上位500行。既定の並びは adjusted_WEDGE の大きい順）
+  - 並べ替えは件数・各率の *_val・平均着順・回収値・WIN・EDGE・WEDGE・adjusted_WEDGE・adjusted_WEDGE_件数。空欄は常に最後
 - `/entries`: 日付（最新が既定）・場所でレース一覧。リンクは `レースID(新/馬番無)`（旧リンク `ridn=場 R` も開ける）
-- `/entries/hits`: 馬ごとの該当数の要約と、区分ごとの表。照合経路（xjoin / on-the-fly）を表示。並びは オッズ帯（通常→10倍未満→10〜50倍→50倍以上）→ 馬番 → 複勝率（消しは昇順）
+- `/entries/hits`: 馬ごとの該当数の要約と、区分ごとの表（WEDGE・adjusted_WEDGE・年数の列あり）。照合経路（xjoin / on-the-fly）を表示。並びは オッズ帯（通常→10倍未満→10〜50倍→50倍以上）→ 馬番 → 複勝率（消しは昇順）
+- `/entries/key`: WEDGE・adjusted_WEDGE・年数の列あり
 - DB が未構築・旧形式なら各画面の上部に作り直しの案内を出す（旧形式の DB でもエラーにしない）
 
 ---
@@ -194,6 +202,8 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 | *_val（上の5つ）, 掲示板率_val | **CSV では頻度%**（0–100） |
 | 掲示板率 | `"80.00%"`（頻度のみ） |
 | 平均着順, 単勝回収値, 複勝回収値, 単勝適正回収値 | 数値 |
+| WIN, EDGE, WEDGE, adjusted_WEDGE | 数値（小数4桁）。§6.2。adjusted_WEDGE は条件を満たす年が無ければ空 |
+| adjusted_WEDGE_年数, adjusted_WEDGE_件数, adjusted_WEDGE_最終年 | adjusted_WEDGE に使った年の数・件数の合計・最も新しい年（整数。使った年が無ければ 0 / 0 / 空） |
 | 提案勝率〜提案3着率 | 推定%のみ |
 | 場所, 芝・ダ, 距離, 芝(内・外) | グループ内で最初の非空値 |
 
@@ -214,11 +224,11 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 |---|---|
 | `__tables_meta__` | table_name, source_file, kind(foragg/entries/xjoin), family, odds_mode, rank_scheme, indicator, region, n_rows |
 | `foragg_*` | 成績表1本=1テーブル（§4.3 の列。5つの率の *_val は推定値に置換） |
-| `unified_all` | 全 foragg_* の縦結合（場所, 芝・ダ, 距離, 芝(内・外), 結合データ, 成績列, *_val, family, odds_mode, rank_scheme, indicator, region, テーブル名）。索引 (結合データ, family, indicator) |
+| `unified_all` | 全 foragg_* の縦結合（場所, 芝・ダ, 距離, 芝(内・外), 結合データ, 成績列, *_val, WIN〜adjusted_WEDGE_最終年, family, odds_mode, rank_scheme, indicator, region, テーブル名）。索引 (結合データ, family, indicator)・テーブル名・WEDGE・adjusted_WEDGE |
 | `__facets__` | 画面の選択肢（col, val） |
 | `entries_*` | 出馬表（元の列 ＋ 正規化したキー部品 `場所/芝・ダ/距離/芝(内・外)/重量種別/クラス名/枠番グループ/騎手`、`日付`、`レースID(新/馬番無)`、`距離_raw`、`クラス名_raw`） |
 | `entries_all` | 全出馬表の主要列の縦結合（画面では使わない） |
-| `entries_xjoin_*` | 照合結果: source_table, 日付, レースID(新), レースID(新/馬番無), 場 R, 馬番, 枠番, 枠番グループ, 騎手, 馬名, base(指数), key, テーブル名, family, odds_mode, rank_scheme, indicator, region, 成績列 |
+| `entries_xjoin_*` | 照合結果: source_table, 日付, レースID(新), レースID(新/馬番無), 場 R, 馬番, 枠番, 枠番グループ, 騎手, 馬名, base(指数), key, テーブル名, family, odds_mode, rank_scheme, indicator, region, 成績列（WEDGE 系を含む） |
 
 `*_val` の意味:
 
@@ -294,7 +304,9 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 
 ---
 
-## 6. 条件ヒット馬の分類（`shisu/classify.py`）
+## 6. 評価指標
+
+### 6.1 条件ヒット馬の分類（`shisu/classify.py`）
 
 値: `fv`=複勝率_val（推定）, `rv`=連対率_val（推定）, `top5`=掲示板率_val（頻度）, `frc`=複勝回収値, `tra`=単勝適正回収値, `cnt`=件数。欠損は「満たさない」。
 判定順 **消し → 絶対軸 → 軸候補 → 相手** で、最初に当てはまった区分を1つだけ付ける。
@@ -306,7 +318,24 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 | 軸候補 | cnt≥10 かつ [fv≥80&top5≥90 / rv≥60&top5≥90 / fv≥70&top5≥80&frc≥100 / rv≥50&top5≥80&frc≥100] のいずれか |
 | 相手候補 | cnt≥30 かつ [fv≥60&top5≥70 / rv≥50&top5≥70 / fv≥33&frc≥150&top5≥50] のいずれか |
 
-推定値は「軸は下限、消しは上限」で判定する設計（複勝率の推定は頻度20%以下なら上側90%点）。閾値は `classify.py` の定数で変える。`/` のプリセットも同じ定義の SQL を使う。
+推定値は「軸は下限、消しは上限」で判定する設計（複勝率の推定は頻度20%以下なら上側90%点）。閾値は `classify.py` の定数で変える。`/` のプリセットも同じ定義の SQL を使う。WEDGE はこの分類には使っていない（表示と並べ替え・絞り込み用）。
+
+### 6.2 WEDGE（`shisu/wedge.py`、aggregate が成績表の列として計算）
+
+グループ（結合データ）ごとに、aggregate の分母と同じ馬（取消・除外を除く。失格・中止は着順=頭数）で計算する。
+
+- **WIN**（決定力）= (1着数×3.0 + 2着数×1.5 + 3着数×1.0) / (件数×3.0)
+- **EDGE**（市場の期待を超える力）= 成功数 / オッズのある件数。単勝オッズ（100倍超は100倍にクリップ）の帯ごとに、着順が次以内なら成功:
+  1.0〜1.4倍→1着 / 1.5〜2.9→1着 / 3.0〜4.9→2着 / 5.0〜9.9→3着 / 10.0〜19.9→4着 / 20.0〜49.9→6着 / 50.0〜100.0→8着。オッズが無い・1倍未満の馬は EDGE の分母から外す
+- **WEDGE** = WIN + EDGE（目安: 1.00以上=トップ級、0.62前後=平均、0.50未満=下位）
+- **adjusted_WEDGE**（年度加重）:
+  1. 年（素材の `year`）ごとに WEDGE を出す
+  2. 窓 = 終わりの年から遡る5年。終わりの年は既定（`data`）で**素材ファイル全体の最終年**（＝データとしての「今」）。`--wedge-window key` なら結合データ自身の最終年。窓の外の古い年は使わない
+  3. 件数が30未満（`--wedge-min-year-count`）の年は除く
+  4. 残った年数 m に応じて古い順にウェイト: m=5 `[0.06, 0.11, 0.18, 0.25, 0.40]`、m=4 `[0.12, 0.19, 0.27, 0.42]`、m≤3 `linspace(0.1, 0.5, m)` を合計1に正規化（m=1→1.0、m=2→約0.17/0.83）
+  5. 残った年が無ければ空。使った年数・件数の合計・最終年を `adjusted_WEDGE_年数/件数/最終年` に出す
+- オッズ帯別の成績表（odds10u など）でも同じ EDGE 表を使う。窓の終わりは4本とも同じ（素材全体の最終年）
+- 正しさの確認: テストで、ベクトル版 `wedge_columns` と仕様どおりの1グループ版（`wedge_from_frame`・`adjusted_wedge`）をランダムデータと手計算の例で照合している
 
 ---
 
@@ -324,7 +353,7 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 
 `python -m pytest`（Docker: `docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest`）
 
-- `tests/test_core.py`: 正規化・台帳・偏差値の規則・キー（ベクトル版と1件版の一致、**過去側キーが出馬表側の候補に必ず含まれる**こと）・ファイル名・オッズ・着順・分類（境界値、Python 版と SQL 版の一致）・WEDGE
+- `tests/test_core.py`: 正規化・台帳・偏差値の規則・キー（ベクトル版と1件版の一致、**過去側キーが出馬表側の候補に必ず含まれる**こと）・ファイル名・オッズ・着順・分類（境界値、Python 版と SQL 版の一致）・WEDGE（EDGE 表の境界、ベクトル版と1グループ版の照合、手計算例、年度窓・30件除外・ウェイト）
 - `tests/test_scripts.py`: 各スクリプトの関数単位（指数順位N の対応付け、旧形式の順位 `13.0`、頭数列なし、mean モード、--clean など）
 - `tests/test_pipeline.py`: 合成データ（`tests/synth.py`。空欄の内外・髙・Ｇ１・全頭0・欠損2頭を含む）で replace → aggregate → calc → build_db → app を通し、旧版の不具合が再発しないこと、xjoin とその場照合の分類結果が一致すること、`--mode entries --prune` で foragg_* が消えないことを確認
 
@@ -340,16 +369,16 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 6. 同梱の `entries_out/entries_merged_hensachi.csv` は旧版の出力で、新版の列（`X_順位帯_s1` など）は無い。再生成して使う（build_db は旧形式として警告する）
 7. **xjoin の容量とメモリ**: 1頭×1指数あたり最大 15 family × キー候補 × 50 行を保存するので、1日分（約550頭×15指数）で数百MB規模になる。統合ファイルだけを DB に入れ（`--merge-only`）、古い日の出馬表は entries_out から外す（`--clean`）。構築中のメモリは照合キャッシュに上限（2万件）を設けたので数百MB程度
 8. 過去 CSV に `頭数`（`頭`）列が無いと、警告を出して頭数で絞らずに処理する（TARGET 側で10頭以上に抽出済みの前提）
+9. **adjusted_WEDGE の付きやすさ**: 「年30件以上」は騎手・枠番を含む細かいキーではほとんど満たせない（合成データでは全グループの約5%）。aggregate の最後のログで本番の割合を見て、必要なら `--wedge-min-year-count` を下げる。値の信頼度は `adjusted_WEDGE_件数`、新しさは `adjusted_WEDGE_最終年` で確認する
+10. **WEDGE の小標本**: 全期間の WEDGE には件数の下限が無い（成績表の件数≥5 だけ）。件数5で全勝なら WEDGE=2.0 になるので、横断ランキングでは「件数 下限」と併用する
 
 ---
 
 ## 10. 今後（Phase 3・4 の設計メモ）
 
-### Phase 3: WEDGE
-- 素材に `日付`・`year` を持たせた（済）。EDGE の成功判定は**素材には焼き込まず、集計時に `着順`＋`単勝オッズ` から計算**する（判定表を変えても aggregate の再実行だけで済むため）
-- 関数は `shisu/wedge.py` に実装済み（`edge_threshold`・`edge_success`・`win_score`・`edge_score`・`year_weights`・`adjusted_wedge`・`wedge_from_frame`）
-- 次の実装: aggregate で (結合データ, year) ごとの WIN/EDGE/WEDGE と件数を出し、`adjusted_WEDGE`（直近最大5年の加重平均）を成績表の列に追加 → build_db → 画面の並べ替え・抽出条件へ
-- 決めること: 年の件数が少ない場合の除外閾値（`adjusted_wedge(min_year_count=...)`。騎手版は30）、odds 帯別テーブルでも同じ EDGE 表を使うか
+### Phase 3: WEDGE（実装済み。§6.2）
+- EDGE の成功判定は素材に焼き込まず、集計時に `着順`＋`単勝オッズ` から計算する（判定表を変えても aggregate の再実行だけで済む）
+- 今後の候補: 条件ヒット馬の分類や `/entries/hits` の並びに adjusted_WEDGE を使うか、年別 WEDGE の推移を画面で見せるか（年別の値は今は成績表に出していない。必要なら master_csv から計算できる）
 
 ### Phase 4: 指数の組み合わせ・傾向分析
 - `master_csv`（1頭1行、全頭・着順・オッズ・順位・偏差値付き）を入力に、レース単位で「指数1位が3着内のとき残り2頭の順位帯/偏差値帯」などを集計する想定。master を DB に取り込むテーブルを追加する
@@ -357,6 +386,12 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 ---
 
 ## 11. 変更履歴
+
+### 2026-11-04 Phase 3（WEDGE）
+- aggregate が成績表に WIN・EDGE・WEDGE・adjusted_WEDGE（＋年数・件数・最終年）を出す。年の最低件数30・直近5年の窓（素材全体の最終年まで）・仕様どおりのウェイト
+- build_db: unified_all・foragg_*・xjoin に WEDGE 列。WEDGE と adjusted_WEDGE に索引。WEDGE 列の無い DB は旧形式として作り直しを促す
+- app: 横断検索に WEDGE 系の並べ替え・下限フィルタ・全集計表の横断ランキング（まとめて表示）。条件ヒット馬・キー詳細に WEDGE 列
+- テスト 156件（WEDGE の照合・手計算例・境界・DB・画面）
 
 ### 2026-11-04 Phase 1・2（旧 CLAUDE.md §5 の課題への対応）
 - キー生成を `shisu/` に一本化（過去側・出馬表側が同じ関数を使用）

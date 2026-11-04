@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """Flask UI。
 
-  /              横断検索（集計表 foragg_* を family・指数・オッズ帯・地域・コース条件で絞り込み）
+  /              横断検索（集計表 foragg_* を family・指数・オッズ帯・地域・コース条件で絞り込み。
+                 表ごとの表示と、全表をまとめて WEDGE などで並べる横断ランキングの2通り）
   /entries       出馬表のレース一覧（日付・場所で絞り込み）
   /entries/race  出馬表（各馬の指数順位・偏差値）
   /entries/key   結合データの前方一致で unified_all を表示
@@ -28,20 +29,28 @@ from shisu.keys import ALL_FAMILIES, FAMILY_LABELS
 from shisu.matching import UNIFIED, indicator_bases, match_entry_row, unified_status
 from shisu.naming import ENTRIES_ALL, XJOIN_PREFIX, xjoin_table_for
 from shisu.odds import ODDS_LABELS, ODDS_MODES, ODDS_RANK
+from shisu.wedge import DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WEDGE_FLOAT_COLUMNS
 
 DB_PATH = str(config.db_path())
 META = "__tables_meta__"
 FACETS = "__facets__"
 MAX_TABLES = 100       # 横断検索で一度に表示する集計表の上限（超えたら絞り込みを促す）
 ROWS_PER_TABLE = 200
+RANK_LIMIT = 500       # 横断ランキングの表示行数
 SORTABLE = ("件数", "勝率_val", "連対率_val", "複勝率_val", "2着率_val", "3着率_val", "掲示板率_val",
-            "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値")
+            "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値",
+            "WIN", "EDGE", "WEDGE", "adjusted_WEDGE", "adjusted_WEDGE_件数")
 DISPLAY_ORDER = ("結合データ", "件数", "勝率_val", "勝率", "連対率_val", "連対率", "複勝率_val", "複勝率",
                  "2着率_val", "2着率", "3着率_val", "3着率", "掲示板率_val", "掲示板率",
-                 "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値",
+                 "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値", *WEDGE_COLUMNS,
                  "提案勝率", "提案連対率", "提案複勝率", "提案2着率", "提案3着率",
                  "場所", "芝・ダ", "距離", "芝(内・外)")
+RANK_COLUMNS = ("結合データ", "件数", "複勝率_val", "連対率_val", "掲示板率_val", "単勝回収値", "複勝回収値",
+                "単勝適正回収値", *WEDGE_COLUMNS)
 PRESETS = ("none", "abs", "axis", "opp", "keshi")
+VIEWS = ("tables", "rank")
+# 下限フィルタ（クエリ引数名, 列）
+MIN_FILTERS = (("min_cnt", "件数"), ("min_wedge", "WEDGE"), ("min_adj", "adjusted_WEDGE"))
 
 app = Flask(__name__)
 
@@ -96,6 +105,11 @@ def fmt(v, digits: int = 2) -> str:
     return str(v)
 
 
+def fmt_cell(col: str, v) -> str:
+    """列に合わせた表示（WIN/EDGE/WEDGE は小数3桁）。"""
+    return fmt(v, 3 if col in WEDGE_FLOAT_COLUMNS else 2)
+
+
 def to_int(s, default: int = 1_000_000) -> int:
     m = re.match(r"\d+", str(s or ""))
     return int(m.group()) if m else default
@@ -110,7 +124,7 @@ def family_label(fam: str, scheme: str = "") -> str:
     return f"{label}（{scheme}）" if scheme else label
 
 
-app.jinja_env.globals.update(fmt=fmt, odds_label=odds_label, family_label=family_label,
+app.jinja_env.globals.update(fmt=fmt, fmt_cell=fmt_cell, odds_label=odds_label, family_label=family_label,
                              CATEGORY_LABELS=CATEGORY_LABELS)
 
 LAYOUT = """<!doctype html>
@@ -174,22 +188,44 @@ INDEX_BODY = """
   <div style="margin-top:10px"><label>推奨プリセット（条件ヒット馬と同じ判定）</label><div class="cbs">
     {% for p in presets %}<label class="cb"><input type="radio" name="preset" value="{{ p }}" {{ 'checked' if q_preset == p else '' }}>{{ 'なし' if p == 'none' else CATEGORY_LABELS[p] }}</label>{% endfor %}
   </div></div>
+  <div class="grid" style="margin-top:10px">
+    <div><label>件数 下限</label><input name="min_cnt" value="{{ q_min.min_cnt }}" inputmode="decimal" placeholder="例 30"></div>
+    <div><label>WEDGE 下限</label><input name="min_wedge" value="{{ q_min.min_wedge }}" inputmode="decimal" placeholder="例 1.0"></div>
+    <div><label>adjusted_WEDGE 下限</label><input name="min_adj" value="{{ q_min.min_adj }}" inputmode="decimal" placeholder="例 0.8"></div>
+    <div><label>並べ替え</label><select name="sort">{% for c in sortable %}<option value="{{ c }}" {{ 'selected' if c == q_sort else '' }}>{{ c }}</option>{% endfor %}</select></div>
+    <div><label>順序</label><select name="sortdir"><option value="DESC" {{ 'selected' if q_dir == 'DESC' else '' }}>大きい順</option><option value="ASC" {{ 'selected' if q_dir == 'ASC' else '' }}>小さい順</option></select></div>
+  </div>
+  <div style="margin-top:10px"><label>表示</label><div class="cbs">
+    <label class="cb"><input type="radio" name="view" value="tables" {{ 'checked' if q_view == 'tables' else '' }}>集計表ごと</label>
+    <label class="cb"><input type="radio" name="view" value="rank" {{ 'checked' if q_view == 'rank' else '' }}>まとめて（全集計表の横断ランキング・上位{{ rank_limit }}行）</label>
+  </div></div>
   <div style="margin-top:12px"><button type="submit">検索</button>
-    <span class="muted">並び替え: {{ q_sort }} {{ q_dir }}（列見出しの *_val などをクリック）</span></div>
-  <input type="hidden" name="sort" value="{{ q_sort }}"><input type="hidden" name="sortdir" value="{{ q_dir }}">
+    <span class="muted">WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=下位）。adjusted_WEDGE は直近5年の年度加重（既定では件数{{ wedge_min_year }}未満の年を除外）。空欄は条件を満たす年が無い</span></div>
   <input type="hidden" name="submitted" value="1">
 </form></div>
 {% if submitted %}
-  {% if truncated %}<div class="card warn">該当する集計表が {{ n_tables }} 個あります。先頭 {{ max_tables }} 個だけ表示しています。条件を絞ってください。</div>{% endif %}
+  {% if q_view == 'rank' %}
+    <div class="card"><h2>横断ランキング（{{ q_sort }} {{ '大きい順' if q_dir == 'DESC' else '小さい順' }}、空欄は最後）</h2>
+    <div class="muted">{{ rank_rows|length }} 行{% if rank_rows|length >= rank_limit %}（上位 {{ rank_limit }} 行まで）{% endif %}</div>
+    <table><thead><tr><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th>
+    {% for c in rank_columns %}{% if c in sortable %}<th><a href="{{ sort_links[c] }}">{{ c }}{% if c == q_sort %} {{ '▼' if q_dir == 'DESC' else '▲' }}{% endif %}</a></th>{% else %}<th>{{ c }}</th>{% endif %}{% endfor %}
+    </tr></thead><tbody>
+    {% for row in rank_rows %}<tr><td>{{ row.indicator }}</td><td>{{ family_label(row.family, row.rank_scheme) }}</td><td>{{ odds_label(row.odds_mode) }}</td><td>{{ row.region }}</td>
+      {% for c in rank_columns %}<td{% if c != '結合データ' %} class="num"{% endif %}>{{ fmt_cell(c, row[c]) }}</td>{% endfor %}</tr>
+    {% else %}<tr><td colspan="{{ rank_columns|length + 4 }}">該当なし</td></tr>{% endfor %}
+    </tbody></table></div>
+  {% else %}
+  {% if truncated %}<div class="card warn">該当する集計表が {{ n_tables }} 個あります。先頭 {{ max_tables }} 個だけ表示しています。条件を絞るか「まとめて」表示を使ってください。</div>{% endif %}
   {% for r in results %}
     <div class="card"><h2>{{ family_label(r.family, r.rank_scheme) }}<span class="tag">{{ r.indicator }}</span><span class="tag">{{ odds_label(r.odds_mode) }}</span><span class="tag">{{ r.region }}</span></h2>
     <div class="muted">{{ r.table }}</div>
     <table><thead><tr>{% for c in r.columns %}
-      {% if c in sortable %}<th><a href="{{ r.sort_links[c] }}">{{ c }}{% if c == q_sort %} {{ '▼' if q_dir == 'DESC' else '▲' }}{% endif %}</a></th>{% else %}<th>{{ c }}</th>{% endif %}
+      {% if c in sortable %}<th><a href="{{ sort_links[c] }}">{{ c }}{% if c == q_sort %} {{ '▼' if q_dir == 'DESC' else '▲' }}{% endif %}</a></th>{% else %}<th>{{ c }}</th>{% endif %}
     {% endfor %}</tr></thead><tbody>
-      {% for row in r.rows %}<tr>{% for c in r.columns %}<td>{{ fmt(row[c]) }}</td>{% endfor %}</tr>{% endfor %}
+      {% for row in r.rows %}<tr>{% for c in r.columns %}<td>{{ fmt_cell(c, row[c]) }}</td>{% endfor %}</tr>{% endfor %}
     </tbody></table></div>
   {% else %}<div class="card">該当する行はありませんでした。</div>{% endfor %}
+  {% endif %}
 {% else %}<div class="card muted">条件を選んで「検索」を押してください（初期表示では一覧を描画しません）。</div>{% endif %}
 """
 
@@ -209,6 +245,35 @@ def _meta_values(con, col: str) -> list[str]:
         f"SELECT DISTINCT {q(col)} FROM {META} WHERE kind='foragg' AND {q(col)} IS NOT NULL AND {q(col)} <> ''")]
 
 
+def _num_arg(name: str) -> float | None:
+    v = request.args.get(name, "").strip()
+    try:
+        f = float(v)
+    except ValueError:
+        return None
+    return f if f == f else None
+
+
+def _course_filters(place, sd, dist, inout) -> tuple[list[str], list]:
+    w, p = [], []
+    for col, val in (("場所", place), ("芝・ダ", sd), ("距離", dist), ("芝(内・外)", inout)):
+        if val:
+            w.append(f"{q(col)} = ?")
+            p.append(val)
+    return w, p
+
+
+def _min_filters(mins: dict) -> tuple[list[str], list, list[str]]:
+    """下限フィルタの WHERE 句・値・必要な列。"""
+    w, p, cols = [], [], []
+    for name, col in MIN_FILTERS:
+        if mins.get(name) is not None:
+            w.append(f"{q(col)} >= ?")
+            p.append(mins[name])
+            cols.append(col)
+    return w, p, cols
+
+
 @app.route("/", methods=["GET"])
 def index():
     a = request.args
@@ -222,10 +287,16 @@ def index():
     q_preset = a.get("preset", "none")
     if q_preset not in PRESETS:
         q_preset = "none"
-    q_sort = a.get("sort", "複勝率_val")
+    q_view = a.get("view", "tables")
+    if q_view not in VIEWS:
+        q_view = "tables"
+    default_sort = "adjusted_WEDGE" if q_view == "rank" else "複勝率_val"
+    q_sort = a.get("sort", default_sort)
     if q_sort not in SORTABLE:
-        q_sort = "複勝率_val"
+        q_sort = default_sort
     q_dir = "ASC" if a.get("sortdir", "DESC").upper() == "ASC" else "DESC"
+    mins = {name: _num_arg(name) for name, _ in MIN_FILTERS}
+    q_min = {name: ("" if v is None else f"{v:g}") for name, v in mins.items()}
 
     with connect() as con:
         status = db_status(con)
@@ -238,8 +309,11 @@ def index():
         selects = [("place", "場所", facets.get("場所", []), place), ("sd", "芝・ダ", facets.get("芝・ダ", []), sd),
                    ("dist", "距離", facets.get("距離", []), dist), ("inout", "芝(内・外)", facets.get("芝(内・外)", []), inout),
                    ("region", "地域（元ファイル）", regions, region)]
-        results, n_tables, truncated = [], 0, False
-        if submitted and has_db:
+        results, rank_rows, n_tables, truncated = [], [], 0, False
+        if submitted and has_db and q_view == "rank":
+            rank_rows = _rank_query(con, q_families, q_inds, q_odds, region, (place, sd, dist, inout),
+                                    q_preset, mins, q_sort, q_dir)
+        elif submitted and has_db:
             where, params = ["kind='foragg'"], []
             if q_families:
                 where.append(f"family IN ({','.join('?' * len(q_families))})")
@@ -261,41 +335,68 @@ def index():
                                       ODDS_RANK.get(m["odds_mode"], 9), m["region"] or ""))
             n_tables = len(metas)
             truncated = n_tables > MAX_TABLES
+            mw, mp, mcols = _min_filters(mins)
             for m in metas[:MAX_TABLES]:
                 t = m["table_name"]
                 if not table_exists(con, t):
                     continue
                 cols_in = set(table_columns(con, t))
+                if not set(mcols) <= cols_in:      # 下限を指定した列が無い表（古い集計）は出さない
+                    continue
                 show = [c for c in DISPLAY_ORDER if c in cols_in]
-                w, p = [], []
-                for col, val in (("場所", place), ("芝・ダ", sd), ("距離", dist), ("芝(内・外)", inout)):
-                    if val:
-                        w.append(f"{q(col)} = ?")
-                        p.append(val)
+                w, p = _course_filters(place, sd, dist, inout)
                 if q_preset != "none":
                     w.append(sql_condition(q_preset, m["odds_mode"]))
+                w += mw
+                p += mp
+                order = f"ORDER BY {q(q_sort)} {q_dir} NULLS LAST " if q_sort in cols_in else ""
                 sql = (f"SELECT {', '.join(q(c) for c in show)} FROM {q(t)} "
-                       f"{'WHERE ' + ' AND '.join(w) if w else ''} "
-                       f"ORDER BY {q(q_sort)} {q_dir} NULLS LAST LIMIT {ROWS_PER_TABLE}"
-                       if q_sort in cols_in else
-                       f"SELECT {', '.join(q(c) for c in show)} FROM {q(t)} "
-                       f"{'WHERE ' + ' AND '.join(w) if w else ''} LIMIT {ROWS_PER_TABLE}")
+                       f"{'WHERE ' + ' AND '.join(w) if w else ''} {order}LIMIT {ROWS_PER_TABLE}")
                 rows = [dict(r) for r in con.execute(sql, p)]
                 if not rows:
                     continue
-                links = {c: _sort_link(c, q_sort, q_dir) for c in show if c in SORTABLE}
                 results.append({"table": t, "family": m["family"], "rank_scheme": m["rank_scheme"],
                                 "indicator": m["indicator"], "odds_mode": m["odds_mode"], "region": m["region"],
-                                "columns": show, "rows": rows, "sort_links": links})
+                                "columns": show, "rows": rows})
+        sort_links = {c: _sort_link(c, q_sort, q_dir) for c in SORTABLE}
 
     return render("指数集計 横断検索", INDEX_BODY, selects=selects, families=families, indicators=indicators,
                   odds_modes=ODDS_MODES, presets=PRESETS, q_families=q_families, q_inds=q_inds,
-                  q_odds=q_odds, q_preset=q_preset, q_sort=q_sort, q_dir=q_dir, submitted=submitted,
-                  results=results, sortable=SORTABLE, n_tables=n_tables,
-                  truncated=truncated, max_tables=MAX_TABLES, db_warning=DB_WARNINGS.get(status, ""))
+                  q_odds=q_odds, q_preset=q_preset, q_sort=q_sort, q_dir=q_dir, q_view=q_view, q_min=q_min,
+                  submitted=submitted, results=results, rank_rows=rank_rows, rank_columns=RANK_COLUMNS,
+                  rank_limit=RANK_LIMIT, sortable=SORTABLE, sort_links=sort_links, n_tables=n_tables,
+                  truncated=truncated, max_tables=MAX_TABLES, wedge_min_year=DEFAULT_MIN_YEAR_COUNT,
+                  db_warning=DB_WARNINGS.get(status, ""))
 
 
-QUERY_KEYS = ("place", "sd", "dist", "inout", "region", "family", "ind", "odds_mode", "preset")
+def _rank_query(con, families, inds, odds_mode, region, course, preset, mins, sort, sortdir) -> list[dict]:
+    """unified_all（全集計表の縦結合）を条件で絞り、sort 列で並べた上位 RANK_LIMIT 行。"""
+    where, params = _course_filters(*course)
+    if families:
+        where.append(f"family IN ({','.join('?' * len(families))})")
+        params += families
+    if inds:
+        where.append(f"indicator IN ({','.join('?' * len(inds))})")
+        params += inds
+    if odds_mode != "all":
+        where.append("odds_mode = ?")
+        params.append(odds_mode)
+    if region:
+        where.append("region = ?")
+        params.append(region)
+    if preset != "none":   # 判定はオッズ帯で変わる（消し候補の10倍未満ルール）ので帯ごとに条件を付ける
+        where.append("(" + " OR ".join(f"(odds_mode = '{m}' AND {sql_condition(preset, m)})" for m in ODDS_MODES) + ")")
+    mw, mp, _ = _min_filters(mins)
+    where += mw
+    params += mp
+    cols = ", ".join(q(c) for c in ("indicator", "family", "rank_scheme", "odds_mode", "region", "テーブル名") + RANK_COLUMNS)
+    sql = (f"SELECT {cols} FROM {UNIFIED} {'WHERE ' + ' AND '.join(where) if where else ''} "
+           f"ORDER BY {q(sort)} {sortdir} NULLS LAST LIMIT {RANK_LIMIT}")
+    return [dict(r) for r in con.execute(sql, params)]
+
+
+QUERY_KEYS = ("place", "sd", "dist", "inout", "region", "family", "ind", "odds_mode", "preset", "view",
+              "min_cnt", "min_wedge", "min_adj")
 
 
 def _sort_link(col: str, cur: str, cur_dir: str) -> str:
@@ -436,11 +537,12 @@ def entries_race():
 KEY_BODY = """
 <div class="card"><h1>結合データ: {{ key }}…</h1><div class="muted">前方一致・件数の多い順に最大 {{ limit }} 行</div></div>
 <div class="card"><table><thead><tr><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th><th>件数</th>
-<th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th></tr></thead>
+<th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th>
+<th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th></tr></thead>
 <tbody>{% for r in rows %}<tr><td>{{ r.indicator }}</td><td>{{ family_label(r.family, r.rank_scheme) }}</td><td>{{ odds_label(r.odds_mode) }}</td><td>{{ r.region }}</td>
 <td>{{ r['結合データ'] }}</td><td class="num">{{ r['件数'] }}</td>
-{% for c in ['勝率_val','連対率_val','複勝率_val','掲示板率_val','平均着順','単勝回収値','複勝回収値','単勝適正回収値'] %}<td class="num">{{ fmt(r[c]) }}</td>{% endfor %}</tr>
-{% else %}<tr><td colspan="14">該当なし</td></tr>{% endfor %}</tbody></table></div>
+{% for c in ['勝率_val','連対率_val','複勝率_val','掲示板率_val','平均着順','単勝回収値','複勝回収値','単勝適正回収値','WEDGE','adjusted_WEDGE','adjusted_WEDGE_年数'] %}<td class="num">{{ fmt_cell(c, r[c]) }}</td>{% endfor %}</tr>
+{% else %}<tr><td colspan="17">該当なし</td></tr>{% endfor %}</tbody></table></div>
 """
 
 
@@ -519,13 +621,13 @@ HITS_BODY = """
 <div class="muted">{% for line in desc[c] %}• {{ line }}<br>{% endfor %}</div>
 <table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
 <th>件数</th><th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>勝率</th><th>連対率</th><th>複勝率</th>
-<th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th></tr></thead><tbody>
+<th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th></tr></thead><tbody>
 {% for h in buckets[c] %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
 <td>{{ h['base'] }}</td><td>{{ family_label(h['family'], h['rank_scheme']) }}</td><td>{{ odds_label(h['odds_mode']) }}</td><td>{{ h['region'] }}</td><td>{{ h['key'] }}</td>
 <td class="num">{{ h['件数'] }}</td>{% for k in ['勝率_val','連対率_val','複勝率_val','掲示板率_val'] %}<td class="num">{{ fmt(h[k]) }}</td>{% endfor %}
 <td>{{ h['勝率'] }}</td><td>{{ h['連対率'] }}</td><td>{{ h['複勝率'] }}</td>
-{% for k in ['平均着順','単勝回収値','複勝回収値','単勝適正回収値'] %}<td class="num">{{ fmt(h[k]) }}</td>{% endfor %}</tr>
-{% else %}<tr><td colspan="21">該当なし</td></tr>{% endfor %}</tbody></table></div>
+{% for k in ['平均着順','単勝回収値','複勝回収値','単勝適正回収値','WEDGE','adjusted_WEDGE','adjusted_WEDGE_年数'] %}<td class="num">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}</tr>
+{% else %}<tr><td colspan="24">該当なし</td></tr>{% endfor %}</tbody></table></div>
 {% endfor %}
 """
 HITS_ORDER = ("abs", "axis", "keshi", "opp")

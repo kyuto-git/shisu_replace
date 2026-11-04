@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import synth  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
+AGG_TEST_ARGS = ["--wedge-min-year-count", "2"]
 
 
 @pytest.fixture(scope="module")
@@ -26,7 +27,8 @@ def base(tmp_path_factory, monkeypatch_module):
     #   素材に旧形式（オッズ接頭辞付き・非圧縮）、成績表に odds5p
     src = next((b / "foragg_csv").glob("foragg_normal_*カツラキ.csv.gz"))
     shutil.copy(src, b / "foragg_csv" / ("foragg_odds10u_" + src.name[len("foragg_"):]))
-    assert aggregate_stats_ver2.main(["--clean"]) == 0
+    # 合成データは1キーあたり年に数件しかないので、adjusted_WEDGE の年の最低件数を下げて通す
+    assert aggregate_stats_ver2.main(["--clean", *AGG_TEST_ARGS]) == 0
     agg = next((b / "agg_csv").glob("foragg_normal_*カツラキ.csv"))
     shutil.copy(agg, b / "agg_csv" / ("foragg_odds5p_" + agg.name[len("foragg_"):]))
     assert calc_entry_hensachi.main(["--merge-one"]) == 0
@@ -71,7 +73,7 @@ def test_aggregate_does_not_overwrite_material_and_is_rerunnable(base):
     outs = sorted(p for p in (base / "agg_csv").glob("foragg_*normal_主*カツラキ.csv") if "odds5p" not in p.name)
     assert len(outs) == 4                               # 通常 + odds10u + odds10_50 + odds50p
     first = [o.read_bytes() for o in outs]
-    assert aggregate_stats_ver2.main([]) == 0
+    assert aggregate_stats_ver2.main(AGG_TEST_ARGS) == 0
     assert src.read_bytes() == before and [o.read_bytes() for o in outs] == first
 
 
@@ -284,3 +286,123 @@ def test_sort_link_ignores_reserved_args(base, monkeypatch):
         r = c.get(f"/?submitted=1&ind=カツラキ&{extra}")
         assert r.status_code == 200, extra
         assert "http://" not in r.get_data(as_text=True).split("<table>")[-1][:2000]
+
+
+# ---------------------------------------------------------------- WEDGE（Phase 3）
+WEDGE_COLS = ("WIN", "EDGE", "WEDGE", "adjusted_WEDGE", "adjusted_WEDGE_年数", "adjusted_WEDGE_件数",
+              "adjusted_WEDGE_最終年")
+
+
+def test_wedge_columns_in_agg_csv_match_reference(base):
+    """成績表の WEDGE 列が、仕様どおりの素直な実装（1グループずつ計算）と一致する。"""
+    from shisu import wedge
+    from shisu.finish import parse_finish
+    src = next((base / "foragg_csv").glob("foragg_normal_*カツラキ.csv.gz"))
+    mat = pd.read_csv(src, encoding="cp932", dtype=str, keep_default_na=False)
+    fl = parse_finish(mat["着順"], mat["頭数"])
+    mat = mat[fl["denom"]].assign(finish_num=fl["finish_num"][fl["denom"]])
+    ref_year = int(pd.to_numeric(mat["year"]).max())
+    agg = pd.read_csv(base / "agg_csv" / src.name.replace(".csv.gz", ".csv"), encoding="cp932")
+    assert list(agg.columns[18:25]) == list(WEDGE_COLS)
+    checked = 0
+    for _, row in agg.iterrows():
+        g = mat[mat["結合データ"] == row["結合データ"]]
+        r = wedge.wedge_from_frame(g)
+        assert row["WIN"] == pytest.approx(round(r["WIN"], 4))
+        assert row["EDGE"] == pytest.approx(round(r["EDGE"], 4))
+        assert row["WEDGE"] == pytest.approx(round(r["WEDGE"], 4))
+        yearly, counts = {}, {}
+        for y, gy in g.groupby(g["year"].astype(int)):
+            yearly[y] = wedge.wedge_from_frame(gy)["WEDGE"]
+            counts[y] = len(gy)
+        adj = wedge.adjusted_wedge(yearly, counts, min_year_count=2, window_end=ref_year)
+        if adj != adj:
+            assert pd.isna(row["adjusted_WEDGE"]) and row["adjusted_WEDGE_年数"] == 0
+        else:
+            assert row["adjusted_WEDGE"] == pytest.approx(round(adj, 4))
+            used = [y for y in counts if ref_year - 4 <= y <= ref_year and counts[y] >= 2]
+            assert row["adjusted_WEDGE_年数"] == len(used)
+            assert row["adjusted_WEDGE_件数"] == sum(counts[y] for y in used)
+            assert row["adjusted_WEDGE_最終年"] == max(used)
+            checked += 1
+    assert checked > 10
+
+
+def test_wedge_in_db_and_xjoin(base):
+    with db(base) as con:
+        cols = {r[1]: r[2] for r in con.execute("PRAGMA table_info(unified_all)")}
+        assert all(c in cols for c in WEDGE_COLS)
+        assert cols["WEDGE"] == "REAL" and cols["adjusted_WEDGE_年数"] == "INTEGER"
+        n, n_w, n_adj = con.execute('SELECT COUNT(*), COUNT("WEDGE"), COUNT("adjusted_WEDGE") FROM unified_all').fetchone()
+        assert n == n_w and n_adj > 0      # テストでは年の最低件数を2にしているので大半に付く
+        lo, hi = con.execute('SELECT MIN("WEDGE"), MAX("WEDGE") FROM unified_all').fetchone()
+        assert 0 <= lo and hi <= 2.0
+        x = con.execute('SELECT COUNT("WEDGE") FROM entries_xjoin_merged_hensachi').fetchone()[0]
+        assert x > 0
+        plan = " ".join(str(r) for r in con.execute(
+            'EXPLAIN QUERY PLAN SELECT * FROM unified_all ORDER BY "adjusted_WEDGE" DESC NULLS LAST LIMIT 10'))
+        assert "idx_unified_adj_wedge" in plan
+
+
+def test_ranking_view_sorted_by_adjusted_wedge(base, monkeypatch):
+    am = _app(base, monkeypatch)
+    with am.connect() as con:
+        rows = am._rank_query(con, [], ["カツラキ"], "all", "", ("", "", "", ""), "none",
+                              {"min_cnt": None, "min_wedge": None, "min_adj": None}, "adjusted_WEDGE", "DESC")
+    vals = [r["adjusted_WEDGE"] for r in rows]
+    non_null = [v for v in vals if v is not None]
+    assert non_null == sorted(non_null, reverse=True)
+    assert vals[: len(non_null)] == non_null                  # 空欄は最後
+    assert {r["indicator"] for r in rows} == {"カツラキ"}
+    with am.connect() as con:
+        rows = am._rank_query(con, ["normal"], [], "odds50p", "", ("", "", "", ""), "none",
+                              {"min_cnt": 6, "min_wedge": 0.3, "min_adj": None}, "WEDGE", "ASC")
+    assert rows and all(r["WEDGE"] >= 0.3 and r["件数"] >= 6 for r in rows)
+    assert [r["WEDGE"] for r in rows] == sorted(r["WEDGE"] for r in rows)
+    assert {r["family"] for r in rows} == {"normal"} and {r["odds_mode"] for r in rows} == {"odds50p"}
+
+
+def test_ranking_preset_matches_classify(base, monkeypatch):
+    """横断ランキングのプリセットは、オッズ帯ごとの判定（消し候補の10倍未満ルール）まで classify と一致する。"""
+    from shisu.classify import classify
+    am = _app(base, monkeypatch)
+    am.RANK_LIMIT = 10_000
+    try:
+        with am.connect() as con:
+            for preset in ("keshi", "opp"):
+                got = am._rank_query(con, [], [], "all", "", ("", "", "", ""), preset,
+                                     {"min_cnt": None, "min_wedge": None, "min_adj": None}, "件数", "DESC")
+                every = [dict(r) for r in con.execute(
+                    'SELECT "テーブル名", "結合データ", "件数", "複勝率_val", "連対率_val", "掲示板率_val", '
+                    '"複勝回収値", "単勝適正回収値", odds_mode FROM unified_all')]
+                want = {(r["テーブル名"], r["結合データ"]) for r in every if classify(
+                    {"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
+                     "frc": r["複勝回収値"], "tra": r["単勝適正回収値"]}, r["odds_mode"]) == preset}
+                assert {(r["テーブル名"], r["結合データ"]) for r in got} == want, preset
+    finally:
+        am.RANK_LIMIT = 500
+
+
+def test_index_page_wedge_views(base, monkeypatch):
+    am = _app(base, monkeypatch)
+    c = am.app.test_client()
+    r = c.get("/", query_string={"submitted": "1", "view": "rank", "ind": "ZI"})
+    html = r.get_data(as_text=True)
+    assert r.status_code == 200 and "横断ランキング（adjusted_WEDGE 大きい順" in html
+    r = c.get("/", query_string={"submitted": "1", "view": "tables", "ind": "ZI", "family": "normal",
+                                 "sort": "WEDGE", "sortdir": "DESC", "min_wedge": "0.6", "min_cnt": "x"})
+    html = r.get_data(as_text=True)
+    assert r.status_code == 200 and "WEDGE ▼" in html and 'name="min_cnt" value=""' in html
+    rid = _race_id(base)
+    hits = c.get("/entries/hits", query_string={"table": "entries_merged_hensachi", "rid": rid}).get_data(as_text=True)
+    assert "adjusted_WEDGE" in hits
+
+
+def test_phase2_db_without_wedge_is_old(base, tmp_path):
+    """WEDGE 列の無い unified_all（Phase 2 の DB）は旧形式として扱う（作り直しを促す）。"""
+    from shisu.matching import unified_status
+    p = tmp_path / "p2.db"
+    shutil.copy(base / "racing.db", p)
+    with sqlite3.connect(p) as con:
+        con.execute("ALTER TABLE unified_all DROP COLUMN adjusted_WEDGE_最終年")
+        assert unified_status(con) == "old"

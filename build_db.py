@@ -15,6 +15,7 @@
 
 *_val（勝率・連対率・複勝率・2着率・3着率）は、集計CSVの文字列 '頻度%（推定%）' の括弧内（推定値）で
 作り直す。掲示板率_val は頻度のまま。率はすべて 0–100。
+WIN / EDGE / WEDGE / adjusted_WEDGE（と adjusted_WEDGE_年数・件数・最終年）は集計CSVの値をそのまま入れる。
 
 --prune は「今回作り直した種類」の古いテーブルだけを消す（--mode entries --prune で foragg_* は消えない）。
 """
@@ -36,18 +37,20 @@ from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, FORAGG_PREFIX, file_stem,
 from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_series, distance_series,
                              entry_inner_outer, frame_group_series, infer_entry_weight, race_date,
                              race_id_without_horse, weight_series)
+from shisu.wedge import WEDGE_COLUMNS, WEDGE_FLOAT_COLUMNS, WEDGE_INT_COLUMNS
 
 META = "__tables_meta__"
 FACETS = "__facets__"
 RATE_NAMES = ("勝率", "連対率", "複勝率", "2着率", "3着率")
-FLOAT_COLUMNS = ("掲示板率_val", "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値")
+FLOAT_COLUMNS = ("掲示板率_val", "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値") + WEDGE_FLOAT_COLUMNS
+INT_COLUMNS = ("件数",) + WEDGE_INT_COLUMNS
 META_COLUMNS = ("table_name", "source_file", "kind", "family", "odds_mode", "rank_scheme", "indicator",
                 "region", "n_rows")
 UNIFIED_TEXT = ("場所", "芝・ダ", "距離", "芝(内・外)", "結合データ")
 UNIFIED_STATS = ("件数", "勝率", "連対率", "複勝率", "2着率", "3着率", "掲示板率",
                  "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値",
                  "提案勝率", "提案連対率", "提案複勝率", "提案2着率", "提案3着率",
-                 "勝率_val", "連対率_val", "複勝率_val", "2着率_val", "3着率_val", "掲示板率_val")
+                 "勝率_val", "連対率_val", "複勝率_val", "2着率_val", "3着率_val", "掲示板率_val") + WEDGE_COLUMNS
 UNIFIED_META = ("family", "odds_mode", "rank_scheme", "indicator", "region", "テーブル名")
 FACET_COLUMNS = ("場所", "芝・ダ", "距離", "芝(内・外)")
 XJOIN_CACHE_LIMIT = 20_000
@@ -58,7 +61,7 @@ ENTRIES_ALL_COLUMNS = ("日付", "レースID(新)", "レースID(新/馬番無)
 ENTRIES_REQUIRED = ("日付", "レースID(新)", "レースID(新/馬番無)", "場 R", "レース名", "場所", "芝・ダ",
                     "距離", "距離_raw", "芝(内・外)", "クラス名", "クラス名_raw", "重量種別", "頭数",
                     "枠番", "枠番グループ", "馬番", "馬名", "騎手")
-_SQL_TYPES = {"件数": "INTEGER", **{c: "REAL" for c in STAT_COLUMNS if c.endswith("_val")},
+_SQL_TYPES = {**{c: "INTEGER" for c in INT_COLUMNS}, **{c: "REAL" for c in STAT_COLUMNS if c.endswith("_val")},
               **{c: "REAL" for c in FLOAT_COLUMNS}}
 
 
@@ -102,7 +105,9 @@ def estimate_percent(series: pd.Series) -> pd.Series:
 
 def prepare_agg_frame(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["件数"] = pd.to_numeric(df["件数"], errors="coerce").astype("Int64")
+    for c in INT_COLUMNS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").round().astype("Int64")
     for c in FLOAT_COLUMNS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -158,6 +163,9 @@ def rebuild_unified_all(con: sqlite3.Connection, loaded: list[dict]) -> None:
                     (t["family"], t["odds_mode"], t["rank_scheme"], t["indicator"], t["region"], t["table_name"]))
     con.execute(f'CREATE INDEX idx_unified_match ON {UNIFIED}("結合データ", "family", "indicator")')
     con.execute(f'CREATE INDEX idx_unified_table ON {UNIFIED}("テーブル名")')
+    # 横断ランキング（/ の「まとめて表示」）を WEDGE 系で並べ替えるときに使う
+    con.execute(f'CREATE INDEX idx_unified_wedge ON {UNIFIED}("WEDGE")')
+    con.execute(f'CREATE INDEX idx_unified_adj_wedge ON {UNIFIED}("adjusted_WEDGE")')
     n = con.execute(f"SELECT COUNT(*) FROM {UNIFIED}").fetchone()[0]
     print(f"[foragg] unified_all: {n} rows")
 
@@ -388,7 +396,7 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             rc = 1
         elif status == "old":
-            print("[ERROR] unified_all が旧形式です（family/indicator 列が無い）。"
+            print("[ERROR] unified_all が旧形式です（family/indicator/WEDGE などの列が無い）。"
                   "replace → aggregate → build_db.py --fresh で作り直してください（xjoin は作りません）", file=sys.stderr)
             rc = 1
 
