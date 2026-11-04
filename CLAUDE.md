@@ -144,7 +144,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 - 回収値: 単勝・複勝は 100円均等買い。単勝適正回収値 = 100×Σ(1/オッズ×配当/100×的中)/Σ(1/オッズ)
 - WIN / EDGE / WEDGE / adjusted_WEDGE（＋年数・件数・最終年）を `shisu.wedge.wedge_columns` で付ける（§6.2）。年度の窓の終わりは、オッズ帯で絞る前の素材ファイル全体の最終年
   - `--wedge-min-year-count N`（既定30、環境変数 `AGG_WEDGE_MIN_YEAR_COUNT`）、`--wedge-window data|key`（既定 data、`AGG_WEDGE_WINDOW`）
-  - 実行の最後に「adjusted_WEDGE が付いたグループ: x/y」を出す（年30件の条件は細かいキーほど満たしにくいので、本番データで割合を確認する）
+  - 実行の最後に「adjusted_WEDGE が付いたグループ: x/y」と年度窓の終わりの年を出す（年30件の条件は細かいキーほど満たしにくいので、本番データで割合を確認する。窓の終わりが素材によって違えば警告）
 - 件数 < 5 のグループは計算前に除く（出力しない）
 - 集計できた素材が0本なら終了コード2（replace を先に実行）
 - 環境変数: `AGG_PROP_MODE`(lower|mean), `AGG_LOWER_Q`, `AGG_UPPER_Q`, `AGG_PRIOR_ALPHA/BETA`, `PLC_SWITCH_THRESHOLD_PCT`, `AGG_MIN_SAMPLE`, `AGG_RANKBAND_SCHEMES`, `AGG_WEDGE_MIN_YEAR_COUNT`, `AGG_WEDGE_WINDOW`。オプション `--clean`, `--workers N`, `--wedge-min-year-count`, `--wedge-window`
@@ -163,6 +163,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 - `--mode both|foragg|entries`, `--fresh`, `--prune`, `--no-xjoin`, `--agg-dir`, `--allow-empty`, `--entries-dir`, `--db-path`（既定は `DB_PATH` か `racing.db`）
 - foragg: 成績表を読み、5つの率の `*_val` を文字列の括弧内（推定値）で作り直す（WEDGE 系の列は数値化してそのまま）→ テーブル（名前はファイル名そのまま。接頭辞 `foragg_` は1つ）→ unified_all（索引: 照合用 (結合データ, family, indicator)、テーブル名、WEDGE、adjusted_WEDGE）→ __facets__
   - 読める成績表が0本なら DB に触らず終了コード2（空にしたいときだけ `--allow-empty`）
+  - WEDGE 列の無い旧形式の成績表（Phase 3 より前の aggregate の出力）は取り込まず、終了コード1（`aggregate_stats_ver2.py --clean` をやり直す）
 - entries: `normalize_entries_df`（§5）→ テーブル → entries_all → xjoin（各馬 × 指数 × 15 family × キー候補を unified_all と完全一致照合。照合結果のキャッシュは2万件で空にする）
   - unified_all が無い・旧形式（family/indicator/WEDGE などの列が無い。Phase 2 で作った DB も含む）なら xjoin を作らず終了コード1
   - レースID(新) が無い出馬表は「日付_場 R」をレースの識別子にする。旧形式の出馬表（`X_順位帯_s1` が無い）は警告。順位 `13.0` は `13` として扱う
@@ -171,9 +172,11 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 
 - `/`: 条件（場所・芝・ダ・距離・芝(内・外)・地域）、family、指数、オッズ帯、プリセット（絶対軸・軸候補・相手候補・消し候補。判定は `classify` と同じ SQL）、下限（件数・WEDGE・adjusted_WEDGE）で絞り込む
   - 表示は2通り: 「集計表ごと」（最大100表・各200行）と「まとめて」（unified_all の横断ランキング、上位500行。既定の並びは adjusted_WEDGE の大きい順）
-  - 並べ替えは件数・各率の *_val・平均着順・回収値・WIN・EDGE・WEDGE・adjusted_WEDGE・adjusted_WEDGE_件数。空欄は常に最後
+  - 並べ替えは件数・各率の *_val・平均着順・回収値・WIN・EDGE・WEDGE・adjusted_WEDGE・adjusted_WEDGE_件数。空欄は常に最後。並べ替え欄の「既定」は表示に合わせる（集計表ごと=複勝率_val、まとめて=adjusted_WEDGE）。表示列に無い列で並べたらその列も表示する
+  - 横断ランキングの速さ: 絞り込みが無ければ WEDGE/adjusted_WEDGE の索引で即座に返る。他の条件で絞るときは索引を使わず全件を読んで並べる（索引を最後までたどると遅くなるため）。合成550万行で最大約1.4秒
+  - 下限の入力は全角・カンマ区切りも受ける。読めない値は入力欄に残して警告
 - `/entries`: 日付（最新が既定）・場所でレース一覧。リンクは `レースID(新/馬番無)`（旧リンク `ridn=場 R` も開ける）
-- `/entries/hits`: 馬ごとの該当数の要約と、区分ごとの表（WEDGE・adjusted_WEDGE・年数の列あり）。照合経路（xjoin / on-the-fly）を表示。並びは オッズ帯（通常→10倍未満→10〜50倍→50倍以上）→ 馬番 → 複勝率（消しは昇順）
+- `/entries/hits`: 馬ごとの該当数の要約と、区分ごとの表（WEDGE・adjusted_WEDGE・年数の列あり）。xjoin が古い形式（WEDGE 列なし）ならその場の照合に切り替えて、その旨を表示。照合経路（xjoin / on-the-fly）を表示。並びは オッズ帯（通常→10倍未満→10〜50倍→50倍以上）→ 馬番 → 複勝率（消しは昇順）
 - `/entries/key`: WEDGE・adjusted_WEDGE・年数の列あり
 - DB が未構築・旧形式なら各画面の上部に作り直しの案内を出す（旧形式の DB でもエラーにしない）
 
@@ -326,10 +329,10 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 
 - **WIN**（決定力）= (1着数×3.0 + 2着数×1.5 + 3着数×1.0) / (件数×3.0)
 - **EDGE**（市場の期待を超える力）= 成功数 / オッズのある件数。単勝オッズ（100倍超は100倍にクリップ）の帯ごとに、着順が次以内なら成功:
-  1.0〜1.4倍→1着 / 1.5〜2.9→1着 / 3.0〜4.9→2着 / 5.0〜9.9→3着 / 10.0〜19.9→4着 / 20.0〜49.9→6着 / 50.0〜100.0→8着。オッズが無い・1倍未満の馬は EDGE の分母から外す
+  1.0〜1.4倍→1着 / 1.5〜2.9→1着 / 3.0〜4.9→2着 / 5.0〜9.9→3着 / 10.0〜19.9→4着 / 20.0〜49.9→6着 / 50.0〜100.0→8着。オッズが無い・1倍未満の馬は EDGE の分母から外す。着順が数値にならない馬は WIN と同じく分母に入れて失敗扱い
 - **WEDGE** = WIN + EDGE（目安: 1.00以上=トップ級、0.62前後=平均、0.50未満=下位）
 - **adjusted_WEDGE**（年度加重）:
-  1. 年（素材の `year`）ごとに WEDGE を出す
+  1. 年（素材の `year`。1900〜2100 の整数だけ）ごとに WEDGE を出す
   2. 窓 = 終わりの年から遡る5年。終わりの年は既定（`data`）で**素材ファイル全体の最終年**（＝データとしての「今」）。`--wedge-window key` なら結合データ自身の最終年。窓の外の古い年は使わない
   3. 件数が30未満（`--wedge-min-year-count`）の年は除く
   4. 残った年数 m に応じて古い順にウェイト: m=5 `[0.06, 0.11, 0.18, 0.25, 0.40]`、m=4 `[0.12, 0.19, 0.27, 0.42]`、m≤3 `linspace(0.1, 0.5, m)` を合計1に正規化（m=1→1.0、m=2→約0.17/0.83）
@@ -371,6 +374,7 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 8. 過去 CSV に `頭数`（`頭`）列が無いと、警告を出して頭数で絞らずに処理する（TARGET 側で10頭以上に抽出済みの前提）
 9. **adjusted_WEDGE の付きやすさ**: 「年30件以上」は騎手・枠番を含む細かいキーではほとんど満たせない（合成データでは全グループの約5%）。aggregate の最後のログで本番の割合を見て、必要なら `--wedge-min-year-count` を下げる。値の信頼度は `adjusted_WEDGE_件数`、新しさは `adjusted_WEDGE_最終年` で確認する
 10. **WEDGE の小標本**: 全期間の WEDGE には件数の下限が無い（成績表の件数≥5 だけ）。件数5で全勝なら WEDGE=2.0 になるので、横断ランキングでは「件数 下限」と併用する
+11. **年度窓の決め方（要確認）**: 今は「暦年で直近5年を切ってから30件未満の年を除く」。このため (a) 素材の最終年が年明け数日分だけの端数年だと、窓が1年ずれ、その年も30件未満で落ちて実質4年になる。(b) 開催の無い年（京都の改修期間など）があると、窓の中に残る年が減る。「30件以上の年のうち新しい方から5年」にする方式も選べるようにできる（その場合は遡る年数の上限も決める）
 
 ---
 
@@ -388,6 +392,7 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 ## 11. 変更履歴
 
 ### 2026-11-04 Phase 3（WEDGE）
+- 独立レビュー（独自実装との全列照合でずれ0件）の指摘を反映: 着順不明の馬を EDGE でも失敗扱い、WEDGE 列の無い旧成績表を取り込まない（旧 xjoin はその場照合に切替）、絞り込み付き横断ランキングで並べ替え用索引を使わない（最大14秒→約1.4秒）、並べ替え欄の既定、下限入力の全角・カンマ対応、表示列に無い列での並べ替え、年度窓の終わりのログ、年の値の検査。テスト 162件
 - aggregate が成績表に WIN・EDGE・WEDGE・adjusted_WEDGE（＋年数・件数・最終年）を出す。年の最低件数30・直近5年の窓（素材全体の最終年まで）・仕様どおりのウェイト
 - build_db: unified_all・foragg_*・xjoin に WEDGE 列。WEDGE と adjusted_WEDGE に索引。WEDGE 列の無い DB は旧形式として作り直しを促す
 - app: 横断検索に WEDGE 系の並べ替え・下限フィルタ・全集計表の横断ランキング（まとめて表示）。条件ヒット馬・キー詳細に WEDGE 列

@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 
 from flask import Flask, redirect, render_template_string, request, url_for
@@ -26,7 +27,7 @@ from shisu import config
 from shisu.classify import CATEGORIES, CATEGORY_LABELS, classify, description_lines, sql_condition
 from shisu.indicators import INDICATOR_ORDER
 from shisu.keys import ALL_FAMILIES, FAMILY_LABELS
-from shisu.matching import UNIFIED, indicator_bases, match_entry_row, unified_status
+from shisu.matching import HIT_COLUMNS, UNIFIED, indicator_bases, match_entry_row, unified_status
 from shisu.naming import ENTRIES_ALL, XJOIN_PREFIX, xjoin_table_for
 from shisu.odds import ODDS_LABELS, ODDS_MODES, ODDS_RANK
 from shisu.wedge import DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WEDGE_FLOAT_COLUMNS
@@ -192,13 +193,14 @@ INDEX_BODY = """
     <div><label>件数 下限</label><input name="min_cnt" value="{{ q_min.min_cnt }}" inputmode="decimal" placeholder="例 30"></div>
     <div><label>WEDGE 下限</label><input name="min_wedge" value="{{ q_min.min_wedge }}" inputmode="decimal" placeholder="例 1.0"></div>
     <div><label>adjusted_WEDGE 下限</label><input name="min_adj" value="{{ q_min.min_adj }}" inputmode="decimal" placeholder="例 0.8"></div>
-    <div><label>並べ替え</label><select name="sort">{% for c in sortable %}<option value="{{ c }}" {{ 'selected' if c == q_sort else '' }}>{{ c }}</option>{% endfor %}</select></div>
+    <div><label>並べ替え</label><select name="sort"><option value="" {{ 'selected' if not q_sort_arg else '' }}>（既定: 集計表ごと=複勝率_val／まとめて=adjusted_WEDGE）</option>{% for c in sortable %}<option value="{{ c }}" {{ 'selected' if c == q_sort_arg else '' }}>{{ c }}</option>{% endfor %}</select></div>
     <div><label>順序</label><select name="sortdir"><option value="DESC" {{ 'selected' if q_dir == 'DESC' else '' }}>大きい順</option><option value="ASC" {{ 'selected' if q_dir == 'ASC' else '' }}>小さい順</option></select></div>
   </div>
   <div style="margin-top:10px"><label>表示</label><div class="cbs">
     <label class="cb"><input type="radio" name="view" value="tables" {{ 'checked' if q_view == 'tables' else '' }}>集計表ごと</label>
     <label class="cb"><input type="radio" name="view" value="rank" {{ 'checked' if q_view == 'rank' else '' }}>まとめて（全集計表の横断ランキング・上位{{ rank_limit }}行）</label>
   </div></div>
+  {% if bad_inputs %}<div class="warn" style="margin-top:8px">下限の値を数値として読めませんでした（無視しました）: {{ bad_inputs|join('、') }}</div>{% endif %}
   <div style="margin-top:12px"><button type="submit">検索</button>
     <span class="muted">WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=下位）。adjusted_WEDGE は直近5年の年度加重（既定では件数{{ wedge_min_year }}未満の年を除外）。空欄は条件を満たす年が無い</span></div>
   <input type="hidden" name="submitted" value="1">
@@ -245,13 +247,19 @@ def _meta_values(con, col: str) -> list[str]:
         f"SELECT DISTINCT {q(col)} FROM {META} WHERE kind='foragg' AND {q(col)} IS NOT NULL AND {q(col)} <> ''")]
 
 
-def _num_arg(name: str) -> float | None:
-    v = request.args.get(name, "").strip()
+def _num_arg(name: str) -> tuple[float | None, str, bool]:
+    """下限の入力値 → (数値, 入力欄に戻す文字列, 読めなかったか)。全角・カンマ区切りも受ける。"""
+    raw = request.args.get(name, "")
+    v = unicodedata.normalize("NFKC", raw).strip().replace(",", "")
+    if not v:
+        return None, "", False
     try:
         f = float(v)
     except ValueError:
-        return None
-    return f if f == f else None
+        return None, raw.strip(), True
+    if f != f or f in (float("inf"), float("-inf")):
+        return None, raw.strip(), True
+    return f, v, False
 
 
 def _course_filters(place, sd, dist, inout) -> tuple[list[str], list]:
@@ -291,12 +299,16 @@ def index():
     if q_view not in VIEWS:
         q_view = "tables"
     default_sort = "adjusted_WEDGE" if q_view == "rank" else "複勝率_val"
-    q_sort = a.get("sort", default_sort)
-    if q_sort not in SORTABLE:
-        q_sort = default_sort
+    q_sort_arg = a.get("sort", "")
+    if q_sort_arg not in SORTABLE:
+        q_sort_arg = ""
+    q_sort = q_sort_arg or default_sort
     q_dir = "ASC" if a.get("sortdir", "DESC").upper() == "ASC" else "DESC"
-    mins = {name: _num_arg(name) for name, _ in MIN_FILTERS}
-    q_min = {name: ("" if v is None else f"{v:g}") for name, v in mins.items()}
+    parsed = {name: _num_arg(name) for name, _ in MIN_FILTERS}
+    mins = {name: v[0] for name, v in parsed.items()}
+    q_min = {name: v[1] for name, v in parsed.items()}
+    labels = {"min_cnt": "件数", "min_wedge": "WEDGE", "min_adj": "adjusted_WEDGE"}
+    bad_inputs = [f"{labels[n]}「{v[1]}」" for n, v in parsed.items() if v[2]]
 
     with connect() as con:
         status = db_status(con)
@@ -362,15 +374,26 @@ def index():
 
     return render("指数集計 横断検索", INDEX_BODY, selects=selects, families=families, indicators=indicators,
                   odds_modes=ODDS_MODES, presets=PRESETS, q_families=q_families, q_inds=q_inds,
-                  q_odds=q_odds, q_preset=q_preset, q_sort=q_sort, q_dir=q_dir, q_view=q_view, q_min=q_min,
-                  submitted=submitted, results=results, rank_rows=rank_rows, rank_columns=RANK_COLUMNS,
+                  q_odds=q_odds, q_preset=q_preset, q_sort=q_sort, q_sort_arg=q_sort_arg, q_dir=q_dir,
+                  q_view=q_view, q_min=q_min, bad_inputs=bad_inputs,
+                  submitted=submitted, results=results, rank_rows=rank_rows, rank_columns=rank_columns(q_sort),
                   rank_limit=RANK_LIMIT, sortable=SORTABLE, sort_links=sort_links, n_tables=n_tables,
                   truncated=truncated, max_tables=MAX_TABLES, wedge_min_year=DEFAULT_MIN_YEAR_COUNT,
                   db_warning=DB_WARNINGS.get(status, ""))
 
 
+def rank_columns(sort: str) -> tuple[str, ...]:
+    """横断ランキングの表示列。並べ替えに使った列が表示列に無ければ末尾に足す。"""
+    return RANK_COLUMNS if sort in RANK_COLUMNS else RANK_COLUMNS + (sort,)
+
+
 def _rank_query(con, families, inds, odds_mode, region, course, preset, mins, sort, sortdir) -> list[dict]:
-    """unified_all（全集計表の縦結合）を条件で絞り、sort 列で並べた上位 RANK_LIMIT 行。"""
+    """unified_all（全集計表の縦結合）を条件で絞り、sort 列で並べた上位 RANK_LIMIT 行。
+
+    WEDGE・adjusted_WEDGE には並べ替え用の索引がある。絞り込みが無い（か、並べ替え列の下限だけの）ときは
+    索引を順にたどれば速いが、他の条件で絞ると索引を最後までたどって遅くなる（550万行で約14秒）。
+    その場合は `ORDER BY +列` で索引を使わせず、全件を読んで並べる（同約1秒）。
+    """
     where, params = _course_filters(*course)
     if families:
         where.append(f"family IN ({','.join('?' * len(families))})")
@@ -386,12 +409,15 @@ def _rank_query(con, families, inds, odds_mode, region, course, preset, mins, so
         params.append(region)
     if preset != "none":   # 判定はオッズ帯で変わる（消し候補の10倍未満ルール）ので帯ごとに条件を付ける
         where.append("(" + " OR ".join(f"(odds_mode = '{m}' AND {sql_condition(preset, m)})" for m in ODDS_MODES) + ")")
+    only_sort_bound = not where and all(col == sort for name, col in MIN_FILTERS if mins.get(name) is not None)
     mw, mp, _ = _min_filters(mins)
     where += mw
     params += mp
-    cols = ", ".join(q(c) for c in ("indicator", "family", "rank_scheme", "odds_mode", "region", "テーブル名") + RANK_COLUMNS)
+    cols = ", ".join(q(c) for c in ("indicator", "family", "rank_scheme", "odds_mode", "region", "テーブル名")
+                     + rank_columns(sort))
+    order_col = q(sort) if only_sort_bound else "+" + q(sort)
     sql = (f"SELECT {cols} FROM {UNIFIED} {'WHERE ' + ' AND '.join(where) if where else ''} "
-           f"ORDER BY {q(sort)} {sortdir} NULLS LAST LIMIT {RANK_LIMIT}")
+           f"ORDER BY {order_col} {sortdir} NULLS LAST LIMIT {RANK_LIMIT}")
     return [dict(r) for r in con.execute(sql, params)]
 
 
@@ -574,15 +600,18 @@ def collect_hits(con, table: str, race_rows: list[dict]) -> tuple[list[dict], st
     if not rid:
         return [], "レースIDなし"
     xname = xjoin_table_for(table)
+    note = "on-the-fly"
     if table_exists(con, xname):
-        hits = [dict(r) for r in con.execute(f'SELECT * FROM {q(xname)} WHERE "レースID(新/馬番無)" = ?', (rid,))]
-        return hits, "xjoin"
+        if set(HIT_COLUMNS) <= set(table_columns(con, xname)):
+            hits = [dict(r) for r in con.execute(f'SELECT * FROM {q(xname)} WHERE "レースID(新/馬番無)" = ?', (rid,))]
+            return hits, "xjoin"
+        note = "on-the-fly（照合結果 xjoin が古い形式のため。build_db.py --mode entries で作り直してください）"
     bases = indicator_bases(race_rows[0].keys())
     cache: dict = {}
     hits: list[dict] = []
     for r in race_rows:
         hits.extend(match_entry_row(con, r, bases, table, cache=cache))
-    return hits, "on-the-fly"
+    return hits, note
 
 
 def classify_hits(hits: list[dict]) -> dict[str, list[dict]]:

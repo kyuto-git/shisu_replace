@@ -1,14 +1,16 @@
 """WEDGE（= WIN + EDGE）と年度加重 adjusted_WEDGE。
 
 WIN  = (1着数×3.0 + 2着数×1.5 + 3着数×1.0) / (件数×3.0)
-EDGE = 成功数 / オッズのある件数。成功 = 単勝オッズ帯ごとの期待着順以内に入ったこと
+EDGE = 成功数 / オッズのある件数。成功 = 単勝オッズ帯ごとの期待着順以内に入ったこと（着順が不明なら失敗）
        （オッズは 100倍超を 100倍にクリップ）
          1.0〜1.4倍 → 1着 / 1.5〜2.9 → 1着 / 3.0〜4.9 → 2着以内 / 5.0〜9.9 → 3着以内
          10.0〜19.9 → 4着以内 / 20.0〜49.9 → 6着以内 / 50.0〜100.0 → 8着以内
 WEDGE = WIN + EDGE。目安: 1.00以上=トップ級、0.62前後=平均、0.50未満=下位
 
-件数は aggregate と同じ「分母に入る馬」（取消・除外を除く。失格・中止は着順=頭数で失敗扱い）。
-オッズが無い・1倍未満の馬は EDGE の分母から外す（WIN の分母には入る）。
+件数は aggregate と同じ「分母に入る馬」（取消・除外を除く。失格・中止は着順=頭数で失敗扱い。
+着順が数値にならない馬も WIN・勝率と同じく分母に入れて失敗扱い）。
+オッズが無い・1倍未満の馬だけは EDGE の分母から外す（WIN の分母には入る）。
+year は 1900〜2100 の整数だけを年別集計に使う（それ以外は年別集計から外す）。
 
 年度加重 adjusted_WEDGE:
   1. 年（year）ごとに WEDGE を出す
@@ -132,7 +134,7 @@ def wedge_from_frame(df: pd.DataFrame, finish_col: str = "finish_num", odds_col:
     n = int(len(df))
     n1, n2, n3 = int((fin == 1).sum()), int((fin == 2).sum()), int((fin == 3).sum())
     th = pd.to_numeric(df[odds_col], errors="coerce").map(edge_threshold)
-    ok = th.notna() & fin.notna()
+    ok = th.notna()                       # 着順が不明な馬は分母に残して失敗扱い（fin<=th が False）
     n_edge = int(ok.sum())
     win = win_score(n1, n2, n3, n)
     edge = edge_score(int((fin[ok] <= th[ok]).sum()), n_edge)
@@ -152,11 +154,17 @@ def edge_thresholds(odds: pd.Series) -> pd.Series:
 
 
 def edge_success(odds: pd.Series, finish_num: pd.Series) -> pd.Series:
-    """1頭ごとの EDGE 成功フラグ（1/0）。オッズか着順が欠損なら <NA>。"""
+    """1頭ごとの EDGE 成功フラグ（1/0）。オッズが欠損なら <NA>、着順が不明なら 0。"""
     th = edge_thresholds(odds)
     fin = pd.to_numeric(finish_num, errors="coerce")
-    ok = th.notna() & fin.notna()
+    ok = th.notna()
     return (fin <= th).astype("Int64").where(ok, pd.NA).astype("Int64")
+
+
+def valid_years(years: pd.Series) -> pd.Series:
+    """西暦として使える年（1900〜2100 の整数）だけを残し、他は NaN。"""
+    y = pd.to_numeric(years, errors="coerce").astype(float)
+    return y.where(y.between(1900, 2100) & (y == np.floor(y)))
 
 
 def _scores(s: pd.DataFrame) -> pd.DataFrame:
@@ -190,10 +198,10 @@ def wedge_columns(keys: pd.Series, finish_num: pd.Series, odds: pd.Series, years
         raise ValueError(f"window は {WINDOWS} のどれか: {window}")
     fin = pd.to_numeric(finish_num, errors="coerce")
     th = edge_thresholds(odds)
-    ok = th.notna() & fin.notna()
+    ok = th.notna()
     base = pd.DataFrame({
         "k": keys.to_numpy(),
-        "y": pd.to_numeric(years, errors="coerce").to_numpy(),
+        "y": valid_years(years).to_numpy(),
         "n": 1,
         "n1": (fin == 1).astype(int).to_numpy(),
         "n2": (fin == 2).astype(int).to_numpy(),

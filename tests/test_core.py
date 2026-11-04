@@ -464,3 +464,23 @@ def test_wedge_columns_edge_cases():
     assert out.loc["a", "adjusted_WEDGE_年数"] == 0 and pd.isna(out.loc["a", "adjusted_WEDGE_最終年"])
     with pytest.raises(ValueError):
         wedge.wedge_columns(pd.Series(["a"]), pd.Series([1]), pd.Series([2.0]), pd.Series([2024]), window="bad")
+
+
+def test_unknown_finish_is_edge_failure():
+    """着順が数値にならない馬は WIN と同じく分母に残して失敗扱い（オッズの無い馬だけ EDGE の分母から外す）。"""
+    fin = pd.Series([1, np.nan, np.nan, np.nan, 10, 10, 10, 10, 10, 10], dtype=float)
+    odds = pd.Series([2.0] * 9 + [None])
+    out = wedge.wedge_columns(pd.Series(["a"] * 10), fin, odds, pd.Series([2025] * 10), min_year_count=0)
+    assert out.loc["a", "EDGE"] == pytest.approx(1 / 9)          # 分母 = オッズのある9頭
+    assert out.loc["a", "WIN"] == pytest.approx(3 / 30)          # 分母 = 10頭
+    r = wedge.wedge_from_frame(pd.DataFrame({"finish_num": fin, "単勝オッズ": odds}))
+    assert r["EDGE"] == pytest.approx(1 / 9)
+    assert wedge.edge_success(odds, fin).tolist()[:4] == [1, 0, 0, 0]
+
+
+def test_invalid_years_are_ignored():
+    y = pd.Series(["2024", "2024.5", "99999", "inf", "", "1899", "2025"])
+    assert wedge.valid_years(y).tolist()[0] == 2024 and wedge.valid_years(y).tolist()[-1] == 2025
+    assert wedge.valid_years(y).iloc[1:6].isna().all()
+    out = wedge.wedge_columns(pd.Series(["a"] * 7), pd.Series([1] * 7), pd.Series([2.0] * 7), y, min_year_count=0)
+    assert out.loc["a", "adjusted_WEDGE_年数"] == 2 and out.loc["a", "adjusted_WEDGE_最終年"] == 2025

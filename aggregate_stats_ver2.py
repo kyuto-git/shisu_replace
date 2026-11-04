@@ -42,7 +42,7 @@ from shisu.finish import parse_finish
 from shisu.naming import agg_filename, file_stem, parse_foragg_stem
 from shisu.normalize import race_date
 from shisu.odds import ODDS_MODES, odds_mask
-from shisu.wedge import DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WINDOWS, wedge_columns
+from shisu.wedge import DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WINDOWS, valid_years, wedge_columns
 
 KEY = "結合データ"
 RID = "レースID(新)"
@@ -100,7 +100,7 @@ def year_series(df: pd.DataFrame) -> pd.Series:
 
 def ref_year_of(df: pd.DataFrame) -> int | None:
     """年度加重の窓の終わり（素材全体の最終年）。"""
-    y = pd.to_numeric(year_series(df), errors="coerce")
+    y = valid_years(year_series(df))
     return int(y.max()) if y.notna().any() else None
 
 
@@ -261,15 +261,29 @@ def main(argv=None) -> int:
 
 
 def _print_wedge_coverage(results: list[str]) -> None:
-    """adjusted_WEDGE が付いたグループの割合（30件/年の条件はキーの粒度が細かいと満たしにくいので確認用）。"""
+    """adjusted_WEDGE が付いたグループの割合と、年度窓の終わりの年（素材ごと）の範囲を出す。
+
+    30件/年の条件はキーの粒度が細かいと満たしにくい。また窓の終わりは素材ファイルごとの最終年なので、
+    更新が止まった素材が混ざると、その指数だけ古い年の adjusted_WEDGE になる。どちらも確認用。
+    """
     import re
     total = adj = 0
+    ends: dict[str, list[str]] = {}
     for r in results:
         for g, a in re.findall(r"=(\d+)\(adj (\d+)\)", r):
             total += int(g)
             adj += int(a)
+        m = re.search(r"^\[OK\] (.+?): .*年度窓の終わり=(\S+)$", r)
+        if m:
+            ends.setdefault(m.group(2), []).append(m.group(1))
     if total:
         print(f"[INFO] adjusted_WEDGE が付いたグループ: {adj}/{total} ({adj / total:.1%})")
+    if len(ends) > 1:
+        detail = ", ".join(f"{y}: {len(v)}本" for y, v in sorted(ends.items()))
+        print(f"[WARN] 年度窓の終わり（素材の最終年）が素材によって違います: {detail}。"
+              "古い年で止まった素材の adjusted_WEDGE はその年までの値です", file=sys.stderr)
+    elif ends:
+        print(f"[INFO] 年度窓の終わり: {next(iter(ends))}年（直近5年 = この年から遡る5年）")
 
 
 def _run(job) -> str:

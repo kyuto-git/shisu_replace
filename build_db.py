@@ -117,12 +117,13 @@ def prepare_agg_frame(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> list[dict]:
+def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict], int]:
+    """成績表を取り込む。戻り値は (取り込んだ表の情報, WEDGE 列が無く取り込まなかった旧形式の本数)。"""
     files = sorted(Path(agg_dir).glob("*.csv"))
     if not files:
         print(f"[foragg] 集計CSVがありません: {agg_dir}（aggregate_stats_ver2.py を先に実行）")
-        return []
-    loaded, skipped, empty = [], 0, 0
+        return [], 0
+    loaded, skipped, empty, old_format = [], 0, 0, []
     for p in files:
         info = parse_foragg_stem(file_stem(p.name))
         if info is None:
@@ -133,6 +134,10 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> list[dict]:
         if "結合データ" not in df.columns or "件数" not in df.columns:
             print(f"[foragg] SKIP（集計結果ではありません）: {p.name}", file=sys.stderr)
             skipped += 1
+            continue
+        missing = [c for c in WEDGE_COLUMNS if c not in df.columns]
+        if missing:     # Phase 3 より前の aggregate の出力。取り込むと WEDGE が全部空の DB になる
+            old_format.append(p.name)
             continue
         if df.empty:
             empty += 1
@@ -145,7 +150,10 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> list[dict]:
                        "indicator": info["indicator"], "region": info["region"], "n_rows": int(len(df)),
                        "_cols": set(df.columns)})
     print(f"[foragg] loaded {len(loaded)} tables (0件 {empty} / skip {skipped})")
-    return loaded
+    if old_format:
+        print(f"[ERROR] WEDGE 列の無い旧形式の成績表が {len(old_format)} 本あり、取り込みませんでした"
+              f"（例: {old_format[0]}）。aggregate_stats_ver2.py --clean を実行し直してください", file=sys.stderr)
+    return loaded, len(old_format)
 
 
 def rebuild_unified_all(con: sqlite3.Connection, loaded: list[dict]) -> None:
@@ -358,7 +366,9 @@ def main(argv=None) -> int:
 
     if args.mode in ("both", "foragg"):
         kinds.add("foragg")
-        loaded = load_agg_tables(con, Path(args.agg_dir))
+        loaded, n_old = load_agg_tables(con, Path(args.agg_dir))
+        if n_old:
+            rc = 1
         if not loaded and not args.allow_empty:
             print(f"[ERROR] 読み込める成績表がありません（{args.agg_dir}）。unified_all は変更しません。"
                   "aggregate_stats_ver2.py の実行と --agg-dir を確認してください（空にしたいときは --allow-empty）",

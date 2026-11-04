@@ -1,4 +1,5 @@
 """csv_files → replace → aggregate → calc → build_db → app の通しテスト（合成データ）。"""
+import re
 import shutil
 import sqlite3
 import sys
@@ -392,7 +393,8 @@ def test_index_page_wedge_views(base, monkeypatch):
     r = c.get("/", query_string={"submitted": "1", "view": "tables", "ind": "ZI", "family": "normal",
                                  "sort": "WEDGE", "sortdir": "DESC", "min_wedge": "0.6", "min_cnt": "x"})
     html = r.get_data(as_text=True)
-    assert r.status_code == 200 and "WEDGE ▼" in html and 'name="min_cnt" value=""' in html
+    assert r.status_code == 200 and "WEDGE ▼" in html
+    assert 'name="min_cnt" value="x"' in html and "数値として読めませんでした" in html   # 読めない値は残して警告
     rid = _race_id(base)
     hits = c.get("/entries/hits", query_string={"table": "entries_merged_hensachi", "rid": rid}).get_data(as_text=True)
     assert "adjusted_WEDGE" in hits
@@ -406,3 +408,67 @@ def test_phase2_db_without_wedge_is_old(base, tmp_path):
     with sqlite3.connect(p) as con:
         con.execute("ALTER TABLE unified_all DROP COLUMN adjusted_WEDGE_最終年")
         assert unified_status(con) == "old"
+
+
+def test_build_db_rejects_agg_csv_without_wedge(base, tmp_path, capsys):
+    """WEDGE 列の無い旧形式の成績表は取り込まない（WEDGE が全部空の DB を「正常」として作らない）。"""
+    import build_db
+    agg = tmp_path / "agg"
+    shutil.copytree(base / "agg_csv", agg)
+    old = next(agg.glob("foragg_normal_*カツラキ.csv"))
+    df = pd.read_csv(old, encoding="cp932", dtype=str, keep_default_na=False).drop(columns=list(WEDGE_COLS))
+    synth.write_cp932(df, old)
+    p = tmp_path / "x.db"
+    assert build_db.main(["--mode", "foragg", "--fresh", "--agg-dir", str(agg), "--db-path", str(p)]) == 1
+    assert "旧形式の成績表" in capsys.readouterr().err
+    with sqlite3.connect(p) as con:
+        assert con.execute("SELECT COUNT(*) FROM __tables_meta__ WHERE source_file = ?", (old.name,)).fetchone()[0] == 0
+        assert con.execute('SELECT COUNT(*) FROM unified_all WHERE "WEDGE" IS NULL').fetchone()[0] == 0
+    for f in agg.glob("*.csv"):
+        d = pd.read_csv(f, encoding="cp932", dtype=str, keep_default_na=False)
+        synth.write_cp932(d.drop(columns=[c for c in WEDGE_COLS if c in d.columns]), f)
+    assert build_db.main(["--mode", "foragg", "--agg-dir", str(agg), "--db-path", str(p)]) == 2
+
+
+def test_old_xjoin_falls_back_to_on_the_fly(base, monkeypatch, tmp_path):
+    p = tmp_path / "oldx.db"
+    shutil.copy(base / "racing.db", p)
+    with sqlite3.connect(p) as con:
+        con.execute('ALTER TABLE entries_xjoin_merged_hensachi DROP COLUMN "adjusted_WEDGE_最終年"')
+    am = _app(base, monkeypatch, p)
+    with am.connect() as con:
+        race = am._race_rows(con, "entries_merged_hensachi", _race_id(base))
+        hits, path = am.collect_hits(con, "entries_merged_hensachi", race)
+    assert path.startswith("on-the-fly（") and hits and all("WEDGE" in h for h in hits)
+
+
+def test_rank_view_form_defaults_and_inputs(base, monkeypatch):
+    am = _app(base, monkeypatch)
+    c = am.app.test_client()
+    # フォームは並べ替え欄を空で送る → まとめて表示の既定（adjusted_WEDGE）
+    html = c.get("/", query_string={"submitted": "1", "view": "rank", "sort": "", "sortdir": "DESC",
+                                    "odds_mode": "all", "preset": "none"}).get_data(as_text=True)
+    assert "横断ランキング（adjusted_WEDGE 大きい順" in html
+    # 全角の小数点・カンマ区切りも読む。読めない値は警告
+    html = c.get("/", query_string={"submitted": "1", "view": "rank", "min_wedge": "０．５",
+                                    "min_cnt": "1,0", "min_adj": "abc"}).get_data(as_text=True)
+    assert 'name="min_wedge" value="0.5"' in html and 'name="min_cnt" value="10"' in html
+    assert "数値として読めませんでした" in html and "abc" in html
+    # 表示列に無い列で並べたら、その列も表示する
+    html = c.get("/", query_string={"submitted": "1", "view": "rank", "sort": "平均着順",
+                                    "sortdir": "ASC"}).get_data(as_text=True)
+    assert ">平均着順 ▲<" in html
+
+
+def test_rank_query_avoids_sort_index_when_filtered(base, monkeypatch):
+    am = _app(base, monkeypatch)
+    none = {"min_cnt": None, "min_wedge": None, "min_adj": None}
+    seen = []
+    with am.connect() as con:
+        con.set_trace_callback(seen.append)
+        am._rank_query(con, [], [], "all", "", ("", "", "", ""), "none", none, "WEDGE", "DESC")
+        am._rank_query(con, [], [], "all", "", ("", "", "", ""), "none", {**none, "min_wedge": 0.5}, "WEDGE", "DESC")
+        am._rank_query(con, [], ["ZI"], "all", "", ("", "", "", ""), "none", none, "WEDGE", "DESC")
+        am._rank_query(con, [], [], "all", "", ("", "", "", ""), "none", {**none, "min_cnt": 10}, "WEDGE", "DESC")
+    orders = [re.search(r'ORDER BY (\S+)', sql).group(1) for sql in seen if "FROM unified_all" in sql]
+    assert orders == ['"WEDGE"', '"WEDGE"', '+"WEDGE"', '+"WEDGE"']
