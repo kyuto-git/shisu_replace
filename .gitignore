@@ -1,22 +1,25 @@
-# MacのシステムファイルとPythonキャッシュ
+# Mac のシステムファイルと Python キャッシュ
 .DS_Store
 __pycache__/
+.pytest_cache/
 
-# 超巨大なSQLiteデータベース関連（最優先で除外）
+# SQLite データベース
 *.db
 *.db-shm
 *.db-wal
 
-# 蓄積されるCSVファイルと各データフォルダをすべて除外
+# 入力・中間・出力 CSV とデータフォルダ
 *.csv
 csv_files/
+replace_csv/
+foragg_csv/
+agg_csv/
+master_csv/
 entries_in/
 entries_out/
-foragg_csv/
-replace_csv/
 置換前CSV/
 
-# --- 除外の例外（AIに構造を教えるサンプルCSVだけは追跡する） ---
+# --- 例外: 構造確認用のサンプル CSV だけは追跡する ---
 !entries_in/
 entries_in/*
 !entries_in/shisu_20260531_1.csv

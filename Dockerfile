@@ -1,72 +1,29 @@
-# Dockerfile
-FROM python:3.11-slim
+# shisu_replace 実行環境
+#   docker build -t csv_processor_shisu .
+# Docker Hub が使えない環境では: --build-arg PYTHON_IMAGE=mirror.gcr.io/library/python:3.11.18-slim-bookworm
+ARG PYTHON_IMAGE=python:3.11.18-slim-bookworm
+FROM ${PYTHON_IMAGE}
 
 ENV LANG=ja_JP.UTF-8 \
     LC_ALL=ja_JP.UTF-8 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
-# OS最小セット + ロケール + sqlite3 CLI（必要なら）
+# 日本語ロケール + sqlite3 CLI（DB の確認用）
 RUN apt-get update && apt-get install -y --no-install-recommends locales sqlite3 \
  && sed -i '/ja_JP.UTF-8/s/^# //' /etc/locale.gen && locale-gen \
  && rm -rf /var/lib/apt/lists/*
 
-# Pythonライブラリ（まとめて）
-# pandas / numpy はCSV処理、flask はWeb
-RUN pip install --no-cache-dir pandas numpy flask
+# ライブラリは版を固定（pandas の版で欠損値の扱いが変わるため）。pytest も入れてコンテナ内でテストできるようにする
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
 
-# プロジェクト一式コピー（順序はここでOK）
+# コード一式（データ・DB は .dockerignore で除外。実行時は -v "$(pwd)":/app でホストのディレクトリをマウントする）
 COPY . .
+RUN mkdir -p csv_files replace_csv foragg_csv agg_csv master_csv entries_in entries_out
 
-# 作業ディレクトリ（マウント前提の空ディレクトリ群）
-RUN mkdir -p /app/csv_files /app/replace_csv /app/foragg_csv
-
-# ポートを開ける（Flask）
 EXPOSE 8000
-
-# デフォルトはWebを起動
 CMD ["python", "app.py"]
-
-
-# # ベースは軽量な Python
-# FROM python:3.11-slim
-
-# ENV LANG=ja_JP.UTF-8
-# ENV LC_ALL=ja_JP.UTF-8
-# ENV PYTHONUNBUFFERED=1
-
-# WORKDIR /app
-
-
-# # OSレベルの最小限（日本語CSV/Shift_JISに特別な追加は不要）
-# RUN apt-get update && apt-get install -y --no-install-recommends locales \
-#  && sed -i '/ja_JP.UTF-8/s/^# //' /etc/locale.gen && locale-gen \
-#  && rm -rf /var/lib/apt/lists/*
-
-
-# # sqlite3 は Python に標準で含まれるので追加インストール不要
-# # ただしCLIコマンドも使うなら apt 経由で入れる
-# RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
-
-# # ロケールは任意（ログなどで日本語が化ける場合に有効）
-# RUN sed -i '/ja_JP.UTF-8/s/^# //' /etc/locale.gen && locale-gen
-
-# # 依存ライブラリ（scipy を追加）
-# RUN pip install --no-cache-dir pandas numpy scipy flask
-
-# # スクリプトをコピー
-# COPY replace_csv.py /app/replace_csv.py
-# COPY aggregate_stats.py /app/aggregate_stats.py
-
-# # 入出力用ディレクトリ（マウントでもOK）
-# RUN mkdir -p /app/csv_files /app/replace_csv /app/foragg_csv
-
-
-
-# # デフォルトは置換を実行
-# ENTRYPOINT ["python", "/app/replace_csv_ver3.py"]
-
-# COPY . .
-
-# CMD ["python", "app.py"]
