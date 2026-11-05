@@ -491,6 +491,16 @@ def test_wedge_min_year_count_boundary():
     assert out.loc["B", "adjusted_WEDGE"] == pytest.approx(2.0) and out.loc["B", "adjusted_WEDGE_年数"] == 1
 
 
+def test_wedge_key_window_ignores_years_without_wedge():
+    """window=key の窓の終わりは、WEDGE が出る年（オッズのある馬がいる年）の最終年。1グループ版と同じ。"""
+    rows = [{"k": "A", "f": 1, "o": 2.0, "y": 2022} for _ in range(10)]
+    rows += [{"k": "A", "f": 18, "o": None, "y": 2025} for _ in range(10)]       # 2025 はオッズ無し → WEDGE 空
+    df = pd.DataFrame(rows)
+    out = wedge.wedge_columns(df["k"], df["f"], df["o"], df["y"], window="key", max_years=3)
+    scalar = wedge.adjusted_wedge({2022: 2.0, 2025: float("nan")}, {2022: 10, 2025: 10}, 10, None, max_years=3)
+    assert scalar == pytest.approx(2.0) and out.loc["A", "adjusted_WEDGE"] == pytest.approx(scalar)
+
+
 def test_wedge_columns_edge_cases():
     # オッズ全欠損 → EDGE/WEDGE は空、WIN は出る
     out = wedge.wedge_columns(pd.Series(["a"] * 3), pd.Series([1, 2, 3]), pd.Series([None] * 3),

@@ -100,6 +100,7 @@ def read_base(paths: Iterable[Path | str], log: Logger = default_log) -> pd.Data
     レースID(新) は数字だけにそろえる。日付S が無い・空欄の行は レースID(新) の先頭8桁で補う。
     """
     frames = []
+    names: set[str] = set()
     for p in paths:
         p = Path(p)
         df = read_csv_any(p)
@@ -117,7 +118,12 @@ def read_base(paths: Iterable[Path | str], log: Logger = default_log) -> pd.Data
         df[DATE] = date.where(date != "", df[RID].str.slice(0, 8))
         if WORK not in df.columns:
             df[WORK] = ""
-        df[SOURCE_FILE] = p.name
+        name, n = p.name, 1
+        while name in names:            # 同じ名前の別ファイル（別フォルダ・アップロード）はマージ完全版を分ける
+            n += 1
+            name = f"{p.stem}_{n}{p.suffix}"
+        names.add(name)
+        df[SOURCE_FILE] = name
         frames.append(df)
         log(f"[INFO] ベースCSV {p.name}: {len(df)} 行")
     if not frames:

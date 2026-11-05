@@ -120,6 +120,24 @@ def test_decode_prefers_declared_charset():
     assert common._decode(r, "cp932") == text
 
 
+def test_read_base_same_name_files_stay_separate(tmp_path):
+    a = write_base(tmp_path / "dayA" / "base.csv", base_frame().iloc[:2])
+    b = write_base(tmp_path / "dayB" / "base.csv", base_frame().iloc[6:8])
+    base = common.read_base([a, b], lambda m: None)
+    assert base["_source_file"].tolist() == ["base.csv"] * 2 + ["base_2.csv"] * 2
+    common.write_outputs(base, pd.Series("", index=base.index), tmp_path / "o", "x", lambda m: None)
+    assert len(out_csv(tmp_path / "o" / "base_merged.csv")) == 2 and len(out_csv(tmp_path / "o" / "base_2_merged.csv")) == 2
+
+
+def test_lap_duplicate_rows_across_files(tmp_path):
+    a, b = tmp_path / "a.csv", tmp_path / "b.csv"
+    a.write_bytes(lap_rows().iloc[:2].to_csv(index=False).encode("cp932"))
+    b.write_bytes(lap_rows().iloc[1:2].to_csv(index=False).encode("cp932"))
+    logs = []
+    lap.run([a, b], tmp_path / "o", logs.append, today="20261105")
+    assert len(out_csv(tmp_path / "o" / "2F" / "20261012_2F.csv")) == 2 and any("同じ レースID(新)" in m for m in logs)
+
+
 def test_fetcher_interval_retry_404_and_cancel():
     now = [0.0]
     slept = []
@@ -225,6 +243,8 @@ def test_kayochin_key_parse_and_run(tmp_path):
     assert kayochin.page_key("202511020805021101") == "251102kyouto"
     data = kayochin.parse(kayochin_html({1: [(1, "52"), (2, ""), (3, "47")], 12: [(10, "-3")]}))
     assert data == {1: [(1, 52), (3, 47)], 12: [(10, -3)]}               # 空欄の位置で対がずれない
+    html = kayochin_html({11: [(1, "50")]}).replace("<td>11R</td>", "<td>11R 15:25 芝1600m</td>")
+    assert kayochin.parse(html) == {11: [(1, 50)]}                        # 旧版と同じ前方一致
     base = common.read_base([write_base(tmp_path / "base.csv")], lambda m: None)
     pages = {kayochin.page_url("251101tokyo"): kayochin_html({1: [(1, "52"), (2, "48"), (3, "47")], 2: [(3, "60")]})}
     f, s = fast_fetcher(pages)
@@ -427,8 +447,9 @@ def test_yasui_extract_and_target_outputs(tmp_path):
     ex = out_csv(tmp_path / "yasui" / "yasui_extract.csv")
     assert len(ex) == 5 and res.matched == 5
     r0 = ex.iloc[0]
-    assert (r0["安井_スピード"], r0["安井_スピード順位"], r0["安井_スタミナ"], r0["安井_スタミナ順位"]) == ("48", "6", "-17", "12")
-    assert ex.iloc[1]["安井_ランク"] == "" and ex.iloc[1]["安井_スピード"] == "" and ex.iloc[1]["安井_スピード順位"] == "16"
+    assert (r0["安井_スピード"], r0["安井_スピード_Excel順位"], r0["安井_スタミナ"], r0["安井_スタミナ_Excel順位"]) == \
+        ("48", "6", "-17", "12")
+    assert ex.iloc[1]["安井_ランク"] == "" and ex.iloc[1]["安井_スピード"] == "" and ex.iloc[1]["安井_スピード_Excel順位"] == "16"
     assert ex.iloc[4]["日付"] == "20251129" and ex.iloc[4]["レースID(新)"] == "202511290801010101"
     assert any("読み替え" in m for m in logs)
     sp = out_csv(tmp_path / "yasui" / "yasui_speed" / "20251101_yasui_speed.csv").set_index("レースID(新)")["ワーク1"]
@@ -436,7 +457,11 @@ def test_yasui_extract_and_target_outputs(tmp_path):
     assert out_csv(tmp_path / "yasui" / "yasui_yaruki" / "20251102_yasui_yaruki.csv")["ワーク1"].tolist() == ["1", ""]
     assert (tmp_path / "yasui" / "yasui_rank" / "base_merged.csv").exists()
     ent = out_csv(tmp_path / "entries_in" / "yasui_20251101.csv")
-    assert list(ent.columns[:3]) == ["レースID(新)", "安井_馬名", "安井_ランク"] and "安井_賢さ順位" in ent.columns
+    assert list(ent.columns) == ["レースID(新)", "安井_馬名", "安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー",
+                                 "安井_根性", "安井_賢さ", "安井_体力", "安井_やる気"]           # 丸数字の順位は入れない
+    # ベースのその日の全馬（Excel に無い 1R 3番・2R 2番・3番も空欄で入る。過去側の欠損の数え方とそろえる）
+    assert ent["レースID(新)"].tolist() == [r for r, d, _w, _u in BASE_ROWS if d == "20251101"]
+    assert ent.set_index("レースID(新)").loc["202511010504010103", "安井_スピード"] == ""
     assert (tmp_path / "yasui" / "entries_in" / "yasui_20251101.csv").exists()
 
 
@@ -450,25 +475,35 @@ def test_yasui_without_base_writes_extract_only(tmp_path):
 
 def test_yasui_entries_file_feeds_calc_entry_hensachi(tmp_path):
     """出馬表用CSVは calc_entry_hensachi で TARGET の出馬表と レースID(新) で横に結合され、安井_* の偏差値・順位が付く。
-    5つのステータスの順位は Excel の丸数字（安井_スピード順位）を使う。"""
+    順位は値から計算する（過去側は TARGET に取り込んだ値から順位を出すので、Excel の丸数字は使わない）。"""
     import calc_entry_hensachi as c
     from shisu import yasui_extractor as y
     rows = [yrow("東京", 1, (u + 1) // 2, u, 30 + u, f"ウマ{u}", f"{100 - u * 5}{chr(0x2460 + u - 1)}", "1①", "1①",
                  "1①", "1①", 4, 0) for u in range(1, 11)]
-    rows[2][12] = "99③"                                         # 値は1番大きいが丸数字は3位 → 丸数字を使う
+    rows[2][12] = "99③"                     # 値は1番大きいが丸数字は3位 → 値から計算した 1位 を使う
+    rows[4][12] = "70⑤"
+    rows[5][12] = "70⑥"                     # 同値は同順位（丸数字は分けている）
     xlsx = make_yasui_xlsx(tmp_path / "ステータス新バージョン2025_11月.xlsx", {"1101": rows})
     base = pd.DataFrame([{"レースID(新)": f"2025110105040101{u:02d}", "日付S": "20251101", "枠番": str((u + 1) // 2),
                           "馬番": str(u), "ワーク1": ""} for u in range(1, 11)])
     b = common.read_base([write_base(tmp_path / "base.csv", base)], lambda m: None)
     y.run([xlsx], b, tmp_path / "o", lambda m: None)
     yas = read_csv_any(tmp_path / "o" / "entries_in" / "yasui_20251101.csv")
+    assert not [col for col in yas.columns if col.endswith("順位")]
     main = pd.DataFrame([{"レースID(新)": f"2025110105040101{u:02d}", "場 R": "東1", "場所": "東京", "馬番": str(u),
                           "馬名S": f"ウマ{u}", "カツラキ": str(50 + u)} for u in range(1, 11)])
     out = c.merge_frames([c.process_df(main, "main", verbose=False), c.process_df(yas, "yasui", verbose=False)])
     assert {"安井_スピード_偏差値", "安井_スピード_順位", "安井_ランク_順位帯_s1", "カツラキ_順位"} <= set(out.columns)
-    sp_rank = out.set_index("馬番")["安井_スピード_順位"]
-    assert sp_rank["3"] == "3" and sp_rank["1"] == "1"          # 丸数字の順位（値 99 でも3位）
-    assert out.set_index("馬番")["安井_ランク_順位"]["10"] == "1"   # 順位列の無い ランク は値から計算
+    sp_rank = out.set_index("馬番")["安井_スピード_順位"].astype(str)
+    assert sp_rank["3"] == "1" and sp_rank["1"] == "2"
+    assert sp_rank["5"] == sp_rank["6"]
+    # 過去側（replace）と同じ関数・同じ値なら同じ順位になる
+    from shisu.hensachi import compute_indicator
+    from shisu.indicators import spec_for
+    hist = compute_indicator(yas["安井_スピード"], pd.Series("r", index=yas.index), spec_for("安井_スピード"),
+                             pd.Series(False, index=yas.index), None)
+    assert [str(int(v)) for v in hist["順位"]] == [sp_rank[str(u)] for u in range(1, 11)]
+    assert out.set_index("馬番")["安井_ランク_順位"].astype(str)["10"] == "1"
 
 
 def test_yasui_indicators_in_registry():
@@ -576,3 +611,110 @@ def test_ingest_web_cancel(tmp_path, monkeypatch):
     job = web.JOBS[run_id]
     job.thread.join(timeout=30)
     assert job.status == "cancelled"
+
+
+def _post(c, data, **kw):
+    return c.post("/ingest/run", data=data, content_type="multipart/form-data", **kw)
+
+
+def _base_upload(name="b.csv"):
+    return [(io.BytesIO(base_frame().to_csv(index=False).encode("cp932")), name)]
+
+
+@pytest.fixture
+def web_app(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path))
+    import app as am
+    from shisu.ingest import web
+    monkeypatch.setattr(web, "SESSION_FACTORY", lambda: FakeSession({}))
+    monkeypatch.setattr(web, "SLEEP", lambda _: None)
+    monkeypatch.setattr(web, "JOBS", {})
+    monkeypatch.setattr(web, "_RESERVED", set())
+    return am.app.test_client(), web
+
+
+def test_ingest_web_rejects_cross_site_posts(web_app):
+    c, web = web_app
+    data = lambda: {"src": ["omega"], "base_files": _base_upload()}
+    assert _post(c, data(), headers={"Origin": "http://evil.example"}).status_code == 403
+    assert _post(c, data(), headers={"Sec-Fetch-Site": "cross-site"}).status_code == 403
+    assert _post(c, data(), headers={"Origin": "null"}).status_code == 403
+    assert not web.JOBS
+    r = _post(c, data(), headers={"Origin": "http://localhost", "Sec-Fetch-Site": "same-origin"})
+    assert r.status_code == 302
+
+
+def test_ingest_web_validation_error_removes_uploads(web_app, tmp_path):
+    c, web = web_app
+    r = _post(c, {"src": ["lap"], "base_files": _base_upload()})        # ラップCSV が無い → 400
+    assert r.status_code == 400
+    up = tmp_path / "ingest_in" / "uploads"
+    assert not up.exists() or not any(up.iterdir())
+    out = tmp_path / "ingest_out"
+    assert not out.exists() or not any(out.iterdir())
+    assert not web._RESERVED and _post(c, {"src": ["omega"], "base_files": _base_upload()}).status_code == 302
+
+
+def test_ingest_web_same_name_uploads_are_kept_apart(web_app, tmp_path):
+    c, web = web_app
+    a = lap_rows().iloc[:1].to_csv(index=False).encode("cp932")
+    b = lap_rows().iloc[6:7].to_csv(index=False).encode("cp932")
+    r = _post(c, {"src": ["lap"], "lap_files": [(io.BytesIO(a), "dayA/lap.csv"), (io.BytesIO(b), "dayB/lap.csv")]})
+    run_id = r.headers["Location"].rstrip("/").split("/")[-1]
+    web.JOBS[run_id].thread.join(timeout=30)
+    up = tmp_path / "ingest_in" / "uploads" / run_id / "lap"
+    assert sorted(p.name for p in up.iterdir()) == ["lap.csv", "lap_2.csv"]
+    out = tmp_path / "ingest_out" / run_id / "lap" / "2F"
+    assert sorted(p.name for p in out.iterdir()) == ["20261012_2F.csv", "20261013_2F.csv"]
+    assert len(out_csv(out / "20261012_2F.csv")) == 1
+
+
+def test_ingest_web_double_submit_runs_one_job(web_app, monkeypatch):
+    """受付の確認と予約が同じロックの中なので、同時に2回押しても2件目は 409（ID も重ならない）。"""
+    c, web = web_app
+    import datetime as _dt
+    fixed = _dt.datetime(2026, 11, 5, 3, 49, 7)
+
+    class FixedDT(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+    monkeypatch.setattr(web._dt, "datetime", FixedDT)
+    gate = threading.Event()
+    real_accept_save = web.unique_path
+
+    def slow_unique_path(dest, taken):
+        gate.wait(5)                                    # 1件目がアップロードを保存している間に2件目を送る
+        return real_accept_save(dest, taken)
+    monkeypatch.setattr(web, "unique_path", slow_unique_path)
+    results = []
+
+    def submit():
+        cl = web_app[0].application.test_client()
+        results.append(_post(cl, {"src": ["omega"], "base_files": _base_upload()}).status_code)
+    t1 = threading.Thread(target=submit)
+    t1.start()
+    for _ in range(100):
+        if web._RESERVED:
+            break
+        threading.Event().wait(0.01)
+    assert web._RESERVED
+    results.append(_post(c, {"src": ["omega"], "base_files": _base_upload()}).status_code)
+    gate.set()
+    t1.join(10)
+    assert sorted(results) == [302, 409]
+    assert len(web.JOBS) == 1
+
+
+def test_job_finishes_even_if_log_file_fails(tmp_path, monkeypatch):
+    from shisu.ingest import web
+    monkeypatch.setattr(web, "SESSION_FACTORY", lambda: FakeSession({}))
+    monkeypatch.setattr(web, "SLEEP", lambda _: None)
+    req = IngestRequest(sources=["omega"], base_paths=[write_base(tmp_path / "b.csv")])
+    job = web.Job("20261105_000000", tmp_path / "out", req)
+    import shutil
+    shutil.rmtree(tmp_path / "out")                       # 実行中に出力フォルダが消えた
+    (tmp_path / "out").write_text("not a dir")            # しかも同じ名前のファイルがある → ログも出力も書けない
+    job.run()
+    assert job.status == "error" and job.finished is not None
+    assert any("ログファイルに書けません" in line for line in job.lines)

@@ -708,6 +708,7 @@ def entries_hits():
 # ========================= レース別 WEDGE 一覧 =========================
 WEDGE_SORTS = ("adjusted_WEDGE", "WEDGE", "WIN", "EDGE", "件数", "adjusted_WEDGE_件数", "馬番")
 WEDGE_VIEW_LIMIT = 3000        # 画面に出す行数の上限（CSV ダウンロードは全行）
+WEDGE_QUERY_KEYS = ("table", "rid", "ridn", "date", "odds_mode", "ind", "family", "uma", "sort", "dir")
 WEDGE_CSV_COLUMNS = ("馬番", "枠番", "馬名", "騎手", "base", "family", "rank_scheme", "odds_mode", "region", "key",
                      "テーブル名", "件数", "WIN", "EDGE", "WEDGE", "adjusted_WEDGE", "adjusted_WEDGE_年数",
                      "adjusted_WEDGE_件数", "adjusted_WEDGE_最終年", "勝率_val", "連対率_val", "複勝率_val",
@@ -894,7 +895,7 @@ def entries_wedge():
     rid = h.get("レースID(新/馬番無)", p["rid"])
     matrix_bases = [b for b in bases if not p["inds"] or b in p["inds"]]
     matrix_race = [r for r in race if not p["uma"] or str(r.get("馬番")) == p["uma"]]
-    args = {k: v for k, v in request.args.lists()}
+    args = {k: v for k, v in request.args.lists() if k in WEDGE_QUERY_KEYS}   # url_for の予約引数（_anchor 等）を通さない
     args.update({"table": [p["table"]], "rid": [rid]})
     head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}　WEDGE 一覧'
     sub = f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")} / {h.get("クラス名_raw", "")} / {len(race)}頭'

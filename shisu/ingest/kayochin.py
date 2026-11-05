@@ -3,7 +3,7 @@
 URL:  https://kayochinkeiba.com/{YYMMDD}{場所の英語名}/   例: 251019niigata
       場所: 01 sapporo, 02 hakodate, 03 fukushima, 04 niigata, 05 tokyo, 06 nakayama,
             07 cyuukyo（中京）, 08 kyouto（京都）, 09 hanshin, 10 kokura
-解析: すべての <table> の <tr> を見て、td[0] が「1R」〜「12R」の行を馬番行、その直後の td[0] が「指」の行を指数行とする。
+解析: すべての <table> の <tr> を見て、td[0] が「1R」〜「12R」で始まる行を馬番行、その直後の td[0] が「指」の行を指数行とする。
       馬番行の td[1:] の丸数字（①〜⑳）と、指数行の td[1:] の整数を、列の位置で対にする
       （旧版は空のセルを詰めてから対にしていたので、途中に空欄があると馬番と値がずれた）
 照合: (YYMMDD+場所, R, 馬番)
@@ -54,7 +54,7 @@ def parse(html: str) -> dict[int, list[tuple[int, int]]]:
         trs = table.find_all("tr")
         for i, tr in enumerate(trs):
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-            m = re.fullmatch(r"(\d{1,2})R", unicodedata.normalize("NFKC", tds[0]).strip()) if tds else None
+            m = re.match(r"(\d{1,2})R", unicodedata.normalize("NFKC", tds[0]).strip()) if tds else None   # 「11R 15:25」なども可（旧版と同じ前方一致）
             if not m or i + 1 >= len(trs):
                 continue
             nxt = [td.get_text(strip=True) for td in trs[i + 1].find_all("td")]

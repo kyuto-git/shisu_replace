@@ -225,8 +225,8 @@ def wedge_columns(keys: pd.Series, finish_num: pd.Series, odds: pd.Series, years
         if window == "data":
             end = float(ref_year) if ref_year is not None else float(yb["y"].max())
             yearly["end"] = end
-        else:
-            yearly["end"] = yearly.groupby("k")["y"].transform("max")
+        else:   # その結合データの最終年（WEDGE が出る年のうち。オッズが1頭も無い年は数えない＝1グループ版と同じ）
+            yearly["end"] = yearly["y"].where(yearly["WEDGE"].notna()).groupby(yearly["k"]).transform("max")
         yearly = yearly[(yearly["y"] <= yearly["end"]) & (yearly["y"] > yearly["end"] - int(max_years))]
         yearly = yearly[(yearly["n"] >= min_year_count) & yearly["WEDGE"].notna()]
         if not yearly.empty:

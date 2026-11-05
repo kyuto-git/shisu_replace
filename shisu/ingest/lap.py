@@ -186,6 +186,10 @@ def run(paths: Iterable[Path | str], out_dir: Path, log: Logger = default_log,
         log("[WARN] ラップCSVがありません")
         return res
     raw = pd.concat(frames, ignore_index=True)
+    dup = raw[RID].astype(str).str.strip().ne("") & raw.duplicated(subset=[RID], keep="first")
+    if dup.any():       # 同じラップCSVを2回渡した・期間が重なったとき、同じ馬が2行にならないように
+        log(f"[WARN] 同じ レースID(新) の行が {int(dup.sum())} 行あります（最初の行を使います）")
+        raw = raw[~dup].reset_index(drop=True)
     df = compute(preprocess(raw))
     res.total = len(raw)
     res.matched = len(df)

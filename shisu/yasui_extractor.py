@@ -14,16 +14,19 @@ Excel の形（2025年11月〜2026年2月の4ファイルで確認）:
 
 取り出す指数（台帳の正式名。shisu/indicators.py）:
   安井_ランク, 安井_スピード, 安井_スタミナ, 安井_パワー, 安井_根性, 安井_賢さ, 安井_体力, 安井_やる気
-  5つのステータスは順位（丸数字）も 安井_スピード順位 などの列に出す（出馬表側では calc_entry_hensachi が
-  この順位を優先して使う）。値が無く丸数字だけのセル（「⑯」）は値を空欄にする（偏差値・順位の規則は他の指数と同じ。
+  値が無く丸数字だけのセル（「⑯」）は値を空欄にする（偏差値・順位の規則は他の指数と同じ。
   1レースに欠損2頭以上ならそのレースはその指数で使わない）。
+  丸数字の順位は yasui_extract.csv に 安井_スピード_Excel順位 などとして残すだけで、出馬表用CSVには入れない。
+  過去側は TARGET に取り込んだ「値」から順位を出す（同値は同順位・値の無い馬は順位なし）が、Excel の丸数字は
+  同値でも順位を分け、値の無い馬にも順位を付けるので、出馬表側で丸数字を使うと過去側と順位がずれる
+  （4ファイルでステータスごとに約1,400〜4,000頭がずれた）。出馬表側も値から計算して両側をそろえる。
 
 出力（shisu.ingest から使う）:
   yasui/yasui_extract.csv                      取り出した全行（1頭1行。照合できた行は レースID(新) 付き）
   yasui/yasui_{key}/{YYYYMMDD}_yasui_{key}.csv TARGET 取込用（ベースCSVと 日付・場所・R・馬番 で照合）
   yasui/yasui_{key}/{元ファイル名}_merged.csv  マージ完全版
   yasui/entries_in/yasui_{YYYYMMDD}.csv        出馬表（entries_in/）にそのまま置ける形
-                                                （レースID(新) と 安井_* の列。calc_entry_hensachi --merge-* で
+                                                （レースID(新)・安井_馬名・8指数の値。calc_entry_hensachi --merge-* で
                                                  TARGET の出馬表と レースID(新) で横に結合される）
 """
 from __future__ import annotations
@@ -60,6 +63,8 @@ DEFAULT_POSITIONS = {"場": 1, "レース": 2, "条件": 3, "枠番": 4, "馬番
                      "ランク": 9, "馬名": 11, "スピード": 12, "スタミナ": 14, "パワー": 16, "根性": 18, "賢さ": 20,
                      "体力": 22, "やる気": 23}
 HEADER_ROW = 3          # 列名の行（1始まり）
+# 丸数字の順位の列名の接尾辞。calc_entry_hensachi の「元の順位列」（{列}順位 / {列}_順位）に当たらない名前にする
+EXCEL_RANK_SUFFIX = "_Excel順位"
 FIRST_DATA_ROW = 4
 _CIRCLED = re.compile(r"^(.*?)([①-⑳㉑-㉟㊱-㊿])\s*$")
 _NUMBER = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
@@ -199,7 +204,7 @@ def extract_columns() -> list[str]:
     for _key, label, name in INDICATORS:
         cols.append(name)
         if label in STATUS:
-            cols.append(f"{name}順位")
+            cols.append(f"{name}{EXCEL_RANK_SUFFIX}")
     return cols + ["ファイル", "シート"]
 
 
@@ -221,7 +226,7 @@ def _record(row: tuple, pos: dict[str, int], date: str) -> dict | None:
         cell = _cell(row, pos[label])
         if label in STATUS:
             v, rank = split_status(cell)
-            rec[name], rec[f"{name}順位"] = v, ("" if rank is None else str(rank))
+            rec[name], rec[f"{name}{EXCEL_RANK_SUFFIX}"] = v, ("" if rank is None else str(rank))
         else:
             rec[name] = plain_number(cell)
     return rec
@@ -272,27 +277,41 @@ def run(paths: Iterable[Path | str], base: pd.DataFrame | None, out_dir: Path, l
         return res
     by_key = df.set_index("_key")
     bkeys = base[RID].map(key14)
+    values: dict[str, pd.Series] = {}
     for key, _label, name in INDICATORS:
         mapping = {k: v for k, v in by_key[name].items() if k and v != ""}
-        res.files += write_outputs(base, lookup(bkeys, mapping), out_dir / f"yasui_{key}", f"yasui_{key}", log).files
-    res.files += write_entries(df[df[RID] != ""], out_dir / "entries_in", log)
+        values[name] = lookup(bkeys, mapping)
+        res.files += write_outputs(base, values[name], out_dir / f"yasui_{key}", f"yasui_{key}", log).files
+    names = lookup(bkeys, {k: v for k, v in by_key["馬名"].items() if k})
+    days = set(df.loc[df[RID] != "", "日付"])
+    res.files += write_entries(base, values, names, days, out_dir / "entries_in", log)
     if entries_dir is not None:
-        res.files += write_entries(df[df[RID] != ""], Path(entries_dir), log)
+        res.files += write_entries(base, values, names, days, Path(entries_dir), log)
     return res
 
 
 def entries_columns() -> list[str]:
-    return [RID, "安井_馬名"] + [c for c in extract_columns() if c.startswith("安井_")]
+    """出馬表用CSVの列: 値だけ（丸数字の順位は入れない。モジュールの説明を参照）。"""
+    return [RID, "安井_馬名"] + [name for _key, _label, name in INDICATORS]
 
 
-def write_entries(df: pd.DataFrame, out_dir: Path, log: Logger = default_log) -> list[Path]:
-    """出馬表（entries_in/）用: 日付ごとに yasui_{YYYYMMDD}.csv（レースID(新), 安井_馬名, 安井_*）。"""
+def write_entries(base: pd.DataFrame, values: dict[str, pd.Series], names: pd.Series, days: set[str],
+                  out_dir: Path, log: Logger = default_log) -> list[Path]:
+    """出馬表（entries_in/）用: 日付ごとに yasui_{YYYYMMDD}.csv（レースID(新), 安井_馬名, 安井_*）。
+
+    行はベースCSVのその日の全馬（Excel に無い馬は値が空欄）。過去側（TARGET に取り込んだ値。無い馬は空欄）と
+    同じく、欠損の数え方（1レースに欠損2頭以上ならその指数で使わない）がそろうようにする。
+    """
+    out = pd.DataFrame({RID: base[RID], DATE: base[DATE], "安井_馬名": names})
+    for name, v in values.items():
+        out[name] = v
+    out = out[(out[RID].str.len() == 18) & out[DATE].isin(days)]
+    out = out.assign(_has=(out[[n for n in values]] != "").any(axis=1))
+    out = out.sort_values("_has", ascending=False, kind="stable").drop_duplicates(subset=[RID])
     files = []
-    for day, g in df.groupby("日付", sort=True):
-        out = g.rename(columns={"馬名": "安井_馬名"})
-        out = out.sort_values(RID)[entries_columns()]
+    for day, g in out.groupby(DATE, sort=True):
         path = Path(out_dir) / f"yasui_{day}.csv"
-        write_csv(out, path)
+        write_csv(g.sort_values(RID)[entries_columns()], path)
         files.append(path)
     if files:
         log(f"[INFO] {LABEL}: 出馬表用 {len(files)} 本 → {out_dir}")  # entries_in/ に置いたときも分かるようにフルパス

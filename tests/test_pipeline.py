@@ -523,6 +523,10 @@ def test_entries_wedge_lists_all_hits_without_threshold(base, monkeypatch):
     assert w == sorted(w)
     assert c.get("/entries/wedge", query_string={"table": t, "rid": rid, "sort": "x;drop", "odds_mode": "?"}).status_code == 200
     assert c.get("/entries/wedge", query_string={"table": "nope", "rid": rid}).status_code == 302
+    for extra in ("_anchor", "_scheme", "_method", "endpoint", "_external"):   # url_for の予約引数で 500 にならない
+        r = c.get("/entries/wedge", query_string={"table": t, "rid": rid, extra: "1"})
+        assert r.status_code == 200, extra
+        assert "http://" not in r.get_data(as_text=True).split("CSV でダウンロード")[0][-300:]
     # 一覧・出馬表・条件ヒット馬からリンクがある
     assert "/entries/wedge?" in c.get("/entries").get_data(as_text=True)
     assert "/entries/wedge?" in c.get("/entries/race", query_string={"table": t, "rid": rid}).get_data(as_text=True)
