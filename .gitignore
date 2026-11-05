@@ -17,6 +17,10 @@ agg_csv/
 master_csv/
 entries_in/
 entries_out/
+ingest_in/
+ingest_out/
+*.xlsx
+*.xlsm
 置換前CSV/
 
 # --- 例外: 構造確認用のサンプル CSV だけは追跡する ---

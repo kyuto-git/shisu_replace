@@ -24,6 +24,7 @@ class IndicatorSpec:
 
 
 _YOSHIUMA = ("吉馬_SP能力値", "吉馬_先行力", "吉馬_SP信頼", "吉馬_SP調整", "吉馬_SP最大", "吉馬_末脚力")
+_YASUI = ("安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー", "安井_根性", "安井_賢さ", "安井_体力", "安井_やる気")
 
 INDICATORS: tuple[IndicatorSpec, ...] = (
     IndicatorSpec("カツラキ"),
@@ -49,6 +50,8 @@ INDICATORS: tuple[IndicatorSpec, ...] = (
     IndicatorSpec("タイムM", ("マイニング値", "タイム指数", "TimeM"), reverse=True),
     IndicatorSpec("対戦M", ("対戦型マイニング値", "MatchM")),
     IndicatorSpec("圧勝力"),
+    # 安井サロン（月別 Excel。shisu/yasui_extractor.py）
+    *(IndicatorSpec(n) for n in _YASUI),
 )
 
 # 画面での並び順（台帳の順）

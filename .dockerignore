@@ -6,6 +6,10 @@ agg_csv/
 master_csv/
 entries_in/
 entries_out/
+ingest_in/
+ingest_out/
+*.xlsx
+*.xlsm
 置換前CSV/
 *.csv
 *.db

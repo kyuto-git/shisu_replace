@@ -8,6 +8,7 @@
   /entries/key   結合データの前方一致で unified_all を表示
   /entries/hits  条件ヒット馬（絶対軸・軸候補・消し候補・相手候補）
   /entries/wedge レース別 WEDGE 一覧（全馬 × 該当する全キーの WEDGE / adjusted_WEDGE。閾値で足切りしない）
+  /ingest        指数の取得（Ω・吉馬・かよちん・keibaAI・一隊のスクレイピング、ラップ計算、安井Excel。shisu/ingest/web.py）
   /healthz       DB 接続確認
 
 条件ヒット馬は entries_xjoin_*（build_db が事前計算した照合結果）があればそれを読み、
@@ -29,6 +30,7 @@ from flask import Flask, Response, redirect, render_template_string, request, ur
 from shisu import config
 from shisu.classify import CATEGORIES, CATEGORY_LABELS, classify, description_lines, sql_condition
 from shisu.indicators import INDICATOR_ORDER
+from shisu.ingest.web import make_blueprint as make_ingest_blueprint
 from shisu.keys import ALL_FAMILIES, FAMILY_LABELS
 from shisu.matching import HIT_COLUMNS, UNIFIED, indicator_bases, match_entry_row, unified_status
 from shisu.naming import ENTRIES_ALL, XJOIN_PREFIX, xjoin_table_for
@@ -142,6 +144,9 @@ header{background:#111827;color:#fff;padding:14px 20px;font-size:18px}
 h1{font-size:17px;margin:0 0 10px} h2{font-size:15px;margin:14px 0 6px}
 label{font-size:12px;color:#374151}
 select{width:100%;padding:6px;border:1px solid #e5e7eb;border-radius:8px;background:#fff}
+input:not([type]),input[type=text],input[type=number]{padding:6px;border:1px solid #e5e7eb;border-radius:8px;box-sizing:border-box}
+input[type=file]{font-size:12px;margin:4px 0}
+code{background:#f1f5f9;padding:1px 4px;border-radius:4px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
 .cbs{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
 .cb{display:inline-flex;align-items:center;gap:4px;font-size:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:4px 8px}
@@ -157,7 +162,7 @@ td.num{text-align:right}
 a{color:#2563eb;text-decoration:none} a:hover{text-decoration:underline}
 .cat-abs h1{color:#7c2d12} .cat-axis h1{color:#1d4ed8} .cat-keshi h1{color:#6b7280} .cat-opp h1{color:#047857}
 </style></head><body><header>{{ title }}</header><div class="container">
-<div class="nav"><a href="{{ url_for('index') }}">横断検索</a><a href="{{ url_for('entries_index') }}">出馬表</a></div>
+<div class="nav"><a href="{{ url_for('index') }}">横断検索</a><a href="{{ url_for('entries_index') }}">出馬表</a><a href="{{ url_for('ingest.index') }}">指数の取得</a></div>
 {% if db_warning %}<div class="card warn">{{ db_warning }}</div>{% endif %}
 {BODY}
 </div></body></html>"""
@@ -166,6 +171,10 @@ a{color:#2563eb;text-decoration:none} a:hover{text-decoration:underline}
 def render(title: str, body: str, **ctx):
     ctx.setdefault("db_warning", "")
     return render_template_string(LAYOUT.replace("{BODY}", body), title=title, **ctx)
+
+
+app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024     # /ingest のアップロード上限
+app.register_blueprint(make_ingest_blueprint(render))
 
 
 # ========================= 横断検索（/） =========================

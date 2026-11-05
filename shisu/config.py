@@ -41,6 +41,14 @@ def entries_out_dir() -> Path:  # 偏差値付き出馬表
     return base_dir() / "entries_out"
 
 
+def ingest_in_dir() -> Path:   # 指数取得（/ingest・ingest.py）の入力（ベースCSV・ラップCSV・安井Excel）
+    return base_dir() / "ingest_in"
+
+
+def ingest_out_dir() -> Path:  # 指数取得の出力（実行ごとのフォルダ）
+    return base_dir() / "ingest_out"
+
+
 def db_path() -> Path:
     env = os.environ.get("DB_PATH")
     return Path(env) if env else base_dir() / "racing.db"
