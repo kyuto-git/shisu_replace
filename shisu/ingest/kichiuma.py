@@ -6,7 +6,7 @@ URL:  https://kichiuma.net/php/search.php?race_id={YYYYMMDD}{R2}{id}&date={YYYY%
       colspan=2 の見出し（SP信頼・SP調整・SP最大・末脚力）は2列に展開し、右側（*_R）の数値を取る。
       馬 = 馬番、競走馬名 = 馬名
 照合: レースID(新) から 11〜14桁目を除いた14桁（YYYYMMDD + 場所 + R + 馬番）
-出力: 指数ごとのフォルダ kichiuma_{key}/{YYYYMMDD}_kichiuma_{key}.csv
+出力: 指数ごとのフォルダ kichiuma_{key}/{YYYYMMDD}_kichiuma_{key}.csv と {元ファイル名}_{key}_merged.csv（旧版と同じ名前）
 """
 from __future__ import annotations
 
@@ -129,5 +129,5 @@ def run(base: pd.DataFrame, fetcher: Fetcher, out_dir: Path, log: Logger = defau
     res = Outputs()
     for key in INDEXES:
         res.extend(write_outputs(base, lookup(keys, maps[key]), Path(out_dir) / f"kichiuma_{key}",
-                                 f"kichiuma_{key}", log))
+                                 f"kichiuma_{key}", log, merged_suffix=key))
     return res

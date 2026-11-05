@@ -270,7 +270,7 @@ FORM_BODY = """
 </div>
 <div class="card"><h1>2. 入力ファイル</h1>
 {% for kind, (label, exts) in kinds.items() %}
-<h2>{{ label }}{% if kind == 'base' %}（①〜⑤と安井の照合に使う）{% elif kind == 'lap' %}（⑥ ワーク1 にレースのラップ）{% else %}（ステータス新バージョンYYYY_M月.xlsx）{% endif %}</h2>
+<h2>{{ label }}{% if kind == 'base' %}（①〜④と安井の照合に使う。安井は未指定でも ingest_in/base/・entries_in/ に該当日のCSVがあれば自動で使う）{% elif kind == 'lap' %}（⑥ ワーク1 にレースのラップ）{% else %}（ステータス新バージョンYYYY_M月.xlsx）{% endif %}</h2>
 <input type="file" name="{{ kind }}_files" multiple accept="{{ exts|join(',') }}">
 {% if listed[kind] %}<div class="muted" style="margin-top:4px">または ingest_in/{{ kind }}/ から選ぶ:</div><div class="cbs">
 {% for f in listed[kind] %}<label class="cb"><input type="checkbox" name="{{ kind }}_pick" value="{{ f }}" {{ 'checked' if f in q_pick[kind] else '' }}>{{ f }}</label>{% endfor %}</div>
@@ -291,6 +291,7 @@ JOB_BODY = """
 {% if results %}<table style="margin-top:8px"><thead><tr><th>取得元</th><th>結果</th><th>取得値あり / 行</th><th>ファイル</th></tr></thead><tbody>
 {% for r in results %}<tr><td>{{ r.label }}</td><td>{{ r.state }}</td><td class="num">{{ r.ratio }}</td><td class="num">{{ r.files }}</td></tr>{% endfor %}
 </tbody></table>{% endif %}
+{% for n in notes %}<div class="warn" style="margin-top:6px">{{ n }}</div>{% endfor %}
 <div style="margin-top:8px"><a href="{{ url_for('ingest.index') }}">入力に戻る</a> ／ <a href="{{ url_for('ingest.log_txt', run_id=run_id) }}">ログ全文</a>
 {% if files %} ／ <a href="{{ url_for('ingest.zip_all', run_id=run_id) }}">出力をまとめて ZIP</a>{% endif %}</div></div>
 <div class="card"><h1>ログ（最後の {{ tail|length }} 行）</h1><pre style="font-size:12px;white-space:pre-wrap">{{ tail|join('\n') }}</pre></div>
@@ -418,7 +419,7 @@ def make_blueprint(render) -> Blueprint:
             tail = list(j.lines)[-LOG_TAIL:]
         else:
             tail = log_path.read_text(encoding="utf-8").splitlines()[-LOG_TAIL:] if log_path.exists() else []
-        results = []
+        results, notes = [], []
         if j is not None:
             for name, r in j.results.items():
                 if isinstance(r, str):
@@ -426,11 +427,12 @@ def make_blueprint(render) -> Blueprint:
                 else:
                     results.append({"label": SOURCES[name].label, "state": "OK",
                                     "ratio": f"{r.matched}/{r.total}", "files": len(r.files)})
+                    notes += [f"{SOURCES[name].label}: {n}" for n in r.notes]
         running = j is not None and j.status == "running"
         files = [] if running else [f for f in _out_files(d) if f != "ingest.log"]
         return render("指数の取得", JOB_BODY, run_id=run_id, status=STATUS_LABELS[j.status] if j else past_status(d),
                       job_running=running, step=j.step if j else (0, 0), current=j.current if j else "",
-                      results=results, tail=tail, files=files)
+                      results=results, notes=notes, tail=tail, files=files)
 
     @bp.route("/job/<run_id>/cancel", methods=["POST"])
     def cancel(run_id):

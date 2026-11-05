@@ -19,7 +19,7 @@ docker_shisu_replace/
 │   └─ yasui/          安井サロン月別Excel（ステータス新バージョンYYYY_M月.xlsx）
 ├─ ingest_out/         [成果物] 指数取得（/ingest）の出力先（実行日時 YYYYMMDD_HHMMSS/ ごとに保存）
 ├─ shisu/              [コア] 共通Pythonパッケージ（正規化・偏差値・キー生成・分類・WEDGE・ingest群）
-├─ tests/              [検証] 自動テスト群（pytest：全223件）
+├─ tests/              [検証] 自動テスト群（pytest：全225件）
 ├─ replace_csv_ver3.py [Step 1] 過去CSVの正規化・偏差値化・素材（foragg_csv/）生成
 ├─ aggregate_stats_ver2.py [Step 2] オッズ4区分でのグループ集計・Jeffreysベイズ推定・WEDGE算出（agg_csv/）
 ├─ calc_entry_hensachi.py  [Step 3] 出馬表CSVの偏差値・順位・帯計算＆横結合（entries_out/）
@@ -417,8 +417,10 @@ docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu pyth
 --------------------------------------------------------------------------------
 3. 「指数の取得（/ingest 画面）」の使い方とファイル仕様
 --------------------------------------------------------------------------------
-これまで別々のDockerコンテナで動かしていた6つのシステムと安井サロンExcel抽出を、
+これまで別々のDockerコンテナで動かしていたシステム（Ω・吉馬・かよちん・keibaAI・ラップ）と安井サロンExcel抽出を、
 ブラウザ画面（ http://localhost:8000/ingest ）から一括実行する機能です。
+※⑤ 一隊（結果分析スピード指数）は、サイト側の仕様変更でスクレイピングできなくなったため廃止しました
+  （画面・CLIの選択肢から外しています。番号はこれまでどおり ⑥ ラップのままです）。
 
 (1) 入力ファイルは3つとも毎回アップロードする必要があるか？
 ------------------------------------------------------------------------
@@ -432,13 +434,20 @@ docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu pyth
   │ ② 吉馬6指数             │ ベースCSV                    │
   │ ③ かよちん指数          │ ベースCSV                    │
   │ ④ keibaAI指数           │ ベースCSV ＋ 開始ID・終了ID  │
-  │ ⑤ 一隊（スピード指数）  │ ベースCSV                    │
   │ ⑥ ラップ6指数（計算）   │ ラップCSV                    │
   │ 安井サロン Excel        │ 安井Excel（＋ベースCSV推奨） │
   └─────────────────────────┴──────────────────────────────┘
-  ※安井サロンExcelは、Excel単体でも抽出一覧（yasui_extract.csv）を作れますが、
-    「ベースCSV」も同時に渡すことで、レースID(新)が自動照合され、
-    TARGET取込用CSVや出馬表（entries_in）用CSVまで一気に生成されます。
+  ※安井サロンExcelは、吉馬6指数と同じく「8指数ごとのフォルダ」に日付別CSVを出力します
+    （yasui_rank / yasui_speed / yasui_stamina / yasui_power / yasui_konjo / yasui_kashikosa /
+      yasui_tairyoku / yasui_yaruki）。日付は「ファイル名の年・月」＋「シート名のMMDD」で決めます
+    （年またぎのシートや、2025年11月ファイルの 1029・1030 → 11/29・11/30 の読み替えも自動）。
+    ・ベースCSVを一緒に指定した場合：レースID(新)（18桁）を照合して、TARGET取込用の
+      YYYYMMDD_yasui_{指数}.csv（レースID(新), ワーク1）と {元ファイル名}_{指数}_merged.csv を出力。
+    ・ベースCSVを選び忘れた場合：ingest_in/base/ と entries_in/ に該当開催日のCSV（ベースCSVや
+      TARGETの出馬表CSV）があれば、自動でそこから18桁のレースID(新)を引き当てます。
+    ・どこにもベースCSVが無い開催日：レースID(新)の代わりに「日付, 場所, 場所コード, R, 馬番, 馬名, ワーク1」
+      の指数別・日付別CSVを出力し、画面とログに「TARGET取込用の18桁レースIDを付与するには
+      ベースCSVも一緒に指定してください」と案内します（このCSVはそのままではTARGETに取り込めません）。
 
   ★ヒント：毎回ブラウザからファイルを選択しなくても、Macの以下のフォルダにファイルを
             置いておけば、画面上にチェックボックスが出てクリックだけで選べます。
@@ -453,7 +462,7 @@ docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu pyth
 プログラムが必要な列名だけを自動で探し出し、TARGET取込用のファイルには
 「レースID(新), ワーク1」の2列だけを綺麗に切り出して出力します。
 
-  ■ ベースCSV（①〜⑤・安井の照合用）の必須列
+  ■ ベースCSV（①〜④・安井の照合用）の必須列
     ・必須：「レースID(新)」（18桁）、「枠番」、「馬番」
     ・任意：「日付S」、「ワーク1」
       ※「日付S」列が無い、または空欄でも、「レースID(新)」の先頭8桁から自動で日付を補完します。
@@ -484,18 +493,19 @@ docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu pyth
           │   └── 元ファイル名_merged.csv（マージ完全版）
           ├── kichiuma/
           │   └── kichiuma_{sp_ability, senkou, sp_trust, sp_control, sp_max, sueashi}/
+          │       ├── YYYYMMDD_kichiuma_*.csv     （TARGET取込用：レースID(新), ワーク1）
+          │       └── 元ファイル名_*_merged.csv   （マージ完全版。* は指数のキー）
           ├── kayochin/
           │   └── YYYYMMDD_kayochin.csv
           ├── keibaAI/
           │   └── YYYYMMDD_keibaAI.csv
-          ├── ittai/
-          │   └── YYYYMMDD_ittai.csv
           ├── lap/
           │   └── {2F, 1F, 4F, 33rap, rabbit_2F, rabbit_1F, pace}/
           └── yasui/
               ├── yasui_extract.csv      （全シートの抽出データ一覧）
               ├── yasui_{rank, speed, stamina, power, konjo, kashikosa, tairyoku, yaruki}/
-              │   └── YYYYMMDD_yasui_*.csv（TARGET取込用 8指数分）
+              │   ├── YYYYMMDD_yasui_*.csv（TARGET取込用 8指数分。ベースCSVが無い日は 日付・場所・R・馬番つき）
+              │   └── 元ファイル名_*_merged.csv（マージ完全版。ベースCSVがあるとき）
               └── entries_in/
                   └── yasui_YYYYMMDD.csv （出馬表 calc_entry_hensachi 投入用）
 ================================================================================

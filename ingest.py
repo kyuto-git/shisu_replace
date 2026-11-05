@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """外部指数の取得（スクレイピング・ラップ計算・安井Excel）を CLI でまとめて実行する。画面版は app.py の /ingest。
 
-  python ingest.py --sources omega,kichiuma,kayochin,ittai          # ベースCSV は ingest_in/base/*.csv
+  python ingest.py --sources omega,kichiuma,kayochin                # ベースCSV は ingest_in/base/*.csv
   python ingest.py --sources keibaai --keibaai-start 18952 --keibaai-end 18987
   python ingest.py --sources lap                                     # ラップCSV は ingest_in/lap/*.csv
   python ingest.py --sources yasui --yasui-to-entries                # 安井 Excel は ingest_in/yasui/*.xlsx
   python ingest.py --sources omega --base my_base.csv --interval 3
 
-取得元: omega ① Ω指数 / kichiuma ② 吉馬6指数 / kayochin ③ かよちん / keibaai ④ keibaAI / ittai ⑤ 一隊 /
-        lap ⑥ ラップ6指数 / yasui 安井サロン Excel
+取得元: omega ① Ω指数 / kichiuma ② 吉馬6指数 / kayochin ③ かよちん / keibaai ④ keibaAI /
+        lap ⑥ ラップ6指数 / yasui 安井サロン Excel（⑤ 一隊 ittai は廃止）
 出力: ingest_out/{実行日時}/{取得元}/...（TARGET 取込用の日付別2列CSV と マージ完全版。詳細は shisu/ingest/）
 アクセス間隔の既定: Ω・かよちん 3秒、ほかは2秒（1秒未満は1秒にする）。
 """

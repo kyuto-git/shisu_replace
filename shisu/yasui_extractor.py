@@ -21,13 +21,19 @@ Excel の形（2025年11月〜2026年2月の4ファイルで確認）:
   同値でも順位を分け、値の無い馬にも順位を付けるので、出馬表側で丸数字を使うと過去側と順位がずれる
   （4ファイルでステータスごとに約1,400〜4,000頭がずれた）。出馬表側も値から計算して両側をそろえる。
 
-出力（shisu.ingest から使う）:
-  yasui/yasui_extract.csv                      取り出した全行（1頭1行。照合できた行は レースID(新) 付き）
-  yasui/yasui_{key}/{YYYYMMDD}_yasui_{key}.csv TARGET 取込用（ベースCSVと 日付・場所・R・馬番 で照合）
-  yasui/yasui_{key}/{元ファイル名}_merged.csv  マージ完全版
-  yasui/entries_in/yasui_{YYYYMMDD}.csv        出馬表（entries_in/）にそのまま置ける形
-                                                （レースID(新)・安井_馬名・8指数の値。calc_entry_hensachi --merge-* で
-                                                 TARGET の出馬表と レースID(新) で横に結合される）
+出力（shisu.ingest から使う。吉馬6指数と同じく8指数ごとのフォルダ）:
+  yasui/yasui_{key}/{YYYYMMDD}_yasui_{key}.csv     TARGET 取込用（レースID(新), ワーク1 の2列・cp932）
+  yasui/yasui_{key}/{元ファイル名}_{key}_merged.csv マージ完全版（ベースCSVの全列。ワーク1 にその指数）
+      key = rank, speed, stamina, power, konjo, kashikosa, tairyoku, yaruki
+  yasui/yasui_extract.csv                          取り出した全行（1頭1行。照合できた行は レースID(新) 付き）
+  yasui/entries_in/yasui_{YYYYMMDD}.csv            出馬表（entries_in/）にそのまま置ける形
+                                                    （レースID(新)・安井_馬名・8指数の値。calc_entry_hensachi --merge-* で
+                                                     TARGET の出馬表と レースID(新) で横に結合される）
+  レースID(新)（18桁）は Excel に無い（回・日が分からない）ので、ベースCSVと 日付・場所・R・馬番 で照合して付ける。
+  ベースCSVの指定が無い開催日は、search_dirs（ingest では ingest_in/base/ と entries_in/）の CSV から
+  その日の行を探して使う。どこにも無い開催日は、TARGET 取込用の代わりに
+  yasui_{key}/{YYYYMMDD}_yasui_{key}.csv を「日付, 場所, 場所コード, R, 馬番, 馬名, ワーク1」で出し、
+  ベースCSVも指定するよう案内する（このファイルは レースID(新) が無いので TARGET にはそのまま取り込めない）。
 """
 from __future__ import annotations
 
@@ -41,8 +47,8 @@ from typing import Iterable
 import pandas as pd
 
 from .csvio import norm_text, write_csv
-from .ingest.common import (DATE, PLACE_CODES, RID, Logger, Outputs, default_log, int_text, key14, lookup,
-                            series_of, write_outputs)
+from .ingest.common import (DATE, PLACE_CODES, RID, SOURCE_FILE, WORK, Logger, Outputs, default_log,
+                            find_base_files, int_text, key14, lookup, read_base, series_of, write_outputs)
 
 NAME = "yasui"
 LABEL = "安井サロン Excel"
@@ -252,42 +258,114 @@ def extract(paths: Iterable[Path | str], log: Logger = default_log) -> pd.DataFr
     return df.reset_index(drop=True)
 
 
+NO_BASE_COLUMNS = ["日付", "場所", "場所コード", "R", "馬番", "馬名", WORK]
+NO_BASE_GUIDE = ("TARGET取込用の18桁レースID(新)を付与するにはベースCSVも一緒に指定してください"
+                 "（または ingest_in/base/・entries_in/ に該当日のCSVを置いてください）")
+
+
 def run(paths: Iterable[Path | str], base: pd.DataFrame | None, out_dir: Path, log: Logger = default_log,
-        entries_dir: Path | None = None) -> Outputs:
-    """取り出して、ベースCSVがあれば照合して TARGET 用・出馬表用も書く。"""
+        entries_dir: Path | None = None, search_dirs: Iterable[Path | str] = (),
+        exclude_paths: Iterable[Path | str] = ()) -> Outputs:
+    """取り出して、8指数ごとのフォルダに日付別CSV（とマージ完全版）を書く。
+
+    base: 指定されたベースCSV（read_base の結果。無ければ None）
+    search_dirs: base に無い開催日のベースCSVを探すフォルダ。exclude_paths は指定済みのベースCSV（二重に読まない）
+    """
     out_dir = Path(out_dir)
     df = extract(paths, log)
     res = Outputs(total=len(df))
     if df.empty:
         log(f"[WARN] {LABEL}: 取り出せた行がありません")
         return res
-    has_base = base is not None and not base.empty
-    if has_base:
-        bkey = base[RID].map(key14)
-        rid_of = dict(zip(bkey[bkey != ""], base.loc[bkey != "", RID]))
+    days = set(df["日付"])
+    base = complete_base(base, days, search_dirs, exclude_paths, log)
+    bkeys = base[RID].map(key14)
+    if not base.empty:
+        rid_of = dict(zip(bkeys[bkeys != ""], base.loc[bkeys != "", RID]))
         df[RID] = df["_key"].map(lambda k: rid_of.get(k, "")).astype(object)
         res.matched = int((df[RID] != "").sum())
         log(f"[INFO] {LABEL}: ベースCSVと照合できた馬 {res.matched}/{len(df)}")
-        _check_consistency(df, base, bkey, log)
+        _check_consistency(df, base, bkeys, log)
     path = out_dir / "yasui_extract.csv"
     write_csv(df[extract_columns()], path)
     res.files.append(path)
-    if not has_base:
-        log(f"[WARN] {LABEL}: ベースCSVが無いので、TARGET 取込用・出馬表用の CSV は作りません（取り出した表だけ）")
-        return res
+
+    base_days = days & set(base.loc[base[RID].str.len() == 18, DATE]) if not base.empty else set()
+    no_base_days = sorted(days - base_days)
     by_key = df.set_index("_key")
-    bkeys = base[RID].map(key14)
     values: dict[str, pd.Series] = {}
     for key, _label, name in INDICATORS:
-        mapping = {k: v for k, v in by_key[name].items() if k and v != ""}
-        values[name] = lookup(bkeys, mapping)
-        res.files += write_outputs(base, values[name], out_dir / f"yasui_{key}", f"yasui_{key}", log).files
-    names = lookup(bkeys, {k: v for k, v in by_key["馬名"].items() if k})
-    days = set(df.loc[df[RID] != "", "日付"])
-    res.files += write_entries(base, values, names, days, out_dir / "entries_in", log)
-    if entries_dir is not None:
-        res.files += write_entries(base, values, names, days, Path(entries_dir), log)
+        folder = out_dir / f"yasui_{key}"
+        if base_days:
+            mapping = {k: v for k, v in by_key[name].items() if k and v != ""}
+            values[name] = lookup(bkeys, mapping)
+            res.files += write_outputs(base, values[name], folder, f"yasui_{key}", log,
+                                       merged_suffix=key, dates=base_days).files
+        for day in no_base_days:
+            res.files.append(_write_no_base(df[df["日付"] == day], name, folder / f"{day}_yasui_{key}.csv"))
+    if no_base_days:
+        msg = (f"ベースCSVが見つからない開催日 {_fmt_days(no_base_days)} は、レースID(新) の無い指数別CSV"
+               f"（日付・場所・R・馬番）だけを出しました。{NO_BASE_GUIDE}")
+        log(f"[WARN] {LABEL}: {msg}")
+        res.notes.append(msg)
+    unmatched = df[(df[RID] == "") & df["日付"].isin(base_days)]
+    if len(unmatched):
+        where = ", ".join(f"{d} {p}" for d, p in sorted(set(zip(unmatched["日付"], unmatched["場所"]))))
+        msg = (f"ベースCSVはあるが照合できなかった馬 {len(unmatched)} 頭（{where}）は TARGET 取込用CSVに入りません。"
+               "その開催日・場所の行がベースCSVにあるか確かめてください")
+        log(f"[WARN] {LABEL}: {msg}")
+        res.notes.append(msg)
+    if base_days:
+        names = lookup(bkeys, {k: v for k, v in by_key["馬名"].items() if k})
+        matched_days = set(df.loc[df[RID] != "", "日付"])
+        res.files += write_entries(base, values, names, matched_days, out_dir / "entries_in", log)
+        if entries_dir is not None:
+            res.files += write_entries(base, values, names, matched_days, Path(entries_dir), log)
     return res
+
+
+def complete_base(base: pd.DataFrame | None, days: set[str], search_dirs: Iterable[Path | str],
+                  exclude_paths: Iterable[Path | str], log: Logger = default_log) -> pd.DataFrame:
+    """指定されたベースCSVに無い開催日を、search_dirs の CSV から補う（ファイルの順に、まだ無い日の行だけ使う）。"""
+    if base is None or base.empty:
+        base = pd.DataFrame(columns=[RID, DATE, WORK, SOURCE_FILE])
+    have = set(base.loc[base[RID].astype(str).str.len() == 18, DATE])
+    missing = set(days) - have
+    if not missing:
+        return base
+    files = find_base_files(search_dirs, exclude_paths)
+    parts, used = [], []
+    taken = set(base[SOURCE_FILE]) if SOURCE_FILE in base.columns else set()
+    for f in files:
+        if not missing:
+            break
+        part = read_base([f], lambda m: None, taken=taken, dates=missing)
+        if part.empty:
+            continue
+        got = set(part[DATE])
+        parts.append(part)
+        taken |= set(part[SOURCE_FILE])
+        used.append(f"{f.parent.name}/{f.name}（{_fmt_days(sorted(got))}）")
+        missing -= got
+    if not parts:
+        return base
+    log(f"[INFO] {LABEL}: ベースCSVの指定が無い開催日を、次のファイルから補いました: {', '.join(used)}")
+    return pd.concat([base] + parts, ignore_index=True)
+
+
+def _fmt_days(days) -> str:
+    days = sorted(days)
+    return ", ".join(days) if len(days) <= 6 else f"{', '.join(days[:6])} ほか {len(days) - 6} 日"
+
+
+def _write_no_base(g: pd.DataFrame, name: str, path: Path) -> Path:
+    """ベースCSVの無い開催日の指数別CSV（レースID(新) の代わりに 日付・場所・R・馬番）。"""
+    out = pd.DataFrame({"日付": g["日付"], "場所": g["場所"], "場所コード": g["場所コード"], "R": g["R"],
+                        "馬番": g["馬番"], "馬名": g["馬名"], WORK: g[name]})
+    order = out.assign(_r=pd.to_numeric(out["R"], errors="coerce"), _u=pd.to_numeric(out["馬番"], errors="coerce"))
+    out = out.loc[order.sort_values(["場所コード", "場所", "_r", "_u"], kind="stable").index]
+    write_csv(out[NO_BASE_COLUMNS], path)
+    return path
 
 
 def entries_columns() -> list[str]:

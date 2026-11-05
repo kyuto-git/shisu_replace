@@ -8,7 +8,7 @@
   /entries/key   結合データの前方一致で unified_all を表示
   /entries/hits  条件ヒット馬（絶対軸・軸候補・消し候補・相手候補）
   /entries/wedge レース別 WEDGE 一覧（全馬 × 該当する全キーの WEDGE / adjusted_WEDGE。閾値で足切りしない）
-  /ingest        指数の取得（Ω・吉馬・かよちん・keibaAI・一隊のスクレイピング、ラップ計算、安井Excel。shisu/ingest/web.py）
+  /ingest        指数の取得（Ω・吉馬・かよちん・keibaAI のスクレイピング、ラップ計算、安井Excel。shisu/ingest/web.py）
   /healthz       DB 接続確認
 
 条件ヒット馬は entries_xjoin_*（build_db が事前計算した照合結果）があればそれを読み、

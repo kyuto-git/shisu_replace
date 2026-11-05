@@ -1,12 +1,12 @@
-"""外部指数の取得をまとめて実行する（旧: 別々の Docker コンテナだった6システム＋安井Excel）。
+"""外部指数の取得をまとめて実行する（旧: 別々の Docker コンテナだったシステム＋安井Excel）。
 
   omega     ① Ω指数（競馬ラボ）            ベースCSV → omega/{YYYYMMDD}_omega.csv
   kichiuma  ② 吉馬6指数                    ベースCSV → kichiuma/kichiuma_{key}/{YYYYMMDD}_kichiuma_{key}.csv
   kayochin  ③ かよちん指数                 ベースCSV → kayochin/{YYYYMMDD}_kayochin.csv
   keibaai   ④ keibaAI指数（開始〜終了ID）  ベースCSV → keibaAI/{YYYYMMDD}_keibaAI.csv
-  ittai     ⑤ 一隊（結果分析スピード指数） ベースCSV → ittai/{YYYYMMDD}_ittai.csv
   lap       ⑥ ラップ6指数（手元で計算）    ラップCSV → lap/{2F,1F,4F,33rap,rabbit_2F,rabbit_1F,pace}/...
-  yasui     安井サロン Excel               Excel（＋ベースCSV）→ yasui/...
+  yasui     安井サロン Excel               Excel（＋ベースCSV）→ yasui/yasui_{key}/{YYYYMMDD}_yasui_{key}.csv
+（⑤ 一隊 ittai はサイト側の仕様変更で取得できなくなったため廃止。番号は旧来のまま ⑥ ラップを残す）
 
 画面（app.py の /ingest）と CLI（ingest.py）はどちらも run_ingest() を呼ぶ。
 1つの取得元で失敗しても、残りの取得元は続ける（中止ボタンのときだけ全体を止める）。
@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .. import config
 from .common import Cancelled, Fetcher, Logger, Outputs, default_log, read_base
 
 MIN_INTERVAL = 1.0      # スクレイピングのアクセス間隔の下限（秒）
@@ -39,11 +40,12 @@ SOURCES: dict[str, SourceInfo] = {s.name: s for s in (
     SourceInfo("kichiuma", "② 吉馬6指数", "kichiuma", True, 2.0),
     SourceInfo("kayochin", "③ かよちん指数", "kayochin", True, 3.0),
     SourceInfo("keibaai", "④ keibaAI指数（連番ID）", "keibaAI", True, 2.0),
-    SourceInfo("ittai", "⑤ 一隊（結果分析スピード指数）", "ittai", True, 2.0),
     SourceInfo("lap", "⑥ ラップ6指数（計算のみ）", "lap", False, needs="lap"),
     SourceInfo("yasui", "安井サロン Excel", "yasui", False, needs="yasui"),
 )}
 ORDER = tuple(SOURCES)
+# 廃止した取得元（--sources に書かれたら理由を添えて断る）
+DISCONTINUED = {"ittai": "⑤ 一隊（結果分析スピード指数）はサイト側の仕様変更で取得できなくなったため廃止しました"}
 
 
 @dataclass
@@ -64,7 +66,10 @@ class IngestRequest:
 
 def validate(req: IngestRequest) -> list[str]:
     errors = []
-    unknown = [s for s in req.sources if s not in SOURCES]
+    for s in req.sources:
+        if s in DISCONTINUED:
+            errors.append(DISCONTINUED[s])
+    unknown = [s for s in req.sources if s not in SOURCES and s not in DISCONTINUED]
     if unknown:
         errors.append(f"知らない取得元: {unknown}（使えるのは {list(ORDER)}）")
     if not req.sources:
@@ -95,7 +100,7 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
                sleep: Callable[[float], None] = time.sleep,
                on_source: Callable[[str, int, int], None] | None = None) -> dict[str, Outputs | str]:
     """選んだ取得元を順に実行する。戻り値: 取得元 → Outputs（失敗は 'ERROR: …'、中止は 'CANCELLED'）。"""
-    from . import ittai, kayochin, keibaai, kichiuma, lap, omega
+    from . import kayochin, keibaai, kichiuma, lap, omega
     from .. import yasui_extractor
 
     errors = validate(req)
@@ -128,12 +133,13 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
                 res = kayochin.run(base, fetcher, dest, log)
             elif name == "keibaai":
                 res = keibaai.run(base, fetcher, dest, req.keibaai_start, req.keibaai_end, log)
-            elif name == "ittai":
-                res = ittai.run(base, fetcher, dest, log)
             elif name == "lap":
                 res = lap.run(req.lap_paths, dest, log)
             else:
-                res = yasui_extractor.run(req.yasui_paths, base, dest, log, entries_dir=req.yasui_entries_dir)
+                # ベースCSVの指定が無い開催日は ingest_in/base/ と entries_in/ の CSV から探す
+                res = yasui_extractor.run(req.yasui_paths, base, dest, log, entries_dir=req.yasui_entries_dir,
+                                          search_dirs=(config.ingest_in_dir() / "base", config.entries_in_dir()),
+                                          exclude_paths=req.base_paths)
             results[name] = res
             log(f"[DONE] {info.label}: {len(res.files)} ファイル")
         except Cancelled:

@@ -94,13 +94,16 @@ def ymd_text(v) -> str:
 # ---------------------------------------------------------------------------
 # ベースCSV
 # ---------------------------------------------------------------------------
-def read_base(paths: Iterable[Path | str], log: Logger = default_log) -> pd.DataFrame:
+def read_base(paths: Iterable[Path | str], log: Logger = default_log, taken: Iterable[str] = (),
+              dates: set[str] | None = None, label: str = "ベースCSV") -> pd.DataFrame:
     """ベースCSV（複数可）を縦に結合する。列は文字列のまま。各行に _source_file（元ファイル名）を付ける。
 
     レースID(新) は数字だけにそろえる。日付S が無い・空欄の行は レースID(新) の先頭8桁で補う。
+    taken: すでに使っている _source_file の名前（別に読んだベースと名前が重ならないようにする）
+    dates: 指定すると、その日付の行だけ残す（自動で探したベースCSVで使う）
     """
     frames = []
-    keys: set[str] = set()
+    keys: set[str] = {_out_key(t) for t in taken}
     for p in paths:
         p = Path(p)
         df = read_table(p, RID, log)
@@ -117,6 +120,10 @@ def read_base(paths: Iterable[Path | str], log: Logger = default_log) -> pd.Data
         df[DATE] = date.where(date != "", df[RID].str.slice(0, 8))
         if WORK not in df.columns:
             df[WORK] = ""
+        if dates is not None:
+            df = df[df[DATE].isin(dates) & (df[RID].str.len() == 18)]
+            if df.empty:
+                continue
         name, n = p.name, 1
         # 同じ名前の別ファイル（別フォルダ・アップロード）はマージ完全版を分ける。出力名（{stem}_merged.csv）で比べ、
         # 大文字・小文字だけ違う名前（base.csv と base.CSV。macOS では同じファイル名）も別にする
@@ -126,10 +133,35 @@ def read_base(paths: Iterable[Path | str], log: Logger = default_log) -> pd.Data
         keys.add(_out_key(name))
         df[SOURCE_FILE] = name
         frames.append(df)
-        log(f"[INFO] ベースCSV {p.name}: {len(df)} 行")
+        log(f"[INFO] {label} {p.name}: {len(df)} 行")
     if not frames:
         return pd.DataFrame(columns=[RID, DATE, WORK, SOURCE_FILE])
     return pd.concat(frames, ignore_index=True)
+
+
+def find_base_files(dirs: Iterable[Path | str], exclude: Iterable[Path | str] = ()) -> list[Path]:
+    """フォルダ直下の *.csv（ベースCSVの候補）。exclude と同じファイル・このプログラムが出した yasui_*.csv は除く。"""
+    skip = set()
+    for p in exclude:
+        try:
+            skip.add(Path(p).resolve())
+        except OSError:
+            pass
+    out: list[Path] = []
+    for d in dirs:
+        d = Path(d)
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob("*")):
+            if not p.is_file() or p.suffix.lower() != ".csv" or p.name.lower().startswith("yasui_"):
+                continue
+            try:
+                p.name.encode("utf-8")
+            except UnicodeEncodeError:
+                continue
+            if p.resolve() not in skip:
+                out.append(p)
+    return out
 
 
 def _out_key(name: str) -> str:
@@ -180,19 +212,25 @@ class Outputs:
     files: list[Path] = field(default_factory=list)
     matched: int = 0
     total: int = 0
+    notes: list[str] = field(default_factory=list)      # 画面のジョブ結果に出す案内
 
     def extend(self, other: "Outputs") -> None:
         self.files += other.files
         self.matched += other.matched
         self.total += other.total
+        self.notes += other.notes
 
 
 def write_outputs(base: pd.DataFrame, values: pd.Series, out_dir: Path, name: str,
-                  log: Logger = default_log, merged: bool = True) -> Outputs:
+                  log: Logger = default_log, merged: bool = True, merged_suffix: str = "",
+                  dates: set[str] | None = None) -> Outputs:
     """(a) マージ完全版（元ファイルごと）と (b) TARGET 取込用（日付S ごとの2列）を書く。
 
     values はベースと同じ index の文字列（取れなかった行は ''）。
+    (a) の名前は {元ファイル名}_merged.csv。merged_suffix を渡すと {元ファイル名}_{merged_suffix}_merged.csv
+        （吉馬・安井のように1つのベースから指数ごとに出すとき）
     (b) は同じ レースID(新) が複数あれば、値のある行を優先して1行にする（複数のベースCSVが重なっても重複しない）。
+        dates を渡すとその日付だけ書く（安井: Excel に無い日の空のファイルを作らない）。
     """
     out_dir = Path(out_dir)
     res = Outputs(total=len(base), matched=int((values != "").sum()))
@@ -200,7 +238,8 @@ def write_outputs(base: pd.DataFrame, values: pd.Series, out_dir: Path, name: st
     full[WORK] = values.reindex(full.index).fillna("")
     if merged:
         for src, g in full.groupby(SOURCE_FILE, sort=True):
-            path = out_dir / f"{Path(str(src)).stem}_merged.csv"
+            stem = Path(str(src)).stem + (f"_{merged_suffix}" if merged_suffix else "")
+            path = out_dir / f"{stem}_merged.csv"
             write_csv(g.drop(columns=[SOURCE_FILE]), path)
             res.files.append(path)
     small = full[[DATE, RID, WORK]].copy()
@@ -208,7 +247,7 @@ def write_outputs(base: pd.DataFrame, values: pd.Series, out_dir: Path, name: st
     small["_has"] = small[WORK] != ""
     small = small.sort_values("_has", ascending=False, kind="stable").drop_duplicates(subset=[RID], keep="first")
     for day, g in small.groupby(DATE, sort=True):
-        if not day:
+        if not day or (dates is not None and day not in dates):
             continue
         g = g.sort_index()
         path = out_dir / f"{day}_{name}.csv"
@@ -284,7 +323,7 @@ _SJIS_NAMES = {"shift_jis", "shift-jis", "sjis", "windows-31j", "cp932", "ms932"
 
 def _decode(r, fallback: str | None) -> str:
     """応答の本文を文字列に。HTTP ヘッダの charset があればそれ（Shift_JIS 系は cp932 で読む）、
-    無ければ fallback（一隊の cp932 など）、それも無ければ文字コードの推定（requests の apparent_encoding）。"""
+    無ければ fallback（Shift-JIS のページなら cp932 など）、それも無ければ文字コードの推定（requests の apparent_encoding）。"""
     content = getattr(r, "content", None)
     if content is None:
         return getattr(r, "text", "") or ""

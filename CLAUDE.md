@@ -1,6 +1,6 @@
 # CLAUDE.md — shisu_replace（競馬 外部指数の集計・照合システム）
 
-最終更新: 2026-11-05（Phase 1〜3 に加え、WEDGE の年度加重の変更・レース別 WEDGE 一覧・レース単位IDの修正・外部指数の取得の統合（/ingest）・安井サロン Excel を反映）
+最終更新: 2026-11-05（Phase 1〜3 に加え、WEDGE の年度加重の変更・レース別 WEDGE 一覧・レース単位IDの修正・外部指数の取得の統合（/ingest）・安井サロン Excel・一隊の廃止・安井の指数別出力を反映）
 
 ## この文書の扱い
 
@@ -18,7 +18,7 @@ TARGET frontier JV で出力した「過去レース×外部指数」CSVを、�
 当日の「出馬表×外部指数」CSVの各馬について同じ規則でキーを組み立てて成績表と突き合わせ、Flask UI で「絶対軸／軸候補／消し候補／相手候補」を表示する。
 成績表には合成指標 WEDGE（決定力 WIN ＋ 市場の期待を超える力 EDGE）と、その年度加重 adjusted_WEDGE（年10件以上の年すべて・最大10年・新しい年ほど重い指数減衰）も持たせ、「今まさに旬の指数条件」を横断検索で並べたり、1レースの全馬で見比べたりできる（§6.2、`/entries/wedge`）。
 
-外部指数の取得（旧: 別リポジトリの6システム `docker-keiba-omega` / `docker-kichiuma-scraping` / `docker-kayochin-get` / `docker-keibaAI-scraping` / `docker-ittai-scraper` / `lastXF-calculate`）と安井サロンの Excel 抽出は `shisu/ingest/`・`shisu/yasui_extractor.py` に統合した。画面 `/ingest`（または `ingest.py`）で TARGET のベースCSVを1回渡せば、選んだ取得元をまとめて実行し、TARGET 取込用の日付別CSVを作る（§3.6・§3.7）。新しい指数は `shisu/indicators.py` の台帳に1行足して取り込む。
+外部指数の取得（旧: 別リポジトリの6システム `docker-keiba-omega` / `docker-kichiuma-scraping` / `docker-kayochin-get` / `docker-keibaAI-scraping` / `docker-ittai-scraper` / `lastXF-calculate`）と安井サロンの Excel 抽出は `shisu/ingest/`・`shisu/yasui_extractor.py` に統合した（一隊はサイト側の仕様変更で取得できなくなったため 2026-11-05 に廃止）。画面 `/ingest`（または `ingest.py`）で TARGET のベースCSVを1回渡せば、選んだ取得元をまとめて実行し、TARGET 取込用の日付別CSVを作る（§3.6・§3.7）。新しい指数は `shisu/indicators.py` の台帳に1行足して取り込む。
 
 ---
 
@@ -43,7 +43,7 @@ shisu_replace/
 ├─ master_csv/  正規化済み 1頭1行（.csv.gz。WEDGE・組合せ分析用）
 ├─ replace_csv/ processed_*（結合データ確認・TARGET 取込用。--processed のときだけ）
 ├─ ingest_in/   指数取得の入力: base/（ベースCSV）, lap/（ラップCSV）, yasui/（安井 Excel）, uploads/（画面からのアップロード）
-└─ ingest_out/  指数取得の出力（実行ごと: ingest_out/YYYYMMDD_HHMMSS/{omega,kichiuma,kayochin,keibaAI,ittai,lap,yasui}/）
+└─ ingest_out/  指数取得の出力（実行ごと: ingest_out/YYYYMMDD_HHMMSS/{omega,kichiuma,kayochin,keibaAI,lap,yasui}/）
 ```
 
 ### 1.2 前工程（手作業。Readme.txt 冒頭）
@@ -83,12 +83,12 @@ entries_in/*.csv
 
 [D] 外部指数の取得（ingest.py / /ingest）
 ベースCSV（TARGET: レースID(新), 日付S, 枠番, 馬番, ワーク1）
-  └─ ①Ω ②吉馬6 ③かよちん ④keibaAI ⑤一隊（スクレイピング）
+  └─ ①Ω ②吉馬6 ③かよちん ④keibaAI（スクレイピング。⑤一隊は廃止）
 ラップCSV（TARGET: ワーク1 にレースのラップ）
   └─ ⑥ラップ6指数（手元で計算）
 安井 Excel（ステータス新バージョンYYYY_M月.xlsx）＋ベースCSV
-  └─ 安井_ランク〜安井_やる気 の8指数
-  ─> ingest_out/{実行日時}/{取得元}/{YYYYMMDD}_{名前}.csv（TARGET 取込用2列）, {元名}_merged.csv（マージ完全版）
+  └─ 安井_ランク〜安井_やる気 の8指数（指数ごとのフォルダ。ベースCSVは未指定でも ingest_in/base/・entries_in/ から該当日を探す）
+  ─> ingest_out/{実行日時}/{取得元}/{YYYYMMDD}_{名前}.csv（TARGET 取込用2列）, {元名}_merged.csv（マージ完全版。吉馬・安井は {元名}_{key}_merged.csv）
      （TARGET に取り込んで過去レースCSV・出馬表CSVを出し直す → [A][B] へ。安井は entries_in/ に直接置ける形も出す）
 ```
 
@@ -103,7 +103,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
 docker run --rm -p 8000:8000 -v "$(pwd)":/app csv_processor_shisu python app.py
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 # 外部指数の取得（画面なら http://localhost:8000/ingest）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources omega,kichiuma,kayochin,ittai
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources omega,kichiuma,kayochin
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources keibaai --keibaai-start 18952 --keibaai-end 18987
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources lap,yasui --yasui-to-entries
 ```
@@ -140,7 +140,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 | `classify.py` | 条件ヒット馬の分類（Python 版と SQL 版。両者の一致はテストで確認） |
 | `matching.py` | 出馬表1頭 × unified_all の完全一致照合（xjoin 構築と画面のその場照合で共通） |
 | `wedge.py` | WIN・EDGE・WEDGE・年度加重 adjusted_WEDGE（成績表用のベクトル版 `wedge_columns` と、照合用の素直な1グループ版） |
-| `ingest/` | 外部指数の取得。`common.py`（ベースCSV・照合キー・出力・アクセス間隔つき HTTP）、`omega.py` `kichiuma.py` `kayochin.py` `keibaai.py` `ittai.py`（スクレイピング）、`lap.py`（ラップ6指数）、`__init__.py`（まとめて実行 `run_ingest`）、`web.py`（/ingest 画面） |
+| `ingest/` | 外部指数の取得。`common.py`（ベースCSV・照合キー・出力・アクセス間隔つき HTTP）、`omega.py` `kichiuma.py` `kayochin.py` `keibaai.py`（スクレイピング）、`lap.py`（ラップ6指数）、`__init__.py`（まとめて実行 `run_ingest`）、`web.py`（/ingest 画面） |
 | `yasui_extractor.py` | 安井サロンの月別 Excel から8指数を取り出す（§3.7・§4.7） |
 
 ---
@@ -211,22 +211,22 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 
 ### 3.6 ingest.py ／ /ingest（外部指数の取得。`shisu/ingest/`）
 
-旧来の別コンテナ6システムを統合したもの。ベースCSVを1回渡して、選んだ取得元を順に実行する（1つ失敗しても残りは続ける）。
+旧来の別コンテナのシステムを統合したもの。ベースCSVを1回渡して、選んだ取得元を順に実行する（1つ失敗しても残りは続ける）。
+**⑤ 一隊（ittai）は 2026-11-05 に廃止**（サイト側の仕様変更でスクレイピングできなくなった）。画面・CLI の選択肢から外し、`--sources ittai` は理由を添えて断る（終了コード2）。番号は旧来のまま（⑥ ラップ）。
 
 | 取得元 | 入力 | 取りに行く先・1回の単位 | 照合キー | 出力（`ingest_out/{実行日時}/`） |
 |---|---|---|---|---|
 | omega ① Ω指数 | ベースCSV | `keibalab.jp/db/race/{rid12}/syutsuba.html`（1レース。rid12 = 11〜14桁目と17〜18桁目を除いた12桁） | rid12 + 枠番 + 馬番 | `omega/{YYYYMMDD}_omega.csv` |
-| kichiuma ② 吉馬6指数 | ベースCSV | `kichiuma.net/php/search.php?race_id=…&p=fp`（1レース。場所コード1桁目 0→7・1→8） | 11〜14桁目を除いた14桁 | `kichiuma/kichiuma_{sp_ability,senkou,sp_trust,sp_control,sp_max,sueashi}/{YYYYMMDD}_kichiuma_{key}.csv` |
+| kichiuma ② 吉馬6指数 | ベースCSV | `kichiuma.net/php/search.php?race_id=…&p=fp`（1レース。場所コード1桁目 0→7・1→8） | 11〜14桁目を除いた14桁 | `kichiuma/kichiuma_{sp_ability,senkou,sp_trust,sp_control,sp_max,sueashi}/{YYYYMMDD}_kichiuma_{key}.csv` と `{元名}_{key}_merged.csv` |
 | kayochin ③ かよちん | ベースCSV | `kayochinkeiba.com/{YYMMDD}{場所英名}/`（開催日×場所。中京=cyuukyo・京都=kyouto） | (YYMMDD+場所, R, 馬番) | `kayochin/{YYYYMMDD}_kayochin.csv` |
 | keibaai ④ keibaAI | ベースCSV＋開始ID・終了ID | `muryou-keiba-ai.jp/predict/2021/01/06/{連番}/`（1連番。日付・場所・R はページの meta description / title） | 14桁 | `keibaAI/{YYYYMMDD}_keibaAI.csv` |
-| ittai ⑤ 一隊 | ベースCSV | `ittai.net/RK/race_index.php?type=result&id={先頭16桁}&mode=1`（1レース。Shift-JIS） | 16桁 + 馬番2桁（18桁の完全一致） | `ittai/{YYYYMMDD}_ittai.csv` |
 | lap ⑥ ラップ6指数 | ラップCSV | なし（手元で計算） | — | `lap/{2F,1F,4F,33rap,rabbit_2F,rabbit_1F}/{日付S}_{名前}.csv`, `lap/pace/{実行日}_pace_of_racecoment.csv` |
 | yasui 安井 Excel | Excel（＋ベースCSV） | なし | 日付 + 場所コード + R + 馬番（14桁） | §3.7 |
 
-- 出力は各取得元で共通: (a) マージ完全版 `{元ファイル名}_merged.csv`（ベースCSVの全列。ワーク1 は取得値だけ。取れなければ空欄）、(b) TARGET 取込用 `{YYYYMMDD}_{名前}.csv`（日付S ごとに `レースID(新), ワーク1` の2列・cp932。同じ レースID(新) は値のある行を優先して1行。旧 dedupe_keibaAI.py の処理も含む）
+- 出力は各取得元で共通: (a) マージ完全版 `{元ファイル名}_merged.csv`（ベースCSVの全列。ワーク1 は取得値だけ。取れなければ空欄。指数ごとにフォルダを分ける吉馬・安井は `{元ファイル名}_{key}_merged.csv`。旧 kichiuma と同じ名前）、(b) TARGET 取込用 `{YYYYMMDD}_{名前}.csv`（日付S ごとに `レースID(新), ワーク1` の2列・cp932。同じ レースID(新) は値のある行を優先して1行。旧 dedupe_keibaAI.py の処理も含む）
 - 値はベースの1行ごとに辞書で引く（DataFrame の merge はしない）。ページに同じ馬が2回出てもベースの行は増えない
 - ⑥ の計算・丸め・列名・ファイル名は旧 process_csv.py と同じ（同梱サンプル 20261017racerap.csv の79ファイルがバイト単位で一致することを確認済み）。違いは、ラップが数として読めない行を空欄にして続けること
-- 旧版からの意図的な違い: かよちんは馬番の行と指数の行のセルを位置で対にする（旧版は空のセルを詰めてから対にしていたので、途中に空欄があると馬番と値がずれた）。一隊のページは cp932（Shift-JIS の上位互換）で読む。ベースCSVの ワーク1 に元から入っていた値は使わない
+- 旧版からの意図的な違い: かよちんは馬番の行と指数の行のセルを位置で対にする（旧版は空のセルを詰めてから対にしていたので、途中に空欄があると馬番と値がずれた）。ベースCSVの ワーク1 に元から入っていた値は使わない
 - アクセス: 前回のアクセス開始から間隔をあける（既定 Ω・かよちん 3秒、ほか2秒。1秒未満にはできない）。失敗は2回まで間隔を伸ばしてやり直す。404 はやり直さない。User-Agent は `shisu-ingest/1.0`
 - 画面 `/ingest`: 取得元のチェック、keibaAI の開始ID・終了ID、取得元ごとの間隔、入力（アップロード、または `ingest_in/{base,lap,yasui}/` に置いたファイルを選ぶ）→ 実行。裏のスレッドで動き、ジョブ画面に進み具合・ログ（2秒ごとに再読込）・中止ボタン、終わったら出力の一覧（1本ずつ・ZIP でダウンロード）。ログは `ingest_out/{実行日時}/ingest.log`、アップロードは `ingest_in/uploads/{実行日時}/`
   - 同時に動かすのは1件だけ。「実行中か」の確認と実行IDの予約を同じロックの中で行う（同じ秒に2回押しても2件目は 409、ID も重ならない）。入力エラーで受け付けなかったときは予約を外し、保存したアップロードを消してからエラー画面を出す（実行ボタンは押せるまま）
@@ -247,11 +247,15 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
   - ファイル名から年が読めないシートは使わない（macOS の濁点分離・アップロード名の文字化けがあっても `2025_11` の部分が残っていれば読める）
 - 取り出す値: ランク・体力・やる気（数のセル）と、5つのステータス（スピード・スタミナ・パワー・根性・賢さ）の「値」。`48⑥`→48、`-17⑫`→-17、`⑯`→値なし。丸数字は NFKC で数字に変わるので、分けてから値の部分を正規化する
 - **丸数字の順位は照合に使わない**（`yasui_extract.csv` に `安井_スピード_Excel順位` などとして残すだけ）。過去側は TARGET に取り込んだ「値」から順位を出す（同値は同順位・値の無い馬は順位なし）が、Excel の丸数字は同値でも順位を分け、値の無い馬にも順位を付ける。出馬表側で丸数字を使うと過去側と順位がずれる（4ファイルでステータスごとに約1,400〜4,000頭）ので、出馬表側も値から計算する
-- 出力（`yasui/`）: `yasui_extract.csv`（全行。照合できた行は レースID(新) 付き）、`yasui_{rank,speed,stamina,power,konjo,kashikosa,tairyoku,yaruki}/{YYYYMMDD}_yasui_{key}.csv`（TARGET 取込用2列）と `{元名}_merged.csv`、`entries_in/yasui_{YYYYMMDD}.csv`（出馬表用: `レースID(新), 安井_馬名` と8指数の値。`--yasui-to-entries`／画面のチェックで `entries_in/` にも置く）
+- 出力（`yasui/`）: **吉馬6指数と同じく8指数ごとのフォルダ** `yasui_{key}/`（key = rank, speed, stamina, power, konjo, kashikosa, tairyoku, yaruki）
+  - ベースCSVのある開催日: `yasui_{key}/{YYYYMMDD}_yasui_{key}.csv`（TARGET 取込用: `レースID(新), ワーク1`・cp932）と `yasui_{key}/{元ファイル名}_{key}_merged.csv`（マージ完全版）。TARGET 用は Excel にある開催日だけ書く（ベースCSVにある他の日の空のファイルは作らない）
+  - ベースCSVの探し方: 指定されたベースCSV（画面で選ぶ・アップロード／CLI の `--base`、CLI は既定で `ingest_in/base/*.csv`）に無い開催日は、`ingest_in/base/` と `entries_in/` の直下の CSV（`yasui_*.csv` は除く）を順に見て、その日の行を持つ最初のファイルから補う（ログに使ったファイルを出す）。画面で安井 Excel だけを選んでベースCSVを忘れても、該当日の TARGET の出馬表CSVが `entries_in/` にあれば 18桁の レースID(新) が付く
+  - ベースCSVがどこにも無い開催日: `yasui_{key}/{YYYYMMDD}_yasui_{key}.csv` を `日付, 場所, 場所コード, R, 馬番, 馬名, ワーク1` で出し、「TARGET取込用の18桁レースID(新)を付与するにはベースCSVも一緒に指定してください」とログ・ジョブ画面に出す（レースID(新) が無いので TARGET にはそのまま取り込めない。Excel には回・日が無いので18桁は作れない）
+  - ベースCSVはあるのに照合できなかった馬（その開催日・場所の行がベースに無いなど）も件数と開催日・場所を警告する
+  - `yasui_extract.csv`（全行。照合できた行は レースID(新) 付き）、`entries_in/yasui_{YYYYMMDD}.csv`（出馬表用: `レースID(新), 安井_馬名` と8指数の値。照合できた開催日だけ。`--yasui-to-entries`／画面のチェックで `entries_in/` にも置く）
   - 出馬表用CSVの行は、ベースCSVのその日の全馬。値の無い馬（Excel に無い・丸数字だけ）は **0** を入れる。過去側は TARGET に取り込んだ値を TARGET が出したもので、TARGET は取り込んでいない馬の外部指数を 0 で出す（同梱の出馬表サンプルで、外部指数の列に空欄は無く、ZI だけ一部の馬が 0・最下位の順位だった）。これに合わせて欠損の数え方をそろえる。ベースには TARGET の出馬表CSV（またはその日のベースCSV）を渡す
   - ランク・5ステータスは台帳で `zero_missing`（0 = 欠損。§5.3・§5.4）。過去側で TARGET が 0 を出しても、出馬表側で 0 でも空欄でも、両側で欠損として数え、順位は TARGET の 指数順位 を使わずに値から計算する（TARGET の順位は 0 の馬も数えているため）。値が本当に 0 の馬は4ファイルで 0.1〜0.3%（ランク 9頭）で、これは欠損扱いになる。体力・やる気は約14%が 0 の普通の値なので 0 のまま比べる（Excel に無い馬は両側とも 0）
   - calc_entry_hensachi で TARGET の出馬表と レースID(新) で横に結合される（`--merge-only`）。順位は8指数とも値から計算する
-- ベースCSVが無ければ `yasui_extract.csv` だけ（TARGET 用・出馬表用は レースID(新) が要るので作らない）
 - 照合できた馬の枠番・馬名（ベースに 馬名 / 馬名S 列があれば）がベースと違えば件数を警告する（シートの日付違いの検出用）
 
 ---
@@ -472,8 +476,8 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 - `tests/test_scripts.py`: 各スクリプトの関数単位（指数順位N の対応付け、旧形式の順位 `13.0`、頭数列なし、mean モード、--clean など）
 - `tests/test_pipeline.py`: 合成データ（`tests/synth.py`。空欄の内外・髙・Ｇ１・全頭0・欠損2頭を含む）で replace → aggregate → calc → build_db → app を通し、旧版の不具合が再発しないこと、xjoin とその場照合の分類結果が一致すること、`--mode entries --prune` で foragg_* が消えないこと、`/entries/wedge` が閾値なしで全キーを出すこと（CSV の行数 = 照合結果の全件、xjoin とその場照合で同じ）を確認
 - `tests/test_band_regression.py`: 旧版の band 系の件数・勝率の膨張（§11）の再発防止。「中山×ダ×1200×ミナリク×1~3位」が本人の騎乗だけの件数・勝率になること、レース単位（16桁）のIDでも馬単位と成績表が完全に一致すること、素材で1頭が同じキーに2回出ないこと、旧版の結合をこの入力でするとちゃんと膨らむこと（テストが効いている確認）
-- `tests/test_ingest.py`: 指数取得の各取得元（合成 HTML・偽のセッション）、アクセス間隔・やり直し・中止、ラップ6指数の各式（1000m・1150m・不能・±・空欄・クラス/年齢補正）、安井 Excel（丸数字の分割、シートの日付・年またぎ・打ち間違い、TARGET 用・出馬表用の出力、calc_entry_hensachi での結合）、/ingest 画面（アップロード・フォルダから選ぶ・ジョブ・ダウンロード・ZIP・不正なパス・同時実行・中止）
-- 件数: 223（pandas 2.3.3・3.0.5・Docker で全件パス）
+- `tests/test_ingest.py`: 指数取得の各取得元（合成 HTML・偽のセッション。一隊の廃止）、アクセス間隔・やり直し・中止、ラップ6指数の各式（1000m・1150m・不能・±・空欄・クラス/年齢補正）、安井 Excel（丸数字の分割、シートの日付・年またぎ・打ち間違い、8指数ごとの TARGET 用・マージ完全版・出馬表用の出力、ベースCSVの自動の探し方・ベースの無い日の出力と案内、calc_entry_hensachi での結合）、/ingest 画面（アップロード・フォルダから選ぶ・ジョブ・ダウンロード・ZIP・不正なパス・同時実行・中止）
+- 件数: 225（pandas 2.3.3・3.0.5・Docker で全件パス）
 
 ---
 
@@ -510,11 +514,15 @@ aggregate が素材を過去レースの**確定単勝オッズ**で絞って集
 
 ## 11. 変更履歴
 
+### 2026-11-05 一隊の廃止・安井 Excel の指数別出力
+- ⑤ 一隊（ittai）を廃止（サイト側の仕様変更）。`shisu/ingest/ittai.py` を削除し、画面・CLI・`SOURCES`/`ORDER` から外した。`--sources ittai` は理由を添えて断る
+- 安井 Excel の出力を吉馬6指数と同じ8指数ごとのフォルダに統一: `yasui_{key}/{YYYYMMDD}_yasui_{key}.csv` と `{元名}_{key}_merged.csv`（吉馬のマージ完全版も旧版と同じ `{元名}_{key}_merged.csv` に戻した）。ベースCSVが指定されない開催日は `ingest_in/base/`・`entries_in/` から探し、どこにも無い開催日も日付・場所・R・馬番つきの指数別CSVを出して案内する（ジョブ画面にも表示）。テスト 225件
+
 ### 2026-11-05 WEDGE の年度加重・レース別 WEDGE 一覧・band 系の再発防止・外部指数の取得の統合
 - adjusted_WEDGE: 年の最低件数 30→10、固定5年 → 窓（既定10年）の中の有効な年すべてに指数減衰ウェイト（既定0.65、合計1に正規化）。`--wedge-max-years`・`--wedge-decay` を追加
 - `/entries/wedge`（＋CSV）: レースの全馬 × 該当する全キーの WEDGE / adjusted_WEDGE を閾値なしで一覧。`/entries`・`/entries/race`・`/entries/hits` からリンク
 - band 系の件数・勝率の膨張（旧 `export_foragg()` が `out.merge(base_df, on=["レースID(新)", "指数順位帯"])` で列を付けていたため、レース単位のIDだと同じレース・同じ順位帯の別の馬が直積で混入。例「中山×ダ×1200×ミナリク×1~2位」本来4件→22件、他の馬の1着が混入）: 今の replace は merge しない構造であることを確認し、テストで固定。あわせて、レース単位（16桁）のIDは馬番を付けて18桁にし、レースの識別子から R が消える不具合（16桁から末尾2桁を落としていた）を直した。馬の列が無いときに別の馬を重複排除でまとめないようにした
-- 外部指数の取得を `shisu/ingest/`・`ingest.py`・`/ingest` に統合（Ω・吉馬6・かよちん・keibaAI・一隊・ラップ6指数）。安井サロン Excel の抽出（`shisu/yasui_extractor.py`）と台帳への `安井_*` 8指数の登録
+- 外部指数の取得を `shisu/ingest/`・`ingest.py`・`/ingest` に統合（Ω・吉馬6・かよちん・keibaAI・一隊（同日廃止）・ラップ6指数）。安井サロン Excel の抽出（`shisu/yasui_extractor.py`）と台帳への `安井_*` 8指数の登録
 - 依存に requests・beautifulsoup4・lxml・openpyxl を固定版で追加
 - 独立レビューの指摘を反映: 安井の丸数字の順位を出馬表側で使わない（過去側と順位がずれる）・出馬表用CSVはベースの全馬、/ingest の同時実行の予約・ジョブが「実行中」のまま残らない・同名アップロード・別サイトからの POST・入力エラー時のアップロード削除、/entries/wedge の予約引数、window=key の窓の終わり（WEDGE の出る年で決める）、かよちんの「11R …」の前方一致。テスト 217件
 - 2回目の検証（5つの観点で探して、指摘ごとに反証役が再現）で確認された指摘を反映: エラー画面の実行ボタンが押せない・受け付けなかった実行の表示、大文字・小文字だけ違うベースCSVのマージ完全版の上書き、TARGET が値の無い馬を 0 で出すことへの対応（安井のランク・5ステータスを 0=欠損に。出馬表用CSVの無い馬は 0）、再起動で止まった実行を「完了」と表示、DNS リバインディング（Host の確認）、UTF-8 でない入力ファイル名で 500。あわせて BOM なし UTF-8 と空のファイルの入力を受けるように。テスト 223件
