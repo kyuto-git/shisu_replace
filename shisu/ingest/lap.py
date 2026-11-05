@@ -27,8 +27,8 @@ from typing import Iterable
 
 import pandas as pd
 
-from ..csvio import read_csv_any, write_csv
-from .common import DATE, RID, WORK, Logger, Outputs, default_log, ymd_text
+from ..csvio import write_csv
+from .common import DATE, RID, WORK, Logger, Outputs, default_log, read_table, ymd_text
 
 NAME = "lap"
 LABEL = "ラップ6指数"
@@ -174,7 +174,9 @@ def run(paths: Iterable[Path | str], out_dir: Path, log: Logger = default_log,
         today: str | None = None) -> Outputs:
     frames = []
     for p in paths:
-        raw = read_csv_any(p)
+        raw = read_table(Path(p), RID, log)
+        if raw is None:
+            continue
         missing = [c for c in (RID, "着順", "着差", "距離", WORK) if c not in raw.columns]
         if missing:
             log(f"[WARN] {Path(p).name}: 列 {missing} がありません（スキップ）")

@@ -299,14 +299,16 @@ def write_entries(base: pd.DataFrame, values: dict[str, pd.Series], names: pd.Se
                   out_dir: Path, log: Logger = default_log) -> list[Path]:
     """出馬表（entries_in/）用: 日付ごとに yasui_{YYYYMMDD}.csv（レースID(新), 安井_馬名, 安井_*）。
 
-    行はベースCSVのその日の全馬（Excel に無い馬は値が空欄）。過去側（TARGET に取り込んだ値。無い馬は空欄）と
-    同じく、欠損の数え方（1レースに欠損2頭以上ならその指数で使わない）がそろうようにする。
+    行はベースCSVのその日の全馬。値の無い馬（Excel に無い・丸数字だけ）は 0 を入れる。過去側は TARGET に取り込んだ値を
+    TARGET が出力したもので、取り込んでいない馬は 0 になる（同梱の出馬表サンプルの ZI で確認）ので、それに合わせる。
+    ランク・5ステータスは台帳で 0=欠損（zero_missing）なので、0 でも空欄でも両側で欠損として数える
+    （1レースに欠損2頭以上ならその指数で使わない）。体力・やる気は 0 も普通の値なので 0 のまま比べる。
     """
     out = pd.DataFrame({RID: base[RID], DATE: base[DATE], "安井_馬名": names})
     for name, v in values.items():
-        out[name] = v
+        out[name] = v.where(v != "", "0")     # TARGET の出力と同じく、値の無い馬は 0（ランク・ステータスは両側で 0=欠損）
     out = out[(out[RID].str.len() == 18) & out[DATE].isin(days)]
-    out = out.assign(_has=(out[[n for n in values]] != "").any(axis=1))
+    out = out.assign(_has=(pd.DataFrame(values).reindex(out.index) != "").any(axis=1))
     out = out.sort_values("_has", ascending=False, kind="stable").drop_duplicates(subset=[RID])
     files = []
     for day, g in out.groupby(DATE, sort=True):

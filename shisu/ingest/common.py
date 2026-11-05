@@ -100,12 +100,11 @@ def read_base(paths: Iterable[Path | str], log: Logger = default_log) -> pd.Data
     レースID(新) は数字だけにそろえる。日付S が無い・空欄の行は レースID(新) の先頭8桁で補う。
     """
     frames = []
-    names: set[str] = set()
+    keys: set[str] = set()
     for p in paths:
         p = Path(p)
-        df = read_csv_any(p)
-        if RID not in df.columns:
-            log(f"[WARN] {p.name}: 列 {RID} がありません（スキップ）")
+        df = read_table(p, RID, log)
+        if df is None:
             continue
         df = df.copy()
         df[RID] = df[RID].map(clean_rid)
@@ -119,16 +118,45 @@ def read_base(paths: Iterable[Path | str], log: Logger = default_log) -> pd.Data
         if WORK not in df.columns:
             df[WORK] = ""
         name, n = p.name, 1
-        while name in names:            # 同じ名前の別ファイル（別フォルダ・アップロード）はマージ完全版を分ける
+        # 同じ名前の別ファイル（別フォルダ・アップロード）はマージ完全版を分ける。出力名（{stem}_merged.csv）で比べ、
+        # 大文字・小文字だけ違う名前（base.csv と base.CSV。macOS では同じファイル名）も別にする
+        while _out_key(name) in keys:
             n += 1
             name = f"{p.stem}_{n}{p.suffix}"
-        names.add(name)
+        keys.add(_out_key(name))
         df[SOURCE_FILE] = name
         frames.append(df)
         log(f"[INFO] ベースCSV {p.name}: {len(df)} 行")
     if not frames:
         return pd.DataFrame(columns=[RID, DATE, WORK, SOURCE_FILE])
     return pd.concat(frames, ignore_index=True)
+
+
+def _out_key(name: str) -> str:
+    import unicodedata
+    return unicodedata.normalize("NFC", Path(name).stem).casefold()
+
+
+def read_table(path: Path, required: str, log: Logger = default_log) -> pd.DataFrame | None:
+    """入力CSVを読む。空のファイルは警告して None。必須列が見つからなければ UTF-8 で読み直す
+    （cp932 を先に試すので、BOM の無い UTF-8（Mac の Numbers の書き出しなど）は見出しが化けて読めてしまう）。"""
+    from pandas.errors import EmptyDataError
+    try:
+        df = read_csv_any(path)
+    except EmptyDataError:
+        log(f"[WARN] {path.name}: 空のファイルです（スキップ）")
+        return None
+    if required not in df.columns:
+        try:
+            alt = pd.read_csv(path, encoding="utf-8", dtype=str, keep_default_na=False)
+        except (UnicodeDecodeError, EmptyDataError):
+            alt = None
+        if alt is not None and required in alt.columns:
+            log(f"[INFO] {path.name}: UTF-8（BOM なし）として読みました")
+            return alt
+        log(f"[WARN] {path.name}: 列 {required} がありません（スキップ）")
+        return None
+    return df
 
 
 def lookup(keys: pd.Series, mapping: Mapping[str, object]) -> pd.Series:

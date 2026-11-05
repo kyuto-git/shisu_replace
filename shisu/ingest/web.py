@@ -14,6 +14,8 @@ from __future__ import annotations
 import collections
 import datetime as _dt
 import io
+import ipaddress
+import os
 import re
 import threading
 import time
@@ -98,7 +100,7 @@ class Job:
 
 
 STATUS_LABELS = {"running": "実行中", "done": "完了", "error": "完了（エラーあり）", "cancelled": "中止",
-                 "past": "完了（以前の実行）"}
+                 "interrupted": "中断（終了の記録なし。サーバの再起動などで止まった可能性）"}
 JOBS: dict[str, Job] = {}
 _JOBS_LOCK = threading.Lock()
 
@@ -156,6 +158,26 @@ def unique_path(dest: Path, taken: set[Path]) -> Path:
     return p
 
 
+def allowed_host() -> bool:
+    """DNS リバインディング対策: Host が localhost・IP アドレス・SHISU_ALLOWED_HOSTS（カンマ区切り）のどれかのときだけ通す。
+
+    リバインディングでは Host が攻撃側のドメイン名になる。IP アドレスで開いた場合（LAN の別の端末から）は通す。"""
+    host = (request.host or "").strip().lower()
+    if host.startswith("["):
+        name = host[1:host.find("]")] if "]" in host else host[1:]
+    else:
+        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if name in ("localhost",) or name.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    extra = {h.strip().lower() for h in os.environ.get("SHISU_ALLOWED_HOSTS", "").split(",") if h.strip()}
+    return name in extra
+
+
 def same_origin() -> bool:
     """別のサイトのページから送られた POST を断る（この画面はログインなしで動くため）。
 
@@ -177,12 +199,38 @@ def safe_name(name: str) -> str:
     return s or "upload"
 
 
-def listed_inputs() -> dict[str, list[str]]:
+def _utf8_ok(name: str) -> bool:
+    try:
+        name.encode("utf-8")
+        return True
+    except UnicodeEncodeError:      # Windows で作った zip を展開した cp932 の名前など
+        return False
+
+
+def listed_inputs(bad: list[str] | None = None) -> dict[str, list[str]]:
+    """ingest_in/{base,lap,yasui}/ のファイル。名前が UTF-8 でないものは選べないので除き、bad に入れる。"""
     out = {}
     for kind, (_label, exts) in INPUT_KINDS.items():
         d = config.ingest_in_dir() / kind
-        out[kind] = sorted(p.name for p in d.glob("*") if p.is_file() and p.suffix.lower() in exts) if d.exists() else []
+        names = sorted(p.name for p in d.glob("*") if p.is_file() and p.suffix.lower() in exts) if d.exists() else []
+        out[kind] = [n for n in names if _utf8_ok(n)]
+        if bad is not None:
+            bad += [f"ingest_in/{kind}/" + os.fsencode(n).decode("utf-8", "replace") for n in names if not _utf8_ok(n)]
     return out
+
+
+def past_status(job_dir: Path) -> str:
+    """このプロセスで動かしていない実行の状態を ingest.log の最後の「終了」行から読む。
+    無ければ途中で止まった（サーバの再起動など）とみなす。"""
+    label = ""
+    try:
+        for line in (job_dir / "ingest.log").read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.search(r"\[INFO\] 終了: (.+)$", line)
+            if m:
+                label = m.group(1).strip()
+    except OSError:
+        pass
+    return label if label in STATUS_LABELS.values() else STATUS_LABELS["interrupted"]
 
 
 def _out_files(job_dir: Path) -> list[str]:
@@ -260,6 +308,11 @@ def _int_or_none(v: str):
 def make_blueprint(render) -> Blueprint:
     bp = Blueprint("ingest", __name__, url_prefix="/ingest")
 
+    @bp.before_request
+    def _check_host():
+        if not allowed_host():
+            abort(403)
+
     def form(errors=(), q=None, status=200):
         q = q or {}
         root = config.ingest_out_dir()
@@ -267,11 +320,16 @@ def make_blueprint(render) -> Blueprint:
         if root.exists():
             for d in sorted((p for p in root.iterdir() if p.is_dir() and RUN_ID.match(p.name)), reverse=True)[:20]:
                 j = JOBS.get(d.name)
-                past.append({"id": d.name, "status": STATUS_LABELS[j.status if j else "past"],
+                past.append({"id": d.name, "status": STATUS_LABELS[j.status] if j else past_status(d),
                              "n": sum(1 for f in _out_files(d) if f != "ingest.log")})
         picks = {k: set(q.get(f"{k}_pick", [])) for k in INPUT_KINDS}
+        bad_names: list[str] = []
+        listed = listed_inputs(bad_names)
+        if bad_names:
+            errors = list(errors) + [f"ファイル名を UTF-8 で読めないので選べません（名前を付け直してください）: {n}"
+                                     for n in bad_names]
         return render("指数の取得", FORM_BODY, sources=[SOURCES[n] for n in ORDER], kinds=INPUT_KINDS,
-                      listed=listed_inputs(), errors=list(errors), running=running_job(), busy=busy(), past=past,
+                      listed=listed, errors=list(errors), running=running_job(), busy=busy(), past=past,
                       q=q, q_src=set(q.get("src", [])), q_pick=picks, min_interval=MIN_INTERVAL), status
 
     @bp.route("", methods=["GET"])
@@ -294,23 +352,25 @@ def make_blueprint(render) -> Blueprint:
         if run_id is None:
             return form(["実行中のジョブがあります。終わってから実行してください"], q, 409)
         ok = False
+        errors: list[str] = []
         try:
             errors, req, paths = _accept(run_id, q)
-            if errors:
-                return form(errors, q, 400)
-            job = Job(run_id, root / run_id, req)
-            job.log(f"[INFO] 取得元: {', '.join(SOURCES[s].label for s in req.sources)}")
-            for kind in INPUT_KINDS:
-                for p in paths[kind]:
-                    job.log(f"[INFO] 入力（{INPUT_KINDS[kind][0]}）: {p.name}")
-            with _JOBS_LOCK:
-                JOBS[run_id] = job
-            job.thread = threading.Thread(target=job.run, name=f"ingest-{run_id}", daemon=True)
-            job.thread.start()
-            ok = True
-            return redirect(url_for("ingest.job", run_id=run_id))
+            if not errors:
+                job = Job(run_id, root / run_id, req)
+                job.log(f"[INFO] 取得元: {', '.join(SOURCES[s].label for s in req.sources)}")
+                for kind in INPUT_KINDS:
+                    for p in paths[kind]:
+                        job.log(f"[INFO] 入力（{INPUT_KINDS[kind][0]}）: {p.name}")
+                with _JOBS_LOCK:
+                    JOBS[run_id] = job
+                job.thread = threading.Thread(target=job.run, name=f"ingest-{run_id}", daemon=True)
+                job.thread.start()
+                ok = True
         finally:
             release_run(run_id, root, failed=not ok)
+        if errors:      # 予約を外してから描く（実行ボタンが押せる・受け付けなかった実行を一覧に出さない）
+            return form(errors, q, 400)
+        return redirect(url_for("ingest.job", run_id=run_id))
 
     def _accept(run_id: str, q: dict):
         """アップロードを保存し、選んだファイルと合わせて IngestRequest を作る。戻り値: (エラー, 要求, 入力パス)。"""
@@ -368,7 +428,7 @@ def make_blueprint(render) -> Blueprint:
                                     "ratio": f"{r.matched}/{r.total}", "files": len(r.files)})
         running = j is not None and j.status == "running"
         files = [] if running else [f for f in _out_files(d) if f != "ingest.log"]
-        return render("指数の取得", JOB_BODY, run_id=run_id, status=STATUS_LABELS[j.status if j else "past"],
+        return render("指数の取得", JOB_BODY, run_id=run_id, status=STATUS_LABELS[j.status] if j else past_status(d),
                       job_running=running, step=j.step if j else (0, 0), current=j.current if j else "",
                       results=results, tail=tail, files=files)
 

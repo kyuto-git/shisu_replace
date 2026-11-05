@@ -21,10 +21,15 @@ class IndicatorSpec:
     reverse: bool = False           # 小さいほど良い指数（符号反転してから偏差値化）
     zi: bool = False                # ZI 特例: 0/欠損を同レース非ゼロ平均で埋める
     exclude_shinba: bool = False    # 新馬戦を除外する
+    zero_missing: bool = False      # 0 を欠損とみなし、順位は元の順位列を使わず値から計算する（両側で同じ扱い）
+                                    # TARGET は取り込んでいない馬の外部指数を 0 で出す（同梱サンプルの ZI で確認）ため、
+                                    # 0 がほぼ現れない指数で「値なし」を両側そろえて欠損にする
 
 
 _YOSHIUMA = ("吉馬_SP能力値", "吉馬_先行力", "吉馬_SP信頼", "吉馬_SP調整", "吉馬_SP最大", "吉馬_末脚力")
-_YASUI = ("安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー", "安井_根性", "安井_賢さ", "安井_体力", "安井_やる気")
+# 0 を欠損とみなすもの（4ファイルで値0は 0.1〜0.3%）と、0 が普通に出るもの（体力・やる気は約14%が0）
+_YASUI_ZERO_MISSING = ("安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー", "安井_根性", "安井_賢さ")
+_YASUI_ZERO_VALUE = ("安井_体力", "安井_やる気")
 
 INDICATORS: tuple[IndicatorSpec, ...] = (
     IndicatorSpec("カツラキ"),
@@ -51,7 +56,8 @@ INDICATORS: tuple[IndicatorSpec, ...] = (
     IndicatorSpec("対戦M", ("対戦型マイニング値", "MatchM")),
     IndicatorSpec("圧勝力"),
     # 安井サロン（月別 Excel。shisu/yasui_extractor.py）
-    *(IndicatorSpec(n) for n in _YASUI),
+    *(IndicatorSpec(n, zero_missing=True) for n in _YASUI_ZERO_MISSING),
+    *(IndicatorSpec(n) for n in _YASUI_ZERO_VALUE),
 )
 
 # 画面での並び順（台帳の順）

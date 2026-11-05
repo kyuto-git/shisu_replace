@@ -65,6 +65,9 @@ def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpe
     idx = values.index
     key = race_key.astype(str)
     x = pd.to_numeric(norm_series(values), errors="coerce").astype(float)
+    if spec.zero_missing:           # 0 = 値なし（TARGET が取り込んでいない馬を 0 で出すため）
+        x = x.where(x != 0)
+        given_rank = None           # TARGET の順位は 0 の馬も数えているので使わず、値から計算する
 
     miss = x.isna()
     miss_cnt = miss.groupby(key).transform("sum")

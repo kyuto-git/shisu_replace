@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import os
 import sys
 from pathlib import Path
 
@@ -28,7 +29,14 @@ def _files(paths: list[str] | None, default_dir: Path, patterns: tuple[str, ...]
         return [Path(p) for p in paths]
     out: list[Path] = []
     for pat in patterns:
-        out += sorted(default_dir.glob(pat))
+        for p in sorted(default_dir.glob(pat)):
+            try:
+                p.name.encode("utf-8")
+            except UnicodeEncodeError:      # Windows の zip を展開した cp932 の名前など
+                print(f"[WARN] ファイル名を UTF-8 で読めないので使いません（名前を付け直してください）: "
+                      f"{os.fsencode(p.name).decode('utf-8', 'replace')}", file=sys.stderr)
+                continue
+            out.append(p)
     return out
 
 

@@ -459,9 +459,11 @@ def test_yasui_extract_and_target_outputs(tmp_path):
     ent = out_csv(tmp_path / "entries_in" / "yasui_20251101.csv")
     assert list(ent.columns) == ["レースID(新)", "安井_馬名", "安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー",
                                  "安井_根性", "安井_賢さ", "安井_体力", "安井_やる気"]           # 丸数字の順位は入れない
-    # ベースのその日の全馬（Excel に無い 1R 3番・2R 2番・3番も空欄で入る。過去側の欠損の数え方とそろえる）
+    # ベースのその日の全馬。値の無い馬（Excel に無い 1R 3番、丸数字だけの 1R 2番）は TARGET の出力と同じく 0
     assert ent["レースID(新)"].tolist() == [r for r, d, _w, _u in BASE_ROWS if d == "20251101"]
-    assert ent.set_index("レースID(新)").loc["202511010504010103", "安井_スピード"] == ""
+    e = ent.set_index("レースID(新)")
+    assert e.loc["202511010504010103", "安井_スピード"] == "0" and e.loc["202511010504010102", "安井_スピード"] == "0"
+    assert e.loc["202511010504010101", "安井_スピード"] == "48" and e.loc["202511010504010103", "安井_やる気"] == "0"
     assert (tmp_path / "yasui" / "entries_in" / "yasui_20251101.csv").exists()
 
 
@@ -718,3 +720,105 @@ def test_job_finishes_even_if_log_file_fails(tmp_path, monkeypatch):
     job.run()
     assert job.status == "error" and job.finished is not None
     assert any("ログファイルに書けません" in line for line in job.lines)
+
+
+# ---------------------------------------------------------------- 0=欠損（安井）・過去側と出馬表側の一致
+def test_zero_missing_parity_between_target_history_and_entries(tmp_path):
+    """過去側: TARGET に値だけを取り込み、取り込んでいない馬は TARGET が 0 で出す（同梱サンプルの ZI と同じ）。
+    TARGET の 指数順位 は 0 の馬も数えている。出馬表側: 出馬表用CSV（値の無い馬は 0）。
+    ランク・5ステータスは 0=欠損 なので、両側の順位・偏差値・帯が一致する。"""
+    from shisu.hensachi import compute_indicator
+    from shisu.indicators import spec_for
+    from shisu import yasui_extractor as y
+    vals = ["48⑥", "-17⑫", "⑯", "57⑧", "50⑥", "-40⑨", "70①", "62②", "-99⑩", "5③"]
+    rows = [yrow("東京", 1, (u + 1) // 2, u, 30 + u, f"ウマ{u}", vals[u - 1], "1①", "1①", "1①", "1①", 4, u % 3)
+            for u in range(1, 11)]
+    xlsx = make_yasui_xlsx(tmp_path / "ステータス新バージョン2025_11月.xlsx", {"1101": rows})
+    base = pd.DataFrame([{"レースID(新)": f"2025110105040101{u:02d}", "日付S": "20251101", "枠番": str((u + 1) // 2),
+                          "馬番": str(u), "ワーク1": ""} for u in range(1, 12)])        # 11番は Excel に無い
+    b = common.read_base([write_base(tmp_path / "base.csv", base)], lambda m: None)
+    y.run([xlsx], b, tmp_path / "o", lambda m: None)
+    ent = read_csv_any(tmp_path / "o" / "entries_in" / "yasui_20251101.csv")
+    target = read_csv_any(tmp_path / "o" / "yasui_speed" / "20251101_yasui_speed.csv")
+    hist_vals = target["ワーク1"].where(target["ワーク1"] != "", "0")            # TARGET の出力（無い馬は 0）
+    hv = pd.to_numeric(hist_vals)
+    target_rank = hv.rank(ascending=False, method="min").astype(int).astype(str)   # TARGET の順位は 0 も数える
+    key = pd.Series("r", index=target.index)
+    spec = spec_for("安井_スピード")
+    assert spec.zero_missing and not spec_for("安井_やる気").zero_missing
+    hist = compute_indicator(hist_vals, key, spec, None, target_rank)
+    day = compute_indicator(ent["安井_スピード"], key, spec, None, None)
+    for c in ("順位", "偏差値", "偏差値帯", "順位帯_s1", "順位帯_s2", "race_excluded"):
+        assert hist[c].astype(str).tolist() == day[c].astype(str).tolist(), c
+    assert day["race_excluded"].all()                      # 欠損2頭（丸数字だけの3番・Excel に無い11番）→ 使わない
+    one = ent["安井_スピード"].copy()
+    one.iloc[2] = "33"                                       # 欠損を1頭にすると使える。0 の馬だけ順位なし
+    d1 = compute_indicator(one, key, spec, None, None)
+    assert not d1["race_excluded"].any() and pd.isna(d1["順位"].iloc[10]) and d1["順位"].iloc[6] == 1
+
+
+def test_read_base_case_only_name_collision_and_encodings(tmp_path):
+    a = write_base(tmp_path / "a" / "base.csv", base_frame().iloc[:2])
+    b = write_base(tmp_path / "b" / "base.CSV", base_frame().iloc[2:5])
+    u = tmp_path / "c" / "utf8.csv"
+    u.parent.mkdir()
+    u.write_bytes(base_frame().iloc[6:8].to_csv(index=False).encode("utf-8"))          # BOM なし UTF-8
+    e = tmp_path / "c" / "empty.csv"
+    e.write_bytes(b"")
+    logs = []
+    base = common.read_base([a, b, u, e], logs.append)
+    assert len(base) == 7 and set(base["_source_file"]) == {"base.csv", "base_2.CSV", "utf8.csv"}
+    assert any("空のファイル" in m for m in logs) and any("UTF-8" in m for m in logs)
+    common.write_outputs(base, pd.Series("", index=base.index), tmp_path / "o", "x", lambda m: None)
+    assert len(out_csv(tmp_path / "o" / "base_merged.csv")) == 2 and len(out_csv(tmp_path / "o" / "base_2_merged.csv")) == 3
+
+
+def test_ingest_web_error_page_keeps_button_enabled(web_app, tmp_path):
+    c, web = web_app
+    r = _post(c, {"src": ["omega"], "interval_omega": "abc"})
+    page = r.get_data(as_text=True)
+    assert r.status_code == 400 and "アクセス間隔が数ではありません" in page
+    assert '<button type="submit" >実行</button>' in page                  # 押せる
+    assert "これまでの実行" not in page                                     # 受け付けなかった実行は出さない
+    out = tmp_path / "ingest_out"
+    assert not out.exists() or not any(out.iterdir())
+
+
+def test_ingest_web_past_run_status_from_log(web_app, tmp_path):
+    c, web = web_app
+    root = tmp_path / "ingest_out"
+    (root / "20261101_000000").mkdir(parents=True)
+    (root / "20261101_000000" / "ingest.log").write_text("00:00:00 [INFO] 終了: 完了\n", encoding="utf-8")
+    (root / "20261102_000000").mkdir()
+    (root / "20261102_000000" / "ingest.log").write_text("00:00:00 [INFO] ===== 1/1 x =====\n", encoding="utf-8")
+    page = c.get("/ingest").get_data(as_text=True)
+    assert "<td>完了</td>" in page and "中断（終了の記録なし" in page
+    assert "中断（終了の記録なし" in c.get("/ingest/job/20261102_000000").get_data(as_text=True)
+
+
+def test_ingest_web_rejects_unknown_host(web_app, monkeypatch):
+    c, web = web_app
+    assert c.get("/ingest", headers={"Host": "evil.example:8000"}).status_code == 403
+    r = _post(c, {"src": ["omega"], "base_files": _base_upload()},
+              headers={"Host": "evil.example:8000", "Origin": "http://evil.example:8000", "Sec-Fetch-Site": "same-origin"})
+    assert r.status_code == 403 and not web.JOBS                            # DNS リバインディング
+    for host in ("localhost:8000", "127.0.0.1:8000", "192.168.1.20:8000", "[::1]:8000", "app.localhost"):
+        assert c.get("/ingest", headers={"Host": host}).status_code == 200, host
+    monkeypatch.setenv("SHISU_ALLOWED_HOSTS", "mymac.local, other")
+    assert c.get("/ingest", headers={"Host": "mymac.local:8000"}).status_code == 200
+
+
+def test_ingest_web_non_utf8_input_name(web_app, tmp_path):
+    import os
+    c, web = web_app
+    d = tmp_path / "ingest_in" / "base"
+    d.mkdir(parents=True)
+    try:
+        with open(os.path.join(os.fsencode(str(d)), "ベース.csv".encode("cp932")), "wb") as f:
+            f.write(base_frame().to_csv(index=False).encode("cp932"))
+    except OSError:
+        pytest.skip("このファイルシステムは UTF-8 以外のファイル名を作れない")
+    (d / "ok.csv").write_bytes(base_frame().to_csv(index=False).encode("cp932"))
+    r = c.get("/ingest")
+    page = r.get_data(as_text=True)
+    assert r.status_code == 200 and "UTF-8 で読めないので選べません" in page and 'value="ok.csv"' in page
