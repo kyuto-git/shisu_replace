@@ -110,6 +110,16 @@ def test_read_base_and_write_outputs(tmp_path):
     assert (tmp_path / "out" / "20251101_x.csv").read_bytes().decode("cp932")
 
 
+def test_decode_prefers_declared_charset():
+    text = "<th>指数</th>髙"
+    sj = text.encode("cp932")
+    assert common._decode(Resp(200, sj, "Shift_JIS"), "utf-8") == text            # 宣言（Shift_JIS 系 → cp932）
+    assert common._decode(Resp(200, text.encode("utf-8"), "UTF-8"), "cp932") == text   # サイトが UTF-8 に変わっても読める
+    r = Resp(200, sj, "cp932")
+    r.encoding = "ISO-8859-1"                                                        # charset なし → fallback
+    assert common._decode(r, "cp932") == text
+
+
 def test_fetcher_interval_retry_404_and_cancel():
     now = [0.0]
     slept = []

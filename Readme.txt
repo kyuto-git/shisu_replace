@@ -15,8 +15,10 @@ docker_shisu_replace/
 ├─ replace_csv/     processed_*（--processed を付けたときだけ。結合データ確認・TARGET 取込用）
 ├─ entries_in/      入力: 出馬表（shisu_YYYYMMDD_N.csv）
 ├─ entries_out/     偏差値付き出馬表
-├─ shisu/           共通パッケージ（正規化・キー・偏差値・分類。キーの変更は必ずここ）
-├─ replace_csv_ver3.py / aggregate_stats_ver2.py / calc_entry_hensachi.py / build_db.py / app.py
+├─ ingest_in/       指数取得の入力: base/（ベースCSV）, lap/（ラップCSV）, yasui/（安井 Excel）
+├─ ingest_out/      指数取得の出力（実行ごと: ingest_out/YYYYMMDD_HHMMSS/取得元/…）
+├─ shisu/           共通パッケージ（正規化・キー・偏差値・分類・指数の取得。キーの変更は必ずここ）
+├─ replace_csv_ver3.py / aggregate_stats_ver2.py / calc_entry_hensachi.py / build_db.py / app.py / ingest.py
 └─ tests/           pytest
 詳しい仕様は CLAUDE.md（コードが正）。
 
@@ -56,6 +58,16 @@ docker run --rm -p 8000:8000 -v "$(pwd)":/app csv_processor_shisu python app.py
 
 # 8) テスト（任意）
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
+
+# 9) 外部指数の取得（旧: omega / kichiuma / kayochin / keibaAI / ittai / lastXF の各コンテナ ＋ 安井サロン Excel）
+#    画面: 7) を起動して http://localhost:8000/ingest （ファイルをアップロード or ingest_in/ から選ぶ → 実行）
+#    CLI : ベースCSV（レースID(新),日付S,枠番,馬番,ワーク1）を ingest_in/base/ に置いて
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources omega,kichiuma,kayochin,ittai
+#    keibaAI は連番IDの範囲を指定
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources keibaai --keibaai-start 18952 --keibaai-end 18987
+#    ラップ6指数（ingest_in/lap/）と安井 Excel（ingest_in/yasui/。出馬表用CSVを entries_in/ にも置く）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources lap,yasui --yasui-to-entries
+#    出力: ingest_out/実行日時/{omega,kichiuma,kayochin,keibaAI,ittai,lap,yasui}/{YYYYMMDD}_{名前}.csv（TARGET 取込用）
 
 
 DB をブラウザで確認（任意）

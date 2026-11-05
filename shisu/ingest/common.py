@@ -180,7 +180,7 @@ def write_outputs(base: pd.DataFrame, values: pd.Series, out_dir: Path, name: st
         path = out_dir / f"{day}_{name}.csv"
         write_csv(g[[RID, WORK]], path)
         res.files.append(path)
-    log(f"[INFO] {name}: 取得値あり {res.matched}/{res.total} 行 → {out_dir}")
+    log(f"[INFO] {name}: 取得値あり {res.matched}/{res.total} 行 → {out_dir.name}/")
     return res
 
 
@@ -245,17 +245,25 @@ class Fetcher:
         return None
 
 
-def _decode(r, encoding: str | None) -> str:
+_SJIS_NAMES = {"shift_jis", "shift-jis", "sjis", "windows-31j", "cp932", "ms932", "x-sjis"}
+
+
+def _decode(r, fallback: str | None) -> str:
+    """応答の本文を文字列に。HTTP ヘッダの charset があればそれ（Shift_JIS 系は cp932 で読む）、
+    無ければ fallback（一隊の cp932 など）、それも無ければ文字コードの推定（requests の apparent_encoding）。"""
     content = getattr(r, "content", None)
-    if encoding and content is not None:
-        return content.decode(encoding, errors="replace")
-    text = getattr(r, "text", None)
-    if text is not None and content is None:
-        return text
-    enc = getattr(r, "encoding", None) or getattr(r, "apparent_encoding", None) or "utf-8"
-    if enc.lower() in ("iso-8859-1",):        # requests の既定（charset 無し）はページの meta に任せる
-        enc = getattr(r, "apparent_encoding", None) or "utf-8"
-    return content.decode(enc, errors="replace") if content is not None else (text or "")
+    if content is None:
+        return getattr(r, "text", "") or ""
+    declared = (getattr(r, "encoding", None) or "").strip()
+    if declared.lower() == "iso-8859-1":          # requests は charset の無い text/* をこう扱う＝宣言なし
+        declared = ""
+    enc = declared or fallback or getattr(r, "apparent_encoding", None) or "utf-8"
+    if enc.lower() in _SJIS_NAMES:
+        enc = "cp932"
+    try:
+        return content.decode(enc, errors="replace")
+    except LookupError:
+        return content.decode("utf-8", errors="replace")
 
 
 def to_number_text(s) -> str:

@@ -295,7 +295,7 @@ def write_entries(df: pd.DataFrame, out_dir: Path, log: Logger = default_log) ->
         write_csv(out, path)
         files.append(path)
     if files:
-        log(f"[INFO] {LABEL}: 出馬表用 {len(files)} 本 → {out_dir}")
+        log(f"[INFO] {LABEL}: 出馬表用 {len(files)} 本 → {out_dir}")  # entries_in/ に置いたときも分かるようにフルパス
     return files
 
 
