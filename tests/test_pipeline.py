@@ -321,7 +321,8 @@ def test_wedge_columns_in_agg_csv_match_reference(base):
             assert pd.isna(row["adjusted_WEDGE"]) and row["adjusted_WEDGE_年数"] == 0
         else:
             assert row["adjusted_WEDGE"] == pytest.approx(round(adj, 4))
-            used = [y for y in counts if ref_year - 4 <= y <= ref_year and counts[y] >= 2]
+            used = [y for y in counts
+                    if ref_year - wedge.DEFAULT_MAX_YEARS < y <= ref_year and counts[y] >= 2]
             assert row["adjusted_WEDGE_年数"] == len(used)
             assert row["adjusted_WEDGE_件数"] == sum(counts[y] for y in used)
             assert row["adjusted_WEDGE_最終年"] == max(used)
@@ -472,3 +473,72 @@ def test_rank_query_avoids_sort_index_when_filtered(base, monkeypatch):
         am._rank_query(con, [], [], "all", "", ("", "", "", ""), "none", {**none, "min_cnt": 10}, "WEDGE", "DESC")
     orders = [re.search(r'ORDER BY (\S+)', sql).group(1) for sql in seen if "FROM unified_all" in sql]
     assert orders == ['"WEDGE"', '"WEDGE"', '+"WEDGE"', '+"WEDGE"']
+
+
+# ---------------------------------------------------------------- レース別 WEDGE 一覧
+def test_entries_wedge_lists_all_hits_without_threshold(base, monkeypatch):
+    """/entries/wedge は閾値で足切りせず、そのレースの全馬 × 該当する全キーを出す（CSV は全行）。"""
+    import csv as _csv
+    import io
+    am = _app(base, monkeypatch)
+    c = am.app.test_client()
+    t = "entries_merged_hensachi"
+    rid = _race_id(base)
+    with am.connect() as con:
+        race = am._race_rows(con, t, rid)
+        hits, _ = am.collect_hits(con, t, race)
+    every = am.dedupe_hits(hits)
+    classified = [h for v in am.classify_hits(hits).values() for h in v]
+    assert len(every) > len(classified) > 0                  # 分類（閾値あり）より多い＝足切りしていない
+    page = c.get("/entries/wedge", query_string={"table": t, "rid": rid, "odds_mode": "all"}).get_data(as_text=True)
+    assert f"全該当キー（{len(every)}行" in page and "馬 × 指数" in page
+    for r in race:                                            # 全馬が要約表に出る
+        assert f"<td>{r['馬名']}</td>" in page
+    r = c.get("/entries/wedge.csv", query_string={"table": t, "rid": rid, "odds_mode": "all"})
+    assert r.status_code == 200 and r.mimetype == "text/csv"
+    rows = list(_csv.DictReader(io.StringIO(r.data.decode("utf-8-sig"))))
+    assert len(rows) == len(every)
+    ident = lambda h: (str(h["馬番"]), h["base"], h["family"], h["key"], h["テーブル名"])
+    assert {ident(h) for h in rows} == {ident(h) for h in every}
+    vals = [float(h["adjusted_WEDGE"]) for h in rows if h["adjusted_WEDGE"] != ""]
+    assert vals == sorted(vals, reverse=True)                  # 既定は adjusted_WEDGE の大きい順、空欄は最後
+    blanks = [i for i, h in enumerate(rows) if h["adjusted_WEDGE"] == ""]
+    assert not blanks or blanks[0] == len(vals)
+    # 既定のオッズ帯は「通常」
+    r = c.get("/entries/wedge.csv", query_string={"table": t, "rid": rid})
+    normal = list(_csv.DictReader(io.StringIO(r.data.decode("utf-8-sig"))))
+    assert normal and {h["odds_mode"] for h in normal} == {"normal"}
+    # 馬番・指数・パターンで絞る
+    uma = str(race[0]["馬番"])
+    r = c.get("/entries/wedge.csv", query_string={"table": t, "rid": rid, "odds_mode": "all", "uma": uma,
+                                                  "ind": "カツラキ", "family": "rankJ_band"})
+    sub = list(_csv.DictReader(io.StringIO(r.data.decode("utf-8-sig"))))
+    assert sub and all(h["馬番"] == uma and h["base"] == "カツラキ" and h["family"] == "rankJ_band" for h in sub)
+    assert len(sub) == sum(1 for h in every if ident(h)[0] == uma and h["base"] == "カツラキ"
+                           and h["family"] == "rankJ_band")
+    # 並べ替え（WEDGE の小さい順）と不正な引数
+    r = c.get("/entries/wedge.csv", query_string={"table": t, "rid": rid, "odds_mode": "all", "sort": "WEDGE",
+                                                  "dir": "ASC"})
+    w = [float(h["WEDGE"]) for h in _csv.DictReader(io.StringIO(r.data.decode("utf-8-sig"))) if h["WEDGE"] != ""]
+    assert w == sorted(w)
+    assert c.get("/entries/wedge", query_string={"table": t, "rid": rid, "sort": "x;drop", "odds_mode": "?"}).status_code == 200
+    assert c.get("/entries/wedge", query_string={"table": "nope", "rid": rid}).status_code == 302
+    # 一覧・出馬表・条件ヒット馬からリンクがある
+    assert "/entries/wedge?" in c.get("/entries").get_data(as_text=True)
+    assert "/entries/wedge?" in c.get("/entries/race", query_string={"table": t, "rid": rid}).get_data(as_text=True)
+    assert "/entries/wedge?" in c.get("/entries/hits", query_string={"table": t, "rid": rid}).get_data(as_text=True)
+
+
+def test_entries_wedge_on_the_fly_matches_xjoin(base, monkeypatch, tmp_path):
+    import build_db
+    no_x = tmp_path / "noxjoin.db"
+    shutil.copy(base / "racing.db", no_x)
+    assert build_db.main(["--mode", "entries", "--no-xjoin", "--db-path", str(no_x)]) == 0
+    am = _app(base, monkeypatch)
+    c = am.app.test_client()
+    rid = _race_id(base)
+    q = {"table": "entries_merged_hensachi", "rid": rid, "odds_mode": "all"}
+    a = c.get("/entries/wedge.csv", query_string=q).data
+    monkeypatch.setattr(am, "DB_PATH", str(no_x))
+    b = c.get("/entries/wedge.csv", query_string=q).data
+    assert a == b and len(a.splitlines()) > 1

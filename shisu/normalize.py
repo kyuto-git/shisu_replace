@@ -210,13 +210,31 @@ def entry_inner_outer(place: str, surface: str, gaimawari) -> str:
 # レースID・日付
 # ---------------------------------------------------------------------------
 def race_id_without_horse(rid: pd.Series, given: pd.Series | None = None) -> pd.Series:
-    """レースID(新/馬番無)。列があればそれを使い、無ければ レースID(新) の末尾2桁（馬番）を落とす。"""
+    """レースID(新/馬番無)（16桁）。列があればそれを使う。無ければ レースID(新) から作る:
+    18桁 → 先頭16桁 / 16桁（もともとレース単位）→ そのまま / それ以外 → 末尾2桁を落とす（旧来の扱い）。
+    （16桁のレース単位IDから末尾2桁を落とすと R が消えて、同じ日・場の全レースが1レース扱いになる）
+    """
     rid = norm_series(rid)
-    derived = rid.where(rid.str.len() > 2, "").str.slice(0, -2)
+    legacy = rid.where(rid.str.len() > 2, "").str.slice(0, -2)
+    derived = rid.str.slice(0, 16).where(rid.str.fullmatch(r"\d{18}"), rid.where(rid.str.fullmatch(r"\d{16}"), legacy))
     if given is None:
         return derived.astype(object)
     g = norm_series(given)
     return g.where(g != "", derived).astype(object)
+
+
+def horse_race_id(rid: pd.Series, uma: pd.Series) -> pd.Series:
+    """レースID(新) を馬単位（18桁）にそろえる。16桁（レース単位）のIDには 馬番2桁 を付ける。
+
+    TARGET の出力設定によってはレースID(新) がレース単位になる。そのままだと同じレースの馬が
+    同じIDを持ち、レースID で突き合わせる処理で別の馬同士が掛け合わされる（旧版の band 系で
+    件数・勝率が膨らんだ不具合の原因）。馬番が読めない行はそのまま返す。
+    """
+    rid = norm_series(rid)
+    num = int_series(uma)
+    ok = rid.str.fullmatch(r"\d{16}") & num.between(1, 99).fillna(False).astype(bool)
+    pad = num.astype("float").map(lambda v: "" if v != v else f"{int(v):02d}")
+    return rid.where(~ok, rid + pad).astype(object)
 
 
 def race_date(rid: pd.Series) -> pd.Series:

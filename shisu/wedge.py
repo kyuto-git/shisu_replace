@@ -14,15 +14,16 @@ year は 1900〜2100 の整数だけを年別集計に使う（それ以外は�
 
 年度加重 adjusted_WEDGE:
   1. 年（year）ごとに WEDGE を出す
-  2. 直近5年の窓に入る年だけを使う。窓の終わりは
+  2. 窓（既定10年）に入る年だけを使う。窓の終わりは
        window="data"（既定）: 素材ファイル全体の最終年（＝データとしての「今」）
        window="key"         : その結合データ自身の最終年
-     6年以上あっても窓の外の古い年は使わない
-  3. 件数 < min_year_count（既定30）の年は統計的ノイズとして除く
-  4. 残った年数 m に応じて、古い順に次のウェイトで加重平均
-       m=5: [0.06, 0.11, 0.18, 0.25, 0.40] / m=4: [0.12, 0.19, 0.27, 0.42]
-       m≤3: linspace(0.1, 0.5, m) を合計1に正規化（m=1 なら 1.0）
-  5. 残った年が無ければ空（NaN）
+     指数によって過去データは3〜10年分と幅があるので、窓の中に残った年はすべて使う
+  3. 件数 < min_year_count（既定10）の年は統計的ノイズ（1走だけのマグレ当たりなど）として除く
+  4. 残った年に、新しい年ほど重い指数減衰ウェイト w = decay ** (最終年 − 年) を掛け、合計1に正規化して加重平均
+       decay（既定0.65、半減期 約1.6年）は暦の年の差で効く（開催の無い年をはさむと、その分だけ古い年が軽くなる）
+       例 decay=0.65: 5年 ≒ [0.07, 0.11, 0.17, 0.26, 0.40]（Phase 3 の固定ウェイト [0.06, 0.11, 0.18, 0.25, 0.40] とほぼ同じ）
+                      10年 ≒ 新しい年から 0.35, 0.23, 0.15, 0.10, 0.06, …, 0.007（古い5年の合計 約1割）
+  5. 残った年が無ければ空（NaN）。年が1つだけならその年の WEDGE
   あわせて、使った年数・件数の合計・最終年を返す（値の信頼度と新しさの目安）。
 
 scalar 版（edge_threshold / adjusted_wedge / wedge_from_frame）は仕様どおりの素直な実装で、
@@ -46,9 +47,9 @@ EDGE_TABLE: tuple[tuple[float, float, int], ...] = (
     (20.0, 50.0, 6),
     (50.0, float("inf"), 8),
 )
-YEAR_WEIGHTS = {5: (0.06, 0.11, 0.18, 0.25, 0.40), 4: (0.12, 0.19, 0.27, 0.42)}
-MAX_YEARS = 5
-DEFAULT_MIN_YEAR_COUNT = 30
+DEFAULT_MIN_YEAR_COUNT = 10
+DEFAULT_MAX_YEARS = 10
+DEFAULT_DECAY = 0.65
 WINDOWS = ("data", "key")
 
 WEDGE_COLUMNS = ("WIN", "EDGE", "WEDGE", "adjusted_WEDGE",
@@ -94,38 +95,44 @@ def wedge(win: float, edge: float) -> float:
     return win + edge
 
 
-def year_weights(n_years: int) -> np.ndarray:
-    """古い順のウェイト（合計1）。"""
-    n = min(int(n_years), MAX_YEARS)
-    if n <= 0:
+def check_decay(decay: float) -> float:
+    d = float(decay)
+    if not (0.0 < d <= 1.0):
+        raise ValueError(f"decay は 0 より大きく 1 以下: {decay}")
+    return d
+
+
+def year_weights(years, decay: float = DEFAULT_DECAY) -> np.ndarray:
+    """年（並びは任意）→ 同じ並びのウェイト（合計1）。新しい年ほど重い: decay ** (最終年 − 年)。"""
+    ys = np.asarray(list(years), dtype=float)
+    if ys.size == 0:
         return np.array([])
-    if n in YEAR_WEIGHTS:
-        return np.array(YEAR_WEIGHTS[n], dtype=float)
-    w = np.linspace(0.1, 0.5, n)
+    w = check_decay(decay) ** (ys.max() - ys)
     return w / w.sum()
 
 
 def adjusted_wedge(yearly_wedge: Mapping[int, float], yearly_count: Mapping[int, int] | None = None,
-                   min_year_count: int = 0, window_end: int | None = None) -> float:
+                   min_year_count: int = 0, window_end: int | None = None,
+                   max_years: int = DEFAULT_MAX_YEARS, decay: float = DEFAULT_DECAY) -> float:
     """年別 WEDGE の加重平均。
 
-    window_end（窓の終わりの年）から遡る5年だけを使い、件数 < min_year_count の年を除いてからウェイトを決める。
-    window_end を省くと、渡された年の最終年を窓の終わりにする。
+    window_end（窓の終わりの年）から遡る max_years 年だけを使い、件数 < min_year_count の年を除いてから
+    残った年すべてに指数減衰ウェイトを掛ける。window_end を省くと、渡された年の最終年を窓の終わりにする。
     """
     years = [int(y) for y, v in yearly_wedge.items() if v is not None and not (isinstance(v, float) and v != v)]
     if not years:
         return float("nan")
     end = int(window_end) if window_end is not None else max(years)
-    items = []
+    kept = []
     for y in sorted(years):
-        if not (end - MAX_YEARS + 1 <= y <= end):
+        if not (end - int(max_years) + 1 <= y <= end):
             continue
         if yearly_count is not None and min_year_count and yearly_count.get(y, 0) < min_year_count:
             continue
-        items.append(float(yearly_wedge[y]))
-    if not items:
+        kept.append(y)
+    if not kept:
         return float("nan")
-    return float(np.dot(year_weights(len(items)), items))
+    return float(np.dot(year_weights(kept, decay), [float(yearly_wedge[y]) for y in kept]))
 
 
 def wedge_from_frame(df: pd.DataFrame, finish_col: str = "finish_num", odds_col: str = "単勝オッズ") -> dict:
@@ -176,19 +183,10 @@ def _scores(s: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"WIN": win, "EDGE": edge, "WEDGE": win + edge}, index=s.index)
 
 
-def _weight_matrix() -> np.ndarray:
-    m = np.zeros((MAX_YEARS + 1, MAX_YEARS))
-    for k in range(1, MAX_YEARS + 1):
-        m[k, :k] = year_weights(k)
-    return m
-
-
-_WEIGHTS = _weight_matrix()
-
-
 def wedge_columns(keys: pd.Series, finish_num: pd.Series, odds: pd.Series, years: pd.Series,
                   ref_year: int | None = None, min_year_count: int = DEFAULT_MIN_YEAR_COUNT,
-                  window: str = "data") -> pd.DataFrame:
+                  window: str = "data", max_years: int = DEFAULT_MAX_YEARS,
+                  decay: float = DEFAULT_DECAY) -> pd.DataFrame:
     """グループ（keys）ごとの WEDGE 列。index はグループのキー、列は WEDGE_COLUMNS。
 
     入力はすべて同じ index（分母に入る馬だけ）。years は西暦（文字列でも可。不正値は年別集計から外す）。
@@ -196,6 +194,9 @@ def wedge_columns(keys: pd.Series, finish_num: pd.Series, odds: pd.Series, years
     """
     if window not in WINDOWS:
         raise ValueError(f"window は {WINDOWS} のどれか: {window}")
+    if int(max_years) < 1:
+        raise ValueError(f"max_years は1以上: {max_years}")
+    decay = check_decay(decay)
     fin = pd.to_numeric(finish_num, errors="coerce")
     th = edge_thresholds(odds)
     ok = th.notna()
@@ -226,16 +227,15 @@ def wedge_columns(keys: pd.Series, finish_num: pd.Series, odds: pd.Series, years
             yearly["end"] = end
         else:
             yearly["end"] = yearly.groupby("k")["y"].transform("max")
-        yearly = yearly[(yearly["y"] <= yearly["end"]) & (yearly["y"] > yearly["end"] - MAX_YEARS)]
+        yearly = yearly[(yearly["y"] <= yearly["end"]) & (yearly["y"] > yearly["end"] - int(max_years))]
         yearly = yearly[(yearly["n"] >= min_year_count) & yearly["WEDGE"].notna()]
         if not yearly.empty:
-            yearly = yearly.sort_values(["k", "y"])
-            m = yearly.groupby("k")["y"].transform("size").to_numpy()
-            pos = yearly.groupby("k").cumcount().to_numpy()
-            yearly["w"] = _WEIGHTS[m, pos]
+            last = yearly.groupby("k")["y"].transform("max")
+            yearly["w"] = np.power(decay, (last - yearly["y"]).to_numpy(dtype=float))
             yearly["wv"] = yearly["w"] * yearly["WEDGE"]
-            agg = yearly.groupby("k").agg(adj=("wv", "sum"), years=("y", "size"), cnt=("n", "sum"), last=("y", "max"))
-            out.loc[agg.index, "adjusted_WEDGE"] = agg["adj"]
+            agg = yearly.groupby("k").agg(wv=("wv", "sum"), w=("w", "sum"), years=("y", "size"),
+                                          cnt=("n", "sum"), last=("y", "max"))
+            out.loc[agg.index, "adjusted_WEDGE"] = agg["wv"] / agg["w"]
             out.loc[agg.index, "adjusted_WEDGE_年数"] = agg["years"]
             out.loc[agg.index, "adjusted_WEDGE_件数"] = agg["cnt"]
             out.loc[agg.index, "adjusted_WEDGE_最終年"] = agg["last"]

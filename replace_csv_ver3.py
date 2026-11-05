@@ -31,7 +31,7 @@ from shisu.indicators import parse_source_name, spec_for
 from shisu.keys import BAND_FAMILIES, BASE_FAMILIES, SCHEMES, build_key_series
 from shisu.naming import foragg_tag, material_filename
 from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_series, distance_series,
-                             frame_group_series, int_series, race_date, race_id_without_horse, race_year,
+                             frame_group_series, horse_race_id, int_series, race_date, race_id_without_horse, race_year,
                              shinba_mask, weight_series)
 from shisu.odds import odds_bucket
 
@@ -58,8 +58,12 @@ def _col(df: pd.DataFrame, *names: str) -> pd.Series:
 def normalize_history(raw: pd.DataFrame) -> pd.DataFrame:
     """TARGET の列を正規化して、キーの部品と集計に使う列をそろえる。"""
     df = pd.DataFrame(index=raw.index)
-    df["レースID(新)"] = norm_series(_col(raw, "レースID(新)"))
-    df["レースID(新/馬番無)"] = race_id_without_horse(df["レースID(新)"], _col(raw, "レースID(新/馬番無)")
+    rid = norm_series(_col(raw, "レースID(新)"))
+    # レース単位（16桁）のIDは馬番を付けて馬単位（18桁）にする（1頭=1行を保つ。horse_race_id の説明）
+    df["レースID(新)"] = horse_race_id(rid, _col(raw, "馬番"))
+    df.attrs["race_level_ids"] = int((df["レースID(新)"] != rid).sum())
+    df.attrs["race_level_unfixed"] = int((rid.str.fullmatch(r"\d{16}") & (df["レースID(新)"] == rid)).sum())
+    df["レースID(新/馬番無)"] = race_id_without_horse(rid, _col(raw, "レースID(新/馬番無)")
                                                       if "レースID(新/馬番無)" in raw.columns else None)
     df["日付"] = race_date(df["レースID(新)"])
     df["year"] = race_year(df["日付"])
@@ -106,6 +110,12 @@ def process_file(path: str, foragg_dir: str, processed_dir: str | None, master_d
     if "指数" not in raw.columns:
         return f"[SKIP] {base}: 指数 列がありません"
     df = normalize_history(raw)
+    notes = []
+    if df.attrs.get("race_level_ids"):
+        notes.append(f"レース単位のレースID {df.attrs['race_level_ids']}行に馬番を付けて18桁にしました")
+    if df.attrs.get("race_level_unfixed"):
+        print(f"[WARN] {base}: レースID(新) がレース単位（16桁）で馬番が読めない行が {df.attrs['race_level_unfixed']} 行あります。"
+              "1頭を識別できないので、TARGET の出力に 馬番 列を入れてください", file=sys.stderr)
 
     given_rank = df["指数順位_元"] if "指数順位" in raw.columns else None
     ind = compute_indicator(df["指数"], _race_key(df), spec, shinba_mask(df["クラス名_raw"]), given_rank)
@@ -145,7 +155,8 @@ def process_file(path: str, foragg_dir: str, processed_dir: str | None, master_d
     if len(work) == 0:
         print(f"[WARN] {base}: 使える行が0件です（列名・頭数・指数の欠損を確認してください）", file=sys.stderr)
     return (f"[OK] {base}: 指数={indicator} 地域={region} 行={len(df)} 使用={len(work)} "
-            f"(頭数<{MIN_HEADS}・除外レース・新馬除外を除く) → {n_files} files")
+            f"(頭数<{MIN_HEADS}・除外レース・新馬除外を除く) → {n_files} files"
+            + (f" / {'、'.join(notes)}" if notes else ""))
 
 
 def _export(work: pd.DataFrame, family: str, scheme: str, stem: str, base: str,

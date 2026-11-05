@@ -20,8 +20,9 @@
 
 環境変数: AGG_PROP_MODE(lower|mean), AGG_LOWER_Q(0.10), AGG_UPPER_Q(0.90), AGG_PRIOR_ALPHA/BETA(0.5),
           PLC_SWITCH_THRESHOLD_PCT(20), AGG_MIN_SAMPLE(5), AGG_RANKBAND_SCHEMES(例 "s1"),
-          AGG_WEDGE_MIN_YEAR_COUNT(30), AGG_WEDGE_WINDOW(data|key)
-          （WEDGE の2つは --wedge-min-year-count / --wedge-window でも指定できる。引数が優先）
+          AGG_WEDGE_MIN_YEAR_COUNT(10), AGG_WEDGE_MAX_YEARS(10), AGG_WEDGE_DECAY(0.65), AGG_WEDGE_WINDOW(data|key)
+          （WEDGE の4つは --wedge-min-year-count / --wedge-max-years / --wedge-decay / --wedge-window でも
+           指定できる。引数が優先）
 """
 from __future__ import annotations
 
@@ -42,7 +43,8 @@ from shisu.finish import parse_finish
 from shisu.naming import agg_filename, file_stem, parse_foragg_stem
 from shisu.normalize import race_date
 from shisu.odds import ODDS_MODES, odds_mask
-from shisu.wedge import DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WINDOWS, valid_years, wedge_columns
+from shisu.wedge import (DEFAULT_DECAY, DEFAULT_MAX_YEARS, DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WINDOWS,
+                         check_decay, valid_years, wedge_columns)
 
 KEY = "結合データ"
 RID = "レースID(新)"
@@ -56,7 +58,18 @@ PRIOR_B = float(os.getenv("AGG_PRIOR_BETA", "0.5"))
 PLC_SWITCH_PCT = float(os.getenv("PLC_SWITCH_THRESHOLD_PCT", "20.0"))
 MIN_SAMPLE = int(os.getenv("AGG_MIN_SAMPLE", "5"))
 WEDGE_MIN_YEAR_COUNT = int(os.getenv("AGG_WEDGE_MIN_YEAR_COUNT", str(DEFAULT_MIN_YEAR_COUNT)))
+WEDGE_MAX_YEARS = int(os.getenv("AGG_WEDGE_MAX_YEARS", str(DEFAULT_MAX_YEARS)))
+WEDGE_DECAY = float(os.getenv("AGG_WEDGE_DECAY", str(DEFAULT_DECAY)))
 WEDGE_WINDOW = os.getenv("AGG_WEDGE_WINDOW", "data").lower()
+
+
+def wedge_options(min_year_count: int | None = None, window: str | None = None,
+                  max_years: int | None = None, decay: float | None = None) -> dict:
+    """adjusted_WEDGE の設定（引数 > 環境変数 > 既定）。wedge_columns() にそのまま渡せる dict。"""
+    return {"min_year_count": WEDGE_MIN_YEAR_COUNT if min_year_count is None else int(min_year_count),
+            "window": window or WEDGE_WINDOW,
+            "max_years": WEDGE_MAX_YEARS if max_years is None else int(max_years),
+            "decay": WEDGE_DECAY if decay is None else float(decay)}
 
 OUT_COLUMNS = [KEY, "件数", "勝率_val", "勝率", "連対率_val", "連対率", "複勝率_val", "複勝率",
                "2着率_val", "2着率", "3着率_val", "3着率", "掲示板率_val", "掲示板率",
@@ -104,20 +117,23 @@ def ref_year_of(df: pd.DataFrame) -> int | None:
     return int(y.max()) if y.notna().any() else None
 
 
-def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_min_year_count: int | None = None,
-                    wedge_window: str | None = None) -> pd.DataFrame:
-    """素材 DataFrame（文字列）→ 成績表。ref_year は年度加重の窓の終わり（省略時は df の最終年）。"""
+def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: dict | None = None) -> pd.DataFrame:
+    """素材 DataFrame（文字列）→ 成績表。ref_year は年度加重の窓の終わり（省略時は df の最終年）。
+    wedge_opts は wedge_options() の dict（省略時は環境変数・既定値）。"""
     for c in (RID, KEY, "着順"):
         if c not in df.columns:
             raise KeyError(c)
     df = df[df[KEY].astype(str) != ""]
 
     # 重複排除（1頭=1件）: レースID × 結合データ（× 順位帯）× 馬番（無ければ馬名）
+    # 馬を識別する列が無いときは、レースID が馬単位（18桁）の場合だけ重複排除する。
+    # レース単位のIDのまま重複排除すると、同じレース・同じキーの別の馬が1頭にまとめられて件数が減る。
     subset = [RID, KEY] + ([BAND] if BAND in df.columns else [])
     horse = next((c for c in ("馬番", "馬名") if c in df.columns and (df[c] != "").any()), None)
     if horse:
         subset.append(horse)
-    df = df.drop_duplicates(subset=subset, keep="first")
+    if horse or df[RID].astype(str).str.fullmatch(r"\d{18}").all():
+        df = df.drop_duplicates(subset=subset, keep="first")
 
     fl = parse_finish(df["着順"], df["頭数"] if "頭数" in df.columns else None)
     use = fl["denom"]
@@ -170,8 +186,7 @@ def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_min_yea
     out["単勝適正回収値"] = rtn_adj.round(2).values
     wd = wedge_columns(g, f["finish_num"], odds, year_series(d),
                        ref_year=ref_year if ref_year is not None else ref_year_of(d),
-                       min_year_count=WEDGE_MIN_YEAR_COUNT if wedge_min_year_count is None else wedge_min_year_count,
-                       window=wedge_window or WEDGE_WINDOW).reindex(n.index)
+                       **(wedge_opts or wedge_options())).reindex(n.index)
     for c in WEDGE_COLUMNS:
         v = wd[c]
         out[c] = (v.round(4) if v.dtype.kind == "f" else v).values
@@ -184,8 +199,7 @@ def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_min_yea
     return out.reset_index(drop=True)[OUT_COLUMNS]
 
 
-def aggregate_file(src: str, out_dir: str, wedge_min_year_count: int | None = None,
-                   wedge_window: str | None = None) -> str:
+def aggregate_file(src: str, out_dir: str, wedge_opts: dict | None = None) -> str:
     src = Path(src)
     info = parse_foragg_stem(file_stem(src))
     if info is None or info["mode"] != "normal":
@@ -196,7 +210,7 @@ def aggregate_file(src: str, out_dir: str, wedge_min_year_count: int | None = No
     for mode in ODDS_MODES:
         sub = df[odds_mask(df["単勝オッズ"], mode)] if "単勝オッズ" in df.columns else df.iloc[0:0]
         try:
-            out = aggregate_frame(sub, ref_year, wedge_min_year_count, wedge_window)
+            out = aggregate_frame(sub, ref_year, wedge_opts)
         except KeyError as e:
             return f"[SKIP] {src.name}: 列 {e} がありません（素材ではない可能性）"
         write_csv(out, Path(out_dir) / agg_filename(info["family"], mode, info["scheme"], info["source"]))
@@ -220,11 +234,23 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=1, help="並列数（既定1）")
     ap.add_argument("--wedge-min-year-count", type=int, default=None,
                     help=f"adjusted_WEDGE で使う年の最低件数（既定 {WEDGE_MIN_YEAR_COUNT}。環境変数 AGG_WEDGE_MIN_YEAR_COUNT）")
+    ap.add_argument("--wedge-max-years", type=int, default=None,
+                    help=f"adjusted_WEDGE で遡る年数の上限（窓の終わりから。既定 {WEDGE_MAX_YEARS}。環境変数 AGG_WEDGE_MAX_YEARS）")
+    ap.add_argument("--wedge-decay", type=float, default=None,
+                    help=f"年の減衰率（1年古くなるごとのウェイトの倍率。0<d≤1。既定 {WEDGE_DECAY}。環境変数 AGG_WEDGE_DECAY）")
     ap.add_argument("--wedge-window", choices=WINDOWS, default=None,
                     help=f"年度の窓の終わり: data=素材全体の最終年 / key=結合データ自身の最終年（既定 {WEDGE_WINDOW}）")
     args = ap.parse_args(argv)
-    if WEDGE_WINDOW not in WINDOWS and args.wedge_window is None:
-        print(f"[ERROR] AGG_WEDGE_WINDOW は {WINDOWS} のどれか: {WEDGE_WINDOW}", file=sys.stderr)
+    opts = wedge_options(args.wedge_min_year_count, args.wedge_window, args.wedge_max_years, args.wedge_decay)
+    if opts["window"] not in WINDOWS:
+        print(f"[ERROR] AGG_WEDGE_WINDOW は {WINDOWS} のどれか: {opts['window']}", file=sys.stderr)
+        return 2
+    try:
+        check_decay(opts["decay"])
+        if opts["max_years"] < 1:
+            raise ValueError(f"max_years は1以上: {opts['max_years']}")
+    except ValueError as e:
+        print(f"[ERROR] WEDGE の設定: {e}", file=sys.stderr)
         return 2
 
     files = sorted(Path(args.in_dir).glob("foragg_*.csv.gz"))
@@ -237,11 +263,10 @@ def main(argv=None) -> int:
     if args.clean and Path(args.out_dir).exists():
         shutil.rmtree(args.out_dir)
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
-    min_year = WEDGE_MIN_YEAR_COUNT if args.wedge_min_year_count is None else args.wedge_min_year_count
-    window = args.wedge_window or WEDGE_WINDOW
     print(f"[INFO] {len(files)} files / 推定={PROP_MODE} (q={LOWER_Q}/{UPPER_Q}) / scipy={'あり' if has_scipy() else 'なし(正規近似)'}"
-          f" / WEDGE: 年の最低件数={min_year} 窓={window}")
-    jobs = [(str(p), args.out_dir, min_year, window) for p in files]
+          f" / WEDGE: 年の最低件数={opts['min_year_count']} 遡る年数≦{opts['max_years']}"
+          f" 減衰率={opts['decay']} 窓={opts['window']}")
+    jobs = [(str(p), args.out_dir, opts) for p in files]
     if args.workers > 1:
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
             results = list(ex.map(_run, jobs, chunksize=8))
@@ -251,7 +276,7 @@ def main(argv=None) -> int:
     for r in results:
         if not r.startswith("[OK]"):
             print(r)
-    _print_wedge_coverage(results)
+    _print_wedge_coverage(results, opts["max_years"])
     n_ok = sum(r.startswith("[OK]") for r in results)
     print(f"[DONE] OK={n_ok} SKIP={sum(r.startswith('[SKIP]') for r in results)} ERROR={len(errors)}")
     if n_ok == 0:
@@ -260,10 +285,10 @@ def main(argv=None) -> int:
     return 1 if errors else 0
 
 
-def _print_wedge_coverage(results: list[str]) -> None:
+def _print_wedge_coverage(results: list[str], max_years: int = DEFAULT_MAX_YEARS) -> None:
     """adjusted_WEDGE が付いたグループの割合と、年度窓の終わりの年（素材ごと）の範囲を出す。
 
-    30件/年の条件はキーの粒度が細かいと満たしにくい。また窓の終わりは素材ファイルごとの最終年なので、
+    年の最低件数の条件はキーの粒度が細かいと満たしにくい。また窓の終わりは素材ファイルごとの最終年なので、
     更新が止まった素材が混ざると、その指数だけ古い年の adjusted_WEDGE になる。どちらも確認用。
     """
     import re
@@ -283,7 +308,7 @@ def _print_wedge_coverage(results: list[str]) -> None:
         print(f"[WARN] 年度窓の終わり（素材の最終年）が素材によって違います: {detail}。"
               "古い年で止まった素材の adjusted_WEDGE はその年までの値です", file=sys.stderr)
     elif ends:
-        print(f"[INFO] 年度窓の終わり: {next(iter(ends))}年（直近5年 = この年から遡る5年）")
+        print(f"[INFO] 年度窓の終わり: {next(iter(ends))}年（この年から遡る{max_years}年のうち、件数を満たす年をすべて使う）")
 
 
 def _run(job) -> str:

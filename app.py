@@ -7,6 +7,7 @@
   /entries/race  出馬表（各馬の指数順位・偏差値）
   /entries/key   結合データの前方一致で unified_all を表示
   /entries/hits  条件ヒット馬（絶対軸・軸候補・消し候補・相手候補）
+  /entries/wedge レース別 WEDGE 一覧（全馬 × 該当する全キーの WEDGE / adjusted_WEDGE。閾値で足切りしない）
   /healthz       DB 接続確認
 
 条件ヒット馬は entries_xjoin_*（build_db が事前計算した照合結果）があればそれを読み、
@@ -15,13 +16,15 @@ DB の率はすべて 0–100（%）。
 """
 from __future__ import annotations
 
+import csv
+import io
 import os
 import re
 import sqlite3
 import unicodedata
 from contextlib import contextmanager
 
-from flask import Flask, redirect, render_template_string, request, url_for
+from flask import Flask, Response, redirect, render_template_string, request, url_for
 
 from shisu import config
 from shisu.classify import CATEGORIES, CATEGORY_LABELS, classify, description_lines, sql_condition
@@ -30,7 +33,7 @@ from shisu.keys import ALL_FAMILIES, FAMILY_LABELS
 from shisu.matching import HIT_COLUMNS, UNIFIED, indicator_bases, match_entry_row, unified_status
 from shisu.naming import ENTRIES_ALL, XJOIN_PREFIX, xjoin_table_for
 from shisu.odds import ODDS_LABELS, ODDS_MODES, ODDS_RANK
-from shisu.wedge import DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WEDGE_FLOAT_COLUMNS
+from shisu.wedge import DEFAULT_MAX_YEARS, DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WEDGE_FLOAT_COLUMNS
 
 DB_PATH = str(config.db_path())
 META = "__tables_meta__"
@@ -202,7 +205,7 @@ INDEX_BODY = """
   </div></div>
   {% if bad_inputs %}<div class="warn" style="margin-top:8px">下限の値を数値として読めませんでした（無視しました）: {{ bad_inputs|join('、') }}</div>{% endif %}
   <div style="margin-top:12px"><button type="submit">検索</button>
-    <span class="muted">WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=下位）。adjusted_WEDGE は直近5年の年度加重（既定では件数{{ wedge_min_year }}未満の年を除外）。空欄は条件を満たす年が無い</span></div>
+    <span class="muted">WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=下位）。adjusted_WEDGE は年度加重（既定: 件数{{ wedge_min_year }}以上の年すべて・最大{{ wedge_max_years }}年、新しい年ほど重い）。空欄は条件を満たす年が無い</span></div>
   <input type="hidden" name="submitted" value="1">
 </form></div>
 {% if submitted %}
@@ -378,7 +381,7 @@ def index():
                   q_view=q_view, q_min=q_min, bad_inputs=bad_inputs,
                   submitted=submitted, results=results, rank_rows=rank_rows, rank_columns=rank_columns(q_sort),
                   rank_limit=RANK_LIMIT, sortable=SORTABLE, sort_links=sort_links, n_tables=n_tables,
-                  truncated=truncated, max_tables=MAX_TABLES, wedge_min_year=DEFAULT_MIN_YEAR_COUNT,
+                  truncated=truncated, max_tables=MAX_TABLES, wedge_min_year=DEFAULT_MIN_YEAR_COUNT, wedge_max_years=DEFAULT_MAX_YEARS,
                   db_warning=DB_WARNINGS.get(status, ""))
 
 
@@ -461,11 +464,12 @@ ENTRIES_BODY = """
 </div></form></div>
 {% if races %}
 <div class="card"><h1>レース一覧</h1><table>
-<thead><tr><th>日付</th><th>場 R</th><th>レース名</th><th>クラス</th><th>芝・ダ</th><th>距離</th><th>頭数</th><th>出馬表</th><th>条件ヒット馬</th></tr></thead>
+<thead><tr><th>日付</th><th>場 R</th><th>レース名</th><th>クラス</th><th>芝・ダ</th><th>距離</th><th>頭数</th><th>出馬表</th><th>条件ヒット馬</th><th>WEDGE一覧</th></tr></thead>
 <tbody>{% for r in races %}<tr>
   <td>{{ r.date }}</td><td>{{ r.jo }}</td><td>{{ r.name }}</td><td>{{ r.cls }}</td><td>{{ r.sd }}</td><td>{{ r.dist }}</td><td>{{ r.heads }}</td>
   <td><a href="{{ url_for('entries_race', table=q_table, rid=r.rid) }}">出馬表</a></td>
   <td><a href="{{ url_for('entries_hits', table=q_table, rid=r.rid) }}" target="_blank">条件ヒット馬</a></td>
+  <td><a href="{{ url_for('entries_wedge', table=q_table, rid=r.rid) }}" target="_blank">WEDGE一覧</a></td>
 </tr>{% endfor %}</tbody></table></div>
 {% else %}<div class="card muted">レースがありません。</div>{% endif %}
 """
@@ -522,7 +526,8 @@ def _race_rows(con, table: str, rid: str, legacy_ridn: str = "", date: str = "")
 
 RACE_BODY = """
 <div class="card"><h1>{{ head }}</h1><div class="muted">{{ sub }}</div>
-<div style="margin-top:6px"><a href="{{ url_for('entries_hits', table=table, rid=rid) }}" target="_blank">条件ヒット馬を見る</a></div></div>
+<div style="margin-top:6px"><a href="{{ url_for('entries_hits', table=table, rid=rid) }}" target="_blank">条件ヒット馬を見る</a>
+ ／ <a href="{{ url_for('entries_wedge', table=table, rid=rid) }}" target="_blank">WEDGE一覧を見る</a></div></div>
 <div class="card"><table><thead><tr><th>枠番</th><th>馬番</th><th>騎手</th><th>馬名</th>
 {% for b in bases %}<th>{{ b }}<div class="muted">順位 / 偏差値 / 帯</div></th>{% endfor %}<th>結合データ（先頭部分）</th></tr></thead>
 <tbody>{% for r in rows %}<tr><td>{{ r['枠番'] }}</td><td>{{ r['馬番'] }}</td><td>{{ r['騎手'] }}</td><td>{{ r['馬名'] }}</td>
@@ -640,7 +645,8 @@ def classify_hits(hits: list[dict]) -> dict[str, list[dict]]:
 
 HITS_BODY = """
 <div class="card"><h1>{{ head }}</h1><div class="muted">{{ sub }}</div>
-<div class="muted">照合: {{ path }} ／ 率は DB の推定値（複勝率・連対率）と頻度（掲示板率）</div></div>
+<div class="muted">照合: {{ path }} ／ 率は DB の推定値（複勝率・連対率）と頻度（掲示板率）</div>
+<div style="margin-top:6px"><a href="{{ url_for('entries_wedge', table=table, rid=rid) }}" target="_blank">このレースの WEDGE 一覧（閾値なし・全キー）</a></div></div>
 <div class="card"><h1>馬ごとの該当数</h1><table><thead><tr><th>馬番</th><th>馬名</th>
 {% for c in order %}<th>{{ CATEGORY_LABELS[c] }}</th>{% endfor %}</tr></thead><tbody>
 {% for s in summary %}<tr><td>{{ s.uma }}</td><td>{{ s.name }}</td>{% for c in order %}<td class="num">{{ s[c] or '' }}</td>{% endfor %}</tr>{% endfor %}
@@ -686,7 +692,227 @@ def entries_hits():
     head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}'
     sub = f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")} / {h.get("クラス名_raw", "")} / {len(race)}頭'
     return render("条件ヒット馬", HITS_BODY, head=head, sub=sub, path=path, buckets=buckets,
-                  order=HITS_ORDER, desc=description_lines(), summary=summary)
+                  order=HITS_ORDER, desc=description_lines(), summary=summary, table=table,
+                  rid=h.get("レースID(新/馬番無)", rid))
+
+
+# ========================= レース別 WEDGE 一覧 =========================
+WEDGE_SORTS = ("adjusted_WEDGE", "WEDGE", "WIN", "EDGE", "件数", "adjusted_WEDGE_件数", "馬番")
+WEDGE_VIEW_LIMIT = 3000        # 画面に出す行数の上限（CSV ダウンロードは全行）
+WEDGE_CSV_COLUMNS = ("馬番", "枠番", "馬名", "騎手", "base", "family", "rank_scheme", "odds_mode", "region", "key",
+                     "テーブル名", "件数", "WIN", "EDGE", "WEDGE", "adjusted_WEDGE", "adjusted_WEDGE_年数",
+                     "adjusted_WEDGE_件数", "adjusted_WEDGE_最終年", "勝率_val", "連対率_val", "複勝率_val",
+                     "掲示板率_val", "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値")
+
+
+def _num(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
+
+
+def dedupe_hits(hits: list[dict]) -> list[dict]:
+    """同じ馬・指数・family・キー・集計表の重複を除く（classify_hits と同じ同一性）。"""
+    out, seen = [], set()
+    for h in hits:
+        ident = (h.get("馬番"), h.get("base"), h.get("family"), h.get("key"), h.get("テーブル名"))
+        if ident not in seen:
+            seen.add(ident)
+            out.append(h)
+    return out
+
+
+def filter_wedge_hits(hits: list[dict], odds_mode: str = "normal", inds=(), fams=(), uma: str = "") -> list[dict]:
+    """画面の選択（オッズ帯・指数・パターン・馬番）だけで絞る。WEDGE の値による足切りはしない。"""
+    out = []
+    for h in dedupe_hits(hits):
+        if odds_mode != "all" and (h.get("odds_mode") or "normal") != odds_mode:
+            continue
+        if inds and h.get("base") not in inds:
+            continue
+        if fams and h.get("family") not in fams:
+            continue
+        if uma and str(h.get("馬番")) != uma:
+            continue
+        out.append(h)
+    return out
+
+
+def sort_wedge_hits(hits: list[dict], sort: str = "adjusted_WEDGE", desc: bool = True) -> list[dict]:
+    """並べ替え。空欄は常に最後。同値は WEDGE → 馬番 → 指数・パターン・キー・集計表の順（照合経路によらず同じ並び）。"""
+    def tail(h):
+        return (to_int(h.get("馬番")), str(h.get("base") or ""), str(h.get("family") or ""),
+                str(h.get("key") or ""), str(h.get("テーブル名") or ""))
+
+    if sort == "馬番":                     # 馬番の若い順に並べ、馬の中は adjusted_WEDGE の大きい順（順序の指定は使わない）
+        def key(h):
+            a = _num(h.get("adjusted_WEDGE"))
+            return (to_int(h.get("馬番")), a is None, -(a or 0)) + tail(h)
+        return sorted(hits, key=key)
+
+    def key(h):
+        v = _num(h.get(sort))
+        w = _num(h.get("WEDGE"))
+        return (v is None, -(v or 0) if desc else (v or 0), w is None, -(w or 0)) + tail(h)
+    return sorted(hits, key=key)
+
+
+def wedge_matrix(race: list[dict], hits: list[dict], bases: list[str]) -> list[dict]:
+    """馬 × 指数の要約（その馬・指数で該当したキーの adjusted_WEDGE / WEDGE の最大と該当数）。"""
+    by: dict[tuple, list[dict]] = {}
+    for h in hits:
+        by.setdefault((str(h.get("馬番")), h.get("base")), []).append(h)
+    rows = []
+    for r in race:
+        uma = str(r.get("馬番", ""))
+        cells, all_hits = {}, []
+        for b in bases:
+            hs = by.get((uma, b), [])
+            all_hits.extend(hs)
+            adj = [x for x in (_num(h.get("adjusted_WEDGE")) for h in hs) if x is not None]
+            wed = [x for x in (_num(h.get("WEDGE")) for h in hs) if x is not None]
+            cells[b] = {"n": len(hs), "adj": max(adj) if adj else None, "wedge": max(wed) if wed else None}
+        adj = [x for x in (_num(h.get("adjusted_WEDGE")) for h in all_hits) if x is not None]
+        wed = [x for x in (_num(h.get("WEDGE")) for h in all_hits) if x is not None]
+        rows.append({"uma": uma, "waku": r.get("枠番", ""), "name": r.get("馬名", ""), "jockey": r.get("騎手", ""),
+                     "cells": cells, "n": len(all_hits),
+                     "adj_max": max(adj) if adj else None, "adj_mean": sum(adj) / len(adj) if adj else None,
+                     "wedge_max": max(wed) if wed else None, "wedge_mean": sum(wed) / len(wed) if wed else None})
+    return rows
+
+
+def wedge_class(v) -> str:
+    v = _num(v)
+    if v is None:
+        return ""
+    return "w-top" if v >= 1.0 else "w-good" if v >= 0.8 else "w-avg" if v >= 0.62 else "w-mid" if v >= 0.5 else "w-low"
+
+
+app.jinja_env.globals.update(wedge_class=wedge_class)
+
+WEDGE_BODY = """
+<style>.w-top{background:#bbf7d0}.w-good{background:#dcfce7}.w-avg{background:#f0fdf4}.w-low{background:#f3f4f6;color:#6b7280}
+td.cell{text-align:right;min-width:64px} td.cell .sub{color:#6b7280;font-size:11px}</style>
+<div class="card"><h1>{{ head }}</h1><div class="muted">{{ sub }}</div>
+<div class="muted">照合: {{ path }} ／ 閾値による足切りなし（オッズ帯・指数・パターン・馬番の選択だけで絞る）。
+WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=下位）。adjusted_WEDGE は年度加重（空欄=条件を満たす年が無い）</div>
+<div style="margin-top:6px"><a href="{{ url_for('entries_race', table=table, rid=rid) }}">出馬表</a> ／
+<a href="{{ url_for('entries_hits', table=table, rid=rid) }}">条件ヒット馬</a> ／
+<a href="{{ csv_url }}">この条件の全行を CSV でダウンロード</a></div></div>
+<div class="card"><form method="get"><input type="hidden" name="table" value="{{ table }}"><input type="hidden" name="rid" value="{{ rid }}">
+<div class="grid">
+  <div><label>オッズ帯（過去成績の区分）</label><select name="odds_mode">
+    <option value="all" {{ 'selected' if q_odds == 'all' else '' }}>すべて</option>
+    {% for m in odds_modes %}<option value="{{ m }}" {{ 'selected' if m == q_odds else '' }}>{{ odds_label(m) }}</option>{% endfor %}</select></div>
+  <div><label>馬番</label><select name="uma"><option value="">（全馬）</option>
+    {% for r in race %}<option value="{{ r['馬番'] }}" {{ 'selected' if r['馬番']|string == q_uma else '' }}>{{ r['馬番'] }} {{ r['馬名'] }}</option>{% endfor %}</select></div>
+  <div><label>並べ替え</label><select name="sort">{% for c in sorts %}<option value="{{ c }}" {{ 'selected' if c == q_sort else '' }}>{{ c }}</option>{% endfor %}</select></div>
+  <div><label>順序</label><select name="dir"><option value="DESC" {{ 'selected' if q_dir == 'DESC' else '' }}>大きい順</option>
+    <option value="ASC" {{ 'selected' if q_dir == 'ASC' else '' }}>小さい順</option></select></div>
+</div>
+<div style="margin-top:8px"><label>指数（未選択=すべて）</label><div class="cbs">{% for b in bases %}
+  <label class="cb"><input type="checkbox" name="ind" value="{{ b }}" {{ 'checked' if b in q_inds else '' }}>{{ b }}</label>{% endfor %}</div></div>
+<div style="margin-top:8px"><label>パターン（未選択=すべて）</label><div class="cbs">{% for f in families %}
+  <label class="cb"><input type="checkbox" name="family" value="{{ f }}" {{ 'checked' if f in q_fams else '' }}>{{ family_label(f) }}</label>{% endfor %}</div></div>
+<div style="margin-top:10px"><button type="submit">表示</button></div></form></div>
+
+<div class="card"><h1>馬 × 指数（該当キーの adjusted_WEDGE 最大 / WEDGE 最大・該当数）</h1>
+<table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>該当数</th><th>adj 最大</th><th>adj 平均</th><th>WEDGE 最大</th><th>WEDGE 平均</th>
+{% for b in matrix_bases %}<th>{{ b }}</th>{% endfor %}</tr></thead><tbody>
+{% for m in matrix %}<tr><td>{{ m.waku }}</td><td>{{ m.uma }}</td><td>{{ m.name }}</td><td>{{ m.jockey }}</td><td class="num">{{ m.n }}</td>
+<td class="cell {{ wedge_class(m.adj_max) }}">{{ fmt(m.adj_max, 3) }}</td><td class="cell">{{ fmt(m.adj_mean, 3) }}</td>
+<td class="cell {{ wedge_class(m.wedge_max) }}">{{ fmt(m.wedge_max, 3) }}</td><td class="cell">{{ fmt(m.wedge_mean, 3) }}</td>
+{% for b in matrix_bases %}{% set c = m.cells[b] %}<td class="cell {{ wedge_class(c.adj if c.adj is not none else c.wedge) }}">
+{% if c.n %}{{ fmt(c.adj, 3) if c.adj is not none else '—' }}<div class="sub">{{ fmt(c.wedge, 3) }}・{{ c.n }}件</div>{% endif %}</td>{% endfor %}</tr>{% endfor %}
+</tbody></table></div>
+
+<div class="card"><h1>全該当キー（{{ total }}行{% if total > shown|length %}・画面は先頭 {{ shown|length }} 行。残りは CSV で{% endif %}）</h1>
+<table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
+<th>件数</th><th>WIN</th><th>EDGE</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th><th>年の件数計</th><th>最終年</th>
+<th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>単勝回収値</th><th>複勝回収値</th></tr></thead><tbody>
+{% for h in shown %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
+<td>{{ h['base'] }}</td><td>{{ family_label(h['family'], h['rank_scheme']) }}</td><td>{{ odds_label(h['odds_mode']) }}</td><td>{{ h['region'] }}</td>
+<td><a href="{{ url_for('entries_key', key=h['key']) }}" target="_blank">{{ h['key'] }}</a></td><td class="num">{{ h['件数'] }}</td>
+{% for k in ['WIN','EDGE','WEDGE','adjusted_WEDGE'] %}<td class="num {{ wedge_class(h.get(k)) if k in ('WEDGE','adjusted_WEDGE') else '' }}">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}
+{% for k in ['adjusted_WEDGE_年数','adjusted_WEDGE_件数','adjusted_WEDGE_最終年','勝率_val','連対率_val','複勝率_val','掲示板率_val','単勝回収値','複勝回収値'] %}<td class="num">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}</tr>
+{% else %}<tr><td colspan="23">該当なし（この出馬表の馬の条件に合う集計行がありません）</td></tr>{% endfor %}</tbody></table></div>
+"""
+
+
+def _wedge_request():
+    table = request.args.get("table", "").strip()
+    rid = request.args.get("rid", "").strip()
+    legacy = request.args.get("ridn", "").strip()
+    odds_mode = request.args.get("odds_mode", "normal").strip()
+    if odds_mode not in ODDS_MODES + ("all",):
+        odds_mode = "normal"
+    sort = request.args.get("sort", "adjusted_WEDGE").strip()
+    if sort not in WEDGE_SORTS:
+        sort = "adjusted_WEDGE"
+    sdir = "ASC" if request.args.get("dir", "DESC").upper() == "ASC" else "DESC"
+    return {"table": table, "rid": rid, "legacy": legacy, "date": request.args.get("date", "").strip(),
+            "odds_mode": odds_mode, "inds": [v for v in request.args.getlist("ind") if v],
+            "fams": [v for v in request.args.getlist("family") if v in ALL_FAMILIES],
+            "uma": request.args.get("uma", "").strip(), "sort": sort, "dir": sdir}
+
+
+def _wedge_data(p: dict):
+    with connect() as con:
+        if not _valid_entries_table(con, p["table"]) or not (p["rid"] or p["legacy"]):
+            return None
+        race = _race_rows(con, p["table"], p["rid"], p["legacy"], p["date"])
+        hits, path = collect_hits(con, p["table"], race)
+        bases = indicator_bases(table_columns(con, p["table"]))
+    rank = {n: i for i, n in enumerate(INDICATOR_ORDER)}
+    bases = sorted(bases, key=lambda b: (rank.get(b, len(rank)), b))
+    rows = sort_wedge_hits(filter_wedge_hits(hits, p["odds_mode"], p["inds"], p["fams"], p["uma"]),
+                           p["sort"], p["dir"] == "DESC")
+    return race, rows, path, bases
+
+
+@app.route("/entries/wedge", methods=["GET"])
+def entries_wedge():
+    p = _wedge_request()
+    data = _wedge_data(p)
+    if data is None:
+        return redirect(url_for("entries_index"))
+    race, rows, path, bases = data
+    if not race:
+        return render("WEDGE一覧", '<div class="card">該当レースがありません。</div>')
+    h = race[0]
+    rid = h.get("レースID(新/馬番無)", p["rid"])
+    matrix_bases = [b for b in bases if not p["inds"] or b in p["inds"]]
+    matrix_race = [r for r in race if not p["uma"] or str(r.get("馬番")) == p["uma"]]
+    args = {k: v for k, v in request.args.lists()}
+    args.update({"table": [p["table"]], "rid": [rid]})
+    head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}　WEDGE 一覧'
+    sub = f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")} / {h.get("クラス名_raw", "")} / {len(race)}頭'
+    return render("WEDGE一覧", WEDGE_BODY, head=head, sub=sub, path=path, table=p["table"], rid=rid, race=race,
+                  bases=bases, families=ALL_FAMILIES, odds_modes=ODDS_MODES, sorts=WEDGE_SORTS,
+                  q_odds=p["odds_mode"], q_inds=p["inds"], q_fams=p["fams"], q_uma=p["uma"], q_sort=p["sort"],
+                  q_dir=p["dir"], matrix=wedge_matrix(matrix_race, rows, matrix_bases), matrix_bases=matrix_bases,
+                  total=len(rows), shown=rows[:WEDGE_VIEW_LIMIT],
+                  csv_url=url_for("entries_wedge_csv", **args))
+
+
+@app.route("/entries/wedge.csv", methods=["GET"])
+def entries_wedge_csv():
+    p = _wedge_request()
+    data = _wedge_data(p)
+    if data is None:
+        return redirect(url_for("entries_index"))
+    race, rows, _path, _bases = data
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerow(WEDGE_CSV_COLUMNS)
+    for h in rows:
+        w.writerow(["" if h.get(c) is None else h.get(c) for c in WEDGE_CSV_COLUMNS])
+    rid = (race[0].get("レースID(新/馬番無)") if race else "") or p["rid"] or "race"
+    name = re.sub(r"[^0-9A-Za-z_-]", "_", str(rid))
+    return Response(buf.getvalue().encode("utf-8-sig"), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="wedge_{name}.csv"'})
 
 
 @app.route("/healthz")

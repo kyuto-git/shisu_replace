@@ -335,14 +335,34 @@ def test_edge_success_and_wedge():
 
 
 def test_year_weights():
-    assert wedge.year_weights(5).tolist() == [0.06, 0.11, 0.18, 0.25, 0.40]
-    assert wedge.year_weights(4).tolist() == [0.12, 0.19, 0.27, 0.42]
-    w3 = wedge.year_weights(3)
-    assert w3.sum() == pytest.approx(1.0) and w3[0] < w3[1] < w3[2]
-    assert len(wedge.year_weights(7)) == 5
-    yearly = {2019: 9.0, 2020: 1.0, 2021: 1.0, 2022: 1.0, 2023: 1.0, 2024: 2.0}
-    assert wedge.adjusted_wedge(yearly) == pytest.approx(0.06 + 0.11 + 0.18 + 0.25 + 0.8)   # 2019 は切り捨て
-    assert wedge.adjusted_wedge({2023: 1.0, 2024: 2.0}, {2023: 3, 2024: 40}, min_year_count=30) == pytest.approx(2.0)
+    """新しい年ほど重い指数減衰（合計1）。decay=0.65 で Phase 3 の固定ウェイトをほぼ再現する。"""
+    w5 = wedge.year_weights(range(2021, 2026))
+    assert w5.sum() == pytest.approx(1.0) and all(np.diff(w5) > 0)
+    assert w5 == pytest.approx([0.06, 0.11, 0.18, 0.25, 0.40], abs=0.013)
+    assert wedge.year_weights(range(2022, 2026)) == pytest.approx([0.12, 0.19, 0.27, 0.42], abs=0.011)
+    w10 = wedge.year_weights(range(2016, 2026))
+    assert len(w10) == 10 and w10.sum() == pytest.approx(1.0)
+    assert w10[-1] == pytest.approx(1 / sum(0.65 ** k for k in range(10)))
+    assert w10[:5].sum() == pytest.approx(0.104, abs=0.002)                  # 古い5年の合計は約1割
+    assert wedge.year_weights([2025]).tolist() == [1.0]
+    assert wedge.year_weights([2025, 2021, 2024]) == pytest.approx(
+        np.array([1.0, 0.65 ** 4, 0.65]) / (1 + 0.65 ** 4 + 0.65))           # 並びは入力どおり、暦の年の差で効く
+    assert wedge.year_weights(range(2021, 2026), decay=1.0) == pytest.approx([0.2] * 5)
+    with pytest.raises(ValueError):
+        wedge.year_weights([2025], decay=0)
+
+
+def test_adjusted_wedge_scalar():
+    yearly = {2013: 9.0, 2016: 1.0, 2020: 1.0, 2024: 2.0, 2025: 2.0}
+    w = wedge.year_weights([2016, 2020, 2024, 2025])
+    assert wedge.adjusted_wedge(yearly) == pytest.approx(np.dot(w, [1.0, 1.0, 2.0, 2.0]))   # 2013 は10年の窓の外
+    assert wedge.adjusted_wedge(yearly, max_years=20) == pytest.approx(
+        np.dot(wedge.year_weights([2013, 2016, 2020, 2024, 2025]), [9.0, 1.0, 1.0, 2.0, 2.0]))
+    # 件数 < 10 の年は除く（既定の最低件数）
+    assert wedge.adjusted_wedge({2023: 1.0, 2024: 2.0}, {2023: 9, 2024: 10},
+                                min_year_count=wedge.DEFAULT_MIN_YEAR_COUNT) == pytest.approx(2.0)
+    assert wedge.DEFAULT_MIN_YEAR_COUNT == 10 and wedge.DEFAULT_MAX_YEARS == 10
+    assert np.isnan(wedge.adjusted_wedge({2015: 1.0}, window_end=2025))                     # 窓の外だけ
 
 
 # ---------------------------------------------------------------- CSV 入出力
@@ -390,11 +410,13 @@ def _random_material(seed, n=4000, keys=30, years=range(2017, 2026)):
 
 
 @pytest.mark.parametrize("window", ["data", "key"])
-@pytest.mark.parametrize("min_year", [0, 30])
-def test_wedge_columns_match_reference(window, min_year):
-    df = _random_material(1)
+@pytest.mark.parametrize("min_year", [0, 10, 30])
+@pytest.mark.parametrize("max_years,decay", [(10, 0.65), (5, 0.5), (3, 1.0)])
+def test_wedge_columns_match_reference(window, min_year, max_years, decay):
+    df = _random_material(1, years=range(2012, 2026))
     ref_year = 2026 if window == "data" else None      # data 窓: 素材の最終年より後を指定しても動く
-    out = wedge.wedge_columns(df["k"], df["finish_num"], df["単勝オッズ"], df["y"], ref_year, min_year, window)
+    out = wedge.wedge_columns(df["k"], df["finish_num"], df["単勝オッズ"], df["y"], ref_year, min_year, window,
+                              max_years=max_years, decay=decay)
     for k, g in df.groupby("k"):
         r = wedge.wedge_from_frame(g)
         assert out.loc[k, "WIN"] == pytest.approx(r["WIN"])
@@ -404,7 +426,7 @@ def test_wedge_columns_match_reference(window, min_year):
         yearly = {int(y): wedge.wedge_from_frame(x)["WEDGE"] for y, x in gy.groupby("y")}
         counts = {int(y): len(x) for y, x in gy.groupby("y")}
         end = ref_year if window == "data" else max(counts)
-        adj = wedge.adjusted_wedge(yearly, counts, min_year, end)
+        adj = wedge.adjusted_wedge(yearly, counts, min_year, end, max_years=max_years, decay=decay)
         if adj != adj:
             assert pd.isna(out.loc[k, "adjusted_WEDGE"]) and out.loc[k, "adjusted_WEDGE_年数"] == 0
         else:
@@ -412,44 +434,61 @@ def test_wedge_columns_match_reference(window, min_year):
 
 
 def test_wedge_hand_example():
-    """手計算の例。1キー、2021〜2025年の各年40件。"""
+    """手計算の例。1キー、2014〜2025年の各年40件（2016年だけ9件）。"""
     rows = []
-    for y in range(2020, 2026):
+    for y in range(2014, 2026):
         for i in range(40):
             fin = 1 if i < 4 else (2 if i < 8 else (3 if i < 12 else 10))      # 1着4・2着4・3着4・着外28
             odds = 2.0 if i < 20 else 30.0                                    # 2倍→1着のみ成功、30倍→6着以内
             rows.append({"k": "A", "f": fin, "o": odds, "y": y})
     df = pd.DataFrame(rows)
-    df.loc[(df["y"] == 2024) & (df.index % 40 >= 20), "y"] = np.nan             # 2024年は20件（<30）にする
-    out = wedge.wedge_columns(df["k"], df["f"], df["o"], df["y"], ref_year=2025, min_year_count=30)
+    df.loc[(df["y"] == 2016) & (df.index % 40 >= 9), "y"] = np.nan             # 2016年は9件（<10）にする
+    out = wedge.wedge_columns(df["k"], df["f"], df["o"], df["y"], ref_year=2025)   # 既定: 10件・10年・0.65
     # 年40件: WIN = (4*3 + 4*1.5 + 4*1) / (40*3) = 22/120
     #         EDGE = 2倍(20頭)の1着4頭 + 30倍(20頭)の6着以内0頭（i<20 が2倍）→ 4/40
-    win_y, edge_y = 22 / 120, 4 / 40
-    w_y = win_y + edge_y
-    assert out.loc["A", "adjusted_WEDGE_年数"] == 4                      # 2021,2022,2023,2025（2020は窓外、2024は件数不足）
-    assert out.loc["A", "adjusted_WEDGE_件数"] == 160
+    w_y = 22 / 120 + 4 / 40
+    # 窓は2016〜2025。2016は9件で除外 → 2017〜2025の9年。どの年も同じ値なので加重平均もその値
+    assert out.loc["A", "adjusted_WEDGE_年数"] == 9
+    assert out.loc["A", "adjusted_WEDGE_件数"] == 360
     assert out.loc["A", "adjusted_WEDGE_最終年"] == 2025
-    assert out.loc["A", "adjusted_WEDGE"] == pytest.approx(w_y * (0.12 + 0.19 + 0.27 + 0.42))
-    # 全期間（年が欠けた行も含む）: 240件。うち2024年の後半20頭（i>=20 → 着外10着・30倍）も含む
-    assert out.loc["A", "WIN"] == pytest.approx((6 * 22) / (240 * 3))
+    assert out.loc["A", "adjusted_WEDGE"] == pytest.approx(w_y)
+    # 全期間（年が欠けた行も含む）: 480件
+    assert out.loc["A", "WIN"] == pytest.approx((12 * 22) / (480 * 3))
 
 
-def test_wedge_year_weighting_uses_spec_weights():
-    """年ごとに WEDGE が違うとき、古い順にウェイトが掛かる。"""
-    rows = []
-    for j, y in enumerate(range(2019, 2026)):       # 7年分。直近5年だけ使う
-        for i in range(30):
-            rows.append({"k": "A", "f": 1 if i < j else 18, "o": 5.0, "y": y})   # 年ごとに1着数が増える
+def test_wedge_year_weighting_uses_decay_weights():
+    """年ごとに WEDGE が違うとき、新しい年ほど重い減衰ウェイトが掛かる（3〜10年の可変年数）。"""
+    for n_years in (3, 4, 7, 10):
+        rows = []
+        years = list(range(2026 - n_years, 2026))
+        for j, y in enumerate(years):
+            for i in range(10):                                                # 各年ちょうど10件（足切りの境界）
+                rows.append({"k": "A", "f": 1 if i < j % 10 + 1 else 18, "o": 5.0, "y": y})
+        df = pd.DataFrame(rows)
+        out = wedge.wedge_columns(df["k"], df["f"], df["o"], df["y"], ref_year=2025)
+        per_year = [((j % 10 + 1) * 3 / 30) + ((j % 10 + 1) / 10) for j in range(n_years)]
+        w = np.array([0.65 ** (2025 - y) for y in years])
+        assert out.loc["A", "adjusted_WEDGE"] == pytest.approx(np.dot(w / w.sum(), per_year))
+        assert out.loc["A", "adjusted_WEDGE_年数"] == n_years
+
+
+def test_wedge_gap_year_is_older():
+    """開催の無い年（または件数不足の年）をはさむと、それより古い年は暦の差の分だけ軽くなる。"""
+    rows = [{"k": "A", "f": 1, "o": 2.0, "y": 2021} for _ in range(10)]          # 2021: 全勝 → WEDGE=2
+    rows += [{"k": "A", "f": 18, "o": 2.0, "y": 2023} for _ in range(10)]        # 2023: 全敗 → WEDGE=0（2022 は無い）
     df = pd.DataFrame(rows)
-    out = wedge.wedge_columns(df["k"], df["f"], df["o"], df["y"], ref_year=2025, min_year_count=30)
-    per_year = [(j * 3 / 90) + (j / 30) for j in range(2, 7)]                # 2021..2025
-    assert out.loc["A", "adjusted_WEDGE"] == pytest.approx(np.dot([0.06, 0.11, 0.18, 0.25, 0.40], per_year))
-    assert out.loc["A", "adjusted_WEDGE_年数"] == 5
+    out = wedge.wedge_columns(df["k"], df["f"], df["o"], df["y"], ref_year=2023)
+    w_old = 0.65 ** 2 / (1 + 0.65 ** 2)
+    assert out.loc["A", "adjusted_WEDGE"] == pytest.approx(2.0 * w_old)
 
 
-@pytest.mark.parametrize("n,expected", [(1, [1.0]), (2, [0.1 / 0.6, 0.5 / 0.6]), (3, [0.1 / 0.9, 0.3 / 0.9, 0.5 / 0.9])])
-def test_year_weights_short(n, expected):
-    assert wedge.year_weights(n).tolist() == pytest.approx(expected)
+def test_wedge_min_year_count_boundary():
+    rows = [{"k": "A", "f": 1, "o": 2.0, "y": 2024} for _ in range(9)]
+    rows += [{"k": "B", "f": 1, "o": 2.0, "y": 2024} for _ in range(10)]
+    df = pd.DataFrame(rows)
+    out = wedge.wedge_columns(df["k"], df["f"], df["o"], df["y"])
+    assert pd.isna(out.loc["A", "adjusted_WEDGE"]) and out.loc["A", "adjusted_WEDGE_年数"] == 0
+    assert out.loc["B", "adjusted_WEDGE"] == pytest.approx(2.0) and out.loc["B", "adjusted_WEDGE_年数"] == 1
 
 
 def test_wedge_columns_edge_cases():
@@ -464,6 +503,10 @@ def test_wedge_columns_edge_cases():
     assert out.loc["a", "adjusted_WEDGE_年数"] == 0 and pd.isna(out.loc["a", "adjusted_WEDGE_最終年"])
     with pytest.raises(ValueError):
         wedge.wedge_columns(pd.Series(["a"]), pd.Series([1]), pd.Series([2.0]), pd.Series([2024]), window="bad")
+    with pytest.raises(ValueError):
+        wedge.wedge_columns(pd.Series(["a"]), pd.Series([1]), pd.Series([2.0]), pd.Series([2024]), decay=1.5)
+    with pytest.raises(ValueError):
+        wedge.wedge_columns(pd.Series(["a"]), pd.Series([1]), pd.Series([2.0]), pd.Series([2024]), max_years=0)
 
 
 def test_unknown_finish_is_edge_failure():
