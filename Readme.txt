@@ -19,7 +19,7 @@ docker_shisu_replace/
 │   └─ yasui/          安井サロン月別Excel（ステータス新バージョンYYYY_M月.xlsx）
 ├─ ingest_out/         [成果物] 指数取得（/ingest）の出力先（実行日時 YYYYMMDD_HHMMSS/ ごとに保存）
 ├─ shisu/              [コア] 共通Pythonパッケージ（正規化・偏差値・キー生成・分類・WEDGE・ingest群）
-├─ tests/              [検証] 自動テスト群（pytest：全225件）
+├─ tests/              [検証] 自動テスト群（pytest：全228件）
 ├─ replace_csv_ver3.py [Step 1] 過去CSVの正規化・偏差値化・素材（foragg_csv/）生成
 ├─ aggregate_stats_ver2.py [Step 2] オッズ4区分でのグループ集計・Jeffreysベイズ推定・WEDGE算出（agg_csv/）
 ├─ calc_entry_hensachi.py  [Step 3] 出馬表CSVの偏差値・順位・帯計算＆横結合（entries_out/）
@@ -443,11 +443,13 @@ docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu pyth
     （年またぎのシートや、2025年11月ファイルの 1029・1030 → 11/29・11/30 の読み替えも自動）。
     ・ベースCSVを一緒に指定した場合：レースID(新)（18桁）を照合して、TARGET取込用の
       YYYYMMDD_yasui_{指数}.csv（レースID(新), ワーク1）と {元ファイル名}_{指数}_merged.csv を出力。
-    ・ベースCSVを選び忘れた場合：ingest_in/base/ と entries_in/ に該当開催日のCSV（ベースCSVや
-      TARGETの出馬表CSV）があれば、自動でそこから18桁のレースID(新)を引き当てます。
+    ・ベースCSVを選び忘れた場合（または選んだベースCSVに無い開催日・場所がある場合）：
+      ingest_in/base/ と entries_in/ に該当開催日・場所のCSV（ベースCSVやTARGETの出馬表CSV）があれば、
+      自動でそこから18桁のレースID(新)を引き当てます（読めないCSVは警告して飛ばします）。
     ・どこにもベースCSVが無い開催日：レースID(新)の代わりに「日付, 場所, 場所コード, R, 馬番, 馬名, ワーク1」
       の指数別・日付別CSVを出力し、画面とログに「TARGET取込用の18桁レースIDを付与するには
       ベースCSVも一緒に指定してください」と案内します（このCSVはそのままではTARGETに取り込めません）。
+      ベースCSVがある日でも、ある場所の行が無い馬は YYYYMMDD_yasui_{指数}_noid.csv に同じ形で出します。
 
   ★ヒント：毎回ブラウザからファイルを選択しなくても、Macの以下のフォルダにファイルを
             置いておけば、画面上にチェックボックスが出てクリックだけで選べます。

@@ -95,12 +95,15 @@ def ymd_text(v) -> str:
 # ベースCSV
 # ---------------------------------------------------------------------------
 def read_base(paths: Iterable[Path | str], log: Logger = default_log, taken: Iterable[str] = (),
-              dates: set[str] | None = None, label: str = "ベースCSV") -> pd.DataFrame:
+              prefixes: set[str] | None = None, columns: Iterable[str] | None = None,
+              label: str = "ベースCSV") -> pd.DataFrame:
     """ベースCSV（複数可）を縦に結合する。列は文字列のまま。各行に _source_file（元ファイル名）を付ける。
 
     レースID(新) は数字だけにそろえる。日付S が無い・空欄の行は レースID(新) の先頭8桁で補う。
     taken: すでに使っている _source_file の名前（別に読んだベースと名前が重ならないようにする）
-    dates: 指定すると、その日付の行だけ残す（自動で探したベースCSVで使う）
+    prefixes: 指定すると、レースID(新) の先頭10桁（YYYYMMDD + 場所コード）がこの中にある18桁の行だけ残す
+              （自動で探したベースCSVで使う）
+    columns: 指定すると、その列（あるものだけ）に絞る（自動で探した出馬表CSVの余計な列をマージ完全版に混ぜない）
     """
     frames = []
     keys: set[str] = {_out_key(t) for t in taken}
@@ -120,10 +123,12 @@ def read_base(paths: Iterable[Path | str], log: Logger = default_log, taken: Ite
         df[DATE] = date.where(date != "", df[RID].str.slice(0, 8))
         if WORK not in df.columns:
             df[WORK] = ""
-        if dates is not None:
-            df = df[df[DATE].isin(dates) & (df[RID].str.len() == 18)]
+        if prefixes is not None:
+            df = df[(df[RID].str.len() == 18) & df[RID].str.slice(0, 10).isin(prefixes)]
             if df.empty:
                 continue
+        if columns is not None:
+            df = df[[c for c in columns if c in df.columns]]
         name, n = p.name, 1
         # 同じ名前の別ファイル（別フォルダ・アップロード）はマージ完全版を分ける。出力名（{stem}_merged.csv）で比べ、
         # 大文字・小文字だけ違う名前（base.csv と base.CSV。macOS では同じファイル名）も別にする
@@ -172,11 +177,14 @@ def _out_key(name: str) -> str:
 def read_table(path: Path, required: str, log: Logger = default_log) -> pd.DataFrame | None:
     """入力CSVを読む。空のファイルは警告して None。必須列が見つからなければ UTF-8 で読み直す
     （cp932 を先に試すので、BOM の無い UTF-8（Mac の Numbers の書き出しなど）は見出しが化けて読めてしまう）。"""
-    from pandas.errors import EmptyDataError
+    from pandas.errors import EmptyDataError, ParserError
     try:
         df = read_csv_any(path)
     except EmptyDataError:
         log(f"[WARN] {path.name}: 空のファイルです（スキップ）")
+        return None
+    except (ParserError, UnicodeError) as e:     # 列数のそろわない手書きのCSV、名前だけ .csv の Excel など
+        log(f"[WARN] {path.name}: CSV として読めません（スキップ）: {type(e).__name__}: {str(e)[:120]}")
         return None
     if required not in df.columns:
         try:
@@ -238,6 +246,7 @@ def write_outputs(base: pd.DataFrame, values: pd.Series, out_dir: Path, name: st
     full[WORK] = values.reindex(full.index).fillna("")
     if merged:
         for src, g in full.groupby(SOURCE_FILE, sort=True):
+            g = g.dropna(axis=1, how="all")       # 別のファイルにしか無い列（縦に結合したときの NaN）は落とす
             stem = Path(str(src)).stem + (f"_{merged_suffix}" if merged_suffix else "")
             path = out_dir / f"{stem}_merged.csv"
             write_csv(g.drop(columns=[SOURCE_FILE]), path)

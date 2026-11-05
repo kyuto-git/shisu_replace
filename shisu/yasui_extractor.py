@@ -30,8 +30,9 @@ Excel の形（2025年11月〜2026年2月の4ファイルで確認）:
                                                     （レースID(新)・安井_馬名・8指数の値。calc_entry_hensachi --merge-* で
                                                      TARGET の出馬表と レースID(新) で横に結合される）
   レースID(新)（18桁）は Excel に無い（回・日が分からない）ので、ベースCSVと 日付・場所・R・馬番 で照合して付ける。
-  ベースCSVの指定が無い開催日は、search_dirs（ingest では ingest_in/base/ と entries_in/）の CSV から
-  その日の行を探して使う。どこにも無い開催日は、TARGET 取込用の代わりに
+  ベースCSVの指定が無い開催日×場所は、search_dirs（ingest では ingest_in/base/ と entries_in/）の CSV から
+  その行を探して使う（読めない CSV は飛ばす）。ベースのある日でも行の無い場所の馬は
+  yasui_{key}/{YYYYMMDD}_yasui_{key}_noid.csv に出す。どこにも無い開催日は、TARGET 取込用の代わりに
   yasui_{key}/{YYYYMMDD}_yasui_{key}.csv を「日付, 場所, 場所コード, R, 馬番, 馬名, ワーク1」で出し、
   ベースCSVも指定するよう案内する（このファイルは レースID(新) が無いので TARGET にはそのまま取り込めない）。
 """
@@ -278,7 +279,8 @@ def run(paths: Iterable[Path | str], base: pd.DataFrame | None, out_dir: Path, l
         log(f"[WARN] {LABEL}: 取り出せた行がありません")
         return res
     days = set(df["日付"])
-    base = complete_base(base, days, search_dirs, exclude_paths, log)
+    need = {k[:10] for k in df["_key"] if k}             # Excel にある 開催日×場所（YYYYMMDD + 場所コード）
+    base = complete_base(base, need, search_dirs, exclude_paths, log)
     bkeys = base[RID].map(key14)
     if not base.empty:
         rid_of = dict(zip(bkeys[bkeys != ""], base.loc[bkeys != "", RID]))
@@ -309,10 +311,13 @@ def run(paths: Iterable[Path | str], base: pd.DataFrame | None, out_dir: Path, l
         log(f"[WARN] {LABEL}: {msg}")
         res.notes.append(msg)
     unmatched = df[(df[RID] == "") & df["日付"].isin(base_days)]
-    if len(unmatched):
+    if len(unmatched):          # ベースCSVのある日でも、その場所の行がどこにも無い馬は {日付}_yasui_{key}_noid.csv に出す
+        for key, _label, name in INDICATORS:
+            for day, g in unmatched.groupby("日付", sort=True):
+                res.files.append(_write_no_base(g, name, out_dir / f"yasui_{key}" / f"{day}_yasui_{key}_noid.csv"))
         where = ", ".join(f"{d} {p}" for d, p in sorted(set(zip(unmatched["日付"], unmatched["場所"]))))
-        msg = (f"ベースCSVはあるが照合できなかった馬 {len(unmatched)} 頭（{where}）は TARGET 取込用CSVに入りません。"
-               "その開催日・場所の行がベースCSVにあるか確かめてください")
+        msg = (f"ベースCSVに行が無く照合できなかった馬 {len(unmatched)} 頭（{where}）は TARGET 取込用CSVに入らないので、"
+               f"レースID(新) の無い {{日付}}_yasui_{{key}}_noid.csv に出しました。{NO_BASE_GUIDE}")
         log(f"[WARN] {LABEL}: {msg}")
         res.notes.append(msg)
     if base_days:
@@ -324,32 +329,47 @@ def run(paths: Iterable[Path | str], base: pd.DataFrame | None, out_dir: Path, l
     return res
 
 
-def complete_base(base: pd.DataFrame | None, days: set[str], search_dirs: Iterable[Path | str],
+BASE_COLUMNS = (RID, DATE, "枠番", "馬番", "馬名", "馬名S", WORK, SOURCE_FILE)
+
+
+def complete_base(base: pd.DataFrame | None, need: set[str], search_dirs: Iterable[Path | str],
                   exclude_paths: Iterable[Path | str], log: Logger = default_log) -> pd.DataFrame:
-    """指定されたベースCSVに無い開催日を、search_dirs の CSV から補う（ファイルの順に、まだ無い日の行だけ使う）。"""
+    """指定されたベースCSVに無い「開催日×場所」を、search_dirs の CSV から補う。
+
+    need: Excel にある YYYYMMDD + 場所コード（10桁）。ファイルの順に、まだ無い開催日×場所の行だけ使う。
+    補ったファイルはベースCSVの列（BASE_COLUMNS）だけにする（出馬表CSVの何十列をマージ完全版に混ぜない）。
+    読めないファイル（列数のそろわない手書きのCSV など）は警告して飛ばす。
+    """
     if base is None or base.empty:
         base = pd.DataFrame(columns=[RID, DATE, WORK, SOURCE_FILE])
-    have = set(base.loc[base[RID].astype(str).str.len() == 18, DATE])
-    missing = set(days) - have
+    rid = base[RID].astype(str)
+    missing = set(need) - set(rid[rid.str.len() == 18].str.slice(0, 10))
     if not missing:
         return base
-    files = find_base_files(search_dirs, exclude_paths)
     parts, used = [], []
     taken = set(base[SOURCE_FILE]) if SOURCE_FILE in base.columns else set()
-    for f in files:
+    for f in find_base_files(search_dirs, exclude_paths):
         if not missing:
             break
-        part = read_base([f], lambda m: None, taken=taken, dates=missing)
+        warn: list[str] = []
+        try:
+            part = read_base([f], lambda m: warn.append(m) if "読めません" in m else None, taken=taken,
+                             prefixes=missing, columns=BASE_COLUMNS)
+        except Exception as e:  # 候補のファイル1本のせいで全体を止めない
+            warn.append(f"{type(e).__name__}: {e}")
+            part = pd.DataFrame()
+        for w in warn:
+            log(f"[WARN] {LABEL}: ベースCSVの候補 {f.parent.name}/{f.name} を読めないので使いません（{w}）")
         if part.empty:
             continue
-        got = set(part[DATE])
+        got = set(part[RID].str.slice(0, 10))
         parts.append(part)
         taken |= set(part[SOURCE_FILE])
-        used.append(f"{f.parent.name}/{f.name}（{_fmt_days(sorted(got))}）")
+        used.append(f"{f.parent.name}/{f.name}（{_fmt_days(sorted({g[:8] for g in got}))}）")
         missing -= got
     if not parts:
         return base
-    log(f"[INFO] {LABEL}: ベースCSVの指定が無い開催日を、次のファイルから補いました: {', '.join(used)}")
+    log(f"[INFO] {LABEL}: ベースCSVの指定が無い開催日・場所を、次のファイルから補いました: {', '.join(used)}")
     return pd.concat([base] + parts, ignore_index=True)
 
 

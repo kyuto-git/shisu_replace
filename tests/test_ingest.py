@@ -506,13 +506,15 @@ def test_yasui_finds_base_in_search_dirs(tmp_path):
     entries = tmp_path / "entries_in"
     write_base(entries / "shisu_20251108_1.csv", base_frame().iloc[8:10])               # 11/08 小倉
     write_base(entries / "shisu_20251108_2.csv", base_frame().iloc[8:10])               # 同じ日の別ファイルは読まない
-    write_base(entries / "yasui_20251101.csv", base_frame().iloc[:1])                  # 自分の出力は使わない
+    write_base(entries / "yasui_20251115.csv", pd.DataFrame([{"レースID(新)": "202511150504030101", "日付S": "20251115",
+                                                             "枠番": "1", "馬番": "1", "ワーク1": ""}]))  # 自分の出力は使わない
     logs = []
     res = y.run([xlsx], given, tmp_path / "o", logs.append, search_dirs=[ingest_base, entries],
                 exclude_paths=[tmp_path / "given" / "base.csv"])
     assert res.matched == 3
     used = next(m for m in logs if "補いました" in m)
     assert "base/base.csv" in used and "entries_in/shisu_20251108_1.csv" in used and "shisu_20251108_2" not in used
+    assert "yasui_20251115" not in used
     o = tmp_path / "o" / "yasui_speed"
     assert out_csv(o / "20251102_yasui_speed.csv")["ワーク1"].tolist() == ["60", ""]
     assert out_csv(o / "20251108_yasui_speed.csv")["レースID(新)"].tolist() == ["202511081003010101", "202511081003010102"]
@@ -656,6 +658,7 @@ def test_ingest_web_flow(tmp_path, monkeypatch):
     web.JOBS[run2].thread.join(timeout=30)
     page = c.get(f"/ingest/job/{run2}").get_data(as_text=True)
     assert "ベースCSVも一緒に指定してください" in page and "yasui/yasui_speed/20251206_yasui_speed.csv" in page
+    assert '<div class="warn" style="margin-top:6px">安井サロン Excel: ベースCSVが見つからない開催日 20251206' in page
 
 
 def test_ingest_web_cancel(tmp_path, monkeypatch):
@@ -893,3 +896,73 @@ def test_ingest_web_non_utf8_input_name(web_app, tmp_path):
     r = c.get("/ingest")
     page = r.get_data(as_text=True)
     assert r.status_code == 200 and "UTF-8 で読めないので選べません" in page and 'value="ok.csv"' in page
+
+
+# ---------------------------------------------------------------- 安井: ベースCSVの自動の探し方（追加の確認）
+def test_yasui_skips_unreadable_candidates(tmp_path):
+    """ingest_in/base/・entries_in/ に読めない CSV（列数のそろわない手書きのメモ・名前だけ .csv の Excel）があっても
+    安井の取り出しは止まらない。そのファイルは警告して候補から外す。"""
+    from shisu import yasui_extractor as y
+    xlsx = make_yasui_xlsx(tmp_path / "ステータス新バージョン2025_11月.xlsx", {
+        "1101": [yrow("東京", 1, 1, 1, 34, "アア", "48⑥", "1①", "1①", "1①", "1①", 4, 0)],
+        "1102": [yrow("中山", 11, 1, 1, 40, "エエ", "60①", "1⑨", "60⑦", "54③", "50③", 5, 1)]})
+    entries = tmp_path / "entries_in"
+    entries.mkdir()
+    (entries / "a_memo.csv").write_text("日付,メモ\n20251101,外差し\n20251102,内有利, 逃げ残り\n", encoding="cp932")
+    (entries / "b_book.csv").write_bytes(xlsx.read_bytes())              # 名前だけ .csv の Excel
+    write_base(entries / "c_shisu.csv", base_frame().iloc[6:8])         # 11/02 中山
+    given = common.read_base([write_base(tmp_path / "base.csv", base_frame().iloc[:3])], lambda m: None)
+    logs = []
+    res = y.run([xlsx], given, tmp_path / "o", logs.append, search_dirs=[entries])
+    assert res.matched == 2 and not res.notes
+    assert any("a_memo.csv を読めない" in m for m in logs) and any("b_book.csv を読めない" in m for m in logs)
+    assert out_csv(tmp_path / "o" / "yasui_speed" / "20251102_yasui_speed.csv")["ワーク1"].tolist() == ["60", ""]
+    # 指定したベースCSVが読めないときも、その1本を飛ばすだけ
+    bad = tmp_path / "bad.csv"
+    bad.write_text("レースID(新),日付S\n202511010504010101,20251101\n1,2,3\n", encoding="cp932")
+    logs = []
+    assert common.read_base([bad], logs.append).empty and any("CSV として読めません" in m for m in logs)
+
+
+def test_yasui_base_lookup_is_per_date_and_venue(tmp_path):
+    """指定したベースCSVに、ある開催日の一部の場所しか無いときは、残りの場所を探す。
+    どこにも無い場所の馬は {日付}_yasui_{key}_noid.csv（レースIDなし）に出して案内する。
+    自動で補ったファイルのマージ完全版はベースCSVの列だけ、指定したベースのマージ完全版は元の列のまま。"""
+    from shisu import yasui_extractor as y
+    xlsx = make_yasui_xlsx(tmp_path / "ステータス新バージョン2025_11月.xlsx", {
+        "1101": [yrow("東京", 1, 1, 1, 34, "アア", "48⑥", "1①", "1①", "1①", "1①", 4, 0),
+                 yrow("京都", 1, 1, 1, 35, "キキ", "50①", "1①", "1①", "1①", "1①", 4, 0),
+                 yrow("福島", 1, 1, 1, 36, "フフ", "52①", "1①", "1①", "1①", "1①", 4, 0)]})
+    given_df = base_frame().iloc[:3].assign(メモ="x")                    # 11/01 東京だけ（列 メモ は元の列）
+    given = common.read_base([write_base(tmp_path / "base.csv", given_df)], lambda m: None)
+    entries = tmp_path / "entries_in"
+    kyoto = pd.DataFrame([{"レースID(新)": "202511010803010101", "日付S": "20251101", "枠番": "1", "馬番": "1",
+                           "ワーク1": "", "馬名S": "キキ", "GoldAirplane": "88", "騎手": "武豊"}])
+    write_base(entries / "shisu_20251101_1.csv", kyoto)
+    logs = []
+    res = y.run([xlsx], given, tmp_path / "o", logs.append, search_dirs=[entries])
+    assert res.matched == 2
+    d = out_csv(tmp_path / "o" / "yasui_speed" / "20251101_yasui_speed.csv").set_index("レースID(新)")["ワーク1"]
+    assert d["202511010504010101"] == "48" and d["202511010803010101"] == "50"
+    noid = out_csv(tmp_path / "o" / "yasui_speed" / "20251101_yasui_speed_noid.csv")
+    assert noid[["場所", "R", "馬番", "ワーク1"]].values.tolist() == [["福島", "1", "1", "52"]]
+    assert len(res.notes) == 1 and "福島" in res.notes[0] and "noid" in res.notes[0]
+    m1 = out_csv(tmp_path / "o" / "yasui_speed" / "base_speed_merged.csv")
+    assert list(m1.columns) == ["レースID(新)", "日付S", "枠番", "馬番", "ワーク1", "メモ"]          # 元の列のまま
+    m2 = out_csv(tmp_path / "o" / "yasui_speed" / "shisu_20251101_1_speed_merged.csv")
+    assert sorted(m2.columns) == sorted(["レースID(新)", "日付S", "枠番", "馬番", "馬名S", "ワーク1"])  # ベースCSVの列だけ
+    assert m2["ワーク1"].tolist() == ["50"]
+
+
+def test_run_ingest_yasui_uses_entries_in(tmp_path, monkeypatch):
+    """画面で安井 Excel だけを選び、ベースCSVが ingest_in/base/ にも無いとき、entries_in/ の TARGET 出馬表CSVを使う。"""
+    monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path))
+    write_base(tmp_path / "entries_in" / "shisu_20251101_1.csv", base_frame().iloc[:3])
+    xlsx = make_yasui_xlsx(tmp_path / "x" / "ステータス新バージョン2025_11月.xlsx",
+                           {"1101": [yrow("東京", 1, 1, 2, 34, "イイ", "45⑥", "1①", "1①", "1①", "1①", 4, 0)]})
+    logs = []
+    res = run_ingest(IngestRequest(sources=["yasui"], yasui_paths=[xlsx]), tmp_path / "out", logs.append)["yasui"]
+    assert res.matched == 1 and not res.notes
+    assert any("entries_in/shisu_20251101_1.csv" in m for m in logs)
+    d = out_csv(tmp_path / "out" / "yasui" / "yasui_speed" / "20251101_yasui_speed.csv")
+    assert d["ワーク1"].tolist() == ["", "45", ""]
