@@ -154,7 +154,7 @@ button{padding:8px 16px;border:0;background:#2563eb;color:#fff;border-radius:8px
 table{border-collapse:collapse;background:#fff;width:100%}
 th,td{padding:6px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;text-align:left;white-space:nowrap;vertical-align:top}
 th{background:#f8fafc;color:#334155;position:sticky;top:0}
-td.num{text-align:right}
+th.num,td.num{text-align:right}
 .muted{color:#6b7280;font-size:12px}
 .warn{color:#b45309;font-size:13px}
 .tag{display:inline-block;font-size:11px;background:#e5e7eb;padding:2px 6px;border-radius:999px;margin-left:4px}
@@ -657,7 +657,7 @@ HITS_BODY = """
 <div class="muted">照合: {{ path }} ／ 率は DB の推定値（複勝率・連対率）と頻度（掲示板率）</div>
 <div style="margin-top:6px"><a href="{{ url_for('entries_wedge', table=table, rid=rid) }}" target="_blank">このレースの WEDGE 一覧（閾値なし・全キー）</a></div></div>
 <div class="card"><h1>馬ごとの該当数</h1><table><thead><tr><th>馬番</th><th>馬名</th>
-{% for c in order %}<th>{{ CATEGORY_LABELS[c] }}</th>{% endfor %}</tr></thead><tbody>
+{% for c in order %}<th class="num">{{ CATEGORY_LABELS[c] }}</th>{% endfor %}</tr></thead><tbody>
 {% for s in summary %}<tr><td>{{ s.uma }}</td><td>{{ s.name }}</td>{% for c in order %}<td class="num">{{ s[c] or '' }}</td>{% endfor %}</tr>{% endfor %}
 </tbody></table></div>
 {% for c in order %}
