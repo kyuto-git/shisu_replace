@@ -691,7 +691,7 @@ HITS_BODY = """
 {% for c in order %}
 <div class="card cat-{{ c }}"><h1>{{ CATEGORY_LABELS[c] }}（{{ buckets[c]|length }}）</h1>
 <div class="muted">{% for line in desc[c] %}• {{ line }}<br>{% endfor %}</div>
-{% if view[c]|length < buckets[c]|length %}<div class="warn">{{ view[c]|length }} 行だけ表示しています（全 {{ buckets[c]|length }} 行。馬・オッズ帯ごとに同じ行数まで）。全件は <a href="{{ url_for('entries_wedge_csv', table=table, rid=rid, odds_mode='all') }}">WEDGE 一覧の CSV</a>（「区分」列で絞れます）</div>{% endif %}
+{% if view[c]|length < buckets[c]|length %}<div class="warn">{{ view[c]|length }} 行だけ表示しています（全 {{ buckets[c]|length }} 行。馬・オッズ帯ごとに偏らないように選んでいます）。全件は <a href="{{ url_for('entries_wedge_csv', table=table, rid=rid, odds_mode='all') }}">WEDGE 一覧の CSV</a>（「区分」列で絞れます）</div>{% endif %}
 <table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
 <th>件数</th><th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>勝率</th><th>連対率</th><th>複勝率</th>
 <th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th></tr></thead><tbody>
@@ -709,14 +709,25 @@ HITS_VIEW_LIMIT = 500        # 区分ごとに画面に出すおよその行数�
 
 def spread_cap(rows: list[dict], limit: int) -> list[dict]:
     """表示を limit 行ほどに絞る。先頭から切ると後ろの馬・オッズ帯が丸ごと消えるので、
-    (馬番, オッズ帯) ごとに同じ行数まで（並びは元のまま）。"""
+    (馬番, オッズ帯) ごとの行数の上限 c をそろえる（行の少ない組は全部出し、余った枠は多い組に回す。並びは元のまま）。"""
     if len(rows) <= limit:
         return rows
     groups: dict[tuple, int] = {}
     for h in rows:
         g = (h.get("馬番"), h.get("odds_mode"))
         groups[g] = groups.get(g, 0) + 1
-    per = max(1, -(-limit // len(groups)))
+    sizes = sorted(groups.values())
+    per, used_rows = 1, 0           # 合計が limit に収まる最大の c（どの組も最低1行は出す）
+    for i, n in enumerate(sizes):
+        rest = len(sizes) - i
+        c = (limit - used_rows) // rest
+        if c < n:
+            per = max(per, c)
+            break
+        used_rows += n
+        per = n
+    else:
+        per = sizes[-1]
     used: dict[tuple, int] = {}
     out = []
     for h in rows:

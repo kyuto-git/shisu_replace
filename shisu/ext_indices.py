@@ -348,7 +348,7 @@ def _helper_reason(rel: Path) -> str | None:
 def _content_reason(path: Path, pattern: str) -> str | None:
     """先頭の数行が形式に合わなければ理由（見出しが ID でない 日付 などのファイルを外す）。"""
     try:
-        rows = [r for _, r in itertools.islice(_rows(path), 3)]
+        rows = [r for _, r in itertools.islice(_rows(path), 50)]
     except (OSError, csv.Error) as e:
         return f"読めない（{e}）"
     if not rows:
@@ -363,7 +363,8 @@ def _content_reason(path: Path, pattern: str) -> str | None:
         return f"1列目が{_PATTERN_LABEL[pattern]}でない（{_short(first[0])}）"
     check = {"B": normalize_old_id, "C": lambda v: _digits(v, 12), "D": normalize_old_race_id}[pattern]
     valid = [r for r in rows if check(r[0])]
-    if valid and pattern == "B" and not any(len(r) > 2 and r[2].strip() for r in valid):
+    if valid and pattern == "B" and not any(len(r) > 2 for r in valid):
+        # 本当に2列だけのファイル（3列目の欄が無い）は使わない。欄はあって空なら、process_ext が値から順位を作る
         return "3列目（順位）が無い（形式B は 旧ID, 指数値, 順位 の3列）"
     if valid:
         return None

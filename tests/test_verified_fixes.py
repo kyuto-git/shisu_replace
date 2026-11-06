@@ -398,7 +398,7 @@ def test_hits_page_caps_rows_per_category(mini, monkeypatch):
     big = [k for k, v in buckets.items() if len(v) > 2]
     assert big, "合成データで2行を超える区分が要る"
     page = c.get("/entries/hits", query_string={"table": "entries_merged_hensachi", "rid": rid}).get_data(as_text=True)
-    assert "行だけ表示しています" in page and "馬・オッズ帯ごとに同じ行数まで" in page
+    assert "行だけ表示しています" in page and "馬・オッズ帯ごとに偏らないように" in page
     body = page.split("馬ごとの該当数", 1)[1]
     for k in big:                                         # 見出しの件数は全件のまま
         assert f"（{len(buckets[k])}）" in body
@@ -486,3 +486,58 @@ def test_build_db_missing_families_file_is_reported_before_fresh(tmp_path, monke
     assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(agg), "--db-path", str(db)]) == 2
     assert db.exists() and sqlite3.connect(db).execute("SELECT name FROM sqlite_master").fetchall() == [("t",)]
     F.reset()
+
+
+
+# ---------------------------------------------------------------- 4回目の検証の指摘
+def test_spread_cap_fills_budget_when_groups_are_uneven():
+    """行の少ない組は全部出し、余った枠を多い組に回す（1頭に集中していても約 limit 行出る）。"""
+    import app
+    rows = ([{"馬番": "3", "odds_mode": "normal"}] * 800 + [{"馬番": "3", "odds_mode": "odds10u"}] * 300
+            + [{"馬番": str(u), "odds_mode": "normal"} for u in range(4, 14) for _ in range(3)])
+    out = app.spread_cap(rows, 500)
+    assert len(out) == 500
+    n = {}
+    for h in out:
+        n[(h["馬番"], h["odds_mode"])] = n.get((h["馬番"], h["odds_mode"]), 0) + 1
+    assert all(n[("%d" % u, "normal")] == 3 for u in range(4, 14))
+    assert n[("3", "normal")] == n[("3", "odds10u")] == 235
+    assert len(app.spread_cap([{"馬番": str(u), "odds_mode": "n"} for u in range(600)], 500)) == 600   # 各組1行は出す
+
+
+def test_format_b_with_blank_leading_rows_or_blank_ranks(tmp_path):
+    """形式B: 先頭の行に値の無い馬が並んでいても使う。3列目の欄が空のファイルは使い、replace が値から順位を作る。"""
+    from shisu import ext_indices
+    sp = tmp_path / "StridePlus"
+    sp.mkdir()
+    rows = [f"05203801{i:02d},," for i in range(1, 4)] + [f"05203801{i:02d},{40 + i},{i - 3}" for i in range(4, 20)]
+    (sp / "senko_2026.csv").write_text("\n".join(rows), encoding="utf-8")
+    (sp / "tsuiso_2026.csv").write_text("\n".join(f"05203801{i:02d},{50 + i}," for i in range(1, 13)), encoding="utf-8")
+    (sp / "jikyu_2026.csv").write_text("\n".join(f"05203801{i:02d},{50 + i}" for i in range(1, 13)), encoding="utf-8")
+    sources, skipped = ext_indices.discover(tmp_path, log=lambda m: None)
+    assert {"先行", "追走"} <= set(sources) and "持久" not in sources
+
+
+def test_blank_rank_column_falls_back_to_value_ranks(tmp_path, capsys):
+    import replace_csv_ver3 as r
+    df = _race([str(200 - i) for i in range(12)], [str(i) for i in range(1, 13)], [str(i) for i in range(1, 13)])
+    synth.write_cp932(df, tmp_path / "csv" / "新潟_タイムM.csv")
+    sp = tmp_path / "ext" / "StridePlus"
+    sp.mkdir(parents=True)
+    from shisu.ext_indices import old_id_from_new
+    (sp / "tsuiso_2026.csv").write_text("\n".join(f"{old_id_from_new(rid)},{50 + i}," for i, rid in
+                                                  enumerate(df["レースID(新)"])), encoding="utf-8")
+    assert r.main(["--csv-dir", str(tmp_path / "csv"), "--ext-dir", str(tmp_path / "ext"),
+                   "--master-dir", str(tmp_path / "m")]) == 0
+    assert "順位の列が空なので" in capsys.readouterr().err
+    m = pd.read_csv(tmp_path / "m" / "master_新潟_追走.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
+    assert m.sort_values("馬番", key=lambda s: s.astype(int))["順位"].tolist() == [str(i) for i in range(12, 0, -1)]
+
+
+def test_family_name_and_tail_are_required_strings():
+    for d in ({"name": None, "parts": ["騎手"], "tail": "RBAND"}, {"parts": ["騎手"], "tail": "RBAND"},
+              {"name": "X_a", "parts": ["騎手"], "tail": None}):
+        with pytest.raises(ValueError):
+            F.Family.from_dict(d)
+    f = F.Family.from_dict({"name": "X_a", "parts": ["騎手"], "tail": "RBAND", "label": None, "layer": None})
+    assert f.label == "" and f.layer == ""
