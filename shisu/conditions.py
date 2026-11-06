@@ -25,6 +25,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from typing import Mapping
@@ -63,11 +64,13 @@ def _col(df: pd.DataFrame, *names: str) -> pd.Series:
 
 
 def _num(v) -> float | None:
+    """数（斤量・着順など）。読めない・NaN・無限大は None。"""
     s = _WEIGHT_MARKS.sub("", _n(v)).replace("着", "").replace("kg", "")
     try:
-        return float(s)
+        f = float(s)
     except ValueError:
         return None
+    return f if math.isfinite(f) else None
 
 
 def _int_text(v) -> str:
@@ -170,8 +173,8 @@ def standardize_entries(raw: pd.DataFrame, norm: pd.DataFrame) -> pd.DataFrame:
     out["斤量"] = _col(raw, "斤量").map(_float_text)
     prev_w = _col(raw, "前斤量", "前走斤量").map(_float_text)
     if "斤量差" in raw.columns:                 # 前走の斤量が無く 斤量差 だけあるとき
-        diff = _col(raw, "斤量差").map(_num)
-        cur = out["斤量"].map(_num)
+        diff = [_num(v) for v in _col(raw, "斤量差")]      # map だと None が NaN になるので要素ごとに
+        cur = [_num(v) for v in out["斤量"]]
         alt = pd.Series([("" if c is None or d is None else f"{c - d:g}") for c, d in zip(cur, diff)], index=raw.index)
         prev_w = prev_w.where(prev_w != "", alt)
     out["前走斤量"] = prev_w

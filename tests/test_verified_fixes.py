@@ -50,7 +50,7 @@ def test_cancelled_horse_is_left_out_of_hensachi(tmp_path):
     df = _race(vals, ranks, fins)
     synth.write_cp932(df, tmp_path / "csv" / "新潟_タイムM.csv")
     msg = r.process_file(str(tmp_path / "csv" / "新潟_タイムM.csv"), str(tmp_path / "m"), None)
-    assert "取消・除外 1 頭" in msg and "TARGET の順位に合わせて偏差値の向き" in msg
+    assert "取消・除外 1 頭" in msg
     m = pd.read_csv(tmp_path / "m" / "master_新潟_タイムM.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
     gone = m[m["着順"] == "消"].iloc[0]
     assert gone["指数有効"] == "0" and gone["偏差値"] == "" and gone["順位"] == ""
@@ -62,7 +62,7 @@ def test_cancelled_horse_is_left_out_of_hensachi(tmp_path):
 
 
 def test_hensachi_follows_target_rank_direction_on_both_sides():
-    """タイムM は台帳では「小さいほど良い」だが、TARGET の順位が値の大きい馬を1位にしていれば偏差値もその向きにする。
+    """偏差値の向きは TARGET の順位に合わせる（1位が最大値なら大きいほど上、最小値なら小さいほど上）。
     過去側（replace）と出馬表側（calc_entry_hensachi）で同じ。順位が無ければ台帳の向き。"""
     import calc_entry_hensachi as c
     v = pd.Series(["72.4", "50", "22.7", "40"])
@@ -71,8 +71,10 @@ def test_hensachi_follows_target_rank_direction_on_both_sides():
     assert hi.loc[0, "偏差値"] == hi["偏差値"].max() and hi.attrs["direction"] == "rank" and not hi.attrs["reverse"]
     lo = compute_indicator(v, k, spec_for("タイムM"), given_rank=pd.Series(["4", "2", "1", "3"]))
     assert lo.loc[2, "偏差値"] == lo["偏差値"].max() and lo.attrs["reverse"]
-    none = compute_indicator(v, k, spec_for("タイムM"))
-    assert none.attrs["direction"] == "spec" and none.loc[2, "順位"] == 1
+    none = compute_indicator(v, k, spec_for("タイムM"))          # タイムM の台帳の既定は「大きいほど上」
+    assert none.attrs["direction"] == "spec" and none.loc[0, "順位"] == 1
+    rev = compute_indicator(v, k, spec_for("展開"))               # 展開は「小さいほど上」
+    assert rev.attrs["direction"] == "spec" and rev.loc[2, "順位"] == 1
     ent = pd.DataFrame({"レースID(新)": [f"20260531050212010{i}" for i in range(1, 5)], "馬番": ["1", "2", "3", "4"],
                         "マイニング値": v, "マイニング順位": ["1", "2", "4", "3"]})
     out = c.process_df(ent, "t", verbose=False)
@@ -304,3 +306,112 @@ def test_screen_arguments_are_normalized_and_failures_exit_1(mini, tmp_path):
     args = base[2:] + ["--master-dir", str(bad), "--export-selected", str(sel)]
     assert screen_families.main(args) == 1 and not sel.exists()        # 1本でも失敗したら選抜は書かない
     assert rep.exists()
+
+
+# ---------------------------------------------------------------- 2回目の検証の指摘
+def test_entries_weight_change_blank_for_first_starters():
+    """前走の無い馬（前斤量・斤量差が空）は 斤量増減 が空（NaN から '-0.5~-1.5' が出ていた）。"""
+    import build_db
+    raw = pd.DataFrame([
+        {"レースID(新)": "202611010504110101", "場所": "東京", "芝ダ": "芝", "距離": "1600", "馬番": "1", "斤量": "56",
+         "前斤量": "", "斤量差": "", "前走開催": "初"},
+        {"レースID(新)": "202611010504110102", "場所": "東京", "芝ダ": "芝", "距離": "1600", "馬番": "2", "斤量": "57",
+         "前斤量": "", "斤量差": "+1.0", "前走開催": "261018 4東7  3R"},
+        {"レースID(新)": "202611010504110103", "場所": "東京", "芝ダ": "芝", "距離": "1600", "馬番": "3", "斤量": "55",
+         "前斤量": "57", "斤量差": "-2.0", "前走開催": "261018 4東7  3R"},
+    ])
+    out = build_db.normalize_entries_df(raw)
+    assert out["斤量増減"].tolist() == ["", "+0.5~+1.5", "-2kg以下"]
+    from shisu.conditions import _num, weight_change
+    assert _num("nan") is None and _num("inf") is None and weight_change("56", "nan") == ""
+
+
+def test_timem_without_ranks_agrees_with_ranked_side(tmp_path):
+    """過去側に 指数順位 が無く、出馬表側に マイニング順位 がある場合も、タイムM の順位・偏差値が両側で同じ。"""
+    import calc_entry_hensachi as c
+    import replace_csv_ver3 as r
+    vals = [f"{96.9 - i * 1.4:.1f}" for i in range(12)]
+    df = _race(vals, [""] * 12, [str(i) for i in range(1, 13)]).drop(columns=["指数順位"])
+    synth.write_cp932(df, tmp_path / "csv" / "新潟_タイムM.csv")
+    r.process_file(str(tmp_path / "csv" / "新潟_タイムM.csv"), str(tmp_path / "m"), None)
+    m = pd.read_csv(tmp_path / "m" / "master_新潟_タイムM.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
+    ent = pd.DataFrame({"レースID(新)": df["レースID(新)"], "馬番": df["馬番"], "マイニング値": vals,
+                        "マイニング順位": [str(i) for i in range(1, 13)]})
+    e = c.process_df(ent, "t", verbose=False)
+    assert m["順位"].tolist() == e["タイムM_順位"].tolist() == [str(i) for i in range(1, 13)]
+    assert m["偏差値"].tolist() == e["タイムM_偏差値"].tolist()
+
+
+def test_time_indicators_treat_zero_as_missing():
+    """想定前半・想定後半（3Fの秒数）の 0 は欠損。外部指数の無い馬の 0 が最高値（71以上）にならない。"""
+    v = pd.Series(["34.5", "34.8", "35.0", "35.3", "35.6", "36.0", "0"])
+    r = compute_indicator(v, pd.Series(["a"] * 7), spec_for("想定前半"))
+    assert pd.isna(r.loc[6, "偏差値"]) and pd.isna(r.loc[6, "順位"])
+    assert r.loc[0, "順位"] == 1 and r.loc[0, "偏差値帯"] in ("61~65", "66~70", "71以上")
+
+
+def test_ranked_ext_formats_put_absent_horses_last(tmp_path):
+    """形式B（StridePlus）でファイルに無い馬は値 0・レースの最下位（TARGET が出馬表で付ける順位と同じ）。"""
+    import replace_csv_ver3 as r
+    df = _race([str(200 - i) for i in range(12)], [str(i) for i in range(1, 13)], [str(i) for i in range(1, 13)])
+    synth.write_cp932(df, tmp_path / "csv" / "新潟_タイムM.csv")
+    sp = tmp_path / "ext" / "StridePlus"
+    sp.mkdir(parents=True)
+    from shisu.ext_indices import old_id_from_new
+    lines = [f"{old_id_from_new(rid)},{60 - i},{i + 1}" for i, rid in enumerate(df["レースID(新)"]) if i < 10]
+    (sp / "sav_2026.csv").write_text("\n".join(lines), encoding="utf-8")
+    assert r.main(["--csv-dir", str(tmp_path / "csv"), "--ext-dir", str(tmp_path / "ext"),
+                   "--master-dir", str(tmp_path / "m")]) == 0
+    m = pd.read_csv(tmp_path / "m" / "master_新潟_SAV.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
+    tail = m[m["馬番"].isin(["11", "12"])]
+    assert tail["指数"].tolist() == ["0", "0"] and tail["順位"].tolist() == ["11", "11"]
+
+
+def _app_db(mini, monkeypatch):
+    import importlib
+    import build_db
+    import calc_entry_hensachi
+    monkeypatch.setenv("SHISU_BASE_DIR", str(mini))
+    monkeypatch.setenv("DB_PATH", str(mini / "racing.db"))
+    fams = [{"name": "normal", "parts": ["COURSE", "重量種別", "クラス名"], "tail": "RANK"},
+            {"name": "X_jk_band", "parts": ["騎手"], "tail": "RBAND"},
+            {"name": "X_sd_pfin_hen", "parts": ["芝・ダ", "前走着順"], "tail": "HBAND"}]
+    (mini / "fams.json").write_text(json.dumps({"families": fams}, ensure_ascii=False), encoding="utf-8")
+    _agg(mini, "agg_csv", "--clean")
+    assert calc_entry_hensachi.main(["--merge-only", "--clean"]) == 0
+    F.reset()
+    assert build_db.main(["--fresh"]) == 0
+    import app as app_module
+    return importlib.reload(app_module)
+
+
+def test_hits_page_caps_rows_per_category(mini, monkeypatch):
+    am = _app_db(mini, monkeypatch)
+    monkeypatch.setattr(am, "HITS_VIEW_LIMIT", 2)
+    c = am.app.test_client()
+    with sqlite3.connect(mini / "racing.db") as con:
+        rid = con.execute('SELECT "レースID(新/馬番無)" FROM entries_merged_hensachi LIMIT 1').fetchone()[0]
+    with am.connect() as con:
+        race = am._race_rows(con, "entries_merged_hensachi", rid)
+        hits, _ = am.collect_hits(con, "entries_merged_hensachi", race)
+    buckets = am.classify_hits(hits)
+    big = [k for k, v in buckets.items() if len(v) > 2]
+    assert big, "合成データで2行を超える区分が要る"
+    page = c.get("/entries/hits", query_string={"table": "entries_merged_hensachi", "rid": rid}).get_data(as_text=True)
+    assert "先頭 2 行だけ表示しています" in page
+    body = page.split("馬ごとの該当数", 1)[1]
+    for k in big:                                         # 見出しの件数は全件のまま
+        assert f"（{len(buckets[k])}）" in body
+    F.reset()
+
+
+def test_build_db_missing_families_file_is_reported_before_fresh(tmp_path, monkeypatch):
+    import build_db
+    db = tmp_path / "keep.db"
+    sqlite3.connect(db).execute("CREATE TABLE t (x)").connection.commit()
+    agg = tmp_path / "agg"
+    agg.mkdir()
+    monkeypatch.setenv("SHISU_FAMILIES_FILE", str(tmp_path / "nope.json"))
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(agg), "--db-path", str(db)]) == 2
+    assert db.exists() and sqlite3.connect(db).execute("SELECT name FROM sqlite_master").fetchall() == [("t",)]
+    F.reset()

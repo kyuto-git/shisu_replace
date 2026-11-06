@@ -107,7 +107,8 @@ def test_parse_source_name(stem, region, ind):
 
 
 def test_indicator_flags():
-    assert indicators.spec_for("マイニング値").reverse
+    assert not indicators.spec_for("マイニング値").reverse          # TARGET のマイニングは大きいほど良い（★6 で確認）
+    assert indicators.spec_for("想定前半3F").reverse and indicators.spec_for("想定後半").zero_missing
     assert indicators.spec_for("ZI").zi and indicators.spec_for("ZI").exclude_shinba
     assert indicators.spec_for("吉馬_SP最大").exclude_shinba
     assert not indicators.spec_for("対戦M").reverse
@@ -150,8 +151,10 @@ def test_zi_special():
 
 
 def test_reverse_and_shinba():
-    r = _ci([30, 20, 10], ["a"] * 3, name="タイムM")
+    r = _ci([30, 20, 10], ["a"] * 3, name="想定前半")        # 小さいほど良い（符号反転）
     assert r["順位"].tolist() == [3, 2, 1]
+    r = _ci([30, 20, 10], ["a"] * 3, name="タイムM")          # TARGET のマイニングは大きいほど良い
+    assert r["順位"].tolist() == [1, 2, 3]
     r = _ci([1, 2, 3], ["a"] * 3, name="吉馬_SP能力値", shinba=[True, True, True])
     assert r["shinba_excluded"].all() and r["偏差値"].isna().all()
     r = _ci([1, 2, 3], ["a"] * 3, name="SAV", shinba=[True, True, True])

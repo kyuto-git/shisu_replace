@@ -49,9 +49,12 @@ INDICATORS: tuple[IndicatorSpec, ...] = (
     IndicatorSpec("持久", ("持久力",)),
     IndicatorSpec("持続", ("持続力",)),
     IndicatorSpec("瞬発", ("瞬発力",)),
-    IndicatorSpec("想定前半", ("想定前半3F",), reverse=True),
-    IndicatorSpec("想定後半", ("想定後半3F",), reverse=True),
-    IndicatorSpec("タイムM", ("マイニング値", "タイム指数", "TimeM"), reverse=True),
+    # 想定前半・想定後半は3Fの秒数（小さいほど良い）。0 はありえないので欠損（外部指数の無い馬に TARGET が出す 0 を最高値にしない）
+    IndicatorSpec("想定前半", ("想定前半3F",), reverse=True, zero_missing=True),
+    IndicatorSpec("想定後半", ("想定後半3F",), reverse=True, zero_missing=True),
+    # タイムM（TARGET のマイニング）は値の大きい馬が1位（★6 の過去CSV 255レース全部で、TARGET の 指数順位 1 がレースの最大値）。
+    # 旧版は「小さいほど良い」として反転していたが、順位と偏差値が逆向きになっていた
+    IndicatorSpec("タイムM", ("マイニング値", "タイム指数", "TimeM"), reverse=False),
     IndicatorSpec("対戦M", ("対戦型マイニング値", "MatchM")),
     IndicatorSpec("圧勝力"),
     # 安井サロン（月別 Excel。shisu/yasui_extractor.py）

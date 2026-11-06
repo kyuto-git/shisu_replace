@@ -686,10 +686,11 @@ HITS_BODY = """
 {% for c in order %}
 <div class="card cat-{{ c }}"><h1>{{ CATEGORY_LABELS[c] }}（{{ buckets[c]|length }}）</h1>
 <div class="muted">{% for line in desc[c] %}• {{ line }}<br>{% endfor %}</div>
+{% if buckets[c]|length > limit %}<div class="warn">先頭 {{ limit }} 行だけ表示しています（全 {{ buckets[c]|length }} 行。全件は <a href="{{ url_for('entries_wedge_csv', table=table, rid=rid, odds_mode='all') }}">WEDGE 一覧の CSV</a>）</div>{% endif %}
 <table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
 <th>件数</th><th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>勝率</th><th>連対率</th><th>複勝率</th>
 <th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th></tr></thead><tbody>
-{% for h in buckets[c] %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
+{% for h in buckets[c][:limit] %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
 <td>{{ h['base'] }}</td><td>{{ family_label(h['family'], h['rank_scheme']) }}</td><td>{{ odds_label(h['odds_mode']) }}</td><td>{{ h['region'] }}</td><td>{{ h['key'] }}</td>
 <td class="num">{{ h['件数'] }}</td>{% for k in ['勝率_val','連対率_val','複勝率_val','掲示板率_val'] %}<td class="num">{{ fmt(h[k]) }}</td>{% endfor %}
 <td>{{ h['勝率'] }}</td><td>{{ h['連対率'] }}</td><td>{{ h['複勝率'] }}</td>
@@ -698,6 +699,7 @@ HITS_BODY = """
 {% endfor %}
 """
 HITS_ORDER = ("abs", "axis", "keshi", "opp")
+HITS_VIEW_LIMIT = 500        # 区分ごとに画面に出す行数（全件は /entries/wedge.csv。馬ごとの該当数は全件で数える）
 
 
 @app.route("/entries/hits", methods=["GET"])
@@ -724,7 +726,7 @@ def entries_hits():
     head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}'
     sub = f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")} / {h.get("クラス名_raw", "")} / {len(race)}頭'
     return render("条件ヒット馬", HITS_BODY, head=head, sub=sub, path=path, buckets=buckets,
-                  order=HITS_ORDER, desc=description_lines(), summary=summary, table=table,
+                  order=HITS_ORDER, desc=description_lines(), summary=summary, table=table, limit=HITS_VIEW_LIMIT,
                   rid=h.get("レースID(新/馬番無)", rid))
 
 

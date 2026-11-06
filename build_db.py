@@ -391,6 +391,12 @@ def parse_cli(argv=None):
 def main(argv=None) -> int:
     args = parse_cli(argv)
     db = Path(args.db_path)
+    if args.mode in ("both", "foragg"):      # DB を消す前に family の定義を確かめる（指定したファイルが無いなど）
+        try:
+            fams = load_families_for_agg(Path(args.agg_dir))
+        except (FileNotFoundError, ValueError) as e:
+            print(f"[ERROR] family の定義: {e}", file=sys.stderr)
+            return 2
     if args.fresh:
         for suffix in ("", "-wal", "-shm"):
             f = Path(str(db) + suffix)
@@ -407,7 +413,6 @@ def main(argv=None) -> int:
 
     if args.mode in ("both", "foragg"):
         kinds.add("foragg")
-        fams = load_families_for_agg(Path(args.agg_dir))
         loaded, n_old = load_agg_tables(con, Path(args.agg_dir))
         if n_old:
             rc = 1
