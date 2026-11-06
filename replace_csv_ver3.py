@@ -217,6 +217,12 @@ def process_ext(base_path: str, indicator: str, master_dir: str, processed_dir: 
     if ranks is not None and not (ranks != "").any():
         print(f"[WARN] ext_indices/{indicator}: 順位の列が空なので、順位は値から計算します", file=sys.stderr)
         ranks = None
+    elif ranks is not None:
+        race = norm_series(_col(raw, "レースID(新)")).str.slice(0, 16)
+        norank = (values != "").groupby(race).transform("any") & ~(ranks != "").groupby(race).transform("any")
+        if norank.any():     # compute_indicator が、順位の無いレースは値から順位を付ける
+            print(f"[WARN] ext_indices/{indicator}: 順位の無いレース {race[norank].nunique()} 件は値から順位を計算します"
+                  "（順位の欄が空のファイルがあります）", file=sys.stderr)
     if ranks is not None:
         # 形式B・C（順位つき）でファイルに無い馬は、TARGET と同じくレースの最下位（同順位）にする
         # （ファイルに順位のある馬がいるレースだけ。レースごと無いときは全頭 0 で、そのレースは使われない）

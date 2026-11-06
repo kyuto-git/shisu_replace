@@ -12,7 +12,7 @@ compute_indicator() の規則:
   5. 有効値が2頭未満、または全頭が同じ値（標準偏差0。未取得で全頭0のときなど）
      → そのレースはこの指数では使わない（旧版の出馬表側は全頭50にしていた）
   6. 偏差値 = (x − レース平均) / 母標準偏差 × 10 + 50 を四捨五入（numpy の丸め）
-  7. 順位は元データの順位列を優先（0. の指数を除く）。無ければ同値同順位（method=min）で計算する
+  7. 順位は元データの順位列を優先（0. の指数を除く）。無い（またはそのレースに1頭も無い）ときは同値同順位（method=min）で計算する
      （同梱サンプルで TARGET の 指数順位 と照合すると、ZI・オメガ指数は min と100%一致した）。
      ZI を値から順位付けするときは 0 の馬を最下位（同順位）にする
   値は NFKC・空白除去してから数値化する（全角数字・全角マイナスを欠損にしない）
@@ -138,18 +138,22 @@ def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpe
     ok = ~race_excluded & x.notna()
     hensachi = ((x - mean) / std * 10.0 + 50.0).where(ok).round(0)
 
-    if given is not None:
-        rank = given
-    elif spec.zi:
+    if spec.zi:
         # ZI の順位は 0 の馬を最下位（同順位）にする。TARGET の順位と同じ（平均で埋めた値では順位を付けない）
         valid = raw.where(raw != 0)
         if reverse:
             valid = -valid
-        rank = valid.groupby(key).rank(ascending=False, method="min")
+        value_rank = valid.groupby(key).rank(ascending=False, method="min")
         last = valid.notna().groupby(key).transform("sum") + 1
-        rank = rank.where(valid.notna(), last.where(raw == 0))
+        value_rank = value_rank.where(valid.notna(), last.where(raw == 0))
     else:
-        rank = x.groupby(key).rank(ascending=False, method="min")
+        value_rank = x.groupby(key).rank(ascending=False, method="min")
+    if given is not None:
+        # 元の順位を使う。ただし順位が1頭も無いレース（順位の欄が空のファイルのレースなど）は値から付ける
+        no_given = given.isna().groupby(key).transform("all")
+        rank = given.where(~no_given, value_rank)
+    else:
+        rank = value_rank
     rank = rank.where(ok & ~single_missing)
     rank = rank.where(rank >= 1).round().astype("Int64")
 

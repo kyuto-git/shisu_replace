@@ -541,3 +541,41 @@ def test_family_name_and_tail_are_required_strings():
             F.Family.from_dict(d)
     f = F.Family.from_dict({"name": "X_a", "parts": ["騎手"], "tail": "RBAND", "label": None, "layer": None})
     assert f.label == "" and f.layer == ""
+
+
+
+# ---------------------------------------------------------------- 5回目の検証の指摘
+def test_blank_rank_file_mixed_with_ranked_file_gets_value_ranks(tmp_path, capsys):
+    """同じ指数で、順位のあるファイル（2025年）と順位の欄が空のファイル（2026年）が混ざっても、
+    空のほうのレースは値から順位を付ける（順位が全部空のまま キーが作られない、を防ぐ）。"""
+    import replace_csv_ver3 as r
+    a = _race([str(200 - i) for i in range(12)], [str(i) for i in range(1, 13)], [str(i) for i in range(1, 13)],
+              rid="2025102404040304")
+    b = _race([str(200 - i) for i in range(12)], [str(i) for i in range(1, 13)], [str(i) for i in range(1, 13)])
+    synth.write_cp932(pd.concat([a, b], ignore_index=True), tmp_path / "csv" / "新潟_タイムM.csv")
+    sp = tmp_path / "ext" / "StridePlus"
+    sp.mkdir(parents=True)
+    from shisu.ext_indices import old_id_from_new
+    (sp / "tsuiso_2025.csv").write_text("\n".join(f"{old_id_from_new(rid)},{60 - i},{i + 1}" for i, rid in
+                                                  enumerate(a["レースID(新)"])), encoding="utf-8")
+    (sp / "tsuiso_2026.csv").write_text("\n".join(f"{old_id_from_new(rid)},{50 + i}," for i, rid in
+                                                  enumerate(b["レースID(新)"])), encoding="utf-8")
+    assert r.main(["--csv-dir", str(tmp_path / "csv"), "--ext-dir", str(tmp_path / "ext"),
+                   "--master-dir", str(tmp_path / "m")]) == 0
+    assert "順位の無いレース 1 件" in capsys.readouterr().err
+    m = pd.read_csv(tmp_path / "m" / "master_新潟_追走.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
+    ranked = m[m["レースID(新/馬番無)"] == "2025102404040304"].sort_values("馬番", key=lambda s: s.astype(int))
+    blank = m[m["レースID(新/馬番無)"] == "2026102404040304"].sort_values("馬番", key=lambda s: s.astype(int))
+    assert ranked["順位"].tolist() == [str(i) for i in range(1, 13)]                 # ファイルの順位
+    assert blank["順位"].tolist() == [str(i) for i in range(12, 0, -1)]             # 値から（大きいほど上）
+    assert (blank["順位帯_s1"] != "").all()
+
+
+def test_given_rank_missing_for_whole_race_uses_value_rank():
+    v = pd.Series(["10", "30", "20", "5", "7", "9"])
+    k = pd.Series(["a", "a", "a", "b", "b", "b"])
+    g = pd.Series(["3", "1", "2", "", "", ""])
+    r = compute_indicator(v, k, spec_for("SAV"), given_rank=g)
+    assert r["順位"].tolist() == [3, 1, 2, 3, 2, 1]
+    g2 = pd.Series(["3", "1", "", "", "", ""])                                     # 1頭だけ欠けたレースはそのまま
+    assert pd.isna(compute_indicator(v, k, spec_for("SAV"), given_rank=g2).loc[2, "順位"])
