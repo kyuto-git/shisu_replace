@@ -5,10 +5,11 @@ family = 部品（parts）の並び ＋ 末尾の指数の部品（tail）
         shisu/conditions.py の条件（時期・輸送距離・間隔帯・叩き・R値帯・…・前走R印3）
   tail: RANK（指数順位そのもの）/ RBAND（指数順位帯。スキーム s1=細5帯・s2=広3帯）/ HBAND（偏差値帯6種）
   キー = 部品の値を「×」でつないだもの。部品が1つでも空なら作らない
-  前走着順・前走人気・前走上り3F順 は帯にしてから使う。RBAND の family では tail と同じスキーム、
-  それ以外（RANK・HBAND）では s1。s2 は帯が重なる（2位は 1~3 と 1~5 の両方）ので、1頭から2つ以上のキーができる
+  前走着順・前走人気・前走上り3F順 は帯にしてから使う。帯のスキームは family のスキーム（s1/s2）と同じ。
+  これらを含む family は、末尾が偏差値帯でも s1・s2 の2つの集計表になる（uses_schemes）。
+  s2 は帯が重なる（2位は 1~3 と 1~5 の両方）ので、1頭から2つ以上のキーができる
 
-初期セット（DEFAULT_TEMPLATES。49種 = A 15 + B 9 + C 10 + D 15）:
+初期セット（DEFAULT_TEMPLATES。49種 = A 15 + B 9 + C 10 + D 15 → 83 family・スキーム込み129通り）:
   A（コース固定）: normal, rankB, rankJ, rankBJ, normalJ（指数順位）とその *_band（指数順位帯）、hensachi*（偏差値帯）
   B（コース不問・騎手×条件）, C（全国のコース属性の掛け合わせ）, D（コース×条件）: 指数順位帯（name）と
   偏差値帯（name + "_hen"）の2つの family になる
@@ -19,7 +20,7 @@ from __future__ import annotations
 import itertools
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -40,6 +41,7 @@ TAIL_LABELS = {"RANK": "指数順位", "RBAND": "指数順位帯", "HBAND": "偏
 PART_LABELS = {COURSE: "コース", "間隔帯": "レース間隔", "叩き": "叩き良化", "左右遷移": "左右回り遷移",
                "斤量帯": "当日斤量", "前走上り3F順": "前走上がり3F順"}
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,60}$")
+_RESERVED_RE = re.compile(r"^(odds10u|odds10_50|odds50p|odds5p|rankband)_", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -49,16 +51,23 @@ class Family:
     tail: str
     label: str = ""
     layer: str = ""
-    only: tuple[str, ...] = ()      # RBAND で使うスキームを絞る（例 ("s2",)）。空なら s1 と s2 の両方
+    only: tuple[str, ...] = ()      # 使うスキームを絞る（例 ("s2",)）。空なら s1 と s2 の両方
+
+    @property
+    def uses_schemes(self) -> bool:
+        """順位帯のスキーム（s1/s2）で別々の集計表になるか。末尾が指数順位帯、または帯にする条件
+        （前走着順・前走人気・前走上り3F順）を含む family（偏差値帯の family でも前走着順は s1・s2 の両方で作る）。"""
+        return self.tail == "RBAND" or any(p in BANDED_CONDITIONS for p in self.parts)
 
     @property
     def schemes(self) -> tuple[str, ...]:
-        if self.tail != "RBAND":
+        if not self.uses_schemes:
             return ("",)
         return self.only or ("s1", "s2")
 
     @property
     def is_band(self) -> bool:
+        """末尾が指数順位帯か。"""
         return self.tail == "RBAND"
 
     def display(self) -> str:
@@ -74,7 +83,7 @@ class Family:
     @staticmethod
     def from_dict(d: Mapping) -> "Family":
         parts = tuple(d.get("parts") or ())
-        only = tuple(d.get("schemes") or ()) if str(d.get("tail", "")) == "RBAND" else ()
+        only = tuple(d.get("schemes") or ())
         f = Family(str(d.get("name", "")), parts, str(d.get("tail", "")), str(d.get("label", "")),
                    str(d.get("layer", "")), only)
         validate(f)
@@ -103,6 +112,11 @@ def validate(f: Family) -> None:
         raise ValueError(f"family {f.name}: 同じ部品が2回あります: {list(f.parts)}")
     if any(sc not in ("s1", "s2") for sc in f.only) or len(set(f.only)) != len(f.only):
         raise ValueError(f"family {f.name}: schemes は s1・s2 のどれか: {list(f.only)}")
+    if f.only and not f.uses_schemes:
+        raise ValueError(f"family {f.name}: schemes は指数順位帯（RBAND）か、前走着順・前走人気・前走上り3F順を含む family だけに書けます")
+    if _RESERVED_RE.match(f.name):
+        raise ValueError(f"family {f.name}: 名前をオッズ帯の接頭辞（odds10u_・odds10_50_・odds50p_・odds5p_）や "
+                         "rankband_ で始めることはできません（成績表のファイル名と区別できなくなる）")
 
 
 # ---------------------------------------------------------------------------
@@ -174,12 +188,16 @@ def register(fams: Iterable[Family]) -> None:
 
 
 def set_active(fams: Iterable[Family], source: str = "") -> None:
+    """使う family を決める。この定義が正（同じ名前で別の定義が台帳にあれば置き換える。
+    selected_families.json・DB の __families__ は初期セットと同じ名前を別の部品で使ってもよい）。"""
     global _ACTIVE, _SOURCE
     fams = list(fams)
     names = [f.name for f in fams]
     if len(set(names)) != len(names):
         raise ValueError("family の名前が重複しています")
-    register(fams)
+    for f in fams:
+        validate(f)
+        _KNOWN[f.name] = f
     _ACTIVE = names
     _SOURCE = source or _SOURCE
 
@@ -260,8 +278,12 @@ def load_from_db(con) -> list[Family]:
 
 def configure(path: Path | str | None = None, log=print) -> list[Family]:
     """使う family を決める。path（無ければ config.selected_families_path()）があればその定義、無ければ初期セット。"""
+    import os
     from . import config
     p = Path(path) if path else config.selected_families_path()
+    if not p.exists() and (path or os.environ.get("SHISU_FAMILIES_FILE")):
+        # 明示したファイル（--families・SHISU_FAMILIES_FILE）が無いのに初期セットで集計すると気づけないので止める
+        raise FileNotFoundError(f"family の定義ファイルがありません: {p}")
     if p.exists():
         fams = load_families(p)
         set_active(fams, f"{p.name}（{len(fams)} family）")
@@ -275,7 +297,7 @@ def configure(path: Path | str | None = None, log=print) -> list[Family]:
 # キーの組み立て
 # ---------------------------------------------------------------------------
 def _scheme_for_part(fam: Family, scheme: str) -> str:
-    return scheme if fam.tail == "RBAND" and scheme else "s1"
+    return scheme or "s1"
 
 
 def _labels_map(values: np.ndarray, scheme: str, kind: str) -> np.ndarray:
@@ -326,8 +348,8 @@ def build_keys(df: pd.DataFrame, fam: Family | str, scheme: str = "") -> pd.Seri
     """過去側（1頭1行の DataFrame）→ キーの Series。index は元の行の index（s2 の重なりでは同じ行が2回以上出る）。
     キーが作れない行は入らない。"""
     fam = _KNOWN[fam] if isinstance(fam, str) else fam
-    if fam.tail == "RBAND" and scheme not in ("s1", "s2"):
-        raise ValueError(f"{fam.name} は指数順位帯の family なので scheme（s1/s2）が要ります")
+    if fam.uses_schemes and scheme not in ("s1", "s2"):
+        raise ValueError(f"{fam.name} は順位帯の family なので scheme（s1/s2）が要ります")
     pos = np.arange(len(df))
     key = None
     for vals, multi in [_part_values(df, fam, p, scheme) for p in fam.parts] + [_tail_values(df, fam, scheme)]:

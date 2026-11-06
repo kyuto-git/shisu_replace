@@ -32,6 +32,7 @@ import argparse
 import itertools
 import sys
 import time
+import unicodedata
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -250,7 +251,7 @@ def selected_families(report: pd.DataFrame, fams: list[F.Family]) -> list[F.Fami
     out = []
     for name, g in report[report["selected"]].groupby("name", sort=False):
         f = by[name]
-        if f.tail == "RBAND":
+        if f.uses_schemes:
             sch = tuple(s for s in ("s1", "s2") if s in set(g["scheme"]))
             f = F.Family(f.name, f.parts, f.tail, f.label, f.layer, () if sch == ("s1", "s2") else sch)
         out.append(f)
@@ -280,15 +281,17 @@ def main(argv=None) -> int:
 
     import aggregate_stats_ver2 as agg
     masters = [p for p in sorted(Path(args.master_dir).glob("master_*.csv.gz")) if file_stem(p) not in agg.SKIP_MASTERS]
-    inds = {s.strip() for s in args.indicators.split(",") if s.strip()}
-    regs = [s.strip() for s in args.regions.split(",") if s.strip()]
-    from shisu.indicators import parse_source_name
+    from shisu.indicators import canonical_indicator, parse_source_name
+    # ファイル名の地域・指数名と同じ形にそろえる（全角・別名でも当たるように）
+    inds = {canonical_indicator(s) for s in args.indicators.split(",") if s.strip()}
+    regs = [unicodedata.normalize("NFKC", s.strip()) for s in args.regions.split(",") if s.strip()]
     picked = []
     for p in masters:
         region, ind = parse_source_name(file_stem(p)[len("master_"):])
-        if inds and ind not in inds:
+        region_n = unicodedata.normalize("NFKC", region)
+        if inds and canonical_indicator(ind) not in inds:
             continue
-        if regs and not any(r in region for r in regs):
+        if regs and not any(r in region_n for r in regs):
             continue
         picked.append(p)
     if not picked:
@@ -314,9 +317,11 @@ def main(argv=None) -> int:
         for i, j in enumerate(jobs, 1):
             results.append(_score_job(j))
             print(f"[INFO] {i}/{len(jobs)} {Path(j[0]).name}（{time.time() - t0:.0f}秒）", flush=True)
+    failed = []
     for r in results:
         if isinstance(r, str):
             print(r, file=sys.stderr)
+            failed.append(r)
         else:
             rows += r
     if not rows:
@@ -329,6 +334,10 @@ def main(argv=None) -> int:
     n_sel = int(report["selected"].sum())
     print(f"[INFO] 採点 {len(report)} 通り（{time.time() - t0:.0f}秒）→ {args.report}")
     print(f"[INFO] 選抜: {n_sel} 通り（①軸が出る {int(report['select_B'].sum())} / ②識別力 {int(report['select_A'].sum())}）")
+    if failed:
+        print(f"[ERROR] 採点できなかった master が {len(failed)} 本あります。レポートは書きましたが、"
+              "選抜（selected_families.json）は書きません（原因を直してやり直してください）", file=sys.stderr)
+        return 1
     if args.export_selected:
         sel = selected_families(report, fams)
         if not sel:

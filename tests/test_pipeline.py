@@ -58,7 +58,7 @@ def test_outputs_exist(base):
     agg = [p for p in (base / "agg_csv").glob("foragg_*.csv") if "odds5p_normal" not in p.name or
            parse_foragg_stem(p.stem) is not None]
     variants = sum(len(f.schemes) for f in fam_registry.active())
-    assert len(fam_registry.active()) == 83 and variants == 122
+    assert len(fam_registry.active()) == 83 and variants == 129
     assert 3 * variants <= len(agg) <= 3 * variants * 4                   # 0件の成績表は書かない
     normal = {parse_foragg_stem(p.stem)["family"] for p in agg if parse_foragg_stem(p.stem)["mode"] == "normal"}
     assert {f.name for f in fam_registry.active() if f.layer == "A"} <= normal

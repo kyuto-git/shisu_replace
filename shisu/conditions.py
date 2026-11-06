@@ -96,16 +96,35 @@ def _interval_weeks(v) -> str:
     return _int_text(s)
 
 
+_KAISAI_RE = re.compile(r"^(\d{6})\s*(\d{1,2})(\D)(\d{1,2})(?:\s*(\d{1,2})R|\s+(\d{1,2}))$")
+
+
 def _prev_rid16_from_kaisai(v) -> str:
-    """出馬表の「前走開催」（例 '260816 2新8  1R'）→ 前走のレースID(新)先頭16桁（地方などは ''）。"""
-    m = re.match(r"^(\d{6})\s*(\d{1,2})(\D)(\d{1,2})\s*(\d{1,2})R", unicodedata.normalize("NFKC", str(v or "")).strip())
+    """出馬表の「前走開催」（例 '260816 2新8  1R'）→ 前走のレースID(新)先頭16桁（地方・海外などは ''）。
+    TARGET の欄は固定幅なので、日が2桁だと末尾の R が切れる（'260712 1函10 11'）。R が無くても読む。"""
+    m = _KAISAI_RE.match(unicodedata.normalize("NFKC", str(v or "")).strip())
     if not m:
         return ""
-    yymmdd, kai, pc, day, r = m.groups()
+    yymmdd, kai, pc, day, r1, r2 = m.groups()
+    r = r1 or r2
     place = PLACE_CHAR.get(pc)
     if not place:
         return ""
     return f"20{yymmdd}{place}{int(kai):02d}{int(day):02d}{int(r):02d}"
+
+
+def _mare_flags(raw: pd.DataFrame, norm: pd.DataFrame, sex_cols: tuple[str, ...]) -> pd.Series:
+    """牝馬限定 / 混合（両側共通の規則）。性別限定 の列があればそれ（牝 → 牝馬限定）。無ければ、レース名に「牝」がある、
+    またはそのレースの全馬の性が牝なら 牝馬限定。どれも分からなければ ''。"""
+    if "性別限定" in raw.columns:
+        return _col(raw, "性別限定").map(lambda s: "牝馬限定" if s == "牝" else "混合")
+    name = _col(raw, "レース名")
+    sex = _col(raw, *sex_cols)
+    rid = norm["レースID(新/馬番無)"] if "レースID(新/馬番無)" in norm.columns else norm["日付"]
+    all_mare = (sex == "牝").groupby(rid).transform("all") & (sex != "").groupby(rid).transform("all")
+    known = (name != "") | (sex != "")
+    return pd.Series(["牝馬限定" if ("牝" in n or a) else ("混合" if k else "") for n, a, k in zip(name, all_mare, known)],
+                     index=raw.index, dtype=object)
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +141,7 @@ def standardize_history(raw: pd.DataFrame, norm: pd.DataFrame) -> pd.DataFrame:
     out["休明戦目"] = _col(raw, "休み明け～戦目", "休み明け〜戦目", "休明戦目").map(_int_text)
     out["斤量"] = _col(raw, "斤量").map(_float_text)
     out["前走斤量"] = _col(raw, "前走斤量", "前斤量").map(_float_text)
-    sex = _col(raw, "性別限定")
-    if "性別限定" in raw.columns:
-        out["牝馬限定"] = sex.map(lambda s: "牝馬限定" if s == "牝" else "混合")
-    else:
-        out["牝馬限定"] = _col(raw, "レース名").map(lambda s: "牝馬限定" if "牝" in s else "混合")
+    out["牝馬限定"] = _mare_flags(raw, norm, ("性別", "性"))
     out["前走場所"] = _col(raw, "前走場所", "前場所")
     out["前走芝ダ"] = _col(raw, "前芝・ダ", "前芝ダ")
     out["前走距離"] = _col(raw, "前距離").map(_int_text)
@@ -160,14 +175,7 @@ def standardize_entries(raw: pd.DataFrame, norm: pd.DataFrame) -> pd.DataFrame:
         alt = pd.Series([("" if c is None or d is None else f"{c - d:g}") for c, d in zip(cur, diff)], index=raw.index)
         prev_w = prev_w.where(prev_w != "", alt)
     out["前走斤量"] = prev_w
-    name = _col(raw, "レース名")
-    sex = _col(raw, "性", "性別")
-    rid = norm["レースID(新/馬番無)"] if "レースID(新/馬番無)" in norm.columns else norm["日付"]
-    all_mare = (sex == "牝").groupby(rid).transform("all") & (sex != "").groupby(rid).transform("all")
-    if "性別限定" in raw.columns:
-        out["牝馬限定"] = _col(raw, "性別限定").map(lambda s: "牝馬限定" if s == "牝" else "混合")
-    else:
-        out["牝馬限定"] = ["牝馬限定" if ("牝" in n or a) else "混合" for n, a in zip(name, all_mare)]
+    out["牝馬限定"] = _mare_flags(raw, norm, ("性", "性別"))
     out["前走場所"] = _col(raw, "前場所", "前走場所")
     out["前走芝ダ"] = _col(raw, "前芝ダ", "前芝・ダ")
     out["前走距離"] = _col(raw, "前距離").map(_int_text)

@@ -126,6 +126,9 @@ def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True) -> pd
         if given is None and verbose:
             print(f"[INFO] {name}: {canon} の順位列が無いため、指数から順位を計算します")
         r = compute_indicator(df[col], rk, spec_for(canon), shin, given)
+        if verbose and r.attrs.get("direction") == "rank" and r.attrs.get("reverse") != spec_for(canon).reverse:
+            print(f"[INFO] {name}: {canon} は TARGET の順位に合わせて偏差値の向きを「"
+                  + ("小さいほど上" if r.attrs["reverse"] else "大きいほど上") + "」にしました（台帳の既定と逆）")
         derived = {
             f"{canon}_偏差値": int_text_series(r["偏差値"]),
             f"{canon}_偏差値帯": r["偏差値帯"].fillna(""),

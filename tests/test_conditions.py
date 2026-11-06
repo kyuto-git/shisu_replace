@@ -219,7 +219,7 @@ def test_conditions_equal_between_history_and_entries(paired):
 
 
 def test_keys_equal_between_history_and_entries(paired):
-    """同じ馬なら、過去側で作る全 122 variant のキーが、出馬表側の照合候補（matching.entry_fields 経由）に必ず入る。"""
+    """同じ馬なら、過去側で作る全 129 通りのキーが、出馬表側の照合候補（matching.entry_fields 経由）に必ず入る。"""
     from shisu.matching import entry_fields
     h, e = paired
     h = h.assign(順位=[str(i % 12 + 1) for i in range(len(h))], 偏差値帯="51~60")

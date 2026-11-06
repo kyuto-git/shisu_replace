@@ -39,11 +39,17 @@ def test_age_class_rule():
     assert normalize.apply_age_class_rule(cls, w).tolist() == ["1勝・OP", "1勝・OP", "重賞", "1・2_勝"]
 
 
+# 期待値は TARGET の 重量種別（★6タブの過去CSV 202610.csv の264レースで推定と全件一致することを確認した形）
 @pytest.mark.parametrize("name,age,cls,expected", [
     ("むらさＨ･3勝", "４歳以上", "準OP・OP", "ハンデ"), ("目黒記念ＨG2", "４歳以上", "重賞", "ハンデ"),
-    ("安土城Ｈ(L)", "４歳以上", "準OP・OP", "ハンデ"), ("NHKマイルC", "３歳", "G1", "定量"),
-    ("HTB賞", "３歳以上", "1・2_勝", "定量"), ("東京優駿G1", "３歳", "G1", "定量"),
-    ("未勝利", "３歳", "未勝利", "馬齢"), ("朝日杯FSG1", "２歳", "G1", "馬齢"), ("未勝利", "", "未勝利", ""),
+    ("安土城Ｈ(L)", "４歳以上", "準OP・OP", "ハンデ"), ("清里特Ｈ･2勝", "３歳以上", "1・2_勝", "ハンデ"),
+    ("北陸ＳＨ･3勝", "３歳以上", "準OP・OP", "ハンデ"), ("古都ＳＨ･3勝", "３歳以上", "準OP・OP", "ハンデ"),
+    ("福島民友ＣＨ", "３歳以上", "準OP・OP", "ハンデ"), ("NHKマイルC", "３歳", "G1", "馬齢"),
+    ("HTB賞", "３歳以上", "1・2_勝", "定量"), ("ＳＨＩＮ賞", "３歳以上", "1・2_勝", "定量"),
+    ("菊花賞G1", "３歳", "G1", "馬齢"), ("秋華賞G1", "３歳", "G1", "馬齢"),
+    ("アイビー(L)", "２歳", "準OP・OP", "定量"), ("もみじＳ", "２歳", "準OP・OP", "定量"),
+    ("未勝利", "３歳", "未勝利", "馬齢"), ("朝日杯FSG1", "２歳", "G1", "馬齢"), ("アルテミスG3", "２歳", "重賞", "馬齢"),
+    ("１勝ｸﾗｽ", "２歳", "1・2_勝", "馬齢"), ("未勝利", "", "未勝利", ""),
 ])
 def test_infer_weight(name, age, cls, expected):
     assert normalize.infer_entry_weight(name, age, cls) == expected
@@ -201,7 +207,10 @@ def test_build_key_examples():
     # 帯にする条件（前走着順など）は RBAND の family では tail と同じスキーム、偏差値帯の family では s1
     assert _keys(FIELDS, "D_prevfin", "s1") == ["東京×ダ×1600×前走2~3着×4~5位"]
     assert _keys(FIELDS, "D_prevfin", "s2") == ["東京×ダ×1600×前走1~3着×1~5位", "東京×ダ×1600×前走1~5着×1~5位"]
-    assert _keys(FIELDS, "D_prevfin_hen") == ["東京×ダ×1600×前走2~3着×61~65"]
+    # 偏差値帯の family でも、前走着順は s1・s2 の両方の帯で作る（スキームごとに別の集計表）
+    assert _keys(FIELDS, "D_prevfin_hen", "s1") == ["東京×ダ×1600×前走2~3着×61~65"]
+    assert _keys(FIELDS, "D_prevfin_hen", "s2") == ["東京×ダ×1600×前走1~3着×61~65", "東京×ダ×1600×前走1~5着×61~65"]
+    assert keys.get("D_prevfin_hen").schemes == ("s1", "s2") and keys.get("hensachiA").schemes == ("",)
     assert _keys(FIELDS, "B_jk_prevagari", "s2") == ["髙杉吏麒×前走上り1~3位×1~5位", "髙杉吏麒×前走上り1~5位×1~5位"]
     assert _keys(FIELDS, "C_sd_dist_r_hen") == []                          # 距離帯が空 → 作らない
     assert _keys({**FIELDS, "騎手": ""}, "rankJ") == []                    # 部品が空ならキーを作らない
@@ -217,7 +226,7 @@ def test_family_registry_counts():
     assert len(F.DEFAULT_TEMPLATES) == 49
     assert {ly: sum(1 for t in F.DEFAULT_TEMPLATES if t[0] == ly) for ly in "ABCD"} == {"A": 15, "B": 9, "C": 10, "D": 15}
     assert len(fams) == 15 + 2 * 34 == 83
-    assert sum(len(f.schemes) for f in fams) == 122
+    assert sum(len(f.schemes) for f in fams) == 129          # 122 ＋ 前走着順・人気・上り3F順を含む偏差値帯の7種のs2
     assert len({f.name for f in fams}) == 83
     # 初期の49種は、末尾が 新順位帯（s1/s2）＋偏差値帯（B〜D）
     for f in fams:
@@ -246,7 +255,7 @@ def _random_rows(n: int, seed: int) -> pd.DataFrame:
 
 
 def test_history_keys_equal_entry_keys():
-    """過去側（ベクトル版 build_keys）と出馬表側（1件版 entry_keys）が、全 122 variant で同じキーを作る。
+    """過去側（ベクトル版 build_keys）と出馬表側（1件版 entry_keys）が、全 129 通りで同じキーを作る。
     出馬表側は 芝(内・外) の候補を余分に試すので、過去側のキーは必ずその中にあり、内外を合わせれば完全に一致する。"""
     from shisu import families as F
     df = _random_rows(400, 0)

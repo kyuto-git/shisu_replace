@@ -93,6 +93,17 @@ def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpe
     if spec.zero_missing:           # 0 = 値なし（TARGET が取り込んでいない馬を 0 で出すため）
         x = x.where(x != 0)
         given_rank = None           # TARGET の順位は 0 の馬も数えているので使わず、値から計算する
+    given = pd.to_numeric(norm_series(given_rank), errors="coerce") if given_rank is not None else None
+    # 偏差値の向き: TARGET の順位があれば、それと同じ向きにする（1位の馬がレースの最大値か最小値か）。
+    # 台帳の reverse（小さいほど良い）は順位が無いときの既定。両側とも同じ規則なので、片側だけ向きが変わることはない
+    reverse = spec.reverse
+    direction = "spec"
+    if given is not None:
+        votes = rank_direction_votes(x.where(x != 0) if spec.zi else x, given, key)
+        if votes["high"] != votes["low"]:
+            reverse = votes["low"] > votes["high"]
+            direction = "rank"
+    raw = x
 
     miss = x.isna()
     miss_cnt = miss.groupby(key).transform("sum")
@@ -104,7 +115,7 @@ def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpe
         nz_mean = nonzero.groupby(key).transform("mean")
         x = x.where(~(x.isna() | (x == 0)), nz_mean)
 
-    if spec.reverse:
+    if reverse:
         x = -x
 
     if spec.exclude_shinba and shinba is not None:
@@ -123,8 +134,16 @@ def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpe
     ok = ~race_excluded & x.notna()
     hensachi = ((x - mean) / std * 10.0 + 50.0).where(ok).round(0)
 
-    if given_rank is not None:
-        rank = pd.to_numeric(norm_series(given_rank), errors="coerce")
+    if given is not None:
+        rank = given
+    elif spec.zi:
+        # ZI の順位は 0 の馬を最下位（同順位）にする。TARGET の順位と同じ（平均で埋めた値では順位を付けない）
+        valid = raw.where(raw != 0)
+        if reverse:
+            valid = -valid
+        rank = valid.groupby(key).rank(ascending=False, method="min")
+        last = valid.notna().groupby(key).transform("sum") + 1
+        rank = rank.where(valid.notna(), last.where(raw == 0))
     else:
         rank = x.groupby(key).rank(ascending=False, method="min")
     rank = rank.where(ok & ~single_missing)
@@ -139,7 +158,23 @@ def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpe
     out["race_excluded"] = race_excluded.astype(bool)
     out["shinba_excluded"] = shin.astype(bool)
     out["usable"] = (ok & ~shin).astype(bool)
+    out.attrs["reverse"] = bool(reverse)
+    out.attrs["direction"] = direction       # "rank"（TARGET の順位から決めた）/ "spec"（台帳の既定）
     return out
+
+
+def rank_direction_votes(x: pd.Series, rank: pd.Series, key: pd.Series) -> dict:
+    """レースごとに、順位1の馬の値がレースの最大か最小か（{"high": 最大のレース数, "low": 最小のレース数}）。
+    全頭同値・値の無いレースは数えない。"""
+    d = pd.DataFrame({"x": x.to_numpy(), "r": rank.to_numpy(), "k": key.to_numpy()}).dropna(subset=["x"])
+    if d.empty:
+        return {"high": 0, "low": 0}
+    g = d.groupby("k")["x"]
+    d["mx"], d["mn"] = g.transform("max"), g.transform("min")
+    top = d[(d["r"] == 1) & (d["mx"] > d["mn"])]
+    hi = set(top.loc[top["x"] == top["mx"], "k"])
+    lo = set(top.loc[top["x"] == top["mn"], "k"])
+    return {"high": len(hi - lo), "low": len(lo - hi)}
 
 
 def fmt_int(v) -> str:
@@ -153,5 +188,5 @@ def int_text_series(s: pd.Series) -> pd.Series:
     return s.map(fmt_int).astype(object)
 
 
-__all__ = ["compute_indicator", "hensachi_band", "rank_band", "band_labels", "all_band_labels", "RANK_SCHEMES",
+__all__ = ["compute_indicator", "rank_direction_votes", "hensachi_band", "rank_band", "band_labels", "all_band_labels", "RANK_SCHEMES",
            "BAND_UNITS", "fmt_int", "int_text_series", "np"]

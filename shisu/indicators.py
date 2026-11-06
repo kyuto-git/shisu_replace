@@ -88,8 +88,13 @@ _DISCONTINUED_KEYS = {_lookup_key(n) for n in DISCONTINUED}
 
 
 def is_discontinued(raw) -> bool:
-    """廃止した指数か（カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F）。"""
-    return _lookup_key(raw) in _DISCONTINUED_KEYS
+    """廃止した指数か（カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F）。
+    「結果分析スピード指数(ittai)」のように括弧で別名を添えた名前も、括弧の外・中のどちらかが廃止名なら廃止。"""
+    key = _lookup_key(raw)
+    if key in _DISCONTINUED_KEYS:
+        return True
+    m = re.fullmatch(r"(.*?)[(（](.*?)[)）]", key)
+    return bool(m) and (m.group(1) in _DISCONTINUED_KEYS or m.group(2) in _DISCONTINUED_KEYS)
 
 
 def canonical_indicator(raw) -> str:

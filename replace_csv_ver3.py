@@ -32,6 +32,7 @@ from shisu import config
 from shisu.conditions import INNER_FILE, CONDITION_COLUMNS, derive, inner_lookup_from, standardize_history
 from shisu.csvio import norm_series, read_csv_any, write_csv
 from shisu.families import build_keys, get as get_family
+from shisu.finish import parse_finish
 from shisu.hensachi import RANK_SCHEMES, compute_indicator, int_text_series
 from shisu.indicators import canonical_indicator, is_discontinued, parse_source_name, spec_for
 from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_series, distance_series,
@@ -131,8 +132,24 @@ def process_frame(raw: pd.DataFrame, stem: str, region: str, indicator: str, mas
         raw, df = raw[keep], df[keep]
 
     use_rank = ("指数順位" in raw.columns) if given_rank is None else given_rank
-    ind = compute_indicator(df["指数"], _race_key(df), spec, shinba_mask(df["クラス名_raw"]),
-                            df["指数順位_元"] if use_rank else None)
+    # 取消・除外の馬は走っていないので偏差値・順位の計算に入れない（TARGET は 指数 0・指数順位 0 を出す。
+    # 入れると 0 が1頭ぶんの値として平均・標準偏差を動かし、欠損の数え方も変わる）
+    ran = parse_finish(df["着順"])["denom"]
+    if not ran.all():
+        notes.append(f"取消・除外 {int((~ran).sum())} 頭は偏差値・順位の計算から外しました")
+    sub = df[ran]
+    ind = compute_indicator(sub["指数"], _race_key(sub), spec, shinba_mask(sub["クラス名_raw"]),
+                            sub["指数順位_元"] if use_rank else None)
+    if ind.attrs.get("direction") == "rank" and ind.attrs.get("reverse") != spec.reverse:
+        notes.append("TARGET の順位に合わせて偏差値の向きを「" + ("小さいほど上" if ind.attrs["reverse"] else "大きいほど上")
+                     + "」にしました（台帳の既定と逆）")
+    attrs = dict(ind.attrs)
+    ind = ind.reindex(df.index)
+    ind.attrs = attrs
+    for c in ("race_excluded", "shinba_excluded", "usable"):
+        ind[c] = ind[c].eq(True)          # 取消・除外の馬（reindex で NaN）は False
+    for c in ["偏差値帯"] + [f"順位帯_{sc}" for sc in RANK_SCHEMES]:
+        ind[c] = ind[c].fillna("")
     df["順位"] = int_text_series(ind["順位"])
     df["偏差値"] = int_text_series(ind["偏差値"])
     df["偏差値帯"] = ind["偏差値帯"]
@@ -194,12 +211,14 @@ def process_ext(base_path: str, indicator: str, master_dir: str, processed_dir: 
     lookup = ext_indices.load_source(src, log=lambda m: None)
     raw = _read_base(str(base_path)).copy()
     values, ranks = ext_indices.attach(raw, lookup)
-    raw["指数"] = values
+    # 値の無い馬は 0（TARGET は外部指数を取り込んでいない馬を 0 で出す。出馬表側と従来の ★8 の過去CSVもそう。
+    # 0 を欠損として扱う指数（安井のランク・5ステータス）は compute_indicator が欠損に戻す）
+    raw["指数"] = values.where(values != "", "0")
     if ranks is not None:
         raw["指数順位"] = ranks
     elif "指数順位" in raw.columns:
         raw = raw.drop(columns=["指数順位"])               # 基本CSVの順位（タイムM など）を使わない
-    hit = int((values != "").sum())
+    hit = int((values != "").sum())     # 0 で埋める前の、ファイルに値があった馬の数
     stem = f"{region_raw}_{indicator}"
     msg = process_frame(raw, stem, region, indicator, master_dir, processed_dir, inner_lookup,
                         given_rank=ranks is not None, label=f"{base_path.name} + ext_indices/{indicator}")

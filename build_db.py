@@ -126,12 +126,16 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
     if not files:
         print(f"[foragg] 集計CSVがありません: {agg_dir}（aggregate_stats_ver2.py を先に実行）")
         return [], 0
-    loaded, skipped, empty, old_format = [], 0, 0, []
+    loaded, skipped, empty, old_format, inactive = [], 0, 0, [], []
+    active = {f.name: set(f.schemes) for f in fam_registry.active()}
     for p in files:
         info = parse_foragg_stem(file_stem(p.name))
         if info is None:
             print(f"[foragg] SKIP（ファイル名が規約外・旧仕様）: {p.name}", file=sys.stderr)
             skipped += 1
+            continue
+        if info["scheme"] not in active.get(info["family"], set()):
+            inactive.append(p.name)      # 前の実行の別の family・スキームの成績表（families.json に無い）
             continue
         df = read_csv_any(p)
         if "結合データ" not in df.columns or "件数" not in df.columns:
@@ -153,6 +157,9 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
                        "indicator": info["indicator"], "region": info["region"], "n_rows": int(len(df)),
                        "_cols": set(df.columns)})
     print(f"[foragg] loaded {len(loaded)} tables (0件 {empty} / skip {skipped})")
+    if inactive:
+        print(f"[WARN] 今の family（agg_csv/families.json）に無い成績表 {len(inactive)} 本は取り込みませんでした"
+              f"（例: {inactive[0]}）。前の実行の残りなので aggregate_stats_ver2.py --clean で消せます", file=sys.stderr)
     if old_format:
         print(f"[ERROR] WEDGE 列の無い旧形式の成績表が {len(old_format)} 本あり、取り込みませんでした"
               f"（例: {old_format[0]}）。aggregate_stats_ver2.py --clean を実行し直してください", file=sys.stderr)
@@ -220,6 +227,12 @@ def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None) ->
     df["レース名"] = _first_nonempty(df, ("レース名",))
     df["場所"] = _first_nonempty(df, ("場所",))
     surface, dist_raw = split_surface_distance(_first_nonempty(df, ("芝・ダ", "芝ダ")), _first_nonempty(df, ("距離",)))
+    # 障害レース: TARGET の出馬表は 芝ダ に「ダ」「芝」と入り、今芝ダ・レース名（障害…）・トラックコードで分かる。
+    # 過去側は障害を集計していないので「障」にして、どの family のキーも作らない（matching.is_jump_row）
+    track = pd.to_numeric(_first_nonempty(df, ("トラックコード(JV)", "トラックコード")), errors="coerce")
+    jump = ((_first_nonempty(df, ("今芝ダ", "今芝・ダ")) == "障") | (surface == "障")
+            | df["レース名"].astype(str).str.startswith("障害") | (track >= 51).fillna(False))
+    surface = surface.where(~jump, "障")
     df["芝・ダ"] = surface
     dnum = distance_series(dist_raw)
     df["距離_raw"] = dnum.astype(object).where(dnum.notna(), "").map(lambda v: "" if v == "" else str(int(v)))

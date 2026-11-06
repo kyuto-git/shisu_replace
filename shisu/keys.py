@@ -18,8 +18,9 @@ def all_families() -> tuple[str, ...]:
 
 
 def is_band_family(name: str) -> bool:
+    """s1/s2 の2つの集計表になる family か（指数順位帯、または前走着順などの帯を含む）。"""
     f = get(name)
-    return bool(f and f.is_band)
+    return bool(f and f.uses_schemes)
 
 
 def family_label(name: str, scheme: str = "") -> str:

@@ -87,12 +87,11 @@ def _sync_families(con) -> None:
         return
     try:
         fams = fam_registry.load_from_db(con)
-    except sqlite3.Error:
+    except (sqlite3.Error, ValueError):
         fams = []
+    fam_registry.reset()                 # 前の DB の定義を残さない（同じ名前で部品が変わった family もある）
     if fams:
         fam_registry.set_active(fams, "DB の __families__")
-    else:
-        fam_registry.reset()
     _FAMILY_SYNC["stamp"] = stamp
 
 
@@ -888,7 +887,7 @@ def _wedge_request():
     sdir = "ASC" if request.args.get("dir", "DESC").upper() == "ASC" else "DESC"
     return {"table": table, "rid": rid, "legacy": legacy, "date": request.args.get("date", "").strip(),
             "odds_mode": odds_mode, "inds": [v for v in request.args.getlist("ind") if v],
-            "fams": [v for v in request.args.getlist("family") if v in fam_registry.active_names()],
+            "fams": [v for v in request.args.getlist("family") if v],   # 使う family かは DB を読んでから確かめる
             "uma": request.args.get("uma", "").strip(), "sort": sort, "dir": sdir}
 
 
@@ -899,6 +898,8 @@ def _wedge_data(p: dict):
         race = _race_rows(con, p["table"], p["rid"], p["legacy"], p["date"])
         hits, path = collect_hits(con, p["table"], race)
         bases = indicator_bases(table_columns(con, p["table"]))
+    # connect() が DB の __families__ を台帳に反映したあとで、family の絞り込みを確かめる
+    p["fams"] = [v for v in p["fams"] if v in fam_registry.active_names()]
     rank = {n: i for i, n in enumerate(INDICATOR_ORDER)}
     bases = sorted(bases, key=lambda b: (rank.get(b, len(rank)), b))
     rows = sort_wedge_hits(filter_wedge_hits(hits, p["odds_mode"], p["inds"], p["fams"], p["uma"]),

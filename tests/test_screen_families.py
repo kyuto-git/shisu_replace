@@ -59,7 +59,7 @@ def test_report_columns_and_rows(screened):
             "monotonic", "select_A", "select_B", "selected", "reason"}
     need |= {f"{c}_{m}" for c in ("abs", "axis", "opp", "keshi") for m in (*ODDS_MODES, "total")}
     assert need <= set(rep.columns)
-    assert len(rep) == 122                                     # 初期セット 83 family・122 通り
+    assert len(rep) == 129                                     # 初期セット 83 family・129 通り
     assert set(rep["masters"]) == {1}
     assert (rep["groups"] >= rep["groups_ge10"]).all() and rep["coverage"].between(0, 1).all()
     assert (rep["groups"] > 0).sum() > 60
@@ -120,7 +120,7 @@ def test_export_selected(screened):
     assert picked["select_A"].sum() <= 5
     for f in fams:
         schemes = set(picked.loc[picked["name"] == f.name, "scheme"].fillna(""))
-        if f.tail == "RBAND":
+        if f.uses_schemes:
             assert set(f.schemes) == schemes                     # 片方のスキームだけ選ばれたら schemes で絞る
         else:
             assert schemes == {""}

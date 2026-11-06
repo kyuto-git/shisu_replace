@@ -39,7 +39,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - 外部指数の結び付け（`shisu/ext_indices.py`）: 形式A（18桁ID,値: Ω・かよちん・keibaAI・吉馬6・安井8）/ B（旧10桁ID,値,順位: StridePlus 12。ファイル名の接頭辞）/ C（12桁レースID と (値,順位) の組: Gold）/ D（旧8桁レースID と値: BC・ZI）。廃止: カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F
 - 順位帯（指数順位・前走着順・前走人気・前走上がり3F順で共通）: s1 = 1 / 2~3 / 4~5 / 6~9 / 10~、s2 = 1~3 / 1~5 / 6~（重なりあり。両方のキーを作る）
 - 22条件（`shisu/conditions.py`、マスタは `shisu/data/`）: 時期・輸送距離・間隔帯・叩き・R値帯・直線帯・初角帯・CFS帯・F係数帯・今走/前走クワドラント・左右/左右遷移・距離帯・坂・斤量帯・斤量増減・牝馬限定・距離増減・前走着順/人気/上り3F順/脚質/R印3
-- family（`shisu/families.py`）: 初期セット49の型（A 15・B 9・C 10・D 15 → 83 family・122通り）。`selected_families.json` があれば置き換え（集計・DB・照合・画面）。初期セットのままだと成績表・DB は旧版の約8〜9倍
+- family（`shisu/families.py`）: 初期セット49の型（A 15・B 9・C 10・D 15 → 83 family・129通り）。`selected_families.json` があれば置き換え（集計・DB・照合・画面）。初期セットのままだと成績表・DB は旧版の約8〜9倍
 - オッズ帯: 通常 / 10倍未満（odds10u）/ 10〜50倍（odds10_50）/ 50倍以上（odds50p）
 - 推定値: Jeffreys 事前の事後分布の下側10%点（複勝率は頻度20%以下なら上側90%点）。DB の 勝率_val〜3着率_val は推定値、掲示板率_val は頻度。率はすべて 0–100
 - 条件ヒット馬: 消し → 絶対軸 → 軸候補 → 相手 の順で最初に当てはまった区分（閾値は `shisu/classify.py`）。screen_families の基準B はこの判定のキー数

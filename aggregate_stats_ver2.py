@@ -147,9 +147,19 @@ def ref_year_of(df: pd.DataFrame) -> int | None:
     return int(y.max()) if y.notna().any() else None
 
 
-def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: dict | None = None) -> pd.DataFrame:
+def ref_columns_for(fam) -> tuple[str, ...]:
+    """成績表の 場所・芝・ダ・距離・芝(内・外) に値を入れる列。family がその部品で絞っているときだけ
+    （コースを含む family は4つとも、芝・ダ だけを含む family は 芝・ダ だけ。ほかは空。画面の絞り込み用）。"""
+    if fam_registry.COURSE in fam.parts:
+        return tuple(REF_COLUMNS)
+    return ("芝・ダ",) if "芝・ダ" in fam.parts else ()
+
+
+def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: dict | None = None,
+                    ref_columns: tuple[str, ...] | None = None) -> pd.DataFrame:
     """キー付きの DataFrame（master の行。文字列）→ 成績表。ref_year は年度加重の窓の終わり（省略時は df の最終年）。
-    wedge_opts は wedge_options() の dict（省略時は環境変数・既定値）。"""
+    wedge_opts は wedge_options() の dict（省略時は環境変数・既定値）。
+    ref_columns は 場所・芝・ダ・距離・芝(内・外) のうち値を入れる列（省略時は4つとも。ref_columns_for）。"""
     for c in (RID, KEY, "着順"):
         if c not in df.columns:
             raise KeyError(c)
@@ -228,8 +238,9 @@ def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: d
     for c in WEDGE_COLUMNS:
         v = wd[c]
         out[c] = (v.round(4) if v.dtype.kind == "f" else v).values
+    fill = REF_COLUMNS if ref_columns is None else ref_columns
     for c in REF_COLUMNS:
-        if c in d.columns:
+        if c in fill and c in d.columns:
             first = d[c].where(d[c] != "").groupby(g).first().reindex(n.index)
             out[c] = first.fillna("").values
         else:
@@ -269,14 +280,31 @@ def odds_part(sub: pd.DataFrame, mode: str) -> pd.DataFrame:
     return sub[odds_mask(sub["単勝オッズ"], mode)] if "単勝オッズ" in sub.columns else sub.iloc[0:0]
 
 
+def restrict_schemes(fams, schemes: set[str] | None):
+    """AGG_RANKBAND_SCHEMES（例 {"s1"}）で、s1/s2 の family の作るスキームを絞る（無くなる family は外す）。"""
+    if not schemes:
+        return list(fams)
+    out = []
+    for f in fams:
+        if not f.uses_schemes:
+            out.append(f)
+            continue
+        keep = tuple(sc for sc in f.schemes if sc in schemes)
+        if keep:
+            out.append(fam_registry.Family(f.name, f.parts, f.tail, f.label, f.layer,
+                                           () if keep == ("s1", "s2") else keep))
+    return out
+
+
 def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, schemes: set[str] | None = None,
-                     families_file: str | None = None) -> str:
+                     families: list[dict] | None = None) -> str:
+    """master 1本 → 成績表。families は使う family の定義（to_dict の list。並列の子プロセスにも同じ定義を渡す）。"""
     src = Path(src)
     stem = file_stem(src)
     if not stem.startswith(MASTER_PREFIX) or stem in SKIP_MASTERS:
         return f"[SKIP] {src.name}: master のファイルではありません"
-    if families_file:
-        fam_registry.configure(families_file, log=lambda m: None)
+    if families is not None:
+        fam_registry.set_active([fam_registry.Family.from_dict(d) for d in families])
     source = stem[len(MASTER_PREFIX):]
     df = master_frame(read_csv_any(src))
     for c in (RID, "着順"):
@@ -284,11 +312,15 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
             return f"[SKIP] {src.name}: 列 {c} がありません（master ではない可能性）"
     ref_year = ref_year_of(df)
     groups = adj = n_files = 0
-    for fam, scheme, sub in family_frames(df):
-        if schemes and scheme and scheme not in schemes:
-            continue
+    fams = restrict_schemes(fam_registry.active(), schemes)
+    for fam in fams:                     # 作らないスキームの、前の実行の成績表は消す（build_db が取り込まないように）
+        for sc in ("s1", "s2") if fam.uses_schemes else ():
+            if sc not in fam.schemes:
+                for mode in ODDS_MODES:
+                    (Path(out_dir) / agg_filename(fam.name, mode, sc, source)).unlink(missing_ok=True)
+    for fam, scheme, sub in family_frames(df, fams):
         for mode in ODDS_MODES:
-            out = aggregate_frame(odds_part(sub, mode), ref_year, wedge_opts)
+            out = aggregate_frame(odds_part(sub, mode), ref_year, wedge_opts, ref_columns_for(fam))
             path = Path(out_dir) / agg_filename(fam.name, mode, scheme, source)
             if out.empty:                    # 0件の成績表は書かない（前の実行で書いた同じ名前のファイルは消す）
                 path.unlink(missing_ok=True)
@@ -335,19 +367,27 @@ def main(argv=None) -> int:
         print(f"[ERROR] master（master_*.csv.gz）がありません: {args.in_dir}。replace_csv_ver3.py を先に実行してください",
               file=sys.stderr)
         return 2
-    fams = fam_registry.configure(args.families)
-    families_file = args.families or (str(config.selected_families_path())
-                                      if config.selected_families_path().exists() else None)
+    try:
+        fams = fam_registry.configure(args.families)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[ERROR] family の定義: {e}", file=sys.stderr)
+        return 2
+    fams = restrict_schemes(fams, schemes)
+    if not fams:
+        print(f"[ERROR] AGG_RANKBAND_SCHEMES={','.join(sorted(schemes))} で作る family がありません", file=sys.stderr)
+        return 2
+    fam_dicts = [f.to_dict() for f in fams]
     if args.clean and Path(args.out_dir).exists():
         shutil.rmtree(args.out_dir)
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    # build_db・照合・画面はこの定義を使う（AGG_RANKBAND_SCHEMES で絞ったスキームもここに残る）
     fam_registry.save_families(Path(args.out_dir) / "families.json", fams, {"source": fam_registry.active_source()})
     n_var = sum(len(f.schemes) for f in fams)
     print(f"[INFO] family: {fam_registry.active_source()} / {len(fams)} family・{n_var} 通り（スキーム込み）")
     print(f"[INFO] {len(files)} files / 推定={PROP_MODE} (q={LOWER_Q}/{UPPER_Q}) / scipy={'あり' if has_scipy() else 'なし(正規近似)'}"
           f" / WEDGE: 年の最低件数={opts['min_year_count']} 遡る年数≦{opts['max_years']}"
           f" 減衰率={opts['decay']} 窓={opts['window']}")
-    jobs = [(str(p), args.out_dir, opts, schemes or None, families_file) for p in files]
+    jobs = [(str(p), args.out_dir, opts, None, fam_dicts) for p in files]
     if args.workers > 1:
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
             results = list(ex.map(_run, jobs, chunksize=8))

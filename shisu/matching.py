@@ -57,6 +57,11 @@ def rank_text(v) -> str:
 PART_FIELDS = ("場所", "芝・ダ", "距離", "芝(内・外)", "重量種別", "クラス名", "枠番グループ", "騎手") + CONDITION_COLUMNS
 
 
+def is_jump_row(row: Mapping) -> bool:
+    """障害レースの行か（build_db.normalize_entries_df が 芝・ダ を「障」にする）。"""
+    return norm_text(row.get("芝・ダ")) == "障"
+
+
 def entry_fields(row: Mapping, base: str) -> dict:
     """出馬表の1行（build_db で正規化済み。22条件の列も持つ）から、キーの部品を取り出す。"""
     out = {c: norm_text(row.get(c)) for c in PART_FIELDS}
@@ -81,6 +86,8 @@ def match_entry_row(conn: sqlite3.Connection, row: Mapping, bases: Iterable[str]
     """出馬表1頭ぶんのヒット行（HIT_COLUMNS の dict）を返す。"""
     cache = {} if cache is None else cache
     families = tuple(families) if families is not None else _families.active_names()
+    if is_jump_row(row):              # 障害レース: 過去側は集計していない（コースを含まない family でも照合しない）
+        return []
     horse = {c: norm_text(row.get(c)) for c in HORSE_COLUMNS}
     out: list[dict] = []
     for base in bases:

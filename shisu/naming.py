@@ -67,7 +67,7 @@ def parse_foragg_stem(stem: str) -> dict | None:
     family = next((f for f in sorted(_families.known_names(), key=len, reverse=True) if s.startswith(f + "_")), None)
     if family is None:
         return None
-    if _families.get(family).is_band != bool(scheme):
+    if _families.get(family).uses_schemes != bool(scheme):
         return None
     source = s[len(family) + 1:]
     if not source:
