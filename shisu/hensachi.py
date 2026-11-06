@@ -85,8 +85,11 @@ def rank_band(rank, scheme: str) -> str:
 
 def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpec,
                       shinba: pd.Series | None = None,
-                      given_rank: pd.Series | None = None) -> pd.DataFrame:
+                      given_rank: pd.Series | None = None,
+                      last: pd.Series | None = None) -> pd.DataFrame:
     """1指数ぶんの偏差値・順位・帯を返す（index は values と同じ）。
+
+    last: 値から順位を付けるとき最下位（同順位）にする馬（外部指数のファイルに無く 0 で埋めた馬。TARGET と同じ扱い）。
 
     返す列: 偏差値(float), 偏差値帯, 順位(Int64), 順位帯_s1, 順位帯_s2,
             race_excluded(bool: レースごと除外), shinba_excluded(bool), usable(bool)
@@ -138,16 +141,22 @@ def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpe
     ok = ~race_excluded & x.notna()
     hensachi = ((x - mean) / std * 10.0 + 50.0).where(ok).round(0)
 
+    at_last = (last.reindex(idx).fillna(False).astype(bool) if last is not None
+               else pd.Series(False, index=idx))
     if spec.zi:
         # ZI の順位は 0 の馬を最下位（同順位）にする。TARGET の順位と同じ（平均で埋めた値では順位を付けない）
-        valid = raw.where(raw != 0)
+        valid = raw.where((raw != 0) & ~at_last)
         if reverse:
             valid = -valid
         value_rank = valid.groupby(key).rank(ascending=False, method="min")
-        last = valid.notna().groupby(key).transform("sum") + 1
-        value_rank = value_rank.where(valid.notna(), last.where(raw == 0))
+        bottom = valid.notna().groupby(key).transform("sum") + 1
+        value_rank = value_rank.where(valid.notna(), bottom.where((raw == 0) | at_last))
     else:
-        value_rank = x.groupby(key).rank(ascending=False, method="min")
+        # 外部指数のファイルに無い馬（last）は、値の向きに関係なく最下位（小さいほど良い指数でも 0 を1位にしない）
+        present = x.where(~at_last)
+        value_rank = present.groupby(key).rank(ascending=False, method="min")
+        bottom = present.notna().groupby(key).transform("sum") + 1
+        value_rank = value_rank.where(~at_last, bottom.where(at_last & x.notna()))
     if given is not None:
         # 元の順位を使う。ただし順位が1頭も無いレース（順位の欄が空のファイルのレースなど）は値から付ける
         no_given = given.isna().groupby(key).transform("all")

@@ -579,3 +579,40 @@ def test_given_rank_missing_for_whole_race_uses_value_rank():
     assert r["順位"].tolist() == [3, 1, 2, 3, 2, 1]
     g2 = pd.Series(["3", "1", "", "", "", ""])                                     # 1頭だけ欠けたレースはそのまま
     assert pd.isna(compute_indicator(v, k, spec_for("SAV"), given_rank=g2).loc[2, "順位"])
+
+
+
+# ---------------------------------------------------------------- 6回目の検証の指摘
+def test_absent_horses_last_even_when_ranks_come_from_values(tmp_path):
+    """ファイルに無い馬（0 で埋めた馬）は、順位を値から作るレースでも最下位。小さいほど良い 展開 で 0 を1位にしない。"""
+    import replace_csv_ver3 as r
+    a = _race([str(200 - i) for i in range(12)], [str(i) for i in range(1, 13)], [str(i) for i in range(1, 13)],
+              rid="2025102404040304")
+    b = _race([str(200 - i) for i in range(12)], [str(i) for i in range(1, 13)], [str(i) for i in range(1, 13)])
+    synth.write_cp932(pd.concat([a, b], ignore_index=True), tmp_path / "csv" / "新潟_タイムM.csv")
+    sp = tmp_path / "ext" / "StridePlus"
+    sp.mkdir(parents=True)
+    from shisu.ext_indices import old_id_from_new
+    (sp / "tenkai_2025.csv").write_text("\n".join(f"{old_id_from_new(rid)},{10 + i},{i + 1}" for i, rid in
+                                                  enumerate(a["レースID(新)"][:10])), encoding="utf-8")
+    (sp / "tenkai_2026.csv").write_text("\n".join(f"{old_id_from_new(rid)},{10 + i}," for i, rid in
+                                                  enumerate(b["レースID(新)"][:10])), encoding="utf-8")
+    assert r.main(["--csv-dir", str(tmp_path / "csv"), "--ext-dir", str(tmp_path / "ext"),
+                   "--master-dir", str(tmp_path / "m")]) == 0
+    m = pd.read_csv(tmp_path / "m" / "master_新潟_展開.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
+    for rid in ("2025102404040304", "2026102404040304"):
+        g = m[m["レースID(新/馬番無)"] == rid].sort_values("馬番", key=lambda s: s.astype(int))
+        assert g["順位"].tolist() == [str(i) for i in range(1, 11)] + ["11", "11"], rid
+
+
+def test_last_mask_in_compute_indicator():
+    v = pd.Series(["10", "12", "14", "0", "0"])
+    k = pd.Series(["a"] * 5)
+    last = pd.Series([False, False, False, True, True])
+    r = compute_indicator(v, k, spec_for("展開"), last=last)                  # 小さいほど良い
+    assert r["順位"].tolist() == [1, 2, 3, 4, 4]
+    r = compute_indicator(v, k, spec_for("SAV"), last=last)
+    assert r["順位"].tolist() == [3, 2, 1, 4, 4]
+    z = compute_indicator(pd.Series(["90", "95", "0", "80"]), pd.Series(["a"] * 4), spec_for("ZI"),
+                          last=pd.Series([False, False, True, False]))
+    assert z["順位"].tolist() == [2, 1, 4, 3]

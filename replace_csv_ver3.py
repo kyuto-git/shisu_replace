@@ -112,8 +112,9 @@ def _race_key(df: pd.DataFrame) -> pd.Series:
 
 def process_frame(raw: pd.DataFrame, stem: str, region: str, indicator: str, master_dir: str,
                   processed_dir: str | None, inner_lookup: dict | None = None, given_rank: bool | None = None,
-                  label: str = "") -> str:
-    """1地域×1指数の入力（1行=1頭）→ master_{stem}.csv.gz。戻り値はログの1行。"""
+                  label: str = "", absent: pd.Series | None = None) -> str:
+    """1地域×1指数の入力（1行=1頭）→ master_{stem}.csv.gz。戻り値はログの1行。
+    absent: 外部指数のファイルに無く 0 で埋めた馬（値から順位を付けるとき最下位にする）。"""
     label = label or f"{stem}.csv"
     spec = spec_for(indicator)
     if "指数" not in raw.columns:
@@ -139,7 +140,8 @@ def process_frame(raw: pd.DataFrame, stem: str, region: str, indicator: str, mas
         notes.append(f"取消・除外 {int((~ran).sum())} 頭は偏差値・順位の計算から外しました")
     sub = df[ran]
     ind = compute_indicator(sub["指数"], _race_key(sub), spec, shinba_mask(sub["クラス名_raw"]),
-                            sub["指数順位_元"] if use_rank else None)
+                            sub["指数順位_元"] if use_rank else None,
+                            absent.reindex(sub.index) if absent is not None else None)
     if ind.attrs.get("direction") == "rank" and ind.attrs.get("reverse") != spec.reverse:
         notes.append("TARGET の順位に合わせて偏差値の向きを「" + ("小さいほど上" if ind.attrs["reverse"] else "大きいほど上")
                      + "」にしました（台帳の既定と逆）")
@@ -239,7 +241,8 @@ def process_ext(base_path: str, indicator: str, master_dir: str, processed_dir: 
     hit = int((values != "").sum())     # 0 で埋める前の、ファイルに値があった馬の数
     stem = f"{region_raw}_{indicator}"
     msg = process_frame(raw, stem, region, indicator, master_dir, processed_dir, inner_lookup,
-                        given_rank=ranks is not None, label=f"{base_path.name} + ext_indices/{indicator}")
+                        given_rank=ranks is not None, label=f"{base_path.name} + ext_indices/{indicator}",
+                        absent=values == "")
     return msg + f" / 外部指数が付いた馬 {hit}/{len(raw)}"
 
 
