@@ -12,11 +12,13 @@ def test_replace_without_head_column_keeps_rows(tmp_path, capsys):
     """頭数列が無い過去CSVでも、旧版と同じく頭数で絞らずに処理する（0件にしない）。"""
     import replace_csv_ver3 as r
     df = synth.history_frame(seed=3, years=(2024,), races_per_year=8).drop(columns=["頭数"])
-    src = tmp_path / "csv" / "札幌_カツラキ.csv"
+    src = tmp_path / "csv" / "札幌_SAV.csv"
     synth.write_cp932(df, src)
-    msg = r.process_file(str(src), str(tmp_path / "foragg"), None, None, ("s1", "s2"))
-    assert "使用=0" not in msg
+    msg = r.process_file(str(src), str(tmp_path / "master"), None, None)
+    assert msg.startswith("[OK]") and "master=0" not in msg
     assert "頭数 列が無い" in capsys.readouterr().err
+    m = pd.read_csv(tmp_path / "master" / "master_札幌_SAV.csv.gz", encoding="cp932", dtype=str)
+    assert len(m) == len(df)
 
 
 def test_aggregate_mean_mode_keeps_place_quantile(monkeypatch):

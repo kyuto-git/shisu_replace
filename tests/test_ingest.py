@@ -555,9 +555,9 @@ def test_yasui_entries_file_feeds_calc_entry_hensachi(tmp_path):
     yas = read_csv_any(tmp_path / "o" / "entries_in" / "yasui_20251101.csv")
     assert not [col for col in yas.columns if col.endswith("順位")]
     main = pd.DataFrame([{"レースID(新)": f"2025110105040101{u:02d}", "場 R": "東1", "場所": "東京", "馬番": str(u),
-                          "馬名S": f"ウマ{u}", "カツラキ": str(50 + u)} for u in range(1, 11)])
+                          "馬名S": f"ウマ{u}", "SAV": str(50 + u)} for u in range(1, 11)])
     out = c.merge_frames([c.process_df(main, "main", verbose=False), c.process_df(yas, "yasui", verbose=False)])
-    assert {"安井_スピード_偏差値", "安井_スピード_順位", "安井_ランク_順位帯_s1", "カツラキ_順位"} <= set(out.columns)
+    assert {"安井_スピード_偏差値", "安井_スピード_順位", "安井_ランク_順位帯_s1", "SAV_順位"} <= set(out.columns)
     sp_rank = out.set_index("馬番")["安井_スピード_順位"].astype(str)
     assert sp_rank["3"] == "1" and sp_rank["1"] == "2"
     assert sp_rank["5"] == sp_rank["6"]

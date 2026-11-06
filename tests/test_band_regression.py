@@ -9,7 +9,8 @@
 レース単位（16桁）の レースID(新) は馬番を付けて18桁にそろえる。ここではそれを次の性質で固定する:
   - ミナリク騎手の band キーの件数・勝率が、本人の騎乗だけから数えた値と一致する
   - レース単位のIDで入れても、馬単位のIDで入れたときと成績表が完全に一致する
-  - 素材の各ファイルで、同じ馬（レースID × 馬番）が同じキーに2回以上現れない
+  - どの family でも、同じ馬（レースID × 馬番）が同じキーに2回以上現れない
+（Phase 4 以降、素材ファイルは作らず master からその場でキーを作る。ここでも同じ関数でキーを作って確かめる）
 """
 from __future__ import annotations
 
@@ -55,25 +56,23 @@ def minarik_frame(race_level_id: bool, with_rank: bool = True) -> pd.DataFrame:
     return df if with_rank else df.drop(columns=["指数順位"])
 
 
-def run_pipeline(tmp: Path, df: pd.DataFrame, name: str = "中山_カツラキ.csv") -> dict[str, pd.DataFrame]:
+def run_pipeline(tmp: Path, df: pd.DataFrame, name: str = "中山_SAV.csv") -> dict[str, pd.DataFrame]:
     import aggregate_stats_ver2
     import replace_csv_ver3
-    d = {k: tmp / k for k in ("csv", "foragg", "agg", "master", "processed")}
+    d = {k: tmp / k for k in ("csv", "agg", "master", "processed")}
     synth.write_cp932(df, d["csv"] / name)
-    assert replace_csv_ver3.main(["--csv-dir", str(d["csv"]), "--foragg-dir", str(d["foragg"]),
-                                  "--master-dir", str(d["master"]), "--processed-dir", str(d["processed"]),
-                                  "--clean"]) == 0
-    assert aggregate_stats_ver2.main(["--in-dir", str(d["foragg"]), "--out-dir", str(d["agg"]), "--clean",
+    assert replace_csv_ver3.main(["--csv-dir", str(d["csv"]), "--no-ext", "--master-dir", str(d["master"]),
+                                  "--processed-dir", str(d["processed"]), "--clean"]) == 0
+    assert aggregate_stats_ver2.main(["--in-dir", str(d["master"]), "--out-dir", str(d["agg"]), "--clean",
                                       "--wedge-min-year-count", "0"]) == 0
     out = {}
     for p in sorted(d["agg"].glob("*.csv")):
         out[p.name] = pd.read_csv(p, encoding="cp932", dtype=str, keep_default_na=False)
-    out["_foragg_dir"] = d["foragg"]
     out["_master_dir"] = d["master"]
     return out
 
 
-SOURCE = "中山_カツラキ"
+SOURCE = "中山_SAV"
 
 
 def _agg(res: dict, family: str, scheme: str) -> pd.DataFrame:
@@ -82,10 +81,20 @@ def _agg(res: dict, family: str, scheme: str) -> pd.DataFrame:
     return res[agg_filename(family, "normal", scheme, SOURCE)]
 
 
-def _material(res: dict, family: str, scheme: str) -> pd.DataFrame:
-    from shisu.naming import material_filename
-    return pd.read_csv(res["_foragg_dir"] / material_filename(family, scheme, SOURCE), encoding="cp932",
-                       dtype=str, keep_default_na=False)
+def _master(res: dict) -> pd.DataFrame:
+    import aggregate_stats_ver2 as a
+    return a.master_frame(pd.read_csv(res["_master_dir"] / f"master_{SOURCE}.csv.gz", encoding="cp932",
+                                      dtype=str, keep_default_na=False))
+
+
+def _keyed(res: dict, family: str, scheme: str) -> pd.DataFrame:
+    """aggregate と同じ手順で作ったキー付きの行（旧版の素材に当たるもの。今はファイルに書かない）。"""
+    from shisu import families as fam_registry
+    m = _master(res)
+    keys = fam_registry.build_keys(m, family, scheme)
+    out = m.loc[keys.index].copy()
+    out["結合データ"] = keys.to_numpy()
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -100,22 +109,26 @@ def results(tmp_path_factory):
 
 @pytest.mark.parametrize("variant", ["horse", "race"])
 def test_minarik_band_counts_are_true_counts(results, variant):
-    """ミナリクの rankJ_band キーの件数・勝率は、本人の5騎乗だけから数えた値（旧版は件数・勝率が膨らんだ）。"""
+    """ミナリクの rankJ_band キーの件数・勝率は、本人の騎乗だけから数えた値（旧版は件数・勝率が膨らんだ）。"""
     res = results[variant]
-    s1 = _agg(res, "rankJ_band", "s1").set_index("結合データ")
-    row = s1.loc[f"中山×ダ×1200×{MINARIK}×1~3位"]
-    assert row["件数"] == str(N_BAND)
-    assert float(row["勝率_val"]) == 0.0 and float(row["複勝率_val"]) == 0.0 and float(row["連対率_val"]) == 0.0
-    assert float(row["平均着順"]) == 5.0
-    assert f"中山×ダ×1200×{MINARIK}×7~9位" not in s1.index     # 8位は2件（件数<5 なので成績表には出ない）
     s2 = _agg(res, "rankJ_band", "s2").set_index("結合データ")
-    assert s2.loc[f"中山×ダ×1200×{MINARIK}×1~5位", "件数"] == str(N_BAND)
-    # 枠番グループ×騎手×順位帯: 内・外に分かれても合計5件（件数5未満のグループは成績表に出ないので素材で数える）
-    mat = _material(res, "rankBJ_band", "s1")
-    mine = mat[mat["結合データ"].str.contains(f"×{MINARIK}×1~3位", regex=False)]
+    for band in ("1~3位", "1~5位"):           # s2 は重なる帯。順位1〜3の5騎乗は両方に入る
+        row = s2.loc[f"中山×ダ×1200×{MINARIK}×{band}"]
+        assert row["件数"] == str(N_BAND)
+        assert float(row["勝率_val"]) == 0.0 and float(row["複勝率_val"]) == 0.0 and float(row["連対率_val"]) == 0.0
+        assert float(row["平均着順"]) == 5.0
+    assert f"中山×ダ×1200×{MINARIK}×6位~" not in s2.index      # 8位は2件（件数<5 なので成績表には出ない）
+    # s1（排他の細区分）: 1位 2件・2~3位 3件 → どちらも件数<5 で成績表に出ない。キーの段階で数える
+    k1 = _keyed(res, "rankJ_band", "s1")
+    mine = k1[k1["騎手"] == MINARIK]["結合データ"].value_counts().to_dict()
+    assert mine == {f"中山×ダ×1200×{MINARIK}×1位": 2, f"中山×ダ×1200×{MINARIK}×2~3位": 3,
+                    f"中山×ダ×1200×{MINARIK}×6~9位": 2}
+    # 枠番グループ×騎手×順位帯: 内・外に分かれても合計5件
+    k = _keyed(res, "rankBJ_band", "s2")
+    mine = k[k["結合データ"].str.contains(f"×{MINARIK}×1~3位", regex=False)]
     assert len(mine) == N_BAND and (mine["着順"] == "5").all()
     # 同じ順位帯の他の馬（1着・2着）は、他の騎手のキーにだけ入る
-    others = mat[mat["結合データ"].str.endswith("×1~3位") & ~mat["結合データ"].str.contains(MINARIK)]
+    others = k[k["結合データ"].str.endswith("×1~3位") & ~k["結合データ"].str.contains(MINARIK)]
     assert len(others) == N_BAND * 2 + (len(MINARIK_RIDES) - N_BAND) * 3
 
 
@@ -123,7 +136,7 @@ def test_race_level_ids_give_identical_tables(results):
     """レース単位（16桁）の レースID(新) で入れても、馬単位（18桁）と成績表が完全に一致する。"""
     a, b = results["horse"], results["race"]
     names = sorted(k for k in a if not k.startswith("_"))
-    assert names == sorted(k for k in b if not k.startswith("_")) and len(names) == 80
+    assert names == sorted(k for k in b if not k.startswith("_")) and len(names) >= 40
     for n in names:
         pd.testing.assert_frame_equal(a[n], b[n], check_like=False, obj=n)
     a, b = results["horse_norank"], results["race_norank"]
@@ -144,14 +157,24 @@ def test_race_level_ids_keep_races_separate_for_rank(results):
     assert mine["順位"].astype(int).tolist() == [rk for _, rk in MINARIK_RIDES]
 
 
-def test_one_horse_one_row_per_material(results):
-    """素材の各ファイルで、同じ馬（レースID × 馬番）は同じキー（× 順位帯）に1回だけ。行数も入力の頭数を超えない。"""
+def test_one_horse_one_row_per_key(results):
+    """どの family でも、同じ馬（レースID × 馬番）は同じキーに1回だけ。s1・順位・偏差値帯なら1頭1キー、
+    s2 は帯が重なるので1頭が2キーまで（1~3位 と 1~5位）。"""
+    import aggregate_stats_ver2 as a
     for variant in ("horse", "race"):
-        for p in results[variant]["_foragg_dir"].glob("foragg_*.csv.gz"):
-            mat = pd.read_csv(p, encoding="cp932", dtype=str, keep_default_na=False)
-            assert len(mat) <= N_HEADS * len(MINARIK_RIDES), p.name
-            assert not mat.duplicated(["レースID(新)", "馬番"]).any(), p.name      # 1頭がキーを2つ持たない
-            assert (mat["レースID(新)"].str.slice(16, 18) == mat["馬番"].str.zfill(2)).all(), p.name
+        m = _master(results[variant])
+        assert len(m) <= N_HEADS * len(MINARIK_RIDES)
+        assert (m["レースID(新)"].str.slice(16, 18) == m["馬番"].str.zfill(2)).all()
+        n_checked = 0
+        for fam, scheme, sub in a.family_frames(m):
+            if sub.empty:
+                continue
+            n_checked += 1
+            assert not sub.duplicated(["レースID(新)", "馬番", "結合データ"]).any(), (fam.name, scheme)
+            per_horse = sub.groupby(["レースID(新)", "馬番"]).size()
+            limit = 2 if scheme == "s2" else 1
+            assert per_horse.max() <= limit, (fam.name, scheme)
+        assert n_checked >= 20
 
 
 def test_aggregate_dedupe_does_not_merge_horses_without_horse_column():
@@ -180,11 +203,13 @@ def test_horse_race_id_and_race_id_without_horse():
 
 
 def test_replace_source_does_not_merge_on_race_id():
-    """構造の確認: replace は素材を作るときにレースIDで merge / join しない（1頭1行の DataFrame に列を付ける）。"""
-    src = (Path(__file__).resolve().parent.parent / "replace_csv_ver3.py").read_text(encoding="utf-8")
+    """構造の確認: replace と キーの組み立て（shisu/families.py）はレースIDで merge / join しない（1頭1行の DataFrame に列を付ける）。"""
+    root = Path(__file__).resolve().parent.parent
+    src = "\n".join((root / f).read_text(encoding="utf-8") for f in
+                    ("replace_csv_ver3.py", "aggregate_stats_ver2.py", "shisu/families.py", "shisu/conditions.py"))
     assert "merge(" not in src
-    joins = [m.group(1) for m in re.finditer(r"(\S)\.join\(", src)]
-    assert all(c in "'\"" for c in joins), joins                 # 文字列の結合（"、".join など）だけ
+    joins = [m.group(1) for m in re.finditer(r"(\S+)\.join\(", src)]
+    assert all(c[-1] in "'\"" or c.endswith("SEP") for c in joins), joins   # 文字列の結合（"、".join・SEP.join）だけ
 
 
 def test_scenario_reproduces_old_merge_inflation():

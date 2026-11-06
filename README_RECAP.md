@@ -2,41 +2,48 @@
 
 開発再開時の「思い出し用」要約。詳細な仕様は **CLAUDE.md** を参照（コードが正、CLAUDE.md はコードに合わせて更新）。
 
-更新日: 2026-11-05
+更新日: 2026-11-06
 
 ## 流れ
 
 ```
-csv_files/ ─ replace_csv_ver3.py ─> foragg_csv/（素材）, master_csv/, replace_csv/
-           ─ aggregate_stats_ver2.py ─> agg_csv/（成績表）
-           ─ build_db.py ─> racing.db（foragg_*, unified_all, __tables_meta__）
+csv_files/（★6タブの基本CSV {地域}_タイムM / {地域}_対戦M。従来の {地域}_{指数名} も可）＋ ext_indices/（外部指数CSV群）
+           ─ replace_csv_ver3.py ─> master_csv/（1頭1行。キーの部品・22条件・偏差値・順位）
+           ─ screen_families.py（推奨）─> screening_report.csv / selected_families.json（使う family）
+           ─ aggregate_stats_ver2.py ─> agg_csv/（family × s1/s2 × オッズ帯の成績表）＋ families.json
+           ─ build_db.py ─> racing.db（foragg_*, unified_all, __tables_meta__, __families__）
 entries_in/ ─ calc_entry_hensachi.py ─> entries_out/
            ─ build_db.py --mode entries ─> racing.db（entries_*, entries_xjoin_*）
 app.py（http://localhost:8000）: 横断検索 / 出馬表 / 条件ヒット馬 / レース別 WEDGE 一覧 / 指数の取得（/ingest）
-ingest_in/ ─ ingest.py（または /ingest）─> ingest_out/実行日時/（Ω・吉馬6・かよちん・keibaAI・ラップ6・安井 → TARGET 取込用CSV。一隊は廃止）
+ingest_in/ ─ ingest.py（または /ingest）─> ingest_out/実行日時/（Ω・吉馬6・かよちん・keibaAI・ラップ6・安井 → TARGET 取込用CSV ＝ ext_indices の形式A。一隊は廃止）
 ```
 
-正規化・キー・偏差値・分類・照合は共通パッケージ `shisu/` にある。**キーに関わる変更は必ず `shisu/` で行う**（過去側と出馬表側で同じ関数を使うことで一致を保証している）。
+正規化・22条件・family・キー・偏差値・分類・照合は共通パッケージ `shisu/` にある。**キーに関わる変更は必ず `shisu/` で行う**（過去側と出馬表側で同じ関数を使うことで一致を保証している）。
 
 ## よく使うコマンド（プロジェクト直下）
 
 ```bash
 docker build -t csv_processor_shisu .
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python replace_csv_ver3.py --clean
-docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --indicators タイムM,対戦M --workers 4 --export-selected
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --merge-only --clean
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
-docker run --rm -p 8000:8000 -v "$(pwd)":/app csv_processor_shisu python app.py
+docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu python app.py
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources omega,kichiuma,kayochin
 ```
 
 ## 要点
 
+- 外部指数の結び付け（`shisu/ext_indices.py`）: 形式A（18桁ID,値: Ω・かよちん・keibaAI・吉馬6・安井8）/ B（旧10桁ID,値,順位: StridePlus 12。ファイル名の接頭辞）/ C（12桁レースID と (値,順位) の組: Gold）/ D（旧8桁レースID と値: BC・ZI）。廃止: カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F
+- 順位帯（指数順位・前走着順・前走人気・前走上がり3F順で共通）: s1 = 1 / 2~3 / 4~5 / 6~9 / 10~、s2 = 1~3 / 1~5 / 6~（重なりあり。両方のキーを作る）
+- 22条件（`shisu/conditions.py`、マスタは `shisu/data/`）: 時期・輸送距離・間隔帯・叩き・R値帯・直線帯・初角帯・CFS帯・F係数帯・今走/前走クワドラント・左右/左右遷移・距離帯・坂・斤量帯・斤量増減・牝馬限定・距離増減・前走着順/人気/上り3F順/脚質/R印3
+- family（`shisu/families.py`）: 初期セット49の型（A 15・B 9・C 10・D 15 → 83 family・122通り）。`selected_families.json` があれば置き換え（集計・DB・照合・画面）。初期セットのままだと成績表・DB は旧版の約8〜9倍
 - オッズ帯: 通常 / 10倍未満（odds10u）/ 10〜50倍（odds10_50）/ 50倍以上（odds50p）
 - 推定値: Jeffreys 事前の事後分布の下側10%点（複勝率は頻度20%以下なら上側90%点）。DB の 勝率_val〜3着率_val は推定値、掲示板率_val は頻度。率はすべて 0–100
-- 条件ヒット馬: 消し → 絶対軸 → 軸候補 → 相手 の順で最初に当てはまった区分（閾値は `shisu/classify.py`）
-- WEDGE = WIN（決定力）+ EDGE（オッズから見た期待着順を上回った割合）。adjusted_WEDGE は年10件以上の年すべて（最大10年）を新しい年ほど重い指数減衰（0.65）で加重。横断検索の「まとめて」表示で全集計表を adjusted_WEDGE 順に並べられ、`/entries/wedge` で1レースの全馬・全キーを閾値なしで見比べられる
-- 外部指数の取得は `shisu/ingest/`（Ω・吉馬6・かよちん・keibaAI・ラップ6指数。一隊はサイトの仕様変更で廃止）と `shisu/yasui_extractor.py`（安井サロン Excel → 安井_* 8指数。吉馬と同じく指数ごとのフォルダ。ベースCSV未指定でも ingest_in/base/・entries_in/ から該当日を探す）。出力は日付別の `レースID(新), ワーク1`（cp932）
+- 条件ヒット馬: 消し → 絶対軸 → 軸候補 → 相手 の順で最初に当てはまった区分（閾値は `shisu/classify.py`）。screen_families の基準B はこの判定のキー数
+- WEDGE = WIN（決定力）+ EDGE（オッズから見た期待着順を上回った割合）。adjusted_WEDGE は年10件以上の年すべて（最大10年）を新しい年ほど重い指数減衰（0.65）で加重
+- 外部指数の取得は `shisu/ingest/` と `shisu/yasui_extractor.py`（安井 8指数。指数ごとのフォルダ。ベースCSV未指定でも ingest_in/base/・entries_in/ から該当日を探す）
 - レース単位（16桁）の レースID(新) は replace が馬番を付けて18桁にする（旧版の band 系の件数膨張の再発防止。tests/test_band_regression.py）
-- 集計条件だけ変えたときは aggregate → build_db だけでよい（素材は上書きしない）
+- family・集計条件だけ変えたときは aggregate → build_db だけでよい（master はそのまま）

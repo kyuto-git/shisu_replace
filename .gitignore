@@ -19,6 +19,8 @@ entries_in/
 entries_out/
 ingest_in/
 ingest_out/
+ext_indices/
+selected_families.json
 *.xlsx
 *.xlsm
 置換前CSV/
@@ -31,3 +33,7 @@ entries_in/*
 !entries_out/
 entries_out/*
 !entries_out/entries_merged_hensachi.csv
+
+# 同梱のマスタ（コース属性・輸送距離など）は追跡する
+!shisu/data/
+!shisu/data/*.csv

@@ -32,7 +32,6 @@ _YASUI_ZERO_MISSING = ("安井_ランク", "安井_スピード", "安井_スタ
 _YASUI_ZERO_VALUE = ("安井_体力", "安井_やる気")
 
 INDICATORS: tuple[IndicatorSpec, ...] = (
-    IndicatorSpec("カツラキ"),
     IndicatorSpec("Gold", ("GoldAirplane", "Gold指数", "Gold_Airplane")),
     IndicatorSpec("BC", ("BCindex", "BC指数")),
     IndicatorSpec("ZI", ("ZI指数",), zi=True, exclude_shinba=True),
@@ -63,6 +62,10 @@ INDICATORS: tuple[IndicatorSpec, ...] = (
 # 画面での並び順（台帳の順）
 INDICATOR_ORDER: tuple[str, ...] = tuple(s.name for s in INDICATORS)
 
+# 集計の対象から外した指数（2026-11-06）。csv_files・ext_indices・出馬表の列にあっても使わない
+DISCONTINUED: tuple[str, ...] = ("カツラキ", "HPRTV5C", "成績ST指数", "結果分析スピード指数", "一隊", "ittai",
+                                 "33rap", "上がり1F", "上がり2F", "1F", "2F")
+
 
 def _lookup_key(raw) -> str:
     s = unicodedata.normalize("NFKC", str(raw or ""))
@@ -79,6 +82,14 @@ _SPEC_BY_NAME = {s.name: s for s in INDICATORS}
 
 def is_known_indicator(raw) -> bool:
     return _lookup_key(raw) in _BY_KEY
+
+
+_DISCONTINUED_KEYS = {_lookup_key(n) for n in DISCONTINUED}
+
+
+def is_discontinued(raw) -> bool:
+    """廃止した指数か（カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F）。"""
+    return _lookup_key(raw) in _DISCONTINUED_KEYS
 
 
 def canonical_indicator(raw) -> str:

@@ -24,11 +24,44 @@ from .indicators import IndicatorSpec
 HENSACHI_BANDS = ((71, "71以上"), (66, "66~70"), (61, "61~65"), (51, "51~60"), (41, "41~50"))
 HENSACHI_BAND_LOW = "40以下"
 
-# 順位帯（過去側の集計スキーム。出馬表側も同じ定義で帯を作るので必ず一致する）
-RANK_SCHEMES: dict[str, tuple[tuple[int, int | None, str], ...]] = {
-    "s1": ((1, 3, "1~3位"), (4, 6, "4~6位"), (7, 9, "7~9位"), (10, None, "10位~")),
-    "s2": ((1, 5, "1~5位"), (6, 10, "6~10位"), (11, None, "11位~")),
+# 順位帯（指数順位・前走着順・前走人気・前走上がり3F順で共通の8区分）
+#   s1 = 細区分5帯（排他）: 1 / 2~3 / 4~5 / 6~9 / 10~
+#   s2 = 広区分3帯（重複あり）: 1~3 / 1~5 / 6~   … 2位の馬は 1~3 と 1~5 の両方に入る
+# 帯の名前（単位つき）は band_labels() で付ける。指数順位なら「2~3位」、前走着順なら「前走2~3着」
+RANK_SCHEMES: dict[str, tuple[tuple[int, int | None], ...]] = {
+    "s1": ((1, 1), (2, 3), (4, 5), (6, 9), (10, None)),
+    "s2": ((1, 3), (1, 5), (6, None)),
 }
+# 帯の名前の付け方: (前置き, 単位)
+BAND_UNITS = {"rank": ("", "位"), "finish": ("前走", "着"), "pop": ("前走", "人気"), "agari": ("前走上り", "位")}
+
+
+def _band_text(lo: int, hi: int | None, kind: str) -> str:
+    pre, unit = BAND_UNITS[kind]
+    if hi is None:
+        return f"{pre}{lo}{unit}~"
+    if lo == hi:
+        return f"{pre}{lo}{unit}"
+    return f"{pre}{lo}~{hi}{unit}"
+
+
+def band_labels(n, scheme: str, kind: str = "rank") -> list[str]:
+    """順位・着順など（1以上の整数）→ その帯の名前のリスト。s1 は1つ、s2 は1〜2つ（重複あり）。数でなければ []。"""
+    if n is None:
+        return []
+    try:
+        if pd.isna(n):
+            return []
+        r = int(float(n))
+    except (TypeError, ValueError):
+        return []
+    if r < 1:
+        return []
+    return [_band_text(lo, hi, kind) for lo, hi in RANK_SCHEMES[scheme] if r >= lo and (hi is None or r <= hi)]
+
+
+def all_band_labels(scheme: str, kind: str = "rank") -> list[str]:
+    return [_band_text(lo, hi, kind) for lo, hi in RANK_SCHEMES[scheme]]
 
 
 def hensachi_band(v) -> str:
@@ -42,16 +75,8 @@ def hensachi_band(v) -> str:
 
 
 def rank_band(rank, scheme: str) -> str:
-    if rank is None or pd.isna(rank):
-        return ""
-    try:
-        r = int(rank)
-    except (TypeError, ValueError):
-        return ""
-    for lo, hi, label in RANK_SCHEMES[scheme]:
-        if r >= lo and (hi is None or r <= hi):
-            return label
-    return ""
+    """表示用の順位帯（s2 で2つに入るときは「1~3位・1~5位」）。キーは band_labels() で1つずつ作る。"""
+    return "・".join(band_labels(rank, scheme, "rank"))
 
 
 def compute_indicator(values: pd.Series, race_key: pd.Series, spec: IndicatorSpec,
@@ -128,4 +153,5 @@ def int_text_series(s: pd.Series) -> pd.Series:
     return s.map(fmt_int).astype(object)
 
 
-__all__ = ["compute_indicator", "hensachi_band", "rank_band", "RANK_SCHEMES", "fmt_int", "int_text_series", "np"]
+__all__ = ["compute_indicator", "hensachi_band", "rank_band", "band_labels", "all_band_labels", "RANK_SCHEMES",
+           "BAND_UNITS", "fmt_int", "int_text_series", "np"]

@@ -94,7 +94,7 @@ def test_canonical_indicator(raw, canon):
 @pytest.mark.parametrize("stem,region,ind", [
     ("主５場（中山、東京、中京、京都、阪神）_吉馬_先行力", "主5場(中山、東京、中京、京都、阪神)", "吉馬_先行力"),
     ("ローカル５場（札幌、函館、福島、新潟、小倉）_先行", "ローカル5場(札幌、函館、福島、新潟、小倉)", "先行"),
-    ("札幌_カツラキ", "札幌", "カツラキ"), ("吉馬_SP能力値", "", "吉馬_SP能力値"), ("東京_未知の指数", "東京", "未知の指数"),
+    ("札幌_SAV", "札幌", "SAV"), ("吉馬_SP能力値", "", "吉馬_SP能力値"), ("東京_未知の指数", "東京", "未知の指数"),
 ])
 def test_parse_source_name(stem, region, ind):
     assert indicators.parse_source_name(stem) == (region, ind)
@@ -108,7 +108,7 @@ def test_indicator_flags():
 
 
 # ---------------------------------------------------------------- 偏差値
-def _ci(vals, races, name="カツラキ", shinba=None, rank=None):
+def _ci(vals, races, name="SAV", shinba=None, rank=None):
     return hensachi.compute_indicator(pd.Series(vals, dtype=object), pd.Series(races), indicators.spec_for(name),
                                       None if shinba is None else pd.Series(shinba), rank)
 
@@ -118,7 +118,8 @@ def test_hensachi_basic_and_bands():
     assert r["偏差値"].tolist() == [38.0, 50.0, 62.0]
     assert r["偏差値帯"].tolist() == ["40以下", "41~50", "61~65"]
     assert r["順位"].tolist() == [3, 2, 1]
-    assert r["順位帯_s1"].tolist() == ["1~3位"] * 3
+    assert r["順位帯_s1"].tolist() == ["2~3位", "2~3位", "1位"]
+    assert r["順位帯_s2"].tolist() == ["1~3位・1~5位"] * 3      # s2 は重なる帯（表示は「・」でつなぐ）
 
 
 def test_all_same_value_race_is_excluded():
@@ -147,7 +148,7 @@ def test_reverse_and_shinba():
     assert r["順位"].tolist() == [3, 2, 1]
     r = _ci([1, 2, 3], ["a"] * 3, name="吉馬_SP能力値", shinba=[True, True, True])
     assert r["shinba_excluded"].all() and r["偏差値"].isna().all()
-    r = _ci([1, 2, 3], ["a"] * 3, name="カツラキ", shinba=[True, True, True])
+    r = _ci([1, 2, 3], ["a"] * 3, name="SAV", shinba=[True, True, True])
     assert not r["shinba_excluded"].any()
 
 
@@ -156,54 +157,131 @@ def test_given_rank_preferred():
     assert r["順位"].tolist() == [1, 2, 3]
 
 
-@pytest.mark.parametrize("rank,s1,s2", [(1, "1~3位", "1~5位"), (3, "1~3位", "1~5位"), (4, "4~6位", "1~5位"),
-                                        (6, "4~6位", "6~10位"), (9, "7~9位", "6~10位"), (10, "10位~", "6~10位"),
-                                        (11, "10位~", "11位~"), (None, "", "")])
+@pytest.mark.parametrize("rank,s1,s2", [(1, "1位", "1~3位・1~5位"), (2, "2~3位", "1~3位・1~5位"),
+                                        (3, "2~3位", "1~3位・1~5位"), (4, "4~5位", "1~5位"), (5, "4~5位", "1~5位"),
+                                        (6, "6~9位", "6位~"), (9, "6~9位", "6位~"), (10, "10位~", "6位~"),
+                                        (18, "10位~", "6位~"), (None, "", "")])
 def test_rank_bands(rank, s1, s2):
     assert hensachi.rank_band(rank, "s1") == s1 and hensachi.rank_band(rank, "s2") == s2
 
 
+def test_band_labels_kinds():
+    """8区分（s1 の5帯・s2 の3帯）は 指数順位・前走着順・前走人気・前走上がり3F順 で共通。単位だけ違う。"""
+    bl = hensachi.band_labels
+    assert bl(2, "s1", "finish") == ["前走2~3着"] and bl("１", "s1", "pop") == ["前走1人気"]
+    assert bl("1", "s2", "pop") == ["前走1~3人気", "前走1~5人気"]
+    assert bl(7, "s2", "agari") == ["前走上り6位~"] and bl("12.0", "s1", "rank") == ["10位~"]
+    assert bl("0", "s1") == [] and bl("abc", "s2") == [] and bl("", "s1") == [] and bl(None, "s1") == []
+    assert hensachi.all_band_labels("s1") == ["1位", "2~3位", "4~5位", "6~9位", "10位~"]
+    assert hensachi.all_band_labels("s2", "finish") == ["前走1~3着", "前走1~5着", "前走6着~"]
+    # s1 は排他（1〜30 のどれも帯は1つ）、s2 は 1〜3 が2つ、4〜 が1つ
+    assert all(len(bl(n, "s1")) == 1 for n in range(1, 31))
+    assert [len(bl(n, "s2")) for n in range(1, 8)] == [2, 2, 2, 1, 1, 1, 1]
+
+
 # ---------------------------------------------------------------- キー
+SEP = "×"
 FIELDS = {"場所": "東京", "芝・ダ": "ダ", "距離": "1600", "芝(内・外)": "", "重量種別": "定量", "クラス名": "1・2_勝",
-          "枠番グループ": "内枠", "騎手": "髙杉吏麒", "順位": "4", "偏差値帯": "61~65"}
+          "枠番グループ": "内枠", "騎手": "髙杉吏麒", "順位": "4", "偏差値帯": "61~65", "前走着順": "2", "前走人気": "7",
+          "前走上り3F順": "1", "時期": "3-5月", "間隔帯": "中1週", "前走脚質": "先行", "R値帯": "R2"}
+
+
+def _keys(fields: dict, fam: str, scheme: str = "") -> list[str]:
+    return keys.build_keys(pd.DataFrame([fields]), fam, scheme).tolist()
 
 
 def test_build_key_examples():
-    assert keys.build_key(FIELDS, "normal") == "東京×ダ×1600×定量×1・2_勝×4"
-    assert keys.build_key({**FIELDS, "芝(内・外)": "外"}, "rankB") == "東京×ダ×1600×外×内枠×4"
-    assert keys.build_key(FIELDS, "normal_band", "4~6位") == "東京×ダ×1600×定量×1・2_勝×4~6位"
-    assert keys.build_key({**FIELDS, "騎手": ""}, "rankJ") == ""      # 部品が空ならキーを作らない
-    assert keys.build_key({**FIELDS, "距離": ""}, "normal") == ""
+    assert _keys(FIELDS, "normal") == ["東京×ダ×1600×定量×1・2_勝×4"]
+    assert _keys({**FIELDS, "芝(内・外)": "外"}, "rankB") == ["東京×ダ×1600×外×内枠×4"]
+    assert _keys(FIELDS, "normal_band", "s1") == ["東京×ダ×1600×定量×1・2_勝×4~5位"]
+    assert _keys(FIELDS, "normal_band", "s2") == ["東京×ダ×1600×定量×1・2_勝×1~5位"]
+    assert _keys({**FIELDS, "順位": "2"}, "normal_band", "s2") == ["東京×ダ×1600×定量×1・2_勝×1~3位",
+                                                                  "東京×ダ×1600×定量×1・2_勝×1~5位"]
+    assert _keys(FIELDS, "hensachiJ") == ["東京×ダ×1600×髙杉吏麒×61~65"]
+    # 帯にする条件（前走着順など）は RBAND の family では tail と同じスキーム、偏差値帯の family では s1
+    assert _keys(FIELDS, "D_prevfin", "s1") == ["東京×ダ×1600×前走2~3着×4~5位"]
+    assert _keys(FIELDS, "D_prevfin", "s2") == ["東京×ダ×1600×前走1~3着×1~5位", "東京×ダ×1600×前走1~5着×1~5位"]
+    assert _keys(FIELDS, "D_prevfin_hen") == ["東京×ダ×1600×前走2~3着×61~65"]
+    assert _keys(FIELDS, "B_jk_prevagari", "s2") == ["髙杉吏麒×前走上り1~3位×1~5位", "髙杉吏麒×前走上り1~5位×1~5位"]
+    assert _keys(FIELDS, "C_sd_dist_r_hen") == []                          # 距離帯が空 → 作らない
+    assert _keys({**FIELDS, "騎手": ""}, "rankJ") == []                    # 部品が空ならキーを作らない
+    assert _keys({**FIELDS, "距離": ""}, "normal") == []
+    assert _keys({**FIELDS, "前走着順": "取消"}, "D_prevfin", "s1") == []  # 数でない着順は帯にならない
+    with pytest.raises(ValueError):
+        keys.build_keys(pd.DataFrame([FIELDS]), "normal_band", "")
 
 
-def test_vector_and_scalar_keys_agree():
-    rng = random.Random(0)
+def test_family_registry_counts():
+    from shisu import families as F
+    fams = F.default_families()
+    assert len(F.DEFAULT_TEMPLATES) == 49
+    assert {ly: sum(1 for t in F.DEFAULT_TEMPLATES if t[0] == ly) for ly in "ABCD"} == {"A": 15, "B": 9, "C": 10, "D": 15}
+    assert len(fams) == 15 + 2 * 34 == 83
+    assert sum(len(f.schemes) for f in fams) == 122
+    assert len({f.name for f in fams}) == 83
+    # 初期の49種は、末尾が 新順位帯（s1/s2）＋偏差値帯（B〜D）
+    for f in fams:
+        if f.layer != "A":
+            assert f.tail in ("RBAND", "HBAND") and f.name.endswith("_hen") == (f.tail == "HBAND")
+
+
+def _random_rows(n: int, seed: int) -> pd.DataFrame:
+    from shisu.conditions import BANDED_CONDITIONS, CONDITION_COLUMNS
+    rng = random.Random(seed)
     rows = []
-    for _ in range(300):
-        rows.append({k: rng.choice([v, ""]) if k in ("芝(内・外)", "騎手", "順位", "重量種別") else v
-                     for k, v in {**FIELDS, "芝(内・外)": rng.choice(["", "内", "外"]),
-                                  "順位": str(rng.randint(1, 18))}.items()})
-    df = pd.DataFrame(rows)
-    for s in keys.SCHEMES:
-        df[f"rb_{s}"] = [hensachi.rank_band(int(r) if r else None, s) for r in df["順位"]]
-    for fam in keys.ALL_FAMILIES:
-        for s in (keys.SCHEMES if keys.is_band_family(fam) else ("",)):
-            col = f"rb_{s}" if s else None
-            vec = keys.build_key_series(df, fam, col).tolist()
-            sca = [keys.build_key(r, fam, r.get(col, "") if col else "") for r in df.to_dict("records")]
-            assert vec == sca, fam
+    for _ in range(n):
+        r = {"場所": rng.choice(["東京", "京都", "東京", ""]), "芝・ダ": rng.choice(["芝", "ダ", ""]),
+             "距離": rng.choice(["1600", "16-18", ""]), "芝(内・外)": rng.choice(["", "", "内", "外", "内外"]),
+             "重量種別": rng.choice(["定量", "ハンデ", ""]), "クラス名": rng.choice(["1・2_勝", "G1", ""]),
+             "枠番グループ": rng.choice(["内枠", "外枠", ""]), "騎手": rng.choice(["髙杉吏麒", "C.ルメール", ""]),
+             "順位": rng.choice([str(rng.randint(1, 18)), ""]),
+             "偏差値帯": rng.choice(["71以上", "51~60", "40以下", ""])}
+        for c in CONDITION_COLUMNS:
+            if c in BANDED_CONDITIONS:
+                r[c] = rng.choice([str(rng.randint(1, 18)), "", "0"])
+            else:
+                r[c] = rng.choice([f"{c}A", f"{c}B", ""])
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def test_history_keys_equal_entry_keys():
+    """過去側（ベクトル版 build_keys）と出馬表側（1件版 entry_keys）が、全 122 variant で同じキーを作る。
+    出馬表側は 芝(内・外) の候補を余分に試すので、過去側のキーは必ずその中にあり、内外を合わせれば完全に一致する。"""
+    from shisu import families as F
+    df = _random_rows(400, 0)
+    recs = df.to_dict("records")
+    n_keys = 0
+    for fam in F.default_families():
+        for sc in fam.schemes:
+            vec = F.build_keys(df, fam, sc)
+            by_row = {i: set(g) for i, g in vec.groupby(level=0)} if len(vec) else {}
+            for i, r in enumerate(recs):
+                ent = F.entry_keys(r, fam, sc)
+                hist = by_row.get(i, set())
+                assert hist <= set(ent), (fam.name, sc, r)
+                if F.COURSE in fam.parts:
+                    head = SEP.join(r[c] for c in ("場所", "芝・ダ", "距離"))
+                    exact = head + (SEP + r["芝(内・外)"] if r["芝(内・外)"] else "")
+                    if r["芝(内・外)"]:
+                        ent = [k for k in ent if k.startswith(exact + SEP)]
+                    else:
+                        ent = [k for k in ent if k.split(SEP)[3] not in ("内", "外", "内外")]
+                assert hist == set(ent), (fam.name, sc, r)
+                n_keys += len(hist)
+    assert n_keys > 5000
 
 
 def test_history_key_is_among_entry_candidates():
-    """過去側で作るキーが、同じ条件の出馬表側の候補に必ず含まれる（全 family・帯スキーム）。"""
+    """entry_key_candidates（照合で使う窓口）にも、過去側のキーと帯スキームの組が必ず入っている。"""
+    from shisu import families as F
     for inner in ("", "内", "外"):
-        f = {**FIELDS, "芝(内・外)": inner}
+        f = {**FIELDS, "芝(内・外)": inner, "距離帯": "1600-1800", "直線帯": "長", "坂": "あり"}
         cands = keys.entry_key_candidates(f)
-        for fam in keys.ALL_FAMILIES:
-            for s in (keys.SCHEMES if keys.is_band_family(fam) else ("",)):
-                rb = hensachi.rank_band(int(f["順位"]), s) if s else ""
-                hk = keys.build_key(f, fam, rb)
-                assert (hk, s) in cands[fam], (fam, s, inner)
+        for fam in F.default_families():
+            for s in fam.schemes:
+                for hk in _keys(f, fam.name, s):
+                    assert (hk, s) in cands[fam.name], (fam.name, s, inner)
 
 
 def test_unknown_inner_tries_all():
@@ -214,22 +292,20 @@ def test_unknown_inner_tries_all():
 
 # ---------------------------------------------------------------- 名前・オッズ
 def test_foragg_name_roundtrip():
-    for fam, mode in itertools.product(keys.ALL_FAMILIES, odds.ODDS_MODES):
-        for s in (keys.SCHEMES if keys.is_band_family(fam) else ("",)):
-            fn = naming.agg_filename(fam, mode, s, "ローカル５場（札幌、函館、福島、新潟、小倉）_吉馬_先行力")
+    for name, mode in itertools.product(keys.all_families(), odds.ODDS_MODES):
+        for s in keys.get(name).schemes:
+            fn = naming.agg_filename(name, mode, s, "ローカル５場（札幌、函館、福島、新潟、小倉）_吉馬_先行力")
             p = naming.parse_foragg_stem(naming.file_stem(fn))
-            assert (p["family"], p["mode"], p["scheme"], p["indicator"]) == (fam, mode, s, "吉馬_先行力")
+            assert (p["family"], p["mode"], p["scheme"], p["indicator"]) == (name, mode, s, "吉馬_先行力")
             t = naming.table_name_for_foragg(fn)
             assert t.startswith("foragg_") and not t.startswith("foragg_foragg_")
 
 
-def test_material_name_roundtrip():
-    for fam in keys.ALL_FAMILIES:
-        for s in (keys.SCHEMES if keys.is_band_family(fam) else ("",)):
-            fn = naming.material_filename(fam, s, "札幌_先行")
-            assert fn.endswith(".csv.gz")
-            p = naming.parse_foragg_stem(naming.file_stem(fn))
-            assert (p["family"], p["mode"], p["scheme"], p["indicator"], p["source"]) == (fam, "normal", s, "先行", "札幌_先行")
+def test_family_name_prefixes_do_not_collide():
+    """family 名が別の family 名の前方一致になっていても（D_prevfin と D_prevfin_hen）、ファイル名から正しく引ける。"""
+    for a in keys.all_families():
+        fn = naming.agg_filename(a, "normal", keys.get(a).schemes[0], "札幌_SAV")
+        assert naming.parse_foragg_stem(naming.file_stem(fn))["family"] == a
 
 
 @pytest.mark.parametrize("stem", ["foragg_odds5p_normal_札幌_ZI", "foragg_normal_band_札幌_ZI",

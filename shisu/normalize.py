@@ -209,6 +209,18 @@ def entry_inner_outer(place: str, surface: str, gaimawari) -> str:
 # ---------------------------------------------------------------------------
 # レースID・日付
 # ---------------------------------------------------------------------------
+def split_surface_distance(surface: pd.Series, distance: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """芝・ダ 列が無い・空で、距離 が「ダ1200」「芝2000」の形（★6タブの過去レースCSV）なら分ける。
+    独立した 芝・ダ 列がある形（従来の形）はそのまま。障害は「障」。戻り値は (芝・ダ, 距離) の文字列。"""
+    s = norm_series(surface)
+    d = norm_series(distance)
+    m = d.str.extract(r"^(芝|ダ|障)(.+)$")
+    has = m[0].notna()
+    s = s.where(~(has & (s == "")), m[0])
+    d = d.where(~has, m[1])
+    return s.fillna("").astype(object), d.fillna("").astype(object)
+
+
 def race_id_without_horse(rid: pd.Series, given: pd.Series | None = None) -> pd.Series:
     """レースID(新/馬番無)（16桁）。列があればそれを使う。無ければ レースID(新) から作る:
     18桁 → 先頭16桁 / 16桁（もともとレース単位）→ そのまま / それ以外 → 末尾2桁を落とす（旧来の扱い）。

@@ -21,10 +21,6 @@ def processed_dir() -> Path:    # processed_*（結合データ確認用・TARGE
     return base_dir() / "replace_csv"
 
 
-def foragg_dir() -> Path:       # foragg_*（集計素材、1行=1頭）
-    return base_dir() / "foragg_csv"
-
-
 def agg_dir() -> Path:          # 集計結果（1行=1結合データ）。build_db の入力
     return base_dir() / "agg_csv"
 
@@ -39,6 +35,16 @@ def entries_in_dir() -> Path:   # 出馬表入力
 
 def entries_out_dir() -> Path:  # 偏差値付き出馬表
     return base_dir() / "entries_out"
+
+
+def ext_dir() -> Path:          # 外部指数CSV群（★6タブの基本CSVに Python 側で結合する。shisu/ext_indices.py）
+    env = os.environ.get("SHISU_EXT_DIR")
+    return Path(env) if env else base_dir() / "ext_indices"
+
+
+def selected_families_path() -> Path:  # screen_families.py の選抜結果。あれば初期セットの family の代わりに使う
+    env = os.environ.get("SHISU_FAMILIES_FILE")
+    return Path(env) if env else base_dir() / "selected_families.json"
 
 
 def ingest_in_dir() -> Path:   # 指数取得（/ingest・ingest.py）の入力（ベースCSV・ラップCSV・安井Excel）

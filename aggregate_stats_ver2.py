@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""集計素材（foragg_csv/foragg_*.csv.gz、1行=1頭）→ 結合データごとの成績表（agg_csv/）。
+"""master（master_csv/master_*.csv.gz、1行=1頭）→ family ごと・オッズ帯ごとの成績表（agg_csv/）。
 
-素材1本から、オッズ帯（過去レースの確定単勝オッズ）ごとに4本の成績表を作る:
+使う family は shisu/families.py の台帳（selected_families.json があればその定義、無ければ初期セット49種）。
+master 1本（1地域×1指数）について、family（とスキーム s1/s2）ごとにキーを作り、オッズ帯4区分で集計する:
   通常（絞り込みなし）/ odds10u（10倍未満）/ odds10_50（10以上50未満）/ odds50p（50倍以上）
-  出力名: agg_csv/foragg_{オッズ接頭辞}{tag}_{元名}.csv（命名は shisu/naming.py）
-素材は上書きしないので、集計条件やオッズ帯を変えたときは aggregate → build_db だけ再実行すればよい。
+  出力名: agg_csv/foragg_{オッズ接頭辞}{rankband_スキーム_}{family}_{地域}_{指数名}.csv（命名は shisu/naming.py）
+  agg_csv/families.json に使った family の定義を書く（build_db・画面が family の名前と部品を知るため）
+集計に使うのは master の 指数有効=1 の馬（除外レース・新馬除外・欠損の馬を除く）。
+family ごとの素材ファイルは作らない（49 family × 3 の素材は容量・時間ともに大きすぎるため。キーはメモリ上で作る）。
 
 出力列:
   結合データ, 件数, 勝率_val, 勝率, 連対率_val, 連対率, 複勝率_val, 複勝率, 2着率_val, 2着率,
@@ -16,7 +19,7 @@
   - 推定値は shisu/estimates.py（既定: 事後分布の下側10%点、複勝率は頻度20%以下なら上側90%点）
     AGG_PROP_MODE=mean にすると勝率・連対率・2着率・3着率は事後平均になる（複勝率は常に上の分位点の切替）
   - WIN / EDGE / WEDGE / adjusted_WEDGE は shisu/wedge.py（定義・年度加重の規則はそちらの説明を参照）
-    年度の窓の終わり（window=data）は、オッズ帯で絞る前の素材ファイル全体の最終年
+    年度の窓の終わり（window=data）は、オッズ帯で絞る前の master 全体の最終年
 
 環境変数: AGG_PROP_MODE(lower|mean), AGG_LOWER_Q(0.10), AGG_UPPER_Q(0.90), AGG_PRIOR_ALPHA/BETA(0.5),
           PLC_SWITCH_THRESHOLD_PCT(20), AGG_MIN_SAMPLE(5), AGG_RANKBAND_SCHEMES(例 "s1"),
@@ -40,9 +43,10 @@ from shisu import config
 from shisu.csvio import read_csv_any, write_csv
 from shisu.estimates import beta_quantile, has_scipy, posterior_mean
 from shisu.finish import parse_finish
-from shisu.naming import agg_filename, file_stem, parse_foragg_stem
+from shisu import families as fam_registry
+from shisu.naming import agg_filename, file_stem
 from shisu.normalize import race_date
-from shisu.odds import ODDS_MODES, odds_mask
+from shisu.odds import ODDS_MODES, odds_mask, odds_mask_numeric
 from shisu.wedge import (DEFAULT_DECAY, DEFAULT_MAX_YEARS, DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WINDOWS,
                          check_decay, valid_years, wedge_columns)
 
@@ -102,8 +106,34 @@ def _estimate(k: pd.Series, n: pd.Series, upper: pd.Series | None = None) -> pd.
     return lo.where(~upper, hi)
 
 
+# master から先に作っておく列（aggregate_frame が行ごとに求める値。family・オッズ帯ごとに作り直さない）
+PRE_FINISH = {"finish_num": "_pre_finish_num", "denom": "_pre_denom", "win": "_pre_win", "second": "_pre_second",
+              "third": "_pre_third", "place": "_pre_place", "board": "_pre_board"}
+PRE_NUM = {"単勝オッズ": "_pre_odds", "単勝配当": "_pre_pay_win", "複勝配当": "_pre_pay_plc"}
+PRE_YEAR = "_pre_year"
+# aggregate_frame が読む列（これ以外の master の列はキーを作るときだけ使う）
+AGG_INPUT_COLUMNS = (RID, "着順", "頭数", "馬番", "馬名", "単勝オッズ", "単勝配当", "複勝配当", "year", "日付",
+                     "場所", "芝・ダ", "距離", "芝(内・外)")
+
+
+def with_precomputed(df: pd.DataFrame) -> pd.DataFrame:
+    """aggregate_frame の入力に、行ごとに決まる値（着順の解析・オッズ・配当・年）を先に足した細い DataFrame。
+    family ごと・オッズ帯ごとに aggregate_frame を呼ぶとき、毎回の文字列処理を省く（結果は同じ）。"""
+    out = df[[c for c in AGG_INPUT_COLUMNS if c in df.columns]].copy()
+    fl = parse_finish(out["着順"], out["頭数"] if "頭数" in out.columns else None)
+    for k, c in PRE_FINISH.items():
+        out[c] = fl[k]
+    for src, c in PRE_NUM.items():
+        v = pd.to_numeric(out[src], errors="coerce") if src in out.columns else pd.Series(np.nan, index=out.index)
+        out[c] = v if src == "単勝オッズ" else v.fillna(0)
+    out[PRE_YEAR] = year_series(out)
+    return out
+
+
 def year_series(df: pd.DataFrame) -> pd.Series:
-    """素材の year 列（無い・空なら 日付 か レースID(新) の先頭4桁）。"""
+    """year 列（無い・空なら 日付 か レースID(新) の先頭4桁）。"""
+    if PRE_YEAR in df.columns:
+        return df[PRE_YEAR]
     y = df["year"].astype(str) if "year" in df.columns else pd.Series("", index=df.index)
     if (y == "").any():
         src = df["日付"] if "日付" in df.columns else race_date(df.get(RID, pd.Series("", index=df.index)))
@@ -112,13 +142,13 @@ def year_series(df: pd.DataFrame) -> pd.Series:
 
 
 def ref_year_of(df: pd.DataFrame) -> int | None:
-    """年度加重の窓の終わり（素材全体の最終年）。"""
+    """年度加重の窓の終わり（master 全体の最終年）。"""
     y = valid_years(year_series(df))
     return int(y.max()) if y.notna().any() else None
 
 
 def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: dict | None = None) -> pd.DataFrame:
-    """素材 DataFrame（文字列）→ 成績表。ref_year は年度加重の窓の終わり（省略時は df の最終年）。
+    """キー付きの DataFrame（master の行。文字列）→ 成績表。ref_year は年度加重の窓の終わり（省略時は df の最終年）。
     wedge_opts は wedge_options() の dict（省略時は環境変数・既定値）。"""
     for c in (RID, KEY, "着順"):
         if c not in df.columns:
@@ -135,17 +165,22 @@ def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: d
     if horse or df[RID].astype(str).str.fullmatch(r"\d{18}").all():
         df = df.drop_duplicates(subset=subset, keep="first")
 
-    fl = parse_finish(df["着順"], df["頭数"] if "頭数" in df.columns else None)
+    if PRE_FINISH["finish_num"] in df.columns:
+        fl = df[list(PRE_FINISH.values())].rename(columns={v: k for k, v in PRE_FINISH.items()})
+    else:
+        fl = parse_finish(df["着順"], df["頭数"] if "頭数" in df.columns else None)
     use = fl["denom"]
     d, f = df[use], fl[use]
     # 件数 < MIN_SAMPLE のグループは出力しないので、先に除いてから計算する（推定値・文字列整形の無駄を省く）
-    sizes = d[KEY].map(d[KEY].value_counts())
-    keep = sizes >= MIN_SAMPLE
+    codes0, _ = pd.factorize(d[KEY].to_numpy())
+    keep = np.bincount(codes0)[codes0] >= MIN_SAMPLE if len(codes0) else np.zeros(0, dtype=bool)
     d, f = d[keep], f[keep]
     if d.empty:
         return pd.DataFrame(columns=OUT_COLUMNS)
 
-    g = d[KEY]
+    # グループは結合データの整数コードで束ねる（文字列のまま何度も groupby するより速い。並びは結合データの昇順）
+    codes, uniques = pd.factorize(d[KEY].to_numpy(), sort=True)
+    g = pd.Series(codes, index=d.index)
     n = g.groupby(g).size()
     cnt = lambda col: f[col].groupby(g).sum().reindex(n.index).astype(float)
     wins, sec, thr, plc, board = cnt("win"), cnt("second"), cnt("third"), cnt("place"), cnt("board")
@@ -161,9 +196,12 @@ def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: d
     thr_e = _estimate(thr, n)
 
     avg_fin = f["finish_num"].groupby(g).mean().reindex(n.index)
-    pay_win = pd.to_numeric(d.get("単勝配当", pd.Series(index=d.index, dtype=float)), errors="coerce").fillna(0)
-    pay_plc = pd.to_numeric(d.get("複勝配当", pd.Series(index=d.index, dtype=float)), errors="coerce").fillna(0)
-    odds = pd.to_numeric(d.get("単勝オッズ", pd.Series(index=d.index, dtype=float)), errors="coerce")
+    if PRE_NUM["単勝オッズ"] in d.columns:
+        pay_win, pay_plc, odds = d[PRE_NUM["単勝配当"]], d[PRE_NUM["複勝配当"]], d[PRE_NUM["単勝オッズ"]]
+    else:
+        pay_win = pd.to_numeric(d.get("単勝配当", pd.Series(index=d.index, dtype=float)), errors="coerce").fillna(0)
+        pay_plc = pd.to_numeric(d.get("複勝配当", pd.Series(index=d.index, dtype=float)), errors="coerce").fillna(0)
+        odds = pd.to_numeric(d.get("単勝オッズ", pd.Series(index=d.index, dtype=float)), errors="coerce")
     rtn_win = (pay_win.where(f["win"], 0).groupby(g).sum().reindex(n.index) / n)
     rtn_plc = (pay_plc.where(f["place"], 0).groupby(g).sum().reindex(n.index) / n)
     # 単勝適正回収値: w=1/オッズ。100×Σ(w×配当/100×的中)/Σw（≒ 実勝利数 ÷ オッズから見た期待勝利数 ×100）
@@ -172,7 +210,7 @@ def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: d
     w_ret = (w * pay_win / 100.0 * f["win"].astype(float)).groupby(g).sum(min_count=1).reindex(n.index)
     rtn_adj = (100.0 * w_ret / w_sum).replace([np.inf, -np.inf], np.nan)
 
-    out = pd.DataFrame({KEY: n.index, "件数": n.values.astype(int)})
+    out = pd.DataFrame({KEY: uniques[n.index.to_numpy()], "件数": n.values.astype(int)})
     for name, fr, es in (("勝率", win_f, win_e), ("連対率", ren_f, ren_e), ("複勝率", plc_f, plc_e),
                          ("2着率", sec_f, sec_e), ("3着率", thr_f, thr_e)):
         out[f"{name}_val"] = fr.round(2).values
@@ -199,36 +237,74 @@ def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: d
     return out.reset_index(drop=True)[OUT_COLUMNS]
 
 
-def aggregate_file(src: str, out_dir: str, wedge_opts: dict | None = None) -> str:
+MASTER_PREFIX = "master_"
+SKIP_MASTERS = ("__inner_outer__",)
+
+
+def master_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """master → 集計に使う馬（指数有効=1）。"""
+    if "指数有効" in df.columns:
+        df = df[df["指数有効"].astype(str) == "1"]
+    return df
+
+
+def family_frames(df: pd.DataFrame, fams=None, slim: pd.DataFrame | None = None):
+    """(family, スキーム, キー付きの DataFrame) を順に返す。キーは shisu.families.build_keys で作る。
+    返す DataFrame は aggregate_frame の入力に要る列だけ（slim。省略時は with_precomputed(df)）。"""
+    slim = with_precomputed(df) if slim is None else slim
+    for fam in (fams if fams is not None else fam_registry.active()):
+        for scheme in fam.schemes:
+            keys = fam_registry.build_keys(df, fam, scheme)
+            sub = slim.loc[keys.index]                       # s2 の重なりでは同じ行が2回出る（loc が複製する）
+            sub = sub.assign(**{KEY: keys.to_numpy()})
+            yield fam, scheme, sub
+
+
+def odds_part(sub: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """オッズ帯 mode の行（オッズ欠損は normal にだけ入る）。"""
+    if mode == "normal":
+        return sub
+    if PRE_NUM["単勝オッズ"] in sub.columns:
+        return sub[odds_mask_numeric(sub[PRE_NUM["単勝オッズ"]], mode)]
+    return sub[odds_mask(sub["単勝オッズ"], mode)] if "単勝オッズ" in sub.columns else sub.iloc[0:0]
+
+
+def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, schemes: set[str] | None = None,
+                     families_file: str | None = None) -> str:
     src = Path(src)
-    info = parse_foragg_stem(file_stem(src))
-    if info is None or info["mode"] != "normal":
-        return f"[SKIP] {src.name}: 素材のファイル名が規約外（旧仕様のファイルは --clean で消してから replace をやり直す）"
-    df = read_csv_any(src)
+    stem = file_stem(src)
+    if not stem.startswith(MASTER_PREFIX) or stem in SKIP_MASTERS:
+        return f"[SKIP] {src.name}: master のファイルではありません"
+    if families_file:
+        fam_registry.configure(families_file, log=lambda m: None)
+    source = stem[len(MASTER_PREFIX):]
+    df = master_frame(read_csv_any(src))
+    for c in (RID, "着順"):
+        if c not in df.columns:
+            return f"[SKIP] {src.name}: 列 {c} がありません（master ではない可能性）"
     ref_year = ref_year_of(df)
-    counts = []
-    for mode in ODDS_MODES:
-        sub = df[odds_mask(df["単勝オッズ"], mode)] if "単勝オッズ" in df.columns else df.iloc[0:0]
-        try:
-            out = aggregate_frame(sub, ref_year, wedge_opts)
-        except KeyError as e:
-            return f"[SKIP] {src.name}: 列 {e} がありません（素材ではない可能性）"
-        write_csv(out, Path(out_dir) / agg_filename(info["family"], mode, info["scheme"], info["source"]))
-        n_adj = int(out["adjusted_WEDGE"].notna().sum()) if len(out) else 0
-        counts.append(f"{mode}={len(out)}(adj {n_adj})")
-    return f"[OK] {src.name}: groups " + " ".join(counts) + f" / 年度窓の終わり={ref_year}"
-
-
-def _selected(path: Path, schemes: set[str]) -> bool:
-    if not schemes:
-        return True
-    p = parse_foragg_stem(file_stem(path))
-    return p is None or not p["scheme"] or p["scheme"] in schemes
+    groups = adj = n_files = 0
+    for fam, scheme, sub in family_frames(df):
+        if schemes and scheme and scheme not in schemes:
+            continue
+        for mode in ODDS_MODES:
+            out = aggregate_frame(odds_part(sub, mode), ref_year, wedge_opts)
+            path = Path(out_dir) / agg_filename(fam.name, mode, scheme, source)
+            if out.empty:                    # 0件の成績表は書かない（前の実行で書いた同じ名前のファイルは消す）
+                path.unlink(missing_ok=True)
+                continue
+            write_csv(out, path)
+            n_files += 1
+            groups += len(out)
+            adj += int(out["adjusted_WEDGE"].notna().sum()) if len(out) else 0
+    return (f"[OK] {src.name}: {n_files} files groups={groups}(adj {adj}) / 年度窓の終わり={ref_year}")
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--in-dir", default=str(config.foragg_dir()))
+    ap.add_argument("--in-dir", default=str(config.master_dir()), help="master のフォルダ（既定 master_csv）")
+    ap.add_argument("--families", default=None,
+                    help="使う family の定義（JSON）。既定: selected_families.json があればそれ、無ければ初期セット")
     ap.add_argument("--out-dir", default=str(config.agg_dir()))
     ap.add_argument("--clean", action="store_true", help="出力先 agg_csv を空にしてから実行")
     ap.add_argument("--workers", type=int, default=1, help="並列数（既定1）")
@@ -239,7 +315,7 @@ def main(argv=None) -> int:
     ap.add_argument("--wedge-decay", type=float, default=None,
                     help=f"年の減衰率（1年古くなるごとのウェイトの倍率。0<d≤1。既定 {WEDGE_DECAY}。環境変数 AGG_WEDGE_DECAY）")
     ap.add_argument("--wedge-window", choices=WINDOWS, default=None,
-                    help=f"年度の窓の終わり: data=素材全体の最終年 / key=結合データ自身の最終年（既定 {WEDGE_WINDOW}）")
+                    help=f"年度の窓の終わり: data=master 全体の最終年 / key=結合データ自身の最終年（既定 {WEDGE_WINDOW}）")
     args = ap.parse_args(argv)
     opts = wedge_options(args.wedge_min_year_count, args.wedge_window, args.wedge_max_years, args.wedge_decay)
     if opts["window"] not in WINDOWS:
@@ -253,20 +329,25 @@ def main(argv=None) -> int:
         print(f"[ERROR] WEDGE の設定: {e}", file=sys.stderr)
         return 2
 
-    files = sorted(Path(args.in_dir).glob("foragg_*.csv.gz"))
+    files = [p for p in sorted(Path(args.in_dir).glob(f"{MASTER_PREFIX}*.csv.gz")) if file_stem(p) not in SKIP_MASTERS]
     schemes = {s.strip() for s in os.getenv("AGG_RANKBAND_SCHEMES", "").split(",") if s.strip()}
-    files = [p for p in files if _selected(p, schemes)]
     if not files:
-        print(f"[ERROR] 素材（foragg_*.csv.gz）がありません: {args.in_dir}。replace_csv_ver3.py を先に実行してください",
+        print(f"[ERROR] master（master_*.csv.gz）がありません: {args.in_dir}。replace_csv_ver3.py を先に実行してください",
               file=sys.stderr)
         return 2
+    fams = fam_registry.configure(args.families)
+    families_file = args.families or (str(config.selected_families_path())
+                                      if config.selected_families_path().exists() else None)
     if args.clean and Path(args.out_dir).exists():
         shutil.rmtree(args.out_dir)
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    fam_registry.save_families(Path(args.out_dir) / "families.json", fams, {"source": fam_registry.active_source()})
+    n_var = sum(len(f.schemes) for f in fams)
+    print(f"[INFO] family: {fam_registry.active_source()} / {len(fams)} family・{n_var} 通り（スキーム込み）")
     print(f"[INFO] {len(files)} files / 推定={PROP_MODE} (q={LOWER_Q}/{UPPER_Q}) / scipy={'あり' if has_scipy() else 'なし(正規近似)'}"
           f" / WEDGE: 年の最低件数={opts['min_year_count']} 遡る年数≦{opts['max_years']}"
           f" 減衰率={opts['decay']} 窓={opts['window']}")
-    jobs = [(str(p), args.out_dir, opts) for p in files]
+    jobs = [(str(p), args.out_dir, opts, schemes or None, families_file) for p in files]
     if args.workers > 1:
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
             results = list(ex.map(_run, jobs, chunksize=8))
@@ -280,16 +361,16 @@ def main(argv=None) -> int:
     n_ok = sum(r.startswith("[OK]") for r in results)
     print(f"[DONE] OK={n_ok} SKIP={sum(r.startswith('[SKIP]') for r in results)} ERROR={len(errors)}")
     if n_ok == 0:
-        print("[ERROR] 集計できた素材がありません。replace_csv_ver3.py を先に実行してください", file=sys.stderr)
+        print("[ERROR] 集計できた master がありません。replace_csv_ver3.py を先に実行してください", file=sys.stderr)
         return 2
     return 1 if errors else 0
 
 
 def _print_wedge_coverage(results: list[str], max_years: int = DEFAULT_MAX_YEARS) -> None:
-    """adjusted_WEDGE が付いたグループの割合と、年度窓の終わりの年（素材ごと）の範囲を出す。
+    """adjusted_WEDGE が付いたグループの割合と、年度窓の終わりの年（master ごと）の範囲を出す。
 
-    年の最低件数の条件はキーの粒度が細かいと満たしにくい。また窓の終わりは素材ファイルごとの最終年なので、
-    更新が止まった素材が混ざると、その指数だけ古い年の adjusted_WEDGE になる。どちらも確認用。
+    年の最低件数の条件はキーの粒度が細かいと満たしにくい。また窓の終わりは master ごとの最終年なので、
+    更新が止まった master が混ざると、その指数だけ古い年の adjusted_WEDGE になる。どちらも確認用。
     """
     import re
     total = adj = 0
@@ -305,15 +386,15 @@ def _print_wedge_coverage(results: list[str], max_years: int = DEFAULT_MAX_YEARS
         print(f"[INFO] adjusted_WEDGE が付いたグループ: {adj}/{total} ({adj / total:.1%})")
     if len(ends) > 1:
         detail = ", ".join(f"{y}: {len(v)}本" for y, v in sorted(ends.items()))
-        print(f"[WARN] 年度窓の終わり（素材の最終年）が素材によって違います: {detail}。"
-              "古い年で止まった素材の adjusted_WEDGE はその年までの値です", file=sys.stderr)
+        print(f"[WARN] 年度窓の終わり（master の最終年）が master によって違います: {detail}。"
+              "古い年で止まった master の adjusted_WEDGE はその年までの値です", file=sys.stderr)
     elif ends:
         print(f"[INFO] 年度窓の終わり: {next(iter(ends))}年（この年から遡る{max_years}年のうち、件数を満たす年をすべて使う）")
 
 
 def _run(job) -> str:
     try:
-        return aggregate_file(*job)
+        return aggregate_master(*job)
     except Exception as e:
         return f"[ERROR] {Path(job[0]).name}: {type(e).__name__}: {e}"
 

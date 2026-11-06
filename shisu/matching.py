@@ -8,8 +8,10 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable, Mapping
 
+from . import families as _families
+from .conditions import CONDITION_COLUMNS
 from .csvio import norm_text
-from .keys import ALL_FAMILIES, entry_key_candidates
+from .families import entry_key_candidates
 from .wedge import WEDGE_COLUMNS
 
 UNIFIED = "unified_all"
@@ -52,20 +54,15 @@ def rank_text(v) -> str:
     return str(int(f)) if f == f and f >= 1 else ""
 
 
+PART_FIELDS = ("場所", "芝・ダ", "距離", "芝(内・外)", "重量種別", "クラス名", "枠番グループ", "騎手") + CONDITION_COLUMNS
+
+
 def entry_fields(row: Mapping, base: str) -> dict:
-    """出馬表の1行（build_db で正規化済み）から、キーの部品を取り出す。"""
-    return {
-        "場所": norm_text(row.get("場所")),
-        "芝・ダ": norm_text(row.get("芝・ダ")),
-        "距離": norm_text(row.get("距離")),
-        "芝(内・外)": norm_text(row.get("芝(内・外)")),
-        "重量種別": norm_text(row.get("重量種別")),
-        "クラス名": norm_text(row.get("クラス名")),
-        "枠番グループ": norm_text(row.get("枠番グループ")),
-        "騎手": norm_text(row.get("騎手")),
-        "順位": rank_text(row.get(f"{base}_順位")),
-        "偏差値帯": norm_text(row.get(f"{base}_偏差値帯")),
-    }
+    """出馬表の1行（build_db で正規化済み。22条件の列も持つ）から、キーの部品を取り出す。"""
+    out = {c: norm_text(row.get(c)) for c in PART_FIELDS}
+    out["順位"] = rank_text(row.get(f"{base}_順位"))
+    out["偏差値帯"] = norm_text(row.get(f"{base}_偏差値帯"))
+    return out
 
 
 def query_unified(conn: sqlite3.Connection, key: str, family: str, indicator: str,
@@ -79,11 +76,11 @@ def query_unified(conn: sqlite3.Connection, key: str, family: str, indicator: st
 
 
 def match_entry_row(conn: sqlite3.Connection, row: Mapping, bases: Iterable[str], source_table: str,
-                    families: Iterable[str] = ALL_FAMILIES, cache: dict | None = None,
+                    families: Iterable[str] | None = None, cache: dict | None = None,
                     limit: int = DEFAULT_LIMIT) -> list[dict]:
     """出馬表1頭ぶんのヒット行（HIT_COLUMNS の dict）を返す。"""
     cache = {} if cache is None else cache
-    families = tuple(families)
+    families = tuple(families) if families is not None else _families.active_names()
     horse = {c: norm_text(row.get(c)) for c in HORSE_COLUMNS}
     out: list[dict] = []
     for base in bases:

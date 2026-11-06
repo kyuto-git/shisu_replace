@@ -30,17 +30,20 @@ from pathlib import Path
 import pandas as pd
 
 from shisu import config
+from shisu import families as fam_registry
+from shisu.conditions import CONDITION_COLUMNS, derive, load_inner_lookup, standardize_entries
 from shisu.csvio import norm_series, read_csv_any
 from shisu.matching import HIT_COLUMNS, STAT_COLUMNS, UNIFIED, indicator_bases, match_entry_row, unified_status
 from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, FORAGG_PREFIX, file_stem, parse_foragg_stem,
                           table_name_for_entries, table_name_for_foragg, xjoin_table_for)
 from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_series, distance_series,
                              entry_inner_outer, frame_group_series, infer_entry_weight, race_date,
-                             race_id_without_horse, weight_series)
+                             race_id_without_horse, split_surface_distance, weight_series)
 from shisu.wedge import WEDGE_COLUMNS, WEDGE_FLOAT_COLUMNS, WEDGE_INT_COLUMNS
 
 META = "__tables_meta__"
 FACETS = "__facets__"
+FAMILIES_TABLE = fam_registry.DB_TABLE
 RATE_NAMES = ("勝率", "連対率", "複勝率", "2着率", "3着率")
 FLOAT_COLUMNS = ("掲示板率_val", "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値") + WEDGE_FLOAT_COLUMNS
 INT_COLUMNS = ("件数",) + WEDGE_INT_COLUMNS
@@ -198,11 +201,13 @@ def _first_nonempty(df: pd.DataFrame, names: tuple[str, ...]) -> pd.Series:
     return out
 
 
-def normalize_entries_df(raw: pd.DataFrame) -> pd.DataFrame:
-    """出馬表（calc_entry_hensachi の出力）を、キーの部品が過去側と同じ表記になるよう正規化する。"""
+def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None) -> pd.DataFrame:
+    """出馬表（calc_entry_hensachi の出力）を、キーの部品が過去側と同じ表記になるよう正規化する。
+    22条件（shisu/conditions.py）の列も足す。inner_lookup は前走の内外を引く表（replace が master_csv/ に書く）。"""
     df = raw.copy()
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()]
+    raw = df
     rid = norm_series(df["レースID(新)"]) if "レースID(新)" in df.columns else pd.Series("", index=df.index)
     given = df["レースID(新/馬番無)"] if "レースID(新/馬番無)" in df.columns else None
     df["レースID(新)"] = rid
@@ -214,8 +219,10 @@ def normalize_entries_df(raw: pd.DataFrame) -> pd.DataFrame:
     df["レースID(新/馬番無)"] = rid_nh.where(rid_nh != "", fallback)
     df["レース名"] = _first_nonempty(df, ("レース名",))
     df["場所"] = _first_nonempty(df, ("場所",))
-    df["芝・ダ"] = _first_nonempty(df, ("芝・ダ", "芝ダ"))
-    df["距離_raw"] = _first_nonempty(df, ("距離",))
+    surface, dist_raw = split_surface_distance(_first_nonempty(df, ("芝・ダ", "芝ダ")), _first_nonempty(df, ("距離",)))
+    df["芝・ダ"] = surface
+    dnum = distance_series(dist_raw)
+    df["距離_raw"] = dnum.astype(object).where(dnum.notna(), "").map(lambda v: "" if v == "" else str(int(v)))
     if "外回り" in raw.columns:
         inner = pd.Series([entry_inner_outer(p, s, g) for p, s, g in zip(df["場所"], df["芝・ダ"], raw["外回り"])],
                           index=df.index, dtype=object)
@@ -247,6 +254,9 @@ def normalize_entries_df(raw: pd.DataFrame) -> pd.DataFrame:
     for c in ENTRIES_REQUIRED:
         if c not in df.columns:
             df[c] = ""
+    cond = derive(standardize_entries(raw, df), inner_lookup)
+    for c in CONDITION_COLUMNS:
+        df[c] = cond[c]
     return df
 
 
@@ -256,8 +266,9 @@ def load_entries_tables(con: sqlite3.Connection, entries_dir: Path) -> list[dict
         print(f"[entries] 出馬表CSVがありません: {entries_dir}")
         return []
     loaded = []
+    inner = load_inner_lookup()
     for p in files:
-        df = normalize_entries_df(read_csv_any(p))
+        df = normalize_entries_df(read_csv_any(p), inner)
         tname = table_name_for_entries(p.name)
         df.to_sql(tname, con, if_exists="replace", index=False)
         con.execute(f'CREATE INDEX IF NOT EXISTS {q("idx_" + tname + "_race")} ON {q(tname)}("レースID(新/馬番無)")')
@@ -284,8 +295,7 @@ def build_entries_all(con: sqlite3.Connection, loaded: list[dict]) -> None:
 
 def build_xjoin(con: sqlite3.Connection, entries_table: str, families=None) -> dict:
     """entries_table の全馬を unified_all と照合して entries_xjoin_* に保存する。"""
-    from shisu.keys import ALL_FAMILIES
-    families = tuple(families or ALL_FAMILIES)
+    families = tuple(families or fam_registry.active_names())
     xname = xjoin_table_for(entries_table)
     con.execute(f"DROP TABLE IF EXISTS {q(xname)}")
     coldefs = [f"{q(c)} {_SQL_TYPES.get(c, 'TEXT')}" for c in HIT_COLUMNS]
@@ -333,6 +343,24 @@ def prune(con: sqlite3.Connection, kinds: set[str], keep: set[str]) -> None:
     print(f"[prune] dropped {len(stale)} tables" + (f" (例: {stale[0]})" if stale else ""))
 
 
+def load_families_for_agg(agg_dir: Path) -> list:
+    """agg_csv/families.json（aggregate が書く）の family を台帳に入れて、使う family にする。無ければ今の設定のまま。"""
+    p = Path(agg_dir) / "families.json"
+    if not p.exists():
+        return fam_registry.configure()
+    fams = fam_registry.load_families(p)
+    fam_registry.set_active(fams, f"agg_csv/families.json（{len(fams)} family）")
+    return fams
+
+
+def save_families_table(con: sqlite3.Connection, fams) -> None:
+    fam_registry.save_to_db(con, fams)
+
+
+def families_from_db(con: sqlite3.Connection) -> list:
+    return fam_registry.load_from_db(con)
+
+
 def parse_cli(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mode", choices=["both", "foragg", "entries"], default="both")
@@ -366,6 +394,7 @@ def main(argv=None) -> int:
 
     if args.mode in ("both", "foragg"):
         kinds.add("foragg")
+        fams = load_families_for_agg(Path(args.agg_dir))
         loaded, n_old = load_agg_tables(con, Path(args.agg_dir))
         if n_old:
             rc = 1
@@ -377,6 +406,7 @@ def main(argv=None) -> int:
             return 2
         rebuild_unified_all(con, loaded)
         rebuild_facets(con)
+        save_families_table(con, fams)
         replace_meta(con, ("foragg",), loaded)
         keep |= {t["table_name"] for t in loaded}
         con.commit()
@@ -387,6 +417,10 @@ def main(argv=None) -> int:
 
     if args.mode in ("both", "entries"):
         kinds.add("entries")
+        if args.mode == "entries":           # 照合に使う family は、DB を作ったときの family
+            db_fams = families_from_db(con)
+            if db_fams:
+                fam_registry.set_active(db_fams, f"DB の {FAMILIES_TABLE}（{len(db_fams)} family）")
         entries = load_entries_tables(con, Path(args.entries_dir))
         build_entries_all(con, entries)
         keep |= {t["table_name"] for t in entries} | {ENTRIES_ALL}

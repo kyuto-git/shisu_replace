@@ -31,7 +31,7 @@ from shisu import config
 from shisu.classify import CATEGORIES, CATEGORY_LABELS, classify, description_lines, sql_condition
 from shisu.indicators import INDICATOR_ORDER
 from shisu.ingest.web import make_blueprint as make_ingest_blueprint
-from shisu.keys import ALL_FAMILIES, FAMILY_LABELS
+from shisu import families as fam_registry
 from shisu.matching import HIT_COLUMNS, UNIFIED, indicator_bases, match_entry_row, unified_status
 from shisu.naming import ENTRIES_ALL, XJOIN_PREFIX, xjoin_table_for
 from shisu.odds import ODDS_LABELS, ODDS_MODES, ODDS_RANK
@@ -64,13 +64,36 @@ app = Flask(__name__)
 # ========================= 共通 =========================
 @contextmanager
 def connect():
-    """読み取り用の接続（with を抜けたら閉じる）。"""
+    """読み取り用の接続（with を抜けたら閉じる）。DB を作ったときの family（__families__）を台帳に入れる。"""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     try:
+        _sync_families(con)
         yield con
     finally:
         con.close()
+
+
+_FAMILY_SYNC: dict = {}
+
+
+def _sync_families(con) -> None:
+    """DB の __families__ を family の台帳（ラベル・並び・照合に使う family）に反映する（DB が変わったときだけ）。"""
+    try:
+        stamp = (DB_PATH, os.path.getmtime(DB_PATH))
+    except OSError:
+        return
+    if _FAMILY_SYNC.get("stamp") == stamp:
+        return
+    try:
+        fams = fam_registry.load_from_db(con)
+    except sqlite3.Error:
+        fams = []
+    if fams:
+        fam_registry.set_active(fams, "DB の __families__")
+    else:
+        fam_registry.reset()
+    _FAMILY_SYNC["stamp"] = stamp
 
 
 def q(name: str) -> str:
@@ -126,7 +149,7 @@ def odds_label(mode: str) -> str:
 
 
 def family_label(fam: str, scheme: str = "") -> str:
-    label = FAMILY_LABELS.get(fam, fam)
+    label = fam_registry.label(fam)
     return f"{label}（{scheme}）" if scheme else label
 
 
@@ -326,7 +349,8 @@ def index():
         status = db_status(con)
         has_db = status == "ok"
         facets = _facets(con)
-        families = [f for f in ALL_FAMILIES if f in set(_meta_values(con, "family"))]
+        present = set(_meta_values(con, "family"))
+        families = [f for f in fam_registry.active_names() if f in present] + sorted(present - set(fam_registry.active_names()))
         inds_all = set(_meta_values(con, "indicator"))
         indicators = [i for i in INDICATOR_ORDER if i in inds_all] + sorted(inds_all - set(INDICATOR_ORDER))
         regions = sorted(_meta_values(con, "region"))
@@ -353,7 +377,7 @@ def index():
                 params.append(region)
             metas = [dict(r) for r in con.execute(f"SELECT * FROM {META} WHERE {' AND '.join(where)}", params)]
             ind_rank = {n: i for i, n in enumerate(INDICATOR_ORDER)}
-            fam_rank = {f: i for i, f in enumerate(ALL_FAMILIES)}
+            fam_rank = {f: i for i, f in enumerate(fam_registry.active_names())}
             metas.sort(key=lambda m: (ind_rank.get(m["indicator"], 999), m["indicator"] or "",
                                       fam_rank.get(m["family"], 999), m["rank_scheme"] or "",
                                       ODDS_RANK.get(m["odds_mode"], 9), m["region"] or ""))
@@ -864,7 +888,7 @@ def _wedge_request():
     sdir = "ASC" if request.args.get("dir", "DESC").upper() == "ASC" else "DESC"
     return {"table": table, "rid": rid, "legacy": legacy, "date": request.args.get("date", "").strip(),
             "odds_mode": odds_mode, "inds": [v for v in request.args.getlist("ind") if v],
-            "fams": [v for v in request.args.getlist("family") if v in ALL_FAMILIES],
+            "fams": [v for v in request.args.getlist("family") if v in fam_registry.active_names()],
             "uma": request.args.get("uma", "").strip(), "sort": sort, "dir": sdir}
 
 
@@ -900,7 +924,7 @@ def entries_wedge():
     head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}　WEDGE 一覧'
     sub = f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")} / {h.get("クラス名_raw", "")} / {len(race)}頭'
     return render("WEDGE一覧", WEDGE_BODY, head=head, sub=sub, path=path, table=p["table"], rid=rid, race=race,
-                  bases=bases, families=ALL_FAMILIES, odds_modes=ODDS_MODES, sorts=WEDGE_SORTS,
+                  bases=bases, families=fam_registry.active_names(), odds_modes=ODDS_MODES, sorts=WEDGE_SORTS,
                   q_odds=p["odds_mode"], q_inds=p["inds"], q_fams=p["fams"], q_uma=p["uma"], q_sort=p["sort"],
                   q_dir=p["dir"], matrix=wedge_matrix(matrix_race, rows, matrix_bases), matrix_bases=matrix_bases,
                   total=len(rows), shown=rows[:WEDGE_VIEW_LIMIT],

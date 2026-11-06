@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir -r requirements-dev.txt
 
 # コード一式（データ・DB は .dockerignore で除外。実行時は -v "$(pwd)":/app でホストのディレクトリをマウントする）
 COPY . .
-RUN mkdir -p csv_files replace_csv foragg_csv agg_csv master_csv entries_in entries_out \
+RUN mkdir -p csv_files ext_indices replace_csv agg_csv master_csv entries_in entries_out \
              ingest_in/base ingest_in/lap ingest_in/yasui ingest_out
 
 EXPOSE 8000

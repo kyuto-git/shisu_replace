@@ -24,13 +24,13 @@ def base(tmp_path_factory, monkeypatch_module):
     synth.make_entries(b)
     import aggregate_stats_ver2, build_db, calc_entry_hensachi, replace_csv_ver3
     assert replace_csv_ver3.main(["--clean", "--processed"]) == 0
-    # 旧仕様のファイルが残っていても使われないこと:
-    #   素材に旧形式（オッズ接頭辞付き・非圧縮）、成績表に odds5p
-    src = next((b / "foragg_csv").glob("foragg_normal_*カツラキ.csv.gz"))
-    shutil.copy(src, b / "foragg_csv" / ("foragg_odds10u_" + src.name[len("foragg_"):]))
+    # 旧仕様のファイルが残っていても使われないこと: 旧版の素材（foragg_csv/）、成績表に odds5p
+    old = b / "foragg_csv"
+    old.mkdir(exist_ok=True)
+    (old / "foragg_normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv.gz").write_bytes(b"dummy")
     # 合成データは1キーあたり年に数件しかないので、adjusted_WEDGE の年の最低件数を下げて通す
     assert aggregate_stats_ver2.main(["--clean", *AGG_TEST_ARGS]) == 0
-    agg = next((b / "agg_csv").glob("foragg_normal_*カツラキ.csv"))
+    agg = next((b / "agg_csv").glob("foragg_normal_*SAV.csv"))
     shutil.copy(agg, b / "agg_csv" / ("foragg_odds5p_" + agg.name[len("foragg_"):]))
     assert calc_entry_hensachi.main(["--merge-one"]) == 0
     assert build_db.main(["--fresh"]) == 0
@@ -49,42 +49,63 @@ def db(base):
 
 
 def test_outputs_exist(base):
-    assert len(list((base / "foragg_csv").glob("foragg_*.csv.gz"))) == 3 * 20 + 1   # +1 は旧形式のダミー
-    agg = list((base / "agg_csv").glob("foragg_*.csv"))
-    assert len(agg) == 3 * 80 + 1                                                     # +1 は odds5p のダミー
+    from shisu import families as fam_registry
+    from shisu.naming import parse_foragg_stem
+    # 素材（foragg_csv）はもう作らない。master が集計の入力
+    assert [p.name for p in (base / "foragg_csv").iterdir()] == ["foragg_normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv.gz"]
+    masters = sorted(p.name for p in (base / "master_csv").glob("master_*.csv.gz"))
+    assert len(masters) == 3
+    agg = [p for p in (base / "agg_csv").glob("foragg_*.csv") if "odds5p_normal" not in p.name or
+           parse_foragg_stem(p.stem) is not None]
+    variants = sum(len(f.schemes) for f in fam_registry.active())
+    assert len(fam_registry.active()) == 83 and variants == 122
+    assert 3 * variants <= len(agg) <= 3 * variants * 4                   # 0件の成績表は書かない
+    normal = {parse_foragg_stem(p.stem)["family"] for p in agg if parse_foragg_stem(p.stem)["mode"] == "normal"}
+    assert {f.name for f in fam_registry.active() if f.layer == "A"} <= normal
     assert not list((base / "agg_csv").glob("foragg_odds10u_odds10u_*"))
-    assert len(list((base / "replace_csv").glob("processed_*.csv"))) == 3 * 21
+    assert (base / "agg_csv" / "families.json").exists()
+    assert len(list((base / "replace_csv").glob("processed_*.csv"))) == 3
     m = pd.read_csv(next((base / "master_csv").glob("master_*ZI.csv.gz")), encoding="cp932", dtype=str,
                     keep_default_na=False)
     assert {"year", "日付", "指数有効", "オッズ帯", "順位帯_s1", "順位帯_s2"} <= set(m.columns)
     assert set(m["year"]) == {"2022", "2023", "2024", "2025"}
 
 
-def test_foragg_material_columns(base):
-    f = next((base / "foragg_csv").glob("foragg_rankband_s1_normal_band_*カツラキ.csv.gz"))
-    df = pd.read_csv(f, encoding="cp932", dtype=str, keep_default_na=False)
-    assert {"馬番", "日付", "year", "指数順位帯"} <= set(df.columns)
-    assert set(df["指数順位帯"]) <= {"1~3位", "4~6位", "7~9位", "10位~"}
+def test_master_columns_and_bands(base):
+    from shisu.conditions import CONDITION_COLUMNS
+    m = pd.read_csv(next((base / "master_csv").glob("master_*SAV.csv.gz")), encoding="cp932", dtype=str,
+                    keep_default_na=False)
+    assert set(CONDITION_COLUMNS) <= set(m.columns)
+    assert set(m["順位帯_s1"]) <= {"1位", "2~3位", "4~5位", "6~9位", "10位~", ""}
+    assert set(m["順位帯_s2"]) <= {"1~3位・1~5位", "1~5位", "6位~", ""}
+    assert (m.loc[m["順位"] == "2", "順位帯_s2"] == "1~3位・1~5位").all()
+    # 22条件のうち、合成データで値が入るもの（前走は約9割の馬にある）
+    for c in ("時期", "輸送距離", "間隔帯", "叩き", "R値帯", "直線帯", "距離帯", "左右", "坂", "斤量帯", "牝馬限定",
+              "前走着順", "前走人気", "前走脚質", "距離増減", "斤量増減", "左右遷移"):
+        assert (m[c] != "").mean() > 0.5, c
+    # 前走のコースがマスタに無い（大井・その場に無い距離）馬は前走クワドラントが空
+    assert (m["前走クワドラント"] != "").mean() > 0.3
 
 
-def test_aggregate_does_not_overwrite_material_and_is_rerunnable(base):
+def test_aggregate_does_not_touch_master_and_is_rerunnable(base):
     import aggregate_stats_ver2
-    src = next((base / "foragg_csv").glob("foragg_normal_*カツラキ.csv.gz"))
+    src = next((base / "master_csv").glob("master_*SAV.csv.gz"))
     before = src.read_bytes()
-    outs = sorted(p for p in (base / "agg_csv").glob("foragg_*normal_主*カツラキ.csv") if "odds5p" not in p.name)
-    assert len(outs) == 4                               # 通常 + odds10u + odds10_50 + odds50p
+    outs = sorted(p for p in (base / "agg_csv").glob("foragg_*normal_主*SAV.csv") if "odds5p_normal" not in p.name
+                  or p.name.startswith("foragg_odds50p_"))
+    assert len(outs) >= 2                              # 通常 + オッズ帯（0件の帯は書かない）
     first = [o.read_bytes() for o in outs]
     assert aggregate_stats_ver2.main(AGG_TEST_ARGS) == 0
     assert src.read_bytes() == before and [o.read_bytes() for o in outs] == first
 
 
 def test_odds_split_counts(base):
-    """オッズ帯3区分の件数の合計は、オッズ欠損が無ければ通常と一致する。"""
+    """オッズ帯3区分の件数の合計は、オッズ欠損が無ければ通常と一致する（0件の帯はファイルが無い）。"""
     def total(mode):
         prefix = "" if mode == "normal" else mode + "_"
-        f = base / "agg_csv" / f"foragg_{prefix}normal_主５場（中山、東京、中京、京都、阪神）_カツラキ.csv"
-        return pd.read_csv(f, encoding="cp932")["件数"].sum()
-    assert total("odds10u") + total("odds10_50") + total("odds50p") <= total("normal")
+        f = base / "agg_csv" / f"foragg_{prefix}normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv"
+        return pd.read_csv(f, encoding="cp932")["件数"].sum() if f.exists() else 0
+    assert 0 < total("odds10u") + total("odds10_50") + total("odds50p") <= total("normal")
 
 
 def test_no_broken_keys(base):
@@ -94,7 +115,7 @@ def test_no_broken_keys(base):
         assert n == 0
         # 全頭0・欠損2頭のレースは使わない（各指数 4年×2レース×16頭 = 128頭が除外される）
         total = con.execute("SELECT SUM(\"件数\") FROM unified_all WHERE family='normal' AND odds_mode='normal' "
-                            "AND indicator='カツラキ'").fetchone()[0]
+                            "AND indicator='SAV'").fetchone()[0]
         assert total <= 640
 
 
@@ -105,7 +126,7 @@ def test_table_names_and_meta(base):
         modes = {r[0] for r in con.execute("SELECT DISTINCT odds_mode FROM __tables_meta__ WHERE kind='foragg'")}
         assert modes == {"normal", "odds10u", "odds10_50", "odds50p"}
         inds = {r[0] for r in con.execute("SELECT DISTINCT indicator FROM unified_all")}
-        assert inds == {"カツラキ", "ZI", "先行"}
+        assert inds == {"SAV", "ZI", "先行"}
 
 
 def test_entry_keys_hit_history(base):
@@ -127,7 +148,7 @@ def test_merge_fills_blanks(base):
     df = pd.read_csv(base / "entries_out" / "entries_merged_hensachi.csv", encoding="cp932", dtype=str,
                      keep_default_na=False)
     assert len(df) == 48
-    assert (df["先行_偏差値帯"] != "").all() and (df["カツラキ_偏差値帯"] != "").all()
+    assert (df["先行_偏差値帯"] != "").all() and (df["SAV_偏差値帯"] != "").all()
     assert (df["先行_順位帯_s1"] != "").all()
 
 
@@ -161,7 +182,7 @@ def test_app_routes(base, monkeypatch):
     r = c.get("/", query_string={"submitted": "1", "family": "normal", "odds_mode": "odds50p", "preset": "none"})
     assert r.status_code == 200 and "50倍以上" in r.get_data(as_text=True)
     for preset in ("abs", "axis", "opp", "keshi"):
-        assert c.get("/", query_string={"submitted": "1", "preset": preset, "ind": "カツラキ"}).status_code == 200
+        assert c.get("/", query_string={"submitted": "1", "preset": preset, "ind": "SAV"}).status_code == 200
     page = c.get("/entries").get_data(as_text=True)
     assert "entries_all" not in page and "20260531" in page
     rid = _race_id(base)
@@ -262,8 +283,8 @@ def test_empty_agg_dir_does_not_wipe_db(base, tmp_path):
     assert build_db.main(["--mode", "foragg", "--agg-dir", str(empty), "--db-path", str(p)]) == 2
     with sqlite3.connect(p) as con:
         assert con.execute("SELECT COUNT(*) FROM unified_all").fetchone()[0] > 0
-    # 素材のディレクトリを指定しても同じ（素材は .csv.gz なので成績表として読まない）
-    assert build_db.main(["--mode", "foragg", "--agg-dir", str(base / "foragg_csv"), "--db-path", str(p)]) == 2
+    # master のディレクトリを指定しても同じ（.csv.gz は成績表として読まない）
+    assert build_db.main(["--mode", "foragg", "--agg-dir", str(base / "master_csv"), "--db-path", str(p)]) == 2
 
 
 def test_entries_without_race_id_are_split_by_race(base, monkeypatch, tmp_path):
@@ -284,7 +305,7 @@ def test_sort_link_ignores_reserved_args(base, monkeypatch):
     am = _app(base, monkeypatch)
     c = am.app.test_client()
     for extra in ("_scheme=x", "endpoint=x", "_anchor=x", "_external=1"):
-        r = c.get(f"/?submitted=1&ind=カツラキ&{extra}")
+        r = c.get(f"/?submitted=1&ind=SAV&{extra}")
         assert r.status_code == 200, extra
         assert "http://" not in r.get_data(as_text=True).split("<table>")[-1][:2000]
 
@@ -298,12 +319,17 @@ def test_wedge_columns_in_agg_csv_match_reference(base):
     """成績表の WEDGE 列が、仕様どおりの素直な実装（1グループずつ計算）と一致する。"""
     from shisu import wedge
     from shisu.finish import parse_finish
-    src = next((base / "foragg_csv").glob("foragg_normal_*カツラキ.csv.gz"))
-    mat = pd.read_csv(src, encoding="cp932", dtype=str, keep_default_na=False)
+    import aggregate_stats_ver2 as a
+    from shisu import families as fam_registry
+    src = next((base / "master_csv").glob("master_*SAV.csv.gz"))
+    m = a.master_frame(pd.read_csv(src, encoding="cp932", dtype=str, keep_default_na=False))
+    keys = fam_registry.build_keys(m, "normal")
+    mat = m.loc[keys.index].assign(結合データ=keys.to_numpy())
     fl = parse_finish(mat["着順"], mat["頭数"])
     mat = mat[fl["denom"]].assign(finish_num=fl["finish_num"][fl["denom"]])
     ref_year = int(pd.to_numeric(mat["year"]).max())
-    agg = pd.read_csv(base / "agg_csv" / src.name.replace(".csv.gz", ".csv"), encoding="cp932")
+    agg = pd.read_csv(base / "agg_csv" / ("foragg_normal_" + src.name[len("master_"):].replace(".csv.gz", ".csv")),
+                      encoding="cp932")
     assert list(agg.columns[18:25]) == list(WEDGE_COLS)
     checked = 0
     for _, row in agg.iterrows():
@@ -349,13 +375,13 @@ def test_wedge_in_db_and_xjoin(base):
 def test_ranking_view_sorted_by_adjusted_wedge(base, monkeypatch):
     am = _app(base, monkeypatch)
     with am.connect() as con:
-        rows = am._rank_query(con, [], ["カツラキ"], "all", "", ("", "", "", ""), "none",
+        rows = am._rank_query(con, [], ["SAV"], "all", "", ("", "", "", ""), "none",
                               {"min_cnt": None, "min_wedge": None, "min_adj": None}, "adjusted_WEDGE", "DESC")
     vals = [r["adjusted_WEDGE"] for r in rows]
     non_null = [v for v in vals if v is not None]
     assert non_null == sorted(non_null, reverse=True)
     assert vals[: len(non_null)] == non_null                  # 空欄は最後
-    assert {r["indicator"] for r in rows} == {"カツラキ"}
+    assert {r["indicator"] for r in rows} == {"SAV"}
     with am.connect() as con:
         rows = am._rank_query(con, ["normal"], [], "odds50p", "", ("", "", "", ""), "none",
                               {"min_cnt": 6, "min_wedge": 0.3, "min_adj": None}, "WEDGE", "ASC")
@@ -416,7 +442,7 @@ def test_build_db_rejects_agg_csv_without_wedge(base, tmp_path, capsys):
     import build_db
     agg = tmp_path / "agg"
     shutil.copytree(base / "agg_csv", agg)
-    old = next(agg.glob("foragg_normal_*カツラキ.csv"))
+    old = next(agg.glob("foragg_normal_*SAV.csv"))
     df = pd.read_csv(old, encoding="cp932", dtype=str, keep_default_na=False).drop(columns=list(WEDGE_COLS))
     synth.write_cp932(df, old)
     p = tmp_path / "x.db"
@@ -511,10 +537,10 @@ def test_entries_wedge_lists_all_hits_without_threshold(base, monkeypatch):
     # 馬番・指数・パターンで絞る
     uma = str(race[0]["馬番"])
     r = c.get("/entries/wedge.csv", query_string={"table": t, "rid": rid, "odds_mode": "all", "uma": uma,
-                                                  "ind": "カツラキ", "family": "rankJ_band"})
+                                                  "ind": "SAV", "family": "rankJ_band"})
     sub = list(_csv.DictReader(io.StringIO(r.data.decode("utf-8-sig"))))
-    assert sub and all(h["馬番"] == uma and h["base"] == "カツラキ" and h["family"] == "rankJ_band" for h in sub)
-    assert len(sub) == sum(1 for h in every if ident(h)[0] == uma and h["base"] == "カツラキ"
+    assert sub and all(h["馬番"] == uma and h["base"] == "SAV" and h["family"] == "rankJ_band" for h in sub)
+    assert len(sub) == sum(1 for h in every if ident(h)[0] == uma and h["base"] == "SAV"
                            and h["family"] == "rankJ_band")
     # 並べ替え（WEDGE の小さい順）と不正な引数
     r = c.get("/entries/wedge.csv", query_string={"table": t, "rid": rid, "odds_mode": "all", "sort": "WEDGE",

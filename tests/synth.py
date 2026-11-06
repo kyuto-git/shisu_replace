@@ -45,7 +45,9 @@ def _race_rows(rng: random.Random, date: str, venue: str, race_no: int, cond, he
         fin = str(finish[i])
         if i == heads - 1 and race_no % 7 == 0:
             fin = "取消"
+        prev = prev_run(rng, place, surface, dist, date)
         rows.append({
+            **prev["history"],
             "レースID(新)": f"{rid16}{uma:02d}", "場所": place, "芝・ダ": surface, "距離": dist,
             "芝(内・外)": inner, "重量種別": weight, "クラス名": cls, "頭数": str(heads), "枠番": str(waku),
             "馬番": str(uma), "馬名": f"ウマ{date}{race_no}{uma}", "騎手": JOCKEYS[i % len(JOCKEYS)],
@@ -55,6 +57,50 @@ def _race_rows(rng: random.Random, date: str, venue: str, race_no: int, cond, he
             "複勝配当": str(int(100 + odds * 20)) if fin in ("1", "2", "3") else "0",
         })
     return rows
+
+
+PREV_PLACES = ("東京", "中山", "京都", "新潟", "阪神", "小倉", "大井")
+PLACE_CHAR = {"東京": "東", "中山": "中", "京都": "京", "新潟": "新", "阪神": "阪", "小倉": "小"}
+STYLES = (("逃げ", "逃"), ("先行", "先"), ("中団", "中"), ("後方", "後"), ("ﾏｸﾘ", "マ"))
+R3 = ("HHH", "HH", "Ｈ", "Ｍ", "Ｓ", "SS", "SSS", "")
+
+
+def prev_run(rng: random.Random, place: str, surface: str, dist: str, date: str) -> dict:
+    """同じ1頭の「前走」の情報を、過去側（★6タブ）と出馬表側の列名で返す（両側で同じ条件になる）。"""
+    first = rng.random() < 0.12
+    weeks = rng.choice([1, 2, 3, 4, 6, 9, 12, 25])
+    stable = rng.choice(["美浦", "栗東", "地方"])
+    w = rng.choice([54.0, 55.0, 56.0, 57.0, 58.0])
+    pw = w + rng.choice([0.0, 0.0, 1.0, -1.0, 2.0, -2.0, 0.5])
+    mark = rng.choice(["", "", "▲", "△"])
+    pplace = rng.choice(PREV_PLACES)
+    psd = rng.choice(["芝", "ダ"])
+    pdist = rng.choice([1200, 1400, 1600, 1800, 2000])
+    pfin, ppop, pag = rng.randint(1, 16), rng.randint(1, 16), rng.randint(0, 16)
+    style = rng.choice(STYLES)
+    r3 = rng.choice(R3)
+    tataki = rng.randint(1, 6)
+    mare = rng.random() < 0.15
+    pdate = date                              # 前走の日付（形だけ。照合の内外は京都・新潟の芝で使う）
+    prid16 = f"{pdate}{VENUE_CODE.get(pplace, '05')}0103{rng.randint(1, 12):02d}"
+    fw = lambda n: str(n).translate(str.maketrans("0123456789", "０１２３４５６７８９"))
+    hist = {} if first else {
+        "前走場所": pplace, "前芝・ダ": psd, "前距離": str(pdist), "前走レースID(新)": prid16 + "05",
+        "前走着順": fw(pfin) if pfin < 10 else str(pfin), "前走人気": str(ppop), "前走上り3F順": str(pag),
+        "前走脚質": style[0], "前走レース印３": f" {r3} " if r3 else "", "前走斤量": f" {pw:g} ",
+    }
+    hist.update({"所属": {"美浦": "(美)", "栗東": "(栗)", "地方": "[地]"}[stable],
+                 "間隔": "" if first else str(weeks), "休み明け～戦目": str(tataki), "斤量": f"{w:g}{mark}" if mark else f" {w:g} ",
+                 "性別限定": "牝" if mare else ""})
+    pc = PLACE_CHAR.get(pplace)
+    kaisai = f"{pdate[2:]} 1{pc}3  {int(prid16[14:16])}R" if pc else f"{pdate[2:]} 大井 {int(prid16[14:16])}R"
+    ent = {"所属": stable, "間隔": "初走" if first else ("連闘" if weeks == 1 else str(weeks)), "休明戦目": str(tataki),
+           "斤量": f"{w:g}{mark}" if mark else f" {w:g} ", "性": "牝" if mare else "牡"}
+    if not first:
+        ent.update({"前場所": pplace, "前芝ダ": psd, "前距離": str(pdist), "前走開催": kaisai, "前着順": f"{fw(pfin)}着",
+                    "前人気": str(ppop), "前3F順": str(pag), "前脚質": style[1], "前レース印3": f" {r3} " if r3 else "",
+                    "前斤量": f" {pw:g} "})
+    return {"history": hist, "entries": ent}
 
 
 def history_frame(seed: int = 1, years=(2022, 2023, 2024, 2025), races_per_year: int = 12) -> pd.DataFrame:
@@ -76,14 +122,14 @@ def write_cp932(df: pd.DataFrame, path: Path) -> None:
     path.write_bytes(df.to_csv(index=False).encode("cp932"))
 
 
-def make_history(base: Path, indicators=("カツラキ", "ZI", "先行")) -> None:
+def make_history(base: Path, indicators=("SAV", "ZI", "先行")) -> None:
     for n, ind in enumerate(indicators):
         df = history_frame(seed=10 + n)
         write_cp932(df, base / "csv_files" / f"主５場（中山、東京、中京、京都、阪神）_{ind}.csv")
 
 
 def entries_frames(seed: int = 99) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """出馬表2ファイル（_1: カツラキ・ZI、_2: 先行力・マイニング値）。同じ馬・同じレース。"""
+    """出馬表2ファイル（_1: SAV・ZI、_2: 先行力・マイニング値）。同じ馬・同じレース。"""
     rng = random.Random(seed)
     rows1, rows2 = [], []
     races = [
@@ -104,7 +150,8 @@ def entries_frames(seed: int = 99) -> tuple[pd.DataFrame, pd.DataFrame]:
                       "場所": place, "芝ダ": sd, "距離": dist, "外回り": gai, "クラス": cls, "レース名": name,
                       "年限定": age, "頭": str(heads), "枠番": str(min(8, (i * 8) // heads + 1)), "馬番": str(i + 1),
                       "馬名S": f"エントリ{rno}_{i + 1}", "騎手": JOCKEYS[i % len(JOCKEYS)]}
-            rows1.append({**common, "カツラキ": str(k[i]), "指数順位1": str(rk[i]), "ZI": str(z[i]), "指数順位2": str(rz[i])})
+            common.update(prev_run(rng, place, sd, dist, "20260531")["entries"])
+            rows1.append({**common, "SAV": str(k[i]), "指数順位1": str(rk[i]), "ZI": str(z[i]), "指数順位2": str(rz[i])})
             rows2.append({**common, "先行力": str(s[i]), "指数順位1": str(rs[i]), "マイニング値": "", "マイニング順位": ""})
     return pd.DataFrame(rows1), pd.DataFrame(rows2)
 
