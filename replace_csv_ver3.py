@@ -214,13 +214,19 @@ def process_ext(base_path: str, indicator: str, master_dir: str, processed_dir: 
     # 値の無い馬は 0（TARGET は外部指数を取り込んでいない馬を 0 で出す。出馬表側と従来の ★8 の過去CSVもそう。
     # 0 を欠損として扱う指数（安井のランク・5ステータス）は compute_indicator が欠損に戻す）
     raw["指数"] = values.where(values != "", "0")
+    if ranks is not None and not (ranks != "").any():
+        print(f"[WARN] ext_indices/{indicator}: 順位の列が空なので、順位は値から計算します", file=sys.stderr)
+        ranks = None
     if ranks is not None:
         # 形式B・C（順位つき）でファイルに無い馬は、TARGET と同じくレースの最下位（同順位）にする
+        # （ファイルに順位のある馬がいるレースだけ。レースごと無いときは全頭 0 で、そのレースは使われない）
         absent = (values == "") & (ranks == "")
         if absent.any():
             race = norm_series(_col(raw, "レースID(新)")).str.slice(0, 16)
-            last = (ranks != "").groupby(race).transform("sum") + 1
-            ranks = ranks.where(~absent, last.astype(int).astype(str))
+            has = ranks != ""
+            last = has.groupby(race).transform("sum") + 1
+            fill = absent & has.groupby(race).transform("any")
+            ranks = ranks.where(~fill, last.astype(int).astype(str))
         raw["指数順位"] = ranks
     elif "指数順位" in raw.columns:
         raw = raw.drop(columns=["指数順位"])               # 基本CSVの順位（タイムM など）を使わない

@@ -651,6 +651,13 @@ def collect_hits(con, table: str, race_rows: list[dict]) -> tuple[list[dict], st
     return hits, note
 
 
+def hit_category(h: dict) -> str | None:
+    """ヒット行の区分（abs / axis / keshi / opp / None）。classify と同じ判定。"""
+    return classify({"cnt": h.get("件数"), "fv": h.get("複勝率_val"), "rv": h.get("連対率_val"),
+                     "top5": h.get("掲示板率_val"), "frc": h.get("複勝回収値"),
+                     "tra": h.get("単勝適正回収値")}, h.get("odds_mode") or "normal")
+
+
 def classify_hits(hits: list[dict]) -> dict[str, list[dict]]:
     buckets: dict[str, list[dict]] = {c: [] for c in CATEGORIES}
     seen: set = set()
@@ -659,9 +666,7 @@ def classify_hits(hits: list[dict]) -> dict[str, list[dict]]:
         if ident in seen:
             continue
         seen.add(ident)
-        cat = classify({"cnt": h.get("件数"), "fv": h.get("複勝率_val"), "rv": h.get("連対率_val"),
-                        "top5": h.get("掲示板率_val"), "frc": h.get("複勝回収値"),
-                        "tra": h.get("単勝適正回収値")}, h.get("odds_mode") or "normal")
+        cat = hit_category(h)
         if cat:
             buckets[cat].append(h)
 
@@ -686,11 +691,11 @@ HITS_BODY = """
 {% for c in order %}
 <div class="card cat-{{ c }}"><h1>{{ CATEGORY_LABELS[c] }}（{{ buckets[c]|length }}）</h1>
 <div class="muted">{% for line in desc[c] %}• {{ line }}<br>{% endfor %}</div>
-{% if buckets[c]|length > limit %}<div class="warn">先頭 {{ limit }} 行だけ表示しています（全 {{ buckets[c]|length }} 行。全件は <a href="{{ url_for('entries_wedge_csv', table=table, rid=rid, odds_mode='all') }}">WEDGE 一覧の CSV</a>）</div>{% endif %}
+{% if view[c]|length < buckets[c]|length %}<div class="warn">{{ view[c]|length }} 行だけ表示しています（全 {{ buckets[c]|length }} 行。馬・オッズ帯ごとに同じ行数まで）。全件は <a href="{{ url_for('entries_wedge_csv', table=table, rid=rid, odds_mode='all') }}">WEDGE 一覧の CSV</a>（「区分」列で絞れます）</div>{% endif %}
 <table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
 <th>件数</th><th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>勝率</th><th>連対率</th><th>複勝率</th>
 <th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th></tr></thead><tbody>
-{% for h in buckets[c][:limit] %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
+{% for h in view[c] %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
 <td>{{ h['base'] }}</td><td>{{ family_label(h['family'], h['rank_scheme']) }}</td><td>{{ odds_label(h['odds_mode']) }}</td><td>{{ h['region'] }}</td><td>{{ h['key'] }}</td>
 <td class="num">{{ h['件数'] }}</td>{% for k in ['勝率_val','連対率_val','複勝率_val','掲示板率_val'] %}<td class="num">{{ fmt(h[k]) }}</td>{% endfor %}
 <td>{{ h['勝率'] }}</td><td>{{ h['連対率'] }}</td><td>{{ h['複勝率'] }}</td>
@@ -699,7 +704,27 @@ HITS_BODY = """
 {% endfor %}
 """
 HITS_ORDER = ("abs", "axis", "keshi", "opp")
-HITS_VIEW_LIMIT = 500        # 区分ごとに画面に出す行数（全件は /entries/wedge.csv。馬ごとの該当数は全件で数える）
+HITS_VIEW_LIMIT = 500        # 区分ごとに画面に出すおよその行数（全件は /entries/wedge.csv。馬ごとの該当数は全件で数える）
+
+
+def spread_cap(rows: list[dict], limit: int) -> list[dict]:
+    """表示を limit 行ほどに絞る。先頭から切ると後ろの馬・オッズ帯が丸ごと消えるので、
+    (馬番, オッズ帯) ごとに同じ行数まで（並びは元のまま）。"""
+    if len(rows) <= limit:
+        return rows
+    groups: dict[tuple, int] = {}
+    for h in rows:
+        g = (h.get("馬番"), h.get("odds_mode"))
+        groups[g] = groups.get(g, 0) + 1
+    per = max(1, -(-limit // len(groups)))
+    used: dict[tuple, int] = {}
+    out = []
+    for h in rows:
+        g = (h.get("馬番"), h.get("odds_mode"))
+        if used.get(g, 0) < per:
+            used[g] = used.get(g, 0) + 1
+            out.append(h)
+    return out
 
 
 @app.route("/entries/hits", methods=["GET"])
@@ -726,7 +751,8 @@ def entries_hits():
     head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}'
     sub = f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")} / {h.get("クラス名_raw", "")} / {len(race)}頭'
     return render("条件ヒット馬", HITS_BODY, head=head, sub=sub, path=path, buckets=buckets,
-                  order=HITS_ORDER, desc=description_lines(), summary=summary, table=table, limit=HITS_VIEW_LIMIT,
+                  order=HITS_ORDER, desc=description_lines(), summary=summary, table=table,
+                  view={c: spread_cap(buckets[c], HITS_VIEW_LIMIT) for c in HITS_ORDER},
                   rid=h.get("レースID(新/馬番無)", rid))
 
 
@@ -734,7 +760,7 @@ def entries_hits():
 WEDGE_SORTS = ("adjusted_WEDGE", "WEDGE", "WIN", "EDGE", "件数", "adjusted_WEDGE_件数", "馬番")
 WEDGE_VIEW_LIMIT = 3000        # 画面に出す行数の上限（CSV ダウンロードは全行）
 WEDGE_QUERY_KEYS = ("table", "rid", "ridn", "date", "odds_mode", "ind", "family", "uma", "sort", "dir")
-WEDGE_CSV_COLUMNS = ("馬番", "枠番", "馬名", "騎手", "base", "family", "rank_scheme", "odds_mode", "region", "key",
+WEDGE_CSV_COLUMNS = ("馬番", "枠番", "馬名", "騎手", "区分", "base", "family", "rank_scheme", "odds_mode", "region", "key",
                      "テーブル名", "件数", "WIN", "EDGE", "WEDGE", "adjusted_WEDGE", "adjusted_WEDGE_年数",
                      "adjusted_WEDGE_件数", "adjusted_WEDGE_最終年", "勝率_val", "連対率_val", "複勝率_val",
                      "掲示板率_val", "平均着順", "単勝回収値", "複勝回収値", "単勝適正回収値")
@@ -945,6 +971,7 @@ def entries_wedge_csv():
     w = csv.writer(buf, lineterminator="\r\n")
     w.writerow(WEDGE_CSV_COLUMNS)
     for h in rows:
+        h = {**h, "区分": CATEGORY_LABELS.get(hit_category(h), "")}      # 条件ヒット馬と同じ判定（該当なしは空）
         w.writerow(["" if h.get(c) is None else h.get(c) for c in WEDGE_CSV_COLUMNS])
     rid = (race[0].get("レースID(新/馬番無)") if race else "") or p["rid"] or "race"
     name = re.sub(r"[^0-9A-Za-z_-]", "_", str(rid))

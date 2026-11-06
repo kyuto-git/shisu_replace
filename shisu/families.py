@@ -82,6 +82,15 @@ class Family:
 
     @staticmethod
     def from_dict(d: Mapping) -> "Family":
+        if not isinstance(d, Mapping):
+            raise ValueError(f"family の定義は {{\"name\", \"parts\", \"tail\"}} の形のオブジェクト: {d!r}")
+        for k in ("parts", "schemes"):
+            v = d.get(k)
+            if v is not None and (not isinstance(v, (list, tuple)) or not all(isinstance(x, str) for x in v)):
+                raise ValueError(f"family {d.get('name')!r}: {k} は文字列のリスト: {v!r}")
+        for k in ("name", "tail", "label", "layer"):
+            if d.get(k) is not None and not isinstance(d.get(k), str):
+                raise ValueError(f"family {d.get('name')!r}: {k} は文字列: {d.get(k)!r}")
         parts = tuple(d.get("parts") or ())
         only = tuple(d.get("schemes") or ())
         f = Family(str(d.get("name", "")), parts, str(d.get("tail", "")), str(d.get("label", "")),

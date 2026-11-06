@@ -398,11 +398,82 @@ def test_hits_page_caps_rows_per_category(mini, monkeypatch):
     big = [k for k, v in buckets.items() if len(v) > 2]
     assert big, "合成データで2行を超える区分が要る"
     page = c.get("/entries/hits", query_string={"table": "entries_merged_hensachi", "rid": rid}).get_data(as_text=True)
-    assert "先頭 2 行だけ表示しています" in page
+    assert "行だけ表示しています" in page and "馬・オッズ帯ごとに同じ行数まで" in page
     body = page.split("馬ごとの該当数", 1)[1]
     for k in big:                                         # 見出しの件数は全件のまま
         assert f"（{len(buckets[k])}）" in body
+    # 全件の CSV には「区分」の列がある（条件ヒット馬と同じ判定）
+    import csv as _csv
+    import io
+    r = c.get("/entries/wedge.csv", query_string={"table": "entries_merged_hensachi", "rid": rid, "odds_mode": "all"})
+    rows = list(_csv.DictReader(io.StringIO(r.data.decode("utf-8-sig"))))
+    from shisu.classify import CATEGORY_LABELS
+    got = {}
+    for row in rows:
+        got[row["区分"]] = got.get(row["区分"], 0) + 1
+    for k, v in buckets.items():
+        assert got.get(CATEGORY_LABELS[k], 0) == len(v)
     F.reset()
+
+
+def test_spread_cap_keeps_every_horse_and_odds_band():
+    """表示の上限は、先頭から切らずに (馬番, オッズ帯) ごとに同じ行数まで（後ろの馬・オッズ帯が丸ごと消えない）。"""
+    import app
+    rows = [{"馬番": str(u), "odds_mode": m, "i": i} for m in ("normal", "odds10u") for u in range(1, 6) for i in range(20)]
+    out = app.spread_cap(rows, 30)
+    assert {(h["馬番"], h["odds_mode"]) for h in out} == {(h["馬番"], h["odds_mode"]) for h in rows}
+    assert len(out) == 30 and out == [h for h in rows if h in out]            # 並びは元のまま
+    assert app.spread_cap(rows[:10], 30) == rows[:10]
+
+
+def test_malformed_family_entries_are_value_errors(tmp_path, monkeypatch):
+    for bad in (["normal"], [{"name": "X_a", "parts": 5, "tail": "RBAND"}], [{"name": 3, "parts": ["騎手"], "tail": "RBAND"}],
+                [{"name": "X_a", "parts": ["騎手"], "tail": "RBAND", "schemes": "s1"}]):
+        p = tmp_path / "bad.json"
+        p.write_text(json.dumps({"families": bad}, ensure_ascii=False), encoding="utf-8")
+        with pytest.raises(ValueError):
+            F.load_families(p)
+    p.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError):
+        F.load_families(p)
+    import build_db
+    agg = tmp_path / "agg"
+    agg.mkdir()
+    (agg / "families.json").write_text(json.dumps({"families": ["normal"]}), encoding="utf-8")
+    assert build_db.main(["--mode", "foragg", "--agg-dir", str(agg), "--db-path", str(tmp_path / "x.db")]) == 2
+    F.reset()
+
+
+def test_format_b_needs_rank_column(tmp_path):
+    """形式B（StridePlus）は 旧ID, 指数値, 順位 の3列。順位の無いファイルは使わない（向き・順位が狂うため）。"""
+    from shisu import ext_indices
+    sp = tmp_path / "StridePlus"
+    sp.mkdir()
+    (sp / "sav_2026.csv").write_text("0520380101,54\n0520380102,56\n", encoding="utf-8")
+    (sp / "st_2026.csv").write_text("0520380101,54,2\n0520380102,56,1\n", encoding="utf-8")
+    sources, skipped = ext_indices.discover(tmp_path, log=lambda m: None)
+    assert "ST指数" in sources and "SAV" not in sources
+    assert any("3列目" in why for _p, why in skipped)
+
+
+def test_absent_horses_ranked_last_only_in_races_with_file_ranks(tmp_path):
+    """ファイルに1頭も無いレースの馬は（全頭 0 でレースごと使われないので）順位を付けない。"""
+    import replace_csv_ver3 as r
+    a = _race([str(200 - i) for i in range(12)], [str(i) for i in range(1, 13)], [str(i) for i in range(1, 13)])
+    b = _race([str(200 - i) for i in range(12)], [str(i) for i in range(1, 13)], [str(i) for i in range(1, 13)],
+              rid="2026102404040305")
+    df = pd.concat([a, b], ignore_index=True)
+    synth.write_cp932(df, tmp_path / "csv" / "新潟_タイムM.csv")
+    sp = tmp_path / "ext" / "StridePlus"
+    sp.mkdir(parents=True)
+    from shisu.ext_indices import old_id_from_new
+    lines = [f"{old_id_from_new(rid)},{60 - i},{i + 1}" for i, rid in enumerate(a["レースID(新)"])]
+    (sp / "sav_2026.csv").write_text("\n".join(lines), encoding="utf-8")
+    assert r.main(["--csv-dir", str(tmp_path / "csv"), "--ext-dir", str(tmp_path / "ext"),
+                   "--master-dir", str(tmp_path / "m")]) == 0
+    m = pd.read_csv(tmp_path / "m" / "master_新潟_SAV.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
+    gone = m[m["レースID(新/馬番無)"] == "2026102404040305"]
+    assert (gone["指数有効"] == "0").all() and (gone["順位"] == "").all()
 
 
 def test_build_db_missing_families_file_is_reported_before_fresh(tmp_path, monkeypatch):

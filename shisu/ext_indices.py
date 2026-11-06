@@ -362,7 +362,10 @@ def _content_reason(path: Path, pattern: str) -> str | None:
             return None if n_cells <= 2 else f"見出しが2列でない（{_short(','.join(first))}）"
         return f"1列目が{_PATTERN_LABEL[pattern]}でない（{_short(first[0])}）"
     check = {"B": normalize_old_id, "C": lambda v: _digits(v, 12), "D": normalize_old_race_id}[pattern]
-    if any(check(r[0]) for r in rows):
+    valid = [r for r in rows if check(r[0])]
+    if valid and pattern == "B" and not any(len(r) > 2 and r[2].strip() for r in valid):
+        return "3列目（順位）が無い（形式B は 旧ID, 指数値, 順位 の3列）"
+    if valid:
         return None
     return f"1列目が{_PATTERN_LABEL[pattern]}でない（{_short(first[0])}）"
 
