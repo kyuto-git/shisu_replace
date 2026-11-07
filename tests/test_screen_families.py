@@ -177,9 +177,13 @@ def test_expanded_candidates_keep_history_entry_parity():
     from shisu.conditions import BANDED_CONDITIONS, CONDITION_COLUMNS
     rng = random.Random(4)
     rows = []
+    from shisu.course import inner_values
     for _ in range(60):
-        r = {"場所": rng.choice(["東京", "京都"]), "芝・ダ": rng.choice(["芝", "ダ"]), "距離": rng.choice(["1600", "16-18"]),
-             "芝(内・外)": rng.choice(["", "内", "外"]), "重量種別": "定量", "クラス名": rng.choice(["1・2_勝", "G1"]),
+        place, sd, raw = rng.choice(["東京", "京都", "阪神"]), rng.choice(["芝", "ダ"]), rng.choice(["1600", "2000"])
+        # 芝(内・外) は実際にありうる値だけ（ダート・内外の区別の無い芝は空。京都の芝は出馬表でも分かる）
+        inner = "" if sd != "芝" else (rng.choice(["内", "外"]) if place == "京都" else (inner_values(place, sd, raw) or [""])[0])
+        r = {"場所": place, "芝・ダ": sd, "距離": rng.choice(["1600", "16-18"]), "距離_raw": raw,
+             "芝(内・外)": inner, "重量種別": "定量", "クラス名": rng.choice(["1・2_勝", "G1"]),
              "枠番グループ": rng.choice(["内枠", "外枠"]), "騎手": rng.choice(["A", "B"]),
              "順位": str(rng.randint(1, 16)), "偏差値帯": rng.choice(["71以上", "51~60"])}
         for c in CONDITION_COLUMNS:
@@ -195,7 +199,8 @@ def test_expanded_candidates_keep_history_entry_parity():
         for sc in fam.schemes:
             keys = F.build_keys(df, fam, sc)
             for i, k in zip(keys.index, keys):
-                assert k in F.entry_keys({**recs[i], "芝(内・外)": ""}, fam, sc), (fam.name, k)     # 内外が分からない
+                if recs[i]["場所"] != "京都":                                             # 出馬表で内外が分からない
+                    assert k in F.entry_keys({**recs[i], "芝(内・外)": ""}, fam, sc), (fam.name, k)
                 assert k in F.entry_keys(recs[i], fam, sc), (fam.name, k)
                 n += 1
     assert n > 1000
