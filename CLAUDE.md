@@ -1,11 +1,11 @@
 # CLAUDE.md — shisu_replace（競馬 外部指数の集計・照合システム）
 
-最終更新: 2026-11-06（過去データの取得を ★6タブの基本CSV＋ext_indices に変更・順位帯の新8区分・22条件・family の台帳（初期49種／selected_families.json で置き換え）・screen_families.py を反映。それ以前の変更は §11）
+最終更新: 2026-11-07（出馬表への ext_indices の自動結合・/ingest の出力を ext_indices へコピー・raw_csv/ の過去基本CSVの統合・単独の部品 場所/距離/芝(内・外)・screen_families の候補の拡大（骨格・因果トリオ・冗長の除外・複勝スプレッド）を反映。それ以前の変更は §11）
 
 ## この文書の扱い
 
 - **コードが正**。この文書はコードに合わせて更新する。`README_RECAP.md` は要約、`Readme.txt` は TARGET 操作を含む運用メモ。
-- 本番データ（`csv_files/` `ext_indices/` `agg_csv/` `master_csv/` `replace_csv/` `racing.db` `selected_families.json` `screening_report.csv` など）は `.gitignore` で除外。
+- 本番データ（`csv_files/` `raw_csv/` `ext_indices/` `agg_csv/` `master_csv/` `replace_csv/` `racing.db` `selected_families.json` `screening_report.csv` など）は `.gitignore` で除外。
   リポジトリにあるデータは出馬表側サンプル2本（`entries_in/shisu_20260531_1.csv`（入力）／`entries_out/entries_merged_hensachi.csv`（旧版の統合出力））と、`shisu/data/` のマスタ3本（コース属性・輸送距離・クワドラント）だけ。
   ★6タブの過去レースCSV（`202610.csv`）と出馬表（`test.csv`）のサンプルは 2026-11-06 に受け取って列の仕様を確認した（リポジトリには入れていない）。外部指数CSV（ext_indices/）の実ファイルは未確認で、形式は依頼文の仕様と実データ例から組んだ（§4.2）。
 - **キー（結合データ）に関わる処理は `shisu/` パッケージだけで変更する**。過去側と出馬表側が同じ関数を通ることで一致を保証している（部品の値は `shisu/conditions.py`・`shisu/normalize.py`、キーの組み立ては `shisu/families.py`）。
@@ -18,7 +18,9 @@ TARGET frontier JV で出力した過去レースCSVに外部指数を付け、�
 当日の出馬表CSVの各馬について同じ規則でキーを組み立てて成績表と突き合わせ、Flask UI で「絶対軸／軸候補／消し候補／相手候補」や WEDGE を表示する。
 
 - **過去データの取得（2026-11-06〜）**: TARGET からは地域ごとに ★6タブの**基本CSV 2種（タイムM 入り・対戦M 入り。単勝配当・複勝配当つき）**だけを出す。ほかの外部指数は `ext_indices/` に置いた外部指数CSV群を Python 側で レースID(新)・レースID(旧) で各馬に結び付ける（§3.1・§4.2）。従来の `csv_files/{地域}_{指数名}.csv`（★8タブで1指数ずつ出したもの）も読める
-- **キーの型 = family**: 部品（コース・重量種別・クラス名・枠番グループ・騎手・芝・ダ と 22条件）＋末尾の指数の部品（指数順位 / 指数順位帯 s1・s2 / 偏差値帯）。初期セットは 49 の型（83 family・スキーム込み 129 通り。§5.3）。`screen_families.py` で全掛け合わせ候補を採点して選んだ `selected_families.json` があれば、初期セットの代わりにそれを使う（集計・DB・照合・画面）
+- **追加分の過去データ（2026-11-07〜）**: 半年〜1年ごとに出した基本CSVは `raw_csv/` に置く（または `/ingest` からアップロード）。replace が `csv_files/全場_タイムM.csv`・`全場_対戦M.csv` に統合してから master を作る（重複は後のファイル優先・最大10年分。§3.9）
+- **出馬表（2026-11-07〜）**: `entries_in/` にはマイニング値だけの出馬表CSV 1本を置けばよい。calc_entry_hensachi が ext_indices の外部指数を過去側と同じ関数で各馬に付けてから偏差値・順位を計算する（§3.3）。`/ingest` の TARGET 取込用CSVは既定で ext_indices/ にもコピーされる（§3.6）
+- **キーの型 = family**: 部品（コース・重量種別・クラス名・枠番グループ・騎手・芝・ダ・場所・距離・芝(内・外) と 22条件）＋末尾の指数の部品（指数順位 / 指数順位帯 s1・s2 / 偏差値帯）。初期セットは 49 の型（83 family・スキーム込み 129 通り。§5.3）。`screen_families.py` で全掛け合わせ候補を採点して選んだ `selected_families.json` があれば、初期セットの代わりにそれを使う（集計・DB・照合・画面）
 - 順位帯（指数順位・前走着順・前走人気・前走上がり3F順で共通）は **s1 = 1 / 2~3 / 4~5 / 6~9 / 10~（排他）、s2 = 1~3 / 1~5 / 6~（重なりあり。2位は 1~3 と 1~5 の両方）**
 - 合成指標 WEDGE（決定力 WIN ＋ 市場の期待を超える力 EDGE）とその年度加重 adjusted_WEDGE（§6.2）
 - 外部指数の取得（Ω・吉馬6・かよちん・keibaAI のスクレイピング、ラップ6指数、安井サロン Excel）は `shisu/ingest/`・`shisu/yasui_extractor.py`。画面 `/ingest`（または `ingest.py`）で TARGET 取込用（＝ ext_indices の形式A）の日付別CSVを作る（§3.6・§3.7）
@@ -42,6 +44,7 @@ shisu_replace/
 ├─ ingest.py                  [D] 外部指数の取得 CLI（画面版は /ingest）
 ├─ tests/                     pytest（合成データで全段を通す）
 ├─ csv_files/   入力: 過去レース（TARGET）       ├─ entries_in/   入力: 出馬表（TARGET）
+├─ raw_csv/     入力: 追加分の過去基本CSV（replace が csv_files/全場_*.csv に統合。済んだものは raw_csv/merged_done/ へ。§3.9）
 ├─ ext_indices/ 入力: 外部指数CSV群（§4.2）       ├─ entries_out/  偏差値付き出馬表
 ├─ master_csv/  1頭1行（.csv.gz。集計・選抜の入力）＋ __inner_outer__.csv.gz（前走の内外を引く表）
 ├─ agg_csv/     成績表（1行=1結合データ）＋ families.json（集計に使った family）
@@ -59,12 +62,14 @@ shisu_replace/
 - **外部指数**: `ext_indices/` の下にフォルダ・ファイル名で指数が分かる形で置く（§4.2。`/ingest` の出力の TARGET 取込用CSV（形式A）はそのまま置ける）
 - **従来の形**: `csv_files/{地域}_{指数名}.csv`（★8タブで1指数ずつ出したもの）も読める。同じ地域×指数が ext_indices にもあれば csv_files の方を使う
 - **ファイル名の指数名で処理が切り替わる**（符号反転・ZI 特例・新馬除外）。指数名は `shisu/indicators.py` の台帳で正式名に変換される。**廃止した指数**（カツラキ・HPRTV5C・成績ST指数・結果分析スピード指数（一隊）・33rap・上がり1F・上がり2F）は csv_files にあっても ext_indices にあっても読まない
-- **出馬表**: TARGET 出馬表分析 ★4タブ → 外部指数1〜4＋マイニング読込 → 全選択 → CSV → `entries_in/shisu_YYYYMMDD_N.csv`（22条件に使う列: 所属・間隔・休明戦目・斤量・性・前場所・前芝ダ・前距離・前走開催・前着順・前人気・前3F順・前脚質・前レース印3・前斤量。`test.csv` の形）
+- **追加分の過去データ**: 同じ ★6タブで追加の期間を出し、名前に「タイム」「マイニング」（タイムM）か「対戦」（対戦M）を入れて `raw_csv/` に置く。replace が `csv_files/全場_{種類}.csv` に統合する（§3.9）
+- **出馬表**: TARGET 出馬表分析 ★4タブ → マイニング読込（外部指数1〜4 は読み込まなくてよい。読み込んだ指数は出馬表の値が使われる）→ 全選択 → CSV → `entries_in/shisu_YYYYMMDD_N.csv`（22条件に使う列: 所属・間隔・休明戦目・斤量・性・前場所・前芝ダ・前距離・前走開催・前着順・前人気・前3F順・前脚質・前レース印3・前斤量。`test.csv` の形）。ほかの外部指数は ext_indices から付く（§3.3）
 
 ### 1.3 データの流れ
 
 ```
 [A] 過去レース
+raw_csv/*.csv（追加分の基本CSV） ─ replace の最初に統合 ─> csv_files/全場_タイムM.csv・全場_対戦M.csv（§3.9）
 csv_files/{地域}_タイムM.csv・{地域}_対戦M.csv（基本CSV） ＋ ext_indices/（外部指数CSV群）
 csv_files/{地域}_{指数名}.csv（従来の形）
   └─ replace_csv_ver3.py ─┬─> master_csv/master_{地域}_{指数名}.csv.gz   1頭1行（キーの部品・22条件・偏差値・順位・成績）
@@ -78,7 +83,7 @@ csv_files/{地域}_{指数名}.csv（従来の形）
         __tables_meta__, __facets__, __families__（family の定義。照合・画面はこれを使う）
 
 [B] 出馬表
-entries_in/*.csv
+entries_in/*.csv（マイニング値だけの出馬表1本でよい） ＋ ext_indices/（過去側と同じ外部指数CSV群）
   └─ calc_entry_hensachi.py ─> entries_out/{元名}_hensachi.csv / entries_merged_hensachi.csv（--merge-*）
   └─ build_db.py --mode entries|both（unified_all が必要）
         entries_{元名}（キー部品と22条件を正規化）, entries_all, entries_xjoin_{元名}（照合結果。__families__ の family で照合）
@@ -90,14 +95,14 @@ entries_in/*.csv
   /entries/key   結合データの前方一致で unified_all を表示
   /entries/hits  条件ヒット馬（xjoin があれば読む。無ければ同じ関数でその場照合）
   /entries/wedge レース別 WEDGE 一覧（全馬 × 該当する全キー。CSV ダウンロード /entries/wedge.csv）
-  /ingest        外部指数の取得（[D]）
+  /ingest        外部指数の取得（[D]）・raw_csv の統合（§3.9）
 
 [D] 外部指数の取得（ingest.py / /ingest）
 ベースCSV（TARGET: レースID(新), 日付S, 枠番, 馬番, ワーク1）
   └─ ①Ω ②吉馬6 ③かよちん ④keibaAI（スクレイピング。⑤一隊は廃止）
 ラップCSV ─ ⑥ラップ6指数（手元で計算）／ 安井 Excel ─ 安井8指数
   ─> ingest_out/{実行日時}/{取得元}/{YYYYMMDD}_{名前}.csv（TARGET 取込用2列 = ext_indices の形式A）, *_merged.csv
-     （過去分は ext_indices/ に置けば [A] がそのまま結び付ける。出馬表には TARGET で読み込むか、安井は entries_in/ に置く）
+  ─> ext_indices/{OMEGA,kichiuma,kayochin,keibaAI,yasui}/…（TARGET 取込用CSVのコピー。既定でコピーする。[A]・[B] がそのまま結び付ける）
 ```
 
 ### 1.4 実行コマンド（Docker。イメージ名 `csv_processor_shisu`）
@@ -114,17 +119,17 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 # 外部指数の取得（画面なら http://localhost:8000/ingest）
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources omega,kichiuma,kayochin
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources keibaai --keibaai-start 18952 --keibaai-end 18987
-docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources lap,yasui --yasui-to-entries
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources lap,yasui
 ```
 
 ### 1.5 再実行ルール
 
 | 変えたもの | 再実行 |
 |---|---|
-| csv_files・ext_indices（過去データ）・キーの部品の規則（`shisu/` の normalize・conditions・course・data/） | replace → （screen）→ aggregate → build_db --mode both |
+| csv_files・raw_csv・ext_indices（過去データ）・キーの部品の規則（`shisu/` の normalize・conditions・course・data/） | replace → （screen）→ aggregate → build_db --mode both |
 | 使う family（selected_families.json を作り直した・消した） | aggregate --clean → build_db --fresh（master はそのまま使える） |
 | 集計の条件（推定方法・MIN_SAMPLE・オッズ帯の定義・WEDGE の年の最低件数・遡る年数・減衰率・窓など） | aggregate → build_db --mode both |
-| 出馬表 | calc_entry_hensachi --merge-only --clean → build_db --mode entries --prune |
+| 出馬表・ext_indices（出馬表の日の外部指数） | calc_entry_hensachi --merge-only --clean → build_db --mode entries --prune |
 | 画面（app.py・`shisu/classify.py`） | app の再起動だけ |
 
 - `build_db --mode foragg` だけ回すと xjoin（照合結果）が古いまま残るので、警告が出る。続けて `--mode entries` を回す。
@@ -138,14 +143,15 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 
 | モジュール | 役割 |
 |---|---|
-| `config.py` | パス。ルートは `SHISU_BASE_DIR`（既定はリポジトリ直下）、DB は `DB_PATH`（既定 `racing.db`）、外部指数は `SHISU_EXT_DIR`（既定 `ext_indices/`）、family の選抜結果は `SHISU_FAMILIES_FILE`（既定 `selected_families.json`） |
+| `config.py` | パス。ルートは `SHISU_BASE_DIR`（既定はリポジトリ直下）、DB は `DB_PATH`（既定 `racing.db`）、外部指数は `SHISU_EXT_DIR`（既定 `ext_indices/`）、family の選抜結果は `SHISU_FAMILIES_FILE`（既定 `selected_families.json`）、追加分の過去基本CSVは `raw_dir()`（`raw_csv/`） |
 | `csvio.py` | `norm_text`（NFKC・空白除去・欠損表記→""）、CSV 読み書き（読込 cp932→utf-8-sig→utf-8、**書出し cp932**） |
 | `normalize.py` | クラス名・重量種別・距離レンジ・枠番グループ・芝(内・外)・レースID/日付（`horse_race_id`）、`split_surface_distance`（距離「ダ1200」→ 芝・ダ と 距離） |
 | `indicators.py` | 指数の台帳（正式名・別名・符号反転・ZI 特例・新馬除外・0=欠損）、廃止した指数（`DISCONTINUED`・`is_discontinued`）、ファイル名から地域/指数名の取り出し |
-| `ext_indices.py` | ext_indices/ の外部指数CSVを見つけて読み（形式A〜D）、ベースCSVの各馬に値（と順位）を付ける（§4.2） |
+| `ext_indices.py` | ext_indices/ の外部指数CSVを見つけて読み（形式A〜D）、ベースCSVの各馬に値（と順位）を付ける（§4.2）。`attach_filled` は過去側（replace）と出馬表側（calc_entry_hensachi）で共通の付け方（ファイルに無い馬は 0・順位の扱い・`absent`） |
+| `raw_merge.py` | raw_csv/ の追加分の基本CSVを `csv_files/全場_タイムM.csv`・`全場_対戦M.csv` に統合する（§3.9） |
 | `course.py` | `data/` のマスタ（コース属性・輸送距離）を引く。コースの属性・輸送距離・距離帯・左右・坂 |
 | `conditions.py` | 22条件の導出。過去側（★6タブ）と出馬表側の列名の違いを `standardize_history` / `standardize_entries` で吸収し、同じ `derive()` を通す（§5.2） |
-| `families.py` | family の定義・台帳（初期セット・selected_families.json・DB の `__families__`）・キーの組み立て（過去側のベクトル版 `build_keys` と出馬表側の候補 `entry_keys` / `entry_key_candidates`） |
+| `families.py` | family の定義・台帳（初期セット・selected_families.json・DB の `__families__`）・部品（`PART_TOKENS`。COURSE と単独の 場所・距離・芝(内・外) を含む）・キーの組み立て（過去側のベクトル版 `build_keys` と出馬表側の候補 `entry_keys` / `entry_key_candidates`） |
 | `keys.py` | キーの窓口（families.py の再エクスポートと `all_families()`・`is_band_family()` など） |
 | `hensachi.py` | レース内の偏差値・順位・偏差値帯、順位帯（新8区分。`band_labels`。前走着順・前走人気・前走上がり3F順と共通） |
 | `odds.py` | オッズ4区分（normal / odds10u / odds10_50 / odds50p） |
@@ -163,16 +169,17 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 
 ### 3.1 replace_csv_ver3.py（過去レース → master）
 
+0. `raw_csv/` の直下に未統合の CSV があれば、最初に `shisu.raw_merge.merge_raw` で `csv_files/全場_タイムM.csv`・`全場_対戦M.csv` に統合し、済んだファイルを `raw_csv/merged_done/` に移す（§3.9。`--no-raw-merge` でしない、`--raw-dir` で場所を変える）
 1. 入力の決め方（`plan_jobs`）: `csv_files/*.csv` をファイル名で 地域×指数 に分ける。廃止した指数は飛ばす。地域ごとの**基本CSV**（`タイムM` を優先、無ければ `対戦M`）を決め、`ext_indices/` で見つかった各指数（§4.2）を基本CSVに結び付けて「{地域}_{指数名}」の入力として処理する。**同じ地域×指数が csv_files にあれば csv_files を使い**、ext は使わない（ログに出す）。`--no-ext` で ext_indices を見ない。基本CSVが無いのに ext_indices があれば警告
 2. `normalize_history`: 列名ゆれ（芝ダ/芝・ダ、芝(内外)/芝(内・外)、頭/頭数、馬名S など）を吸収し、キー部品を `shisu.normalize` で正規化
    - `芝・ダ` 列が無い・空で `距離` が「ダ1200」「芝2000」「障3000」なら分ける（`split_surface_distance`）
    - `レースID(新)` がレース単位（16桁）なら 馬番2桁 を付けて18桁にする。日付は レースID(新) の先頭8桁（無ければ 日付S）
    - **障害レース**（芝・ダ が「障」、または トラックコード(JV) が51以上）は除く（ログに行数）
-3. ext の指数（`process_ext`）: 基本CSVの全馬に `shisu.ext_indices.attach` で値を付けて 指数 列にする。形式B（StridePlus）・C（Gold）はファイルの順位を 指数順位 にし（ファイルに無い馬はレースの最下位・同順位。TARGET と同じ）、A・D は値から順位を計算する（基本CSVの タイムM の順位は使わない）。**ファイルに値の無い馬は 0**（TARGET は外部指数を取り込んでいない馬を 0 で出すので、出馬表側・従来の ★8 の過去CSVと同じ数え方。0 を欠損とする指数（安井のランク・5ステータス）は欠損に戻る）。ログに「外部指数が付いた馬 x/y」（0 で埋める前の数）
+3. ext の指数（`process_ext`）: 基本CSVの全馬に `shisu.ext_indices.attach_filled`（出馬表側と共通）で値を付けて 指数 列にする。形式B（StridePlus）・C（Gold）はファイルの順位を 指数順位 にし（ファイルに無い馬はレースの最下位・同順位。TARGET と同じ）、A・D は値から順位を計算する（基本CSVの タイムM の順位は使わない）。**ファイルに値の無い馬は 0**（TARGET は外部指数を取り込んでいない馬を 0 で出すので、出馬表側・従来の ★8 の過去CSVと同じ数え方。0 を欠損とする指数（安井のランク・5ステータス）は欠損に戻る）。ログに「外部指数が付いた馬 x/y」（0 で埋める前の数）
 4. `compute_indicator`（§5.5）で偏差値・順位・帯。**取消・除外の馬は計算に入れない**（TARGET は 指数 0・指数順位 0 を出す。入れると 0 が平均を動かす）。TARGET の順位に合わせて偏差値の向きを変えたときはログに出す。22条件（`shisu.conditions`。§5.2）を付ける。前走の内外は、地域ごとの基本CSV（無ければ最初のファイル）の レースID(新)・芝(内・外) から作った表で引く（`__inner_outer__.csv.gz` にも書く）
 5. 頭数10以上（頭数列が無ければ警告して絞らない）の馬を `master_{地域}_{指数名}.csv.gz` に書く。除外レース（欠損2頭以上・全頭同値・有効2頭未満）・新馬除外（ZI・吉馬6種）の馬は `指数有効=0` で残す（集計では使わない）
 - **family ごとの素材ファイルは作らない**（旧版は 20本×入力。今は aggregate が master からその場でキーを作る）
-- オプション: `--clean`（master と processed を空に）, `--workers N`, `--processed`, `--csv-dir`, `--ext-dir`, `--no-ext`, `--master-dir`
+- オプション: `--clean`（master と processed を空に）, `--workers N`, `--processed`, `--csv-dir`, `--ext-dir`, `--no-ext`, `--master-dir`, `--raw-dir`, `--no-raw-merge`
 - 目安: 実サンプル `202610.csv`（3,447行）で 0.6秒
 
 ### 3.2 aggregate_stats_ver2.py（master → 成績表）
@@ -194,6 +201,12 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 
 ### 3.3 calc_entry_hensachi.py（出馬表 → 偏差値付き出馬表）
 
+- **ext_indices の自動結合（2026-11-07〜）**: `entries_in/` にはマイニング値だけの出馬表（`test.csv` の形）1本を置けばよい。ext_indices/ の外部指数（§4.2。形式A〜D）を、過去側と同じ `shisu.ext_indices.attach_filled` で レースID(新)・レースID(旧)（無ければ レースID(新) から作る）を使って各馬に付けてから、偏差値・順位・帯を計算する。同じ馬なら過去側（master）と順位・偏差値・帯が一致する（`tests/test_entries_ext.py`）
+  - 出馬表に**値のある**（0・空欄以外が1頭でもある）指数は、どのファイルでも出馬表の値を使い、ext_indices の同じ指数は使わない（`[INFO] {指数}: 出馬表CSVの値を使います`）
+  - 出馬表に列はあるが 0・空欄だけ（TARGET が読み込んでいない指数を 0 で出したもの）なら、その列を ext の値で上書きし、対応する順位の列（`指数順位N` など）も ext の順位にする（列を消すと ほかの 指数順位N の対応がずれるため）。列が無ければ末尾に `{正式名}`（順位があるなら `{正式名}順位`）を足す
+  - ファイルに値の無い馬は 0・順位の付け方（形式B・C はファイルの順位、ファイルに無い馬は最下位）・0=欠損の指数の扱いは過去側（§3.1 の3）と同じ。ログに「外部指数 {指数} を ext_indices から付けました（値のある馬 a/b）」
+  - レースID(新)・レースID(旧) が無い出馬表には付けられない（`[WARN] 外部指数を結び付けられません`）
+  - `--ext-dir`（既定 `ext_indices/`。`SHISU_EXT_DIR`）、`--no-ext`（結合しない＝従来の動き）。出馬表が複数ファイルでも、同じ ext を各ファイルに付けてから従来どおり横結合する
 - 指数列は台帳で検出し正式名にする（`GoldAirplane→Gold`、`マイニング値→タイムM`、`対戦型マイニング値→対戦M`、`先行力→先行` など）
 - 各指数列の直後に `X_偏差値, X_偏差値帯, X_順位, X_順位帯_s1, X_順位帯_s2` を挿入。計算は過去側と同じ `compute_indicator`。`X_順位帯_s2` は重なる帯を「・」でつないだ表示用（例 `1~3位・1~5位`。キーは帯ごとに作る）
 - 順位は元ファイルの順位列を優先する。対応の付け方: ①明示列（`マイニング順位`・`対戦型マイニング順位`・`{列}順位`）→ ②指数列の**すぐ右**にある `指数順位N`（TARGET の並び）→ ③N 番目の枠（指数を読み込んでいない枠の見出し `指数N` も1枠と数える）→ ④指数が1種類なら無印 `指数順位`。どれも無ければ同値同順位で計算し `[INFO]` を出す
@@ -244,6 +257,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 | yasui 安井 Excel | Excel（＋ベースCSV） | なし | 日付 + 場所コード + R + 馬番（14桁） | §3.7 |
 
 - 出力は各取得元で共通: (a) マージ完全版 `{元ファイル名}_merged.csv`（ベースCSVの全列。ワーク1 は取得値だけ。取れなければ空欄。指数ごとにフォルダを分ける吉馬・安井は `{元ファイル名}_{key}_merged.csv`。旧 kichiuma と同じ名前）、(b) TARGET 取込用 `{YYYYMMDD}_{名前}.csv`（日付S ごとに `レースID(新), ワーク1` の2列・cp932。同じ レースID(新) は値のある行を優先して1行。旧 dedupe_keibaAI.py の処理も含む）
+- **ext_indices へのコピー（2026-11-07〜。既定でする）**: 取得元が成功したら、TARGET 取込用の日付別CSV（`{YYYYMMDD}_{名前}.csv`。`レースID(新)` の見出しで始まるものだけ。`*_merged.csv`・`*_noid.csv`・ベースCSVの無い日の `日付, 場所, …` の形は置かない）を `ext_indices/` の取得元のフォルダに同じ形でコピーする（同じ名前は上書き）: omega → `OMEGA/`、kichiuma → `kichiuma/kichiuma_{key}/`、kayochin → `kayochin/`、keibaai → `keibaAI/`、yasui → `yasui/yasui_{key}/`。§4.2 の振り分けでそのまま見つかるので、replace（過去側）と calc_entry_hensachi（出馬表側）が自動で結び付ける。ラップ6指数は台帳に未登録（§9）なのでコピーしない。画面はチェックボックス「ext_indices/ にも置く」（既定 ON）、CLI は `--no-ext-copy` で止める。コピーしたファイルは `Outputs.ext_files`
 - 値はベースの1行ごとに辞書で引く（DataFrame の merge はしない）。ページに同じ馬が2回出てもベースの行は増えない
 - ⑥ の計算・丸め・列名・ファイル名は旧 process_csv.py と同じ（同梱サンプル 20261017racerap.csv の79ファイルがバイト単位で一致することを確認済み）。違いは、ラップが数として読めない行を空欄にして続けること
 - 旧版からの意図的な違い: かよちんは馬番の行と指数の行のセルを位置で対にする（旧版は空のセルを詰めてから対にしていたので、途中に空欄があると馬番と値がずれた）。ベースCSVの ワーク1 に元から入っていた値は使わない
@@ -255,8 +269,9 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
   - 同じ名前のファイルを複数アップロードしても上書きしない（`lap.csv`, `lap_2.csv`）。ベースCSVのマージ完全版も名前が重なれば `_2` を付けて分ける（大文字・小文字だけ違う `base.csv` と `base.CSV` も別にする）。ラップCSVで同じ レースID(新) の行は最初の1行を使う
   - 入力CSVは cp932 → utf-8-sig → utf-8 の順に読み、必須列（レースID(新)）が見つからなければ BOM なし UTF-8（Mac の Numbers の書き出しなど）として読み直す。空のファイル・CSV として読めないファイル（列数がそろわない等）は警告して飛ばす
   - ジョブはログファイルに書けなくても（フォルダが消えた・容量不足）止まらず、どんな終わり方でも「実行中」のまま残らない
+  - 画面の下に「過去基本CSV（タイムM・対戦M）の統合」（§3.9）: アップロード、または `raw_csv/` に置いたファイルを選んで（既定で全部に印）`POST /ingest/raw_merge` で統合する。結果（既存・追加・重複の置き換え・10年より古い行の削除・残した年）を表示する
   - 別のサイトのページからの POST（Origin が違う・`Sec-Fetch-Site: cross-site`）は 403。Host が `localhost`・IP アドレス・環境変数 `SHISU_ALLOWED_HOSTS`（カンマ区切り）以外なら /ingest 全体を 403（DNS リバインディング対策。Mac のホスト名で開くなら `SHISU_ALLOWED_HOSTS=mymac.local` などを渡す）。ログインは無い（§9）
-- CLI: `python ingest.py --sources omega,kichiuma,…|all [--base …] [--lap …] [--yasui …] [--keibaai-start N --keibaai-end M] [--interval 秒] [--yasui-to-entries] [--out DIR] [--run-id ID]`。入力の既定は `ingest_in/{base,lap,yasui}/` の全ファイル。終了コード: 0 正常 / 1 失敗した取得元あり / 2 入力の不足
+- CLI: `python ingest.py --sources omega,kichiuma,…|all [--base …] [--lap …] [--yasui …] [--keibaai-start N --keibaai-end M] [--interval 秒] [--no-ext-copy] [--out DIR] [--run-id ID]`。入力の既定は `ingest_in/{base,lap,yasui}/` の全ファイル。終了コード: 0 正常 / 1 失敗した取得元あり / 2 入力の不足
 - テストはネットワークに出ない（偽のセッションと、旧スクレイパーの解析コードが前提にしている構造の合成 HTML。keibaAI は旧 Readme に残っていた実ページの断片をまねた）。この開発環境からは各サイトに接続できないため、実ページでの確認は未実施
 
 ### 3.7 安井サロン Excel（`shisu/yasui_extractor.py`。ingest の取得元 yasui）
@@ -274,30 +289,47 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
     - 候補のフォルダにある読めない CSV（列数のそろわない手書きのメモ、名前だけ .csv の Excel など）は、名前を出して警告し、候補から外す（安井の取り出しは止めない）
   - ベースCSVがどこにも無い開催日: `yasui_{key}/{YYYYMMDD}_yasui_{key}.csv` を `日付, 場所, 場所コード, R, 馬番, 馬名, ワーク1` で出し、「TARGET取込用の18桁レースID(新)を付与するにはベースCSVも一緒に指定してください」とログ・ジョブ画面に出す（レースID(新) が無いので TARGET にはそのまま取り込めない。Excel には回・日が無いので18桁は作れない）
   - ベースCSVのある開催日でも、ある場所の行がどこにも無い馬は TARGET 取込用CSVに入らないので、`yasui_{key}/{YYYYMMDD}_yasui_{key}_noid.csv`（上と同じ 日付・場所・R・馬番 の形）に出し、件数と開催日・場所を案内する
-  - `yasui_extract.csv`（全行。照合できた行は レースID(新) 付き）、`entries_in/yasui_{YYYYMMDD}.csv`（出馬表用: `レースID(新), 安井_馬名` と8指数の値。照合できた開催日だけ。`--yasui-to-entries`／画面のチェックで `entries_in/` にも置く）
-  - 出馬表用CSVの行は、ベースCSVのその日の全馬。値の無い馬（Excel に無い・丸数字だけ）は **0** を入れる。過去側は TARGET に取り込んだ値を TARGET が出したもので、TARGET は取り込んでいない馬の外部指数を 0 で出す（同梱の出馬表サンプルで、外部指数の列に空欄は無く、ZI だけ一部の馬が 0・最下位の順位だった）。これに合わせて欠損の数え方をそろえる。ベースには TARGET の出馬表CSV（またはその日のベースCSV）を渡す
+  - `yasui_extract.csv`（全行。照合できた行は レースID(新) 付き）
+  - **出馬表用CSV（`entries_in/yasui_{YYYYMMDD}.csv`）は 2026-11-07 に廃止**（`--yasui-to-entries`・画面のチェックも削除）。TARGET 取込用CSVが ext_indices/yasui/ にコピーされ（§3.6）、calc_entry_hensachi が出馬表の各馬に付ける（§3.3。ファイルに無い馬は 0 で、過去側と同じ数え方）
+  - 警告は2種類に分けて出す: ①「ベースCSVに存在しない開催日 N日（12/06(土) 3頭、…）── 非開催日・シート名の日付の打ち間違いなどの可能性」（その日は 日付・場所… の形で出す）、②「ベースCSVに該当行が無い馬 N頭（11/01(土) 東京 12頭、…）── 別の月のシートの混入・少頭数・ベースCSVの収録期間外などの可能性。TARGET 取込用CSVに入れず `{日付}_yasui_{key}_noid.csv` に分けた」
   - ランク・5ステータスは台帳で `zero_missing`（0 = 欠損。§5.4・§5.5）。過去側で TARGET が 0 を出しても、出馬表側で 0 でも空欄でも、両側で欠損として数え、順位は TARGET の 指数順位 を使わずに値から計算する（TARGET の順位は 0 の馬も数えているため）。値が本当に 0 の馬は4ファイルで 0.1〜0.3%（ランク 9頭）で、これは欠損扱いになる。体力・やる気は約14%が 0 の普通の値なので 0 のまま比べる（Excel に無い馬は両側とも 0。ext_indices から読む過去側も、ファイルに値の無い馬を 0 にする。§3.1）
-  - calc_entry_hensachi で TARGET の出馬表と レースID(新) で横に結合される（`--merge-only`）。順位は8指数とも値から計算する
+  - 出馬表側は ext_indices から付けた値で、順位は8指数とも値から計算する（形式A）
 - 照合できた馬の枠番・馬名（ベースに 馬名 / 馬名S 列があれば）がベースと違えば件数を警告する（シートの日付違いの検出用）
 
 ### 3.8 screen_families.py（family 候補の一括採点と選抜）
 
 DB を作らずにメモリ上で、family の候補を master ごとに**本番と同じ関数**（`build_keys` → `aggregate_frame` → `build_db.prepare_agg_frame` → `classify`）で集計・判定し、master を通して合計する。
 
-- 候補（`--space`）:
-  - `initial`: 初期セット（83 family・129通り）だけ
-  - `default`（既定）: 初期セット ＋ 単一条件×[指数帯] ＋ 2条件ペア×[指数帯] ＋ コース×1条件×[指数帯] ＋ 芝・ダ×距離帯×1条件×[指数帯]（887 family・1,413通り）
-  - `all`: ＋ コース×2条件・芝・ダ×距離帯×2条件（2,235 family・3,582通り）
-  - 条件の候補（POOL）は 重量種別・クラス名・枠番グループ・騎手 と 22条件（左右 は 左右遷移 と重なるので除く）。[指数帯] は 指数順位帯（s1・s2）と 偏差値帯。新しい組み合わせは `X_{部品の略号}`（偏差値帯は末尾 `_hen`）の名前になる
+- 候補（`--space`）= 骨格（舞台）× 条件 × [指数帯]（2026-11-07〜）:
+  - 条件の候補（POOL。28種）は 重量種別・クラス名・枠番グループ・騎手 と 22条件の24列。[指数帯] は 指数順位帯（s1・s2）と 偏差値帯
+  - 骨格: s0 コース不問 / s1 芝・ダ / s2 場所×芝・ダ / s3 芝・ダ×距離 / s4 芝・ダ×距離帯 / s5 場所×芝・ダ×距離帯 / s6 COURSE / s6n COURSE×重量種別×クラス名（normal の舞台）。場所・距離・芝(内・外) は単独の部品（§5.1）
+  - 因果トリオ（s0）: ① 騎手 × ローテ（間隔帯・叩き・斤量帯・斤量増減・距離増減・輸送距離）× 前走（前走着順・前走人気・前走上り3F順・前走脚質・前走R印3・前走クワドラント）、② コースの物理属性 × (前走R印3／前走脚質) × (前走着順／前走上り3F順)、③ 前走人気 × 前走着順 × 今走の条件、④ 枠番グループ × (初角帯／F係数帯) × 前走脚質
+  - `initial`: 初期セット（49の型・83 family・129通り）だけ
+  - `default`（既定）: 初期セット ＋ s0 の単一条件・2条件ペア・因果トリオ ＋ s2〜s6・s6n × 単一条件（633テンプレート → 1,289 family・2,098通り）
+  - `all`: ＋ s1 ×（ペア・トリオ）＋ s2・s3・s4・s6 × ペア ＋ s5 × 主要条件（MAJOR）のペア（2,371テンプレート → 4,635 family・7,557通り）
+  - **冗長の除外**（`redundant()`。同じグループにしかならない組み合わせ）: COURSE とコースの物理属性（R値帯・直線帯・初角帯・CFS帯・F係数帯・今走クワドラント・左右・坂・距離帯）、場所 と 左右・坂、距離 と 距離帯、左右遷移 と 左右。部品の集合が同じ候補（並びだけ違う）は1つにまとめる（初期セットを優先）
+  - 新しい組み合わせは `X_{部品の略号}`（偏差値帯は末尾 `_hen`。場所 `plc`・距離 `dist`・芝(内・外) `io` など）の名前になる
+  - 依頼の目安との差: s2 × 単一条件は 26（左右・坂だけを除くので 28−2）、s2 × ペアは 325（26C2）、s3・s4 × ペアは 350（左右遷移＋左右の1組を除く）
 - `screening_report.csv`（1行 = 候補 × スキーム）:
-  - 基準A: `groups`（件数5以上のグループ数）/ `groups_ge10` / `coverage`（件数10以上のグループに入る馬の割合）/ `adj_groups`（adjusted_WEDGE が付いた数）/ `wedge_top`・`wedge_bottom`・`wedge_spread`、`fuku_top`・`fuku_bottom`・`fuku_spread`（上位帯と下位帯の件数加重平均とその差。上位帯・下位帯 = s1: 1位 / 10位~、s2: 1~3位 / 6位~、偏差値帯: 71以上 / 40以下、指数順位: 1 / 10以上）/ `monotonic`（隣り合う帯で上の帯の平均 WEDGE が高い割合）
+  - 基準A: `groups`（件数5以上のグループ数）/ `groups_ge10` / `coverage`（件数10以上のグループに入る馬の割合）/ `adj_groups`（adjusted_WEDGE が付いた数）/ `wedge_top`・`wedge_bottom`・`wedge_spread`、`adj_wedge_top`・`adj_wedge_bottom`・`adj_wedge_spread`（adjusted_WEDGE が付いたグループだけ）、`fuku_top`・`fuku_bottom`・`fuku_spread`（上位帯と下位帯の件数加重平均とその差。複勝率は頻度の%。上位帯・下位帯 = s1: 1位 / 10位~、s2: 1~3位 / 6位~、偏差値帯: 71以上 / 40以下、指数順位: 1 / 10以上）/ `monotonic`（隣り合う帯で上の帯の平均 WEDGE が高い割合）
   - 基準B: `abs_*`・`axis_*`・`opp_*`・`keshi_*`（オッズ帯4区分ごとと合計 `*_total`）＝ classify で絶対軸・軸候補・相手候補・消し候補になるキーの数（本番の DB を同じ family で作って判定した数と一致することをテストで確認）
   - `select_A`・`select_B`・`selected`・`reason`
-- 選抜（`--export-selected [FILE]`。既定の書き先 `selected_families.json`）: ① 絶対軸＋軸候補のキーが `--min-axis`（既定1）個以上、または ② `groups_ge10 >= --min-groups`（10）かつ `coverage >= --min-coverage`（0.2）かつ `wedge_spread >= --min-spread`（0.10）のうち wedge_spread の大きい順に `--top-a`（30）個。指数順位帯の family は選ばれたスキームだけを持つ（`"schemes": ["s2"]` など）
+- 選抜（`--export-selected [FILE]`。既定の書き先 `selected_families.json`）: ① 絶対軸＋軸候補のキーが `--min-axis`（既定1）個以上、または ② `groups_ge10 >= --min-groups`（10）かつ `coverage >= --min-coverage`（0.2）かつ `fuku_spread >= --min-fuku-spread`（20.0 ＝ 複勝率の差20%ポイント）かつ `wedge_spread >= --min-spread`（0.10）のうち wedge_spread の大きい順に `--top-a`（30）個。値の無い（NaN の）指標は満たさないとみなす。指数順位帯の family は選ばれたスキームだけを持つ（`"schemes": ["s2"]` など）
 - `--indicators`・`--regions` で master を絞る（全角・別名でもファイル名と同じ形にそろえて比べる）。`--workers N` で master を並列に。`--max-candidates` は試し用
 - 採点できない master が1本でもあれば、レポートは書くが選抜（selected_families.json）は書かず終了コード1
-- 目安（検証環境・1プロセス、30万行の master 1本、オッズ帯4区分）: 1通りあたり約2.4秒 → `initial`（129通り）約5分、`default`（1,413通り）約1時間。master が多い（2地域 × 約34指数 = 約68本）と `default` は1プロセスで2日以上かかるので、`--indicators タイムM,対戦M` など代表の指数で選ぶか `--workers` を使う。メモリは1プロセス 0.5GB 前後（30万行）
+- 目安（検証環境・1プロセス、30万行の master 1本、オッズ帯4区分）: 1通りあたり約2.4秒 → `initial`（129通り）約5分、`default`（2,098通り）約1.4時間、`all`（7,557通り）約5時間。master が多い（2地域 × 約34指数 = 約68本）と `default` は1プロセスで4日近くかかるので、`--indicators タイムM,対戦M` など代表の指数で選ぶか `--workers` を使う。メモリは1プロセス 0.5GB 前後（30万行）
 - selected_families.json は family の定義（部品と tail）だけを持ち、指数・地域に依らない。全指数・全地域の集計（aggregate）に使われる
+
+### 3.9 raw_csv/ の統合（`shisu/raw_merge.py`。replace の最初・/ingest の画面）
+
+半年〜1年に1回、TARGET ★6タブで追加分の基本CSVを出したら `raw_csv/` に置く（または `/ingest` 画面からアップロード）。
+
+- 種類はファイル名（NFKC・小文字）で決める: 「対戦」「match」→ 対戦M、「タイム」「time」「マイニング」「mining」→ タイムM（「対戦型マイニング」はマイニングも含むので、対戦を先に見る）。どちらでもないファイルは触らず、名前の付け方を WARN で案内する（raw_csv に残る）
+- 既存の `csv_files/全場_{種類}.csv` と raw_csv のファイル（**更新日時の古い順**、同じなら名前順）を縦につなぎ、`レースID(新)` が同じ行は**後のファイルの行**を使う（追加で出し直したものが優先）。レースID(新) の無い行は残す。列は全ファイルの和（無い列は空）
+- **最大10年分**: 基準年（既定はデータの中の最新年。`merge_raw(ref_year=…)` で指定もできる）の9年前以降を残す。例: 2026年が基準なら 2017〜2026年を残し、2016年以前は消す。年は レースID(新) の先頭4桁（無ければ 日付S）。年の分からない行は残して WARN
+- 書き出しは cp932。統合したファイルは `raw_csv/merged_done/` に移す（同じ名前があれば `_2` などを付ける。次回また統合しない）。読めないファイル・`レースID(新)` 列の無いファイルは WARN を出して raw_csv に残す
+- replace_csv_ver3.py は raw_csv/ の直下に CSV があれば、master を作る前にこれを実行する（`--no-raw-merge` でしない）。統合先は `全場_{種類}.csv` なので、地域を分けた基本CSV（`主５場_タイムM.csv` など）とは別の地域「全場」として集計される
+- 画面（`/ingest` の下の欄）: アップロードは名前のパス部分を除き、.csv で種類の分かる名前だけを `raw_csv/` に保存（同じ名前は `_2`）、選べるのは raw_csv にあるファイルだけ。同時に1件（2件目は 409）、別サイトからの POST は 403
 
 ---
 
@@ -347,7 +379,7 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 | WIN, EDGE, WEDGE, adjusted_WEDGE | 数値（小数4桁）。§6.2。adjusted_WEDGE は条件を満たす年が無ければ空 |
 | adjusted_WEDGE_年数, adjusted_WEDGE_件数, adjusted_WEDGE_最終年 | adjusted_WEDGE に使った年の数・件数の合計・最も新しい年 |
 | 提案勝率〜提案3着率 | 推定%のみ |
-| 場所, 芝・ダ, 距離, 芝(内・外) | グループ内で最初の非空値。**family がその部品で絞っているときだけ**（コースを含む family は4つとも、芝・ダ だけを含む family は 芝・ダ だけ。ほかは空）。画面の場所・芝・ダ・距離の絞り込みは、その部品を持たない family の行を出さない |
+| 場所, 芝・ダ, 距離, 芝(内・外) | グループ内で最初の非空値。**family がその部品で絞っているときだけ**（コースを含む family は4つとも、ほかは parts にある 場所・芝・ダ・距離・芝(内・外) だけ。例: 場所×芝・ダ の family は 場所・芝・ダ。ほかは空）。画面の場所・芝・ダ・距離の絞り込みは、その部品を持たない family の行を出さない |
 
 `agg_csv/families.json`: `{"version": 1, "families": [{"name", "parts", "tail", "label", "layer", "schemes"?}], "source"}`
 
@@ -427,7 +459,9 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 
 キー = family の部品の値を `×` でつないだもの ＋ 末尾の指数の部品。**部品が1つでも空ならキーを作らない**。
 
-- 部品（`shisu/families.py` の `PART_TOKENS`）: `COURSE`（`場所×芝・ダ×距離×[芝(内・外)]`。芝(内・外) は空なら省く）、`重量種別`、`クラス名`、`枠番グループ`、`騎手`、`芝・ダ`、22条件の列（§5.2）
+- 部品（`shisu/families.py` の `PART_TOKENS`）: `COURSE`（`場所×芝・ダ×距離×[芝(内・外)]`。芝(内・外) は空なら省く）、`重量種別`、`クラス名`、`枠番グループ`、`騎手`、`芝・ダ`、単独の `場所`・`距離`（レンジ統合後の値。例 `16-18`）・`芝(内・外)`（2026-11-07〜）、22条件の列（§5.2）
+  - 単独の 芝(内・外) は空なら（ほかの部品と同じく）キーを作らない。出馬表側は値が分かればその値、分からなければ `[内, 外, 内外]` を試す
+  - COURSE と 芝・ダ・場所・距離・芝(内・外) を同じ family に入れると読み込みで弾く（COURSE が含んでいる）
 - 末尾（tail）: `RANK`（指数順位そのもの）/ `RBAND`（指数順位帯。スキーム s1・s2 の2通りの集計表になる）/ `HBAND`（偏差値帯6種）
 - 帯にする条件（前走着順・前走人気・前走上り3F順）は、キーを作るときに帯の名前にする。帯のスキームは family のスキームと同じ。これらを含む family は、末尾が偏差値帯・指数順位でも s1・s2 の2つの集計表になる（`Family.uses_schemes`）
 - s2 は帯が重なるので、1頭から2つ以上のキーができる（指数2位・前走2着なら `…×前走1~3着×1~3位`・`…×前走1~3着×1~5位`・`…×前走1~5着×1~3位`・`…×前走1~5着×1~5位`）。過去側（集計）も出馬表側（照合）も全部作る
@@ -482,7 +516,7 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
   {"families": [{"name": "X_jk_pfin_season", "parts": ["騎手", "前走着順", "時期"], "tail": "RBAND", "schemes": ["s2"]},
                 {"name": "X_crs_mare_hen", "parts": ["COURSE", "牝馬限定"], "tail": "HBAND"}]}
   ```
-  名前は英字で始まる英数字と `_`（61文字まで）。オッズ帯の接頭辞（`odds10u_` など）・`rankband_` で始まる名前、知らない部品・tail・同じ部品の重複、スキームを持たない family の `schemes` は読み込みで弾く。selected_families.json・DB の定義が正（初期セットと同じ名前を別の部品で使えば置き換わる）
+  名前は英字で始まる英数字と `_`（61文字まで）。オッズ帯の接頭辞（`odds10u_` など）・`rankband_` で始まる名前、知らない部品・tail・同じ部品の重複、COURSE と 芝・ダ・場所・距離・芝(内・外) の同居、スキームを持たない family の `schemes` は読み込みで弾く。selected_families.json・DB の定義が正（初期セットと同じ名前を別の部品で使えば置き換わる）
 - 使う family の受け渡し: aggregate → `agg_csv/families.json` → build_db → DB `__families__` → 照合（xjoin）・画面。成績表のファイル名・DB の family 列はこの名前（名前の前方一致は長い順に当てるので `D_prevfin` と `D_prevfin_hen` も区別できる）
 
 ### 5.4 指数の台帳（`shisu/indicators.py`）
@@ -584,15 +618,18 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - `tests/test_pipeline.py`: 合成データ（`tests/synth.py`。空欄の内外・髙・Ｇ１・全頭0・欠損2頭、★6タブ・出馬表の前走の列を含む）で replace → aggregate → calc → build_db → app を通し、旧版の不具合が再発しないこと、xjoin とその場照合の分類結果が一致すること、`--mode entries --prune` で foragg_* が消えないこと、`/entries/wedge` が閾値なしで全キーを出すこと
 - `tests/test_band_regression.py`: 旧版の band 系の件数・勝率の膨張（§11）の再発防止（新8区分・master からのキーで）。レース単位（16桁）のIDでも馬単位と成績表が完全に一致すること、どの family でも1頭が同じキーに2回入らないこと（s2 でも1頭2キーまで）
 - `tests/test_verified_fixes.py`: 検証ワークフローで再現した不具合の再発防止（★6 の「外」「消」、取消の馬の 0、偏差値の向き、ZI の順位、外部指数の値の無い馬、出馬表の障害、前走開催、牝馬限定、廃止名の括弧、family の予約名・定義の置き換え・指定ファイルが無い・スキームの絞り込み・成績表のコース列・古い成績表・画面の同期と wedge の絞り込み、screen の引数・終了コード）
-- `tests/test_ingest.py`: 指数取得の各取得元、ラップ6指数、安井 Excel、/ingest 画面
-- 件数: 402（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
+- `tests/test_ingest.py`: 指数取得の各取得元、ラップ6指数（★6 の「ダ1200」形の距離も）、安井 Excel（警告の2種類・出馬表用CSVを作らないこと）、/ingest 画面、**ext_indices へのコピー**（既定 ON・外すとしない・CLI の `--no-ext-copy`・コピー先が §4.2 の振り分けで正しい指数として見つかること・安井の 0=欠損が過去側と出馬表側で一致すること）
+- `tests/test_entries_ext.py`: 出馬表1本（マイニング値だけ）に ext_indices の指数（オメガ・ST指数・Gold・BC・ZI）が付き、**master と順位・偏差値・偏差値帯・順位帯が一致する**こと、出馬表に値のある指数は出馬表の値を使うこと、0 だけの列（と右の 指数順位1）を ext で上書きすること、`--no-ext`・レースID の無い出馬表
+- `tests/test_raw_merge.py`: ファイル名からの種類、重複の置き換え（後のファイル優先）・10年の窓・merged_done への移動（同じ名前は `_2`）・種類の分からないファイルと読めないファイルを残すこと、replace が master の前に統合すること（`--no-raw-merge`）、/ingest のアップロードと選択・パスの除去・不正な名前・別サイトからの POST
+- `tests/test_screen_families.py` には候補の数（骨格・因果トリオ）・冗長の除外・単独の 場所/距離/芝(内・外) を含む family の過去側と出馬表側のキーの一致・成績表のコース列・select の複勝スプレッド・adj_wedge_* も
+- 件数: 418（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
 
 ---
 
 ## 9. 既知の制約・要確認事項
 
 1. **集計量と DB の大きさ（初期セットのまま全指数を集計する場合）**: 初期セット（129通り）は旧版（20通り）より成績表のグループが多い。実サンプル `202610.csv`（1か月・3,188頭）で unified_all が 33,210行、うちレイヤーA（旧版の15種に当たる）は 3,847行（約8.6倍）、racing.db は 77MB（成績表のテーブルと unified_all に同じ行を2回持つ）。30万行の master 1本（合成）で aggregate 3分19秒・71万グループ・CSV 168MB。2地域×約34指数（約68本）をすべて初期セットで集計すると、時間（1プロセスで約4時間）と DB の大きさ（旧版の約8〜9倍）が問題になりうる。**先に screen_families.py で family を絞り（selected_families.json）、それで集計する**のが前提の運用
-2. **screen_families の時間**: 30万行の master 1本で1通り約2.4秒（`default` 1,413通りで約1時間）。全 master で `default` は1プロセスで2日以上。代表の指数（`--indicators タイムM,対戦M`）で選ぶか `--workers` で並列にする
+2. **screen_families の時間**: 30万行の master 1本で1通り約2.4秒（`default` 2,098通りで約1.4時間、`all` 7,557通りで約5時間）。全 master で `default` は1プロセスで4日近く。代表の指数（`--indicators タイムM,対戦M`）で選ぶか `--workers` で並列にする
 3. **外部指数CSV（ext_indices/）は実ファイルで未確認**: 形式A〜D とフォルダ名・ファイル名の規則は依頼文の仕様と実データ例から組んだ。最初の実行では replace のログ（`外部指数が付いた馬 x/y`・使わないファイルの WARN）を確認する。形式Aは `/ingest` の TARGET 取込用CSVと同じ形
 4. **間隔帯**: TARGET の「間隔」を両側とも週数（1=連闘、2=中1週）とみなし、値 2〜3 を `中2-3` のように分けている（「中N週」の N ではなく TARGET の値そのもの）。出馬表サンプル（`test.csv`）の「2」が前走から14〜15日だったことからの判断。中N週の N で区切りたい場合は `conditions.interval_band` を1つずらす
 5. **牝馬限定（出馬表側）**: 出馬表に `性別限定` 列が無いので、レース名に「牝」がある・そのレースの全馬が牝のときに `牝馬限定` とする。過去側は ★6 の `性別限定` 列。牝馬限定戦に牡馬が1頭でも入る（実際には無い）・レース名に「牝」を含む混合戦があればずれる
@@ -612,6 +649,9 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 19. **展開（StridePlus）の 0**: 「小さいほど良い」指数なので、外部指数ファイルに無い馬の 0 は最高値として数えられる（出馬表側の TARGET の 0 と同じなので両側は一致する）。展開の値に 0 がありえないなら台帳で zero_missing にする [要実データ]
 20. **画面にログインが無い**: `docker run -p 127.0.0.1:8000:8000 …` で起動する
 21. サンプルで分かったこと: `202610.csv` には `単勝配当`・`複勝配当` の列が無い（本番では足す前提。無いと回収値は 0）。`test.csv` のマイニング値・対戦型マイニング値は空だった（照合の確認は値を入れて行った）
+22. **raw_csv の統合先は「全場」**: `csv_files/全場_タイムM.csv`・`全場_対戦M.csv` に統合する。同じ csv_files に地域別の基本CSV（`主５場_タイムM.csv` など）もあれば、全場と地域別が別の地域として両方集計される（11 と同じく同じキーが両方の表でヒットする）。全場で運用するなら地域別のファイルは置かない。10年の基準年は既定でデータの中の最新年（実行日の年ではない）
+23. **出馬表に値のある指数の判定**: 出馬表のどれかのファイルで 0・空欄以外の値が1頭でもあれば、その指数は ext_indices を使わない（TARGET で読み込んだ指数は TARGET の値を使う。読み込んだが一部の馬だけに値がある場合も、残りの馬は 0 のまま）
+24. **ext_indices へのコピーは上書き**: /ingest は同じ名前の `{YYYYMMDD}_{名前}.csv` を上書きする（同じ日を取り直したら新しい値になる）。手で直したファイルを残したいときはチェックを外す（CLI は `--no-ext-copy`）
 
 ---
 
@@ -625,6 +665,15 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 ---
 
 ## 11. 変更履歴
+
+### 2026-11-07 日常運用の自動化とスクリーニングの強化
+- 出馬表: `entries_in/` はマイニング値だけの出馬表1本でよく、calc_entry_hensachi が ext_indices の外部指数（形式A〜D）を過去側と同じ `ext_indices.attach_filled` で付けてから偏差値・順位を計算する。出馬表に値のある指数は出馬表を優先、0 だけの列は ext で上書き。`--ext-dir`・`--no-ext`
+- /ingest・ingest.py: TARGET 取込用CSVを ext_indices/ の取得元のフォルダにコピー（既定 ON。`--no-ext-copy`）。安井の出馬表用CSV（`entries_in/yasui_*.csv`・`--yasui-to-entries`）を廃止。安井の警告を「ベースCSVに存在しない開催日」と「ベースCSVに該当行が無い馬（_noid.csv）」に分けた
+- raw_csv/: 追加分の基本CSVを `csv_files/全場_タイムM.csv`・`全場_対戦M.csv` に統合（レースID(新) で重複排除・後のファイル優先・最大10年分・merged_done/ へ移動）。replace の最初に自動で実行、/ingest の画面からも。`.gitignore`・`.dockerignore`・Dockerfile に raw_csv
+- ラップ6指数: ★6 の形（芝・ダ 列が無く 距離が「ダ1200」）も読む
+- family の部品に単独の 場所・距離・芝(内・外) を追加（COURSE は残す。COURSE との同居は弾く）。成績表のコース列は parts にある部品だけ
+- screen_families: 骨格（s0〜s6・s6n）× 条件28種 × 因果トリオで候補を広げ（default 2,098通り・all 7,557通り）、同じグループにしかならない組み合わせを除く。レポートに adj_wedge_top/bottom/spread、基準A に `--min-fuku-spread`（既定20.0）
+- テスト: test_entries_ext・test_raw_merge を追加、test_ingest・test_screen_families を更新
 
 ### 2026-11-06 過去データの取得の変更・新8区分の順位帯・22条件・family の台帳・screen_families.py
 - 過去データは ★6タブの基本CSV（タイムM・対戦M。単勝配当・複勝配当つき）＋ `ext_indices/` の外部指数CSV群（形式A〜D）に。`shisu/ext_indices.py` で レースID(新)・レースID(旧)（16進の日・先頭0落ち）から各馬に値を付ける。従来の `{地域}_{指数名}.csv` も読み、同名なら csv_files を優先。距離「ダ1200」の分割、配当なし、障害（トラックコード51以上）の除外。カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F を廃止
