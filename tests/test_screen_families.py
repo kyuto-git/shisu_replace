@@ -56,6 +56,7 @@ def test_report_columns_and_rows(screened):
     rep, _ = screened
     need = {"name", "scheme", "layer", "tail", "parts", "label", "masters", "groups", "groups_ge10", "coverage",
             "adj_groups", "wedge_top", "wedge_bottom", "wedge_spread", "fuku_top", "fuku_bottom", "fuku_spread",
+            "adj_wedge_top", "adj_wedge_bottom", "adj_wedge_spread",
             "monotonic", "select_A", "select_B", "selected", "reason"}
     need |= {f"{c}_{m}" for c in ("abs", "axis", "opp", "keshi") for m in (*ODDS_MODES, "total")}
     assert need <= set(rep.columns)
@@ -66,6 +67,10 @@ def test_report_columns_and_rows(screened):
     ok = rep["wedge_top"].notna() & rep["wedge_bottom"].notna()
     assert ok.sum() > 10
     assert ((rep.loc[ok, "wedge_top"] - rep.loc[ok, "wedge_bottom"]).round(4) == rep.loc[ok, "wedge_spread"]).all()
+    ok2 = rep["adj_wedge_top"].notna() & rep["adj_wedge_bottom"].notna()
+    assert ok2.sum() > 10
+    assert ((rep.loc[ok2, "adj_wedge_top"] - rep.loc[ok2, "adj_wedge_bottom"]).round(4)
+            == rep.loc[ok2, "adj_wedge_spread"]).all()
     for c in ("abs", "axis", "opp", "keshi"):
         assert (rep[f"{c}_total"] == sum(rep[f"{c}_{m}"] for m in ODDS_MODES)).all()
 
@@ -133,22 +138,88 @@ def test_candidates_space():
     names = [f.name for f in cands]
     assert len(names) == len(set(names))
     assert {f.name for f in init} <= set(names)                 # 初期セットは名前のまま入る
-    pool = len(S.POOL)
-    singles = sum(1 for f in cands if f.layer == "X:single")
-    pairs = sum(1 for f in cands if f.layer == "X:pair")
-    assert singles == 2 * pool and pairs <= 2 * pool * (pool - 1) // 2 and pairs > 600
-    assert any(f.parts == (F.COURSE, "前走着順") for f in cands)
-    assert any(f.parts == ("芝・ダ", "距離帯", "騎手") for f in cands)
-    assert len(S.make_candidates("all")) > len(cands) * 2
-    def n_conditions(f):          # コース（または 芝・ダ×距離帯）を除いた条件の数
-        parts = list(f.parts)
-        if parts[:1] == [F.COURSE]:
-            parts = parts[1:]
-        elif parts[:2] == ["芝・ダ", "距離帯"]:
-            parts = parts[2:]
-        return len(parts)
-    for space in ("default", "all"):
-        assert all(1 <= n_conditions(f) <= 2 for f in S.make_candidates(space) if f.layer.startswith("X:"))
+    assert len(S.POOL) == 28                                    # 重量種別・クラス名・枠番グループ・騎手 ＋ 22条件の24列
+    kinds = {}
+    for _parts, kind in S.templates("default"):
+        kinds[kind] = kinds.get(kind, 0) + 1
+    assert kinds == {"s0:single": 28, "s0:pair": 377, "s0:trio": 87, "s2:single": 26, "s3:single": 27,
+                     "s4:single": 27, "s5:single": 25, "s6:single": 19, "s6n:single": 17}
+    n_all = len(S.templates("all"))
+    assert 2000 <= n_all <= 3000                                 # 約2,000〜3,000 のテンプレート
+    allk = {}
+    for _parts, kind in S.templates("all"):
+        allk[kind] = allk.get(kind, 0) + 1
+    assert allk["s6:pair"] == 171 and allk["s2:pair"] == 325 and allk["s1:trio"] == 87
+    assert any(f.parts == (F.COURSE, "前走着順") for f in cands)          # 初期セット D_prevfin
+    assert any(f.parts == ("場所", "芝・ダ", "騎手") for f in cands)
+    assert any(f.parts == (F.COURSE, "重量種別", "クラス名", "前走脚質") for f in cands)   # normal × 1条件
+    # 部品の集合が同じなら1つ（初期セットの C_sd_corner_frame と 芝・ダ×枠番グループ×初角帯）
+    sets = [(frozenset(f.parts), f.tail) for f in S.make_candidates("all")]
+    assert len(sets) == len(set(sets))
+    assert all(not S.redundant(f.parts) for f in S.make_candidates("all") if f.layer.startswith("X:"))
+
+
+def test_redundant_rules():
+    import screen_families as S
+    for attr in S.COURSE_ATTRS:                                  # COURSE で一意に決まる属性
+        assert S.redundant((F.COURSE, attr)) and S.redundant(("場所", "芝・ダ", "距離", attr))
+    assert S.redundant(("場所", "芝・ダ", "左右")) and S.redundant(("場所", "坂", "騎手"))
+    assert S.redundant(("芝・ダ", "距離", "距離帯")) and S.redundant(("左右", "左右遷移"))
+    assert S.redundant((F.COURSE, "場所")) and S.redundant((F.COURSE, "芝・ダ", "騎手"))
+    assert not S.redundant(("場所", "芝・ダ", "距離帯", "騎手")) and not S.redundant((F.COURSE, "左右遷移"))
+    assert not S.redundant(("芝・ダ", "距離帯", "直線帯")) and not S.redundant(("場所", "芝・ダ", "R値帯"))
+
+
+def test_expanded_candidates_keep_history_entry_parity():
+    """広げた候補（場所・距離・芝(内・外) を部品に持つ骨格を含む）でも、過去側のキーは出馬表側の候補に必ず入る。"""
+    import random
+    import screen_families as S
+    from shisu.conditions import BANDED_CONDITIONS, CONDITION_COLUMNS
+    rng = random.Random(4)
+    rows = []
+    for _ in range(60):
+        r = {"場所": rng.choice(["東京", "京都"]), "芝・ダ": rng.choice(["芝", "ダ"]), "距離": rng.choice(["1600", "16-18"]),
+             "芝(内・外)": rng.choice(["", "内", "外"]), "重量種別": "定量", "クラス名": rng.choice(["1・2_勝", "G1"]),
+             "枠番グループ": rng.choice(["内枠", "外枠"]), "騎手": rng.choice(["A", "B"]),
+             "順位": str(rng.randint(1, 16)), "偏差値帯": rng.choice(["71以上", "51~60"])}
+        for c in CONDITION_COLUMNS:
+            r[c] = str(rng.randint(1, 12)) if c in BANDED_CONDITIONS else rng.choice([f"{c}1", f"{c}2", ""])
+        rows.append(r)
+    df = pd.DataFrame(rows)
+    recs = df.to_dict("records")
+    fams = [f for f in S.make_candidates("all") if f.layer.startswith("X:s2") or f.layer.startswith("X:s3")
+            or f.layer.startswith("X:s5") or f.layer.startswith("X:s6")][::7]
+    fams.append(F.Family("X_sd_io_dist", ("芝・ダ", "芝(内・外)", "距離"), "HBAND"))
+    n = 0
+    for fam in fams:
+        for sc in fam.schemes:
+            keys = F.build_keys(df, fam, sc)
+            for i, k in zip(keys.index, keys):
+                assert k in F.entry_keys({**recs[i], "芝(内・外)": ""}, fam, sc), (fam.name, k)     # 内外が分からない
+                assert k in F.entry_keys(recs[i], fam, sc), (fam.name, k)
+                n += 1
+    assert n > 1000
+
+
+def test_select_requires_fuku_spread():
+    import screen_families as S
+    rep = pd.DataFrame([
+        {"name": "a", "groups_ge10": 50, "coverage": 0.5, "wedge_spread": 0.5, "fuku_spread": 25.0, "abs_total": 0, "axis_total": 0},
+        {"name": "b", "groups_ge10": 50, "coverage": 0.5, "wedge_spread": 0.9, "fuku_spread": 19.9, "abs_total": 0, "axis_total": 0},
+        {"name": "c", "groups_ge10": 50, "coverage": 0.5, "wedge_spread": 0.2, "fuku_spread": None, "abs_total": 0, "axis_total": 2},
+    ])
+    r = S.select(rep, min_axis=1, min_groups=10, min_coverage=0.2, min_spread=0.10, top_a=30)
+    assert r["select_A"].tolist() == [True, False, False] and r["selected"].tolist() == [True, False, True]
+    r = S.select(rep, 1, 10, 0.2, 0.10, 30, min_fuku_spread=10.0)
+    assert r["select_A"].tolist() == [True, True, False]
+
+
+def test_ref_columns_follow_course_parts():
+    import aggregate_stats_ver2 as a
+    assert a.ref_columns_for(F.Family("X_plc_sd_jk", ("場所", "芝・ダ", "騎手"), "RBAND")) == ("場所", "芝・ダ")
+    assert a.ref_columns_for(F.Family("X_sd_dist_jk", ("芝・ダ", "距離", "騎手"), "RBAND")) == ("芝・ダ", "距離")
+    assert a.ref_columns_for(F.get("normal")) == ("場所", "芝・ダ", "距離", "芝(内・外)")
+    assert a.ref_columns_for(F.get("B_jk_prevfin")) == ()
 
 
 def test_screen_rejects_missing_masters(tmp_path):

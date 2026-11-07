@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import io
+import shutil
 import threading
 import zipfile
 from pathlib import Path
@@ -362,6 +363,21 @@ def test_lap_formulas(tmp_path):
     assert pace["計算結果"].iloc[0] == "逃げ馬2F：24.1、逃げ馬1F：12.1" and len(pace) == 4
 
 
+def test_lap_star6_distance_format_gives_same_output(tmp_path):
+    """★6タブの形（芝・ダ 列が無く 距離 が「ダ1300」）でも、芝・ダ と距離が分かれた形と同じ結果（4F・33rap など）。"""
+    split = lap_rows()
+    star6 = split.drop(columns=["芝・ダ"]).assign(距離=split["芝・ダ"] + split["距離"])
+    blank = split.assign(**{"芝・ダ": ""}).assign(距離=split["芝・ダ"] + split["距離"] + "m")
+    outs = []
+    for name, df in (("split", split), ("star6", star6), ("blank", blank)):
+        p = tmp_path / f"{name}.csv"
+        p.write_bytes(df.to_csv(index=False).encode("cp932"))
+        lap.run([p], tmp_path / name, lambda m: None, today="20261105")
+        outs.append({f.relative_to(tmp_path / name).as_posix(): f.read_bytes() for f in (tmp_path / name).rglob("*.csv")})
+    assert outs[0] == outs[1] == outs[2] and len(outs[0]) > 10
+    assert out_csv(tmp_path / "star6" / "4F" / "20261012_4F.csv")["計算結果"].tolist() == ["47.9", "51.4"]
+
+
 def test_lap_bad_laps_are_blank_not_crash(tmp_path):
     df = lap_rows().iloc[:2].copy()
     df.loc[0, "ワーク1"] = "7.1-abc-11.7"
@@ -436,7 +452,7 @@ def test_yasui_extract_and_target_outputs(tmp_path):
     base.loc[0, "馬名S"] = "アア"
     b = common.read_base([write_base(tmp_path / "base.csv", base)], lambda m: None)
     logs = []
-    res = y.run([xlsx], b, tmp_path / "yasui", logs.append, entries_dir=tmp_path / "entries_in")
+    res = y.run([xlsx], b, tmp_path / "yasui", logs.append)
     ex = out_csv(tmp_path / "yasui" / "yasui_extract.csv")
     assert len(ex) == 5 and res.matched == 5
     r0 = ex.iloc[0]
@@ -453,15 +469,8 @@ def test_yasui_extract_and_target_outputs(tmp_path):
     # Excel に無い開催日（ベースの 20251108）の TARGET 用CSVは作らない
     assert not (tmp_path / "yasui" / "yasui_speed" / "20251108_yasui_speed.csv").exists()
     assert not res.notes
-    ent = out_csv(tmp_path / "entries_in" / "yasui_20251101.csv")
-    assert list(ent.columns) == ["レースID(新)", "安井_馬名", "安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー",
-                                 "安井_根性", "安井_賢さ", "安井_体力", "安井_やる気"]           # 丸数字の順位は入れない
-    # ベースのその日の全馬。値の無い馬（Excel に無い 1R 3番、丸数字だけの 1R 2番）は TARGET の出力と同じく 0
-    assert ent["レースID(新)"].tolist() == [r for r, d, _w, _u in BASE_ROWS if d == "20251101"]
-    e = ent.set_index("レースID(新)")
-    assert e.loc["202511010504010103", "安井_スピード"] == "0" and e.loc["202511010504010102", "安井_スピード"] == "0"
-    assert e.loc["202511010504010101", "安井_スピード"] == "48" and e.loc["202511010504010103", "安井_やる気"] == "0"
-    assert (tmp_path / "yasui" / "entries_in" / "yasui_20251101.csv").exists()
+    # 出馬表用の yasui_{YYYYMMDD}.csv は廃止（ext_indices/yasui/ 経由で出馬表にも結び付く）
+    assert not (tmp_path / "yasui" / "entries_in").exists() and not any("entries_in" in str(p) for p in res.files)
 
 
 YASUI_KEYS = ("rank", "speed", "stamina", "power", "konjo", "kashikosa", "tairyoku", "yaruki")
@@ -486,8 +495,10 @@ def test_yasui_without_base_writes_per_indicator_files(tmp_path):
     assert sp[["場所", "R", "馬番", "ワーク1"]].values.tolist() == [["中山", "1", "1", "-17"], ["中山", "2", "2", "48"],
                                                                  ["阪神", "1", "1", ""]]
     assert out_csv(tmp_path / "o" / "yasui_yaruki" / "20260104_yasui_yaruki.csv")["ワーク1"].tolist() == ["1"]
-    assert res.notes and "ベースCSVも一緒に指定してください" in res.notes[0] and "20251206" in res.notes[0]
-    assert any("ベースCSVも一緒に指定してください" in m for m in logs)
+    note = res.notes[0]
+    assert "ベースCSVに存在しない開催日 2日" in note and "12/06(土) 3頭" in note and "01/04(日) 1頭" in note
+    assert "非開催日・シート名の日付の打ち間違い" in note and "ベースCSV（または出馬表CSV）を一緒に指定" in note
+    assert any("ベースCSVに存在しない開催日" in m for m in logs)
     assert not (tmp_path / "o" / "entries_in").exists()
 
 
@@ -521,7 +532,7 @@ def test_yasui_finds_base_in_search_dirs(tmp_path):
     assert list(out_csv(o / "20251115_yasui_speed.csv").columns)[0] == "日付"          # どこにも無い日
     merged = sorted(p.name for p in o.glob("*_merged.csv"))
     assert merged == ["base_2_speed_merged.csv", "base_speed_merged.csv", "shisu_20251108_1_speed_merged.csv"]
-    assert len(res.notes) == 1 and "20251115" in res.notes[0]
+    assert len(res.notes) == 1 and "11/15(土)" in res.notes[0]
 
 
 def test_run_ingest_yasui_uses_ingest_in_base(tmp_path, monkeypatch):
@@ -538,7 +549,7 @@ def test_run_ingest_yasui_uses_ingest_in_base(tmp_path, monkeypatch):
 
 
 def test_yasui_entries_file_feeds_calc_entry_hensachi(tmp_path):
-    """出馬表用CSVは calc_entry_hensachi で TARGET の出馬表と レースID(新) で横に結合され、安井_* の偏差値・順位が付く。
+    """安井の TARGET 取込用CSVを ext_indices/yasui/ に置けば、calc_entry_hensachi が出馬表に結び付けて 安井_* の偏差値・順位が付く。
     順位は値から計算する（過去側は TARGET に取り込んだ値から順位を出すので、Excel の丸数字は使わない）。"""
     import calc_entry_hensachi as c
     from shisu import yasui_extractor as y
@@ -551,12 +562,17 @@ def test_yasui_entries_file_feeds_calc_entry_hensachi(tmp_path):
     base = pd.DataFrame([{"レースID(新)": f"2025110105040101{u:02d}", "日付S": "20251101", "枠番": str((u + 1) // 2),
                           "馬番": str(u), "ワーク1": ""} for u in range(1, 11)])
     b = common.read_base([write_base(tmp_path / "base.csv", base)], lambda m: None)
-    y.run([xlsx], b, tmp_path / "o", lambda m: None)
-    yas = read_csv_any(tmp_path / "o" / "entries_in" / "yasui_20251101.csv")
-    assert not [col for col in yas.columns if col.endswith("順位")]
+    res = y.run([xlsx], b, tmp_path / "o", lambda m: None)
+    from shisu.ingest import copy_to_ext
+    copy_to_ext(res.files, tmp_path / "o", tmp_path / "ext" / "yasui")      # /ingest が ext_indices/yasui/ に置く
     main = pd.DataFrame([{"レースID(新)": f"2025110105040101{u:02d}", "場 R": "東1", "場所": "東京", "馬番": str(u),
                           "馬名S": f"ウマ{u}", "SAV": str(50 + u)} for u in range(1, 11)])
-    out = c.merge_frames([c.process_df(main, "main", verbose=False), c.process_df(yas, "yasui", verbose=False)])
+    lookups = c.load_ext(tmp_path / "ext", c.present_indicators([main]))
+    assert set(lookups) == {"安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー", "安井_根性", "安井_賢さ",
+                            "安井_体力", "安井_やる気"}
+    yas, masks = c.attach_ext(main, lookups, "main", log=lambda m: None)
+    assert not [col for col in yas.columns if col.startswith("安井") and col.endswith("順位")]   # 順位は値から
+    out = c.process_df(yas, "main", verbose=False, last_masks=masks)
     assert {"安井_スピード_偏差値", "安井_スピード_順位", "安井_ランク_順位帯_s1", "SAV_順位"} <= set(out.columns)
     sp_rank = out.set_index("馬番")["安井_スピード_順位"].astype(str)
     assert sp_rank["3"] == "1" and sp_rank["1"] == "2"
@@ -657,8 +673,24 @@ def test_ingest_web_flow(tmp_path, monkeypatch):
     run2 = r.headers["Location"].rstrip("/").split("/")[-1]
     web.JOBS[run2].thread.join(timeout=30)
     page = c.get(f"/ingest/job/{run2}").get_data(as_text=True)
-    assert "ベースCSVも一緒に指定してください" in page and "yasui/yasui_speed/20251206_yasui_speed.csv" in page
-    assert '<div class="warn" style="margin-top:6px">安井サロン Excel: ベースCSVが見つからない開催日 20251206' in page
+    assert "yasui/yasui_speed/20251206_yasui_speed.csv" in page
+    assert '<div class="warn" style="margin-top:6px">安井サロン Excel: ベースCSVに存在しない開催日 1日（12/06(土) 1頭）' in page
+    # TARGET 取込用CSVは ext_indices/ にも置く（既定）。レースID(新) の無い形（ベースCSVの無い日）は置かない
+    ext = tmp_path / "ext_indices"
+    assert (ext / "OMEGA" / "20251101_omega.csv").exists()
+    assert (ext / "yasui" / "yasui_speed" / "20251101_yasui_speed.csv").exists()
+    assert not (ext / "yasui" / "yasui_speed" / "20251206_yasui_speed.csv").exists()
+    assert not list(ext.rglob("*_merged.csv")) and not (ext / "lap").exists()
+    # チェックを外すと置かない
+    shutil.rmtree(ext)
+    r = c.post("/ingest/run", data={"src": ["yasui"], "to_ext_shown": "1", "yasui_files": [
+        (io.BytesIO(xlsx.read_bytes()), "ステータス新バージョン2025_11月.xlsx")],
+        "base_files": [(io.BytesIO(base_frame().to_csv(index=False).encode("cp932")), "b.csv")]},
+        content_type="multipart/form-data")
+    run3 = r.headers["Location"].rstrip("/").split("/")[-1]
+    web.JOBS[run3].thread.join(timeout=30)
+    assert web.JOBS[run3].status == "done" and not ext.exists()
+    assert 'name="to_ext" value="1" checked' in c.get("/ingest").get_data(as_text=True)      # 画面の既定は ON
 
 
 def test_ingest_web_cancel(tmp_path, monkeypatch):
@@ -799,7 +831,7 @@ def test_job_finishes_even_if_log_file_fails(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- 0=欠損（安井）・過去側と出馬表側の一致
 def test_zero_missing_parity_between_target_history_and_entries(tmp_path):
     """過去側: TARGET に値だけを取り込み、取り込んでいない馬は TARGET が 0 で出す（同梱サンプルの ZI と同じ）。
-    TARGET の 指数順位 は 0 の馬も数えている。出馬表側: 出馬表用CSV（値の無い馬は 0）。
+    TARGET の 指数順位 は 0 の馬も数えている。出馬表側: ext_indices から結び付ける（値の無い馬は 0）。
     ランク・5ステータスは 0=欠損 なので、両側の順位・偏差値・帯が一致する。"""
     from shisu.hensachi import compute_indicator
     from shisu.indicators import spec_for
@@ -811,9 +843,15 @@ def test_zero_missing_parity_between_target_history_and_entries(tmp_path):
     base = pd.DataFrame([{"レースID(新)": f"2025110105040101{u:02d}", "日付S": "20251101", "枠番": str((u + 1) // 2),
                           "馬番": str(u), "ワーク1": ""} for u in range(1, 12)])        # 11番は Excel に無い
     b = common.read_base([write_base(tmp_path / "base.csv", base)], lambda m: None)
-    y.run([xlsx], b, tmp_path / "o", lambda m: None)
-    ent = read_csv_any(tmp_path / "o" / "entries_in" / "yasui_20251101.csv")
+    res = y.run([xlsx], b, tmp_path / "o", lambda m: None)
     target = read_csv_any(tmp_path / "o" / "yasui_speed" / "20251101_yasui_speed.csv")
+    # 出馬表側: /ingest が ext_indices/yasui/ に置いた TARGET 取込用CSVを calc_entry_hensachi が結び付ける（無い馬は 0）
+    import calc_entry_hensachi as calc
+    from shisu.ingest import copy_to_ext
+    copy_to_ext(res.files, tmp_path / "o", tmp_path / "ext" / "yasui")
+    main = base.drop(columns=["ワーク1"])
+    lookups = calc.load_ext(tmp_path / "ext", set(), log=lambda m: None)
+    ent, masks = calc.attach_ext(main, {"安井_スピード": lookups["安井_スピード"]}, log=lambda m: None)
     hist_vals = target["ワーク1"].where(target["ワーク1"] != "", "0")            # TARGET の出力（無い馬は 0）
     hv = pd.to_numeric(hist_vals)
     target_rank = hv.rank(ascending=False, method="min").astype(int).astype(str)   # TARGET の順位は 0 も数える
@@ -821,7 +859,7 @@ def test_zero_missing_parity_between_target_history_and_entries(tmp_path):
     spec = spec_for("安井_スピード")
     assert spec.zero_missing and not spec_for("安井_やる気").zero_missing
     hist = compute_indicator(hist_vals, key, spec, None, target_rank)
-    day = compute_indicator(ent["安井_スピード"], key, spec, None, None)
+    day = compute_indicator(ent["安井_スピード"], key, spec, None, None, masks["安井_スピード"])
     for c in ("順位", "偏差値", "偏差値帯", "順位帯_s1", "順位帯_s2", "race_excluded"):
         assert hist[c].astype(str).tolist() == day[c].astype(str).tolist(), c
     assert day["race_excluded"].all()                      # 欠損2頭（丸数字だけの3番・Excel に無い11番）→ 使わない
@@ -966,3 +1004,41 @@ def test_run_ingest_yasui_uses_entries_in(tmp_path, monkeypatch):
     assert any("entries_in/shisu_20251101_1.csv" in m for m in logs)
     d = out_csv(tmp_path / "out" / "yasui" / "yasui_speed" / "20251101_yasui_speed.csv")
     assert d["ワーク1"].tolist() == ["", "45", ""]
+
+
+# ---------------------------------------------------------------- ext_indices への配置
+def test_cli_copies_to_ext_by_default(tmp_path, monkeypatch):
+    import ingest as cli_mod
+    monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path))
+    seen = {}
+    monkeypatch.setattr(cli_mod, "run_ingest", lambda req, out, *a, **k: seen.setdefault("req", req) and {})
+    base = write_base(tmp_path / "b.csv")
+    assert cli_mod.main(["--sources", "omega", "--base", str(base)]) == 0
+    assert seen.pop("req").ext_dir == tmp_path / "ext_indices"
+    assert cli_mod.main(["--sources", "omega", "--base", str(base), "--no-ext-copy"]) == 0
+    assert seen.pop("req").ext_dir is None
+    with pytest.raises(SystemExit):                          # 安井の出馬表用CSVは廃止
+        cli_mod.main(["--sources", "yasui", "--yasui-to-entries"])
+
+
+def test_copy_to_ext_layout_is_found_by_ext_indices(tmp_path):
+    """吉馬（kichiuma/kichiuma_{key}/）・かよちん・keibaAI の TARGET 取込用CSVを置いた形を、ext_indices が指数として見分ける。"""
+    from shisu import ext_indices
+    from shisu.ingest import EXT_FOLDERS, copy_to_ext
+    src = tmp_path / "run"
+    files = []
+    for rel in ("kichiuma/kichiuma_sp_ability/20251101_kichiuma_sp_ability.csv",
+                "kichiuma/kichiuma_sueashi/20251101_kichiuma_sueashi.csv",
+                "kichiuma/kichiuma_sueashi/base_sueashi_merged.csv",
+                "kayochin/20251101_kayochin.csv", "keibaAI/20251101_keibaAI.csv"):
+        p = src / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes("レースID(新),ワーク1\r\n202511010504010101,55\r\n".encode("cp932"))
+        files.append(p)
+    ext = tmp_path / "ext"
+    for name in ("kichiuma", "kayochin", "keibaai"):
+        folder = {"keibaai": "keibaAI"}.get(name, name)
+        copy_to_ext([f for f in files if f.relative_to(src).parts[0] == folder], src / folder, ext / EXT_FOLDERS[name])
+    sources, _ = ext_indices.discover(ext, log=lambda m: None)
+    assert {"吉馬_SP能力値", "吉馬_末脚力", "かよちん指数", "keibaAI指数"} <= set(sources)
+    assert not list(ext.rglob("*_merged.csv"))

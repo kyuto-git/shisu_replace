@@ -16,7 +16,7 @@ Excel の形（2025年11月〜2026年2月の4ファイルで確認）:
   安井_ランク, 安井_スピード, 安井_スタミナ, 安井_パワー, 安井_根性, 安井_賢さ, 安井_体力, 安井_やる気
   値が無く丸数字だけのセル（「⑯」）は値を空欄にする（偏差値・順位の規則は他の指数と同じ。
   1レースに欠損2頭以上ならそのレースはその指数で使わない）。
-  丸数字の順位は yasui_extract.csv に 安井_スピード_Excel順位 などとして残すだけで、出馬表用CSVには入れない。
+  丸数字の順位は yasui_extract.csv に 安井_スピード_Excel順位 などとして残すだけで、照合には使わない。
   過去側は TARGET に取り込んだ「値」から順位を出す（同値は同順位・値の無い馬は順位なし）が、Excel の丸数字は
   同値でも順位を分け、値の無い馬にも順位を付けるので、出馬表側で丸数字を使うと過去側と順位がずれる
   （4ファイルでステータスごとに約1,400〜4,000頭がずれた）。出馬表側も値から計算して両側をそろえる。
@@ -26,9 +26,8 @@ Excel の形（2025年11月〜2026年2月の4ファイルで確認）:
   yasui/yasui_{key}/{元ファイル名}_{key}_merged.csv マージ完全版（ベースCSVの全列。ワーク1 にその指数）
       key = rank, speed, stamina, power, konjo, kashikosa, tairyoku, yaruki
   yasui/yasui_extract.csv                          取り出した全行（1頭1行。照合できた行は レースID(新) 付き）
-  yasui/entries_in/yasui_{YYYYMMDD}.csv            出馬表（entries_in/）にそのまま置ける形
-                                                    （レースID(新)・安井_馬名・8指数の値。calc_entry_hensachi --merge-* で
-                                                     TARGET の出馬表と レースID(新) で横に結合される）
+  （出馬表用の yasui_{YYYYMMDD}.csv は廃止。TARGET 取込用CSVを ext_indices/yasui/yasui_{key}/ に置けば、
+   過去側（replace）も出馬表側（calc_entry_hensachi）も ext_indices から結び付ける。/ingest は自動で置く）
   レースID(新)（18桁）は Excel に無い（回・日が分からない）ので、ベースCSVと 日付・場所・R・馬番 で照合して付ける。
   ベースCSVの指定が無い開催日×場所は、search_dirs（ingest では ingest_in/base/ と entries_in/）の CSV から
   その行を探して使う（読めない CSV は飛ばす）。ベースのある日でも行の無い場所の馬は
@@ -260,13 +259,10 @@ def extract(paths: Iterable[Path | str], log: Logger = default_log) -> pd.DataFr
 
 
 NO_BASE_COLUMNS = ["日付", "場所", "場所コード", "R", "馬番", "馬名", WORK]
-NO_BASE_GUIDE = ("TARGET取込用の18桁レースID(新)を付与するにはベースCSVも一緒に指定してください"
-                 "（または ingest_in/base/・entries_in/ に該当日のCSVを置いてください）")
 
 
 def run(paths: Iterable[Path | str], base: pd.DataFrame | None, out_dir: Path, log: Logger = default_log,
-        entries_dir: Path | None = None, search_dirs: Iterable[Path | str] = (),
-        exclude_paths: Iterable[Path | str] = ()) -> Outputs:
+        search_dirs: Iterable[Path | str] = (), exclude_paths: Iterable[Path | str] = ()) -> Outputs:
     """取り出して、8指数ごとのフォルダに日付別CSV（とマージ完全版）を書く。
 
     base: 指定されたベースCSV（read_base の結果。無ければ None）
@@ -306,8 +302,7 @@ def run(paths: Iterable[Path | str], base: pd.DataFrame | None, out_dir: Path, l
         for day in no_base_days:
             res.files.append(_write_no_base(df[df["日付"] == day], name, folder / f"{day}_yasui_{key}.csv"))
     if no_base_days:
-        msg = (f"ベースCSVが見つからない開催日 {_fmt_days(no_base_days)} は、レースID(新) の無い指数別CSV"
-               f"（日付・場所・R・馬番）だけを出しました。{NO_BASE_GUIDE}")
+        msg = no_base_day_message(no_base_days, df)
         log(f"[WARN] {LABEL}: {msg}")
         res.notes.append(msg)
     unmatched = df[(df[RID] == "") & df["日付"].isin(base_days)]
@@ -315,18 +310,40 @@ def run(paths: Iterable[Path | str], base: pd.DataFrame | None, out_dir: Path, l
         for key, _label, name in INDICATORS:
             for day, g in unmatched.groupby("日付", sort=True):
                 res.files.append(_write_no_base(g, name, out_dir / f"yasui_{key}" / f"{day}_yasui_{key}_noid.csv"))
-        where = ", ".join(f"{d} {p}" for d, p in sorted(set(zip(unmatched["日付"], unmatched["場所"]))))
-        msg = (f"ベースCSVに行が無く照合できなかった馬 {len(unmatched)} 頭（{where}）は TARGET 取込用CSVに入らないので、"
-               f"レースID(新) の無い {{日付}}_yasui_{{key}}_noid.csv に出しました。{NO_BASE_GUIDE}")
+        msg = unmatched_horse_message(unmatched)
         log(f"[WARN] {LABEL}: {msg}")
         res.notes.append(msg)
-    if base_days:
-        names = lookup(bkeys, {k: v for k, v in by_key["馬名"].items() if k})
-        matched_days = set(df.loc[df[RID] != "", "日付"])
-        res.files += write_entries(base, values, names, matched_days, out_dir / "entries_in", log)
-        if entries_dir is not None:
-            res.files += write_entries(base, values, names, matched_days, Path(entries_dir), log)
     return res
+
+
+def _day_text(day: str) -> str:
+    """'20261101' → '11/01(日)'。"""
+    try:
+        d = _dt.date(int(day[:4]), int(day[4:6]), int(day[6:8]))
+    except ValueError:
+        return day
+    return f"{d.month:02d}/{d.day:02d}({'月火水木金土日'[d.weekday()]})"
+
+
+def no_base_day_message(days, df: pd.DataFrame) -> str:
+    """ベースCSVに存在しない開催日の案内（非開催日・シート名の日付の打ち間違いなど）。"""
+    days = sorted(days)
+    heads = [f"{_day_text(d)} {int((df['日付'] == d).sum())}頭" for d in days[:6]]
+    more = f" ほか {len(days) - 6}日" if len(days) > 6 else ""
+    return (f"ベースCSVに存在しない開催日 {len(days)}日（{'、'.join(heads)}{more}）"
+            "── 非開催日・シート名の日付の打ち間違いなどの可能性があります。"
+            "この日は レースID(新) を付けられないので、日付・場所・R・馬番つきの指数別CSVだけを出しました（TARGET には取り込めません）。"
+            "→ その日のベースCSV（または出馬表CSV）を一緒に指定するか、ingest_in/base/・entries_in/ に置いてやり直してください")
+
+
+def unmatched_horse_message(unmatched: pd.DataFrame) -> str:
+    """ベースCSVに該当行が無い馬の案内（別の月のシートの混入・少頭数・ベースCSVの収録期間外など）。"""
+    groups = unmatched.groupby(["日付", "場所"], sort=True).size()
+    heads = [f"{_day_text(d)} {p} {n}頭" for (d, p), n in groups.head(6).items()]
+    more = f" ほか {len(groups) - 6}件" if len(groups) > 6 else ""
+    return (f"ベースCSVに該当行が無い馬 {len(unmatched)}頭（{'、'.join(heads)}{more}）"
+            "── 別の月のシートの混入・少頭数・ベースCSVの収録期間外などの可能性があります。"
+            "この馬は TARGET 取込用CSVに入れず、{日付}_yasui_{key}_noid.csv に分けました")
 
 
 BASE_COLUMNS = (RID, DATE, "枠番", "馬番", "馬名", "馬名S", WORK, SOURCE_FILE)
@@ -386,36 +403,6 @@ def _write_no_base(g: pd.DataFrame, name: str, path: Path) -> Path:
     out = out.loc[order.sort_values(["場所コード", "場所", "_r", "_u"], kind="stable").index]
     write_csv(out[NO_BASE_COLUMNS], path)
     return path
-
-
-def entries_columns() -> list[str]:
-    """出馬表用CSVの列: 値だけ（丸数字の順位は入れない。モジュールの説明を参照）。"""
-    return [RID, "安井_馬名"] + [name for _key, _label, name in INDICATORS]
-
-
-def write_entries(base: pd.DataFrame, values: dict[str, pd.Series], names: pd.Series, days: set[str],
-                  out_dir: Path, log: Logger = default_log) -> list[Path]:
-    """出馬表（entries_in/）用: 日付ごとに yasui_{YYYYMMDD}.csv（レースID(新), 安井_馬名, 安井_*）。
-
-    行はベースCSVのその日の全馬。値の無い馬（Excel に無い・丸数字だけ）は 0 を入れる。過去側は TARGET に取り込んだ値を
-    TARGET が出力したもので、取り込んでいない馬は 0 になる（同梱の出馬表サンプルの ZI で確認）ので、それに合わせる。
-    ランク・5ステータスは台帳で 0=欠損（zero_missing）なので、0 でも空欄でも両側で欠損として数える
-    （1レースに欠損2頭以上ならその指数で使わない）。体力・やる気は 0 も普通の値なので 0 のまま比べる。
-    """
-    out = pd.DataFrame({RID: base[RID], DATE: base[DATE], "安井_馬名": names})
-    for name, v in values.items():
-        out[name] = v.where(v != "", "0")     # TARGET の出力と同じく、値の無い馬は 0（ランク・ステータスは両側で 0=欠損）
-    out = out[(out[RID].str.len() == 18) & out[DATE].isin(days)]
-    out = out.assign(_has=(pd.DataFrame(values).reindex(out.index) != "").any(axis=1))
-    out = out.sort_values("_has", ascending=False, kind="stable").drop_duplicates(subset=[RID])
-    files = []
-    for day, g in out.groupby(DATE, sort=True):
-        path = Path(out_dir) / f"yasui_{day}.csv"
-        write_csv(g.sort_values(RID)[entries_columns()], path)
-        files.append(path)
-    if files:
-        log(f"[INFO] {LABEL}: 出馬表用 {len(files)} 本 → {out_dir}")  # entries_in/ に置いたときも分かるようにフルパス
-    return files
 
 
 def _check_consistency(df: pd.DataFrame, base: pd.DataFrame, bkey: pd.Series, log: Logger) -> None:

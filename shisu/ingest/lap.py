@@ -3,7 +3,8 @@
 入力: TARGET のレース検索（★5タブ）でワーク1にレースのラップタイムを読み込んで出力したCSV
   列: レースID(新), 日付S, 場所, 芝・ダ, 距離, コース区分, 馬場状態, クラス名, 年齢限定, 着順, 着差, 補正,
       レース印２, 1角, 2角, 3角, 4角, 人気, 単勝オッズ, ワーク1（例 " 7.1-11.0-11.7-12.0-12.2-12.3-12.4"）
-前処理: 着順の全角数字を半角に → 着順が 消・止・外 の行、着順・着差が数でない行を除く
+前処理: 着順の全角数字を半角に → 着順が 消・止・外 の行、着順・着差が数でない行を除く。
+        芝・ダ 列が無い・空で 距離 が「ダ1200」「芝2000」の形（★6タブ）なら、芝・ダ と数の距離に分ける
 出力（日付S ごと。列名も旧版と同じ）:
   2F/{日付S}_2F.csv            末尾2ハロンの合計（2着以下は +着差）
   1F/{日付S}_1F.csv            末尾1ハロン + クラス補正（3着以内かつ 補正85以上だけ）、2歳 −0.2・3歳 −0.1
@@ -19,7 +20,6 @@
 from __future__ import annotations
 
 import datetime as _dt
-import math
 import unicodedata
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -28,6 +28,7 @@ from typing import Iterable
 import pandas as pd
 
 from ..csvio import write_csv
+from ..normalize import distance_series, split_surface_distance
 from .common import DATE, RID, WORK, Logger, Outputs, default_log, read_table, ymd_text
 
 NAME = "lap"
@@ -73,7 +74,11 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["着順"])
     df["着差"] = pd.to_numeric(df["着差"].astype(str).str.strip(), errors="coerce")
     df = df.dropna(subset=["着差"])
-    df["距離"] = pd.to_numeric(df["距離"].astype(str).str.strip(), errors="coerce")
+    # ★6タブの形（芝・ダ 列が無く 距離 が「ダ1200」）でも、芝・ダ と数の距離に分ける（過去レースの replace と同じ関数）
+    surface = df["芝・ダ"] if "芝・ダ" in df.columns else pd.Series("", index=df.index)
+    surface, dist = split_surface_distance(surface, df["距離"])
+    df["芝・ダ"] = surface
+    df["距離"] = pd.to_numeric(distance_series(dist), errors="coerce")
     df["補正"] = pd.to_numeric(df.get("補正", pd.Series("", index=df.index)).astype(str).str.strip(), errors="coerce")
     df[DATE] = df[DATE].map(ymd_text) if DATE in df.columns else df[RID].astype(str).str.slice(0, 8)
     return df

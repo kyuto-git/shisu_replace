@@ -10,6 +10,8 @@
       各馬に外部指数を レースID(新)・レースID(旧) で結び付け、「{地域}_{指数名}」の入力があるものとして処理する
       （csv_files に同じ地域・指数のファイルがあれば、そちらを使う）
   廃止した指数（カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F）は読まない
+  raw_csv/ に未統合の基本CSV（追加抽出したタイムM・対戦M）があれば、先に csv_files/全場_タイムM.csv・全場_対戦M.csv に
+  統合する（レースID(新) で重複を除き後のファイルを優先・最大10年分。shisu/raw_merge.py。--no-raw-merge で飛ばす）
 
 出力:
   master_csv/master_{地域}_{指数名}.csv.gz  1頭1行（頭数10以上）。キーの部品・22条件・偏差値・順位・成績の列
@@ -212,37 +214,25 @@ def process_ext(base_path: str, indicator: str, master_dir: str, processed_dir: 
         return f"[SKIP] ext_indices に {indicator} がありません"
     lookup = ext_indices.load_source(src, log=lambda m: None)
     raw = _read_base(str(base_path)).copy()
-    values, ranks = ext_indices.attach(raw, lookup)
-    # 値の無い馬は 0（TARGET は外部指数を取り込んでいない馬を 0 で出す。出馬表側と従来の ★8 の過去CSVもそう。
-    # 0 を欠損として扱う指数（安井のランク・5ステータス）は compute_indicator が欠損に戻す）
-    raw["指数"] = values.where(values != "", "0")
-    if ranks is not None and not (ranks != "").any():
+    att = ext_indices.attach_filled(raw, lookup)      # 値の無い馬は 0・順位は最下位（出馬表側と同じ関数）
+    if att.rank_column_empty:
         print(f"[WARN] ext_indices/{indicator}: 順位の列が空なので、順位は値から計算します", file=sys.stderr)
-        ranks = None
-    elif ranks is not None:
-        race = norm_series(_col(raw, "レースID(新)")).str.slice(0, 16)
-        norank = (values != "").groupby(race).transform("any") & ~(ranks != "").groupby(race).transform("any")
-        if norank.any():     # compute_indicator が、順位の無いレースは値から順位を付ける
-            print(f"[WARN] ext_indices/{indicator}: 順位の無いレース {race[norank].nunique()} 件は値から順位を計算します"
-                  "（順位の欄が空のファイルがあります）", file=sys.stderr)
+    elif att.norank_races:
+        print(f"[WARN] ext_indices/{indicator}: 順位の無いレース {att.norank_races} 件は値から順位を計算します"
+              "（順位の欄が空のファイルがあります）", file=sys.stderr)
+    # 値の無い馬は 0（TARGET は外部指数を取り込んでいない馬を 0 で出す。出馬表側と従来の ★8 の過去CSVもそう。
+    # 0 を欠損として扱う指数（安井のランク・5ステータス、想定前半・後半）は compute_indicator が欠損に戻す）
+    raw["指数"] = att.values
+    ranks = att.ranks
     if ranks is not None:
-        # 形式B・C（順位つき）でファイルに無い馬は、TARGET と同じくレースの最下位（同順位）にする
-        # （ファイルに順位のある馬がいるレースだけ。レースごと無いときは全頭 0 で、そのレースは使われない）
-        absent = (values == "") & (ranks == "")
-        if absent.any():
-            race = norm_series(_col(raw, "レースID(新)")).str.slice(0, 16)
-            has = ranks != ""
-            last = has.groupby(race).transform("sum") + 1
-            fill = absent & has.groupby(race).transform("any")
-            ranks = ranks.where(~fill, last.astype(int).astype(str))
         raw["指数順位"] = ranks
     elif "指数順位" in raw.columns:
         raw = raw.drop(columns=["指数順位"])               # 基本CSVの順位（タイムM など）を使わない
-    hit = int((values != "").sum())     # 0 で埋める前の、ファイルに値があった馬の数
+    hit = att.hit                       # 0 で埋める前の、ファイルに値があった馬の数
     stem = f"{region_raw}_{indicator}"
     msg = process_frame(raw, stem, region, indicator, master_dir, processed_dir, inner_lookup,
                         given_rank=ranks is not None, label=f"{base_path.name} + ext_indices/{indicator}",
-                        absent=values == "")
+                        absent=att.absent)
     return msg + f" / 外部指数が付いた馬 {hit}/{len(raw)}"
 
 
@@ -301,6 +291,9 @@ def main(argv=None) -> int:
     ap.add_argument("--csv-dir", default=str(config.csv_dir()))
     ap.add_argument("--ext-dir", default=str(config.ext_dir()), help="外部指数CSV群のフォルダ（既定 ext_indices）")
     ap.add_argument("--no-ext", action="store_true", help="ext_indices を使わない")
+    ap.add_argument("--raw-dir", default=str(config.raw_dir()),
+                    help="未統合の過去基本CSVのフォルダ（既定 raw_csv）。あれば csv_files/全場_タイムM.csv・全場_対戦M.csv に統合してから進む")
+    ap.add_argument("--no-raw-merge", action="store_true", help="raw_csv の統合をしない")
     ap.add_argument("--master-dir", default=str(config.master_dir()))
     ap.add_argument("--processed-dir", default=str(config.processed_dir()))
     ap.add_argument("--processed", action="store_true", help="processed_*（normal family のキーの確認用）も出力する")
@@ -308,6 +301,11 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=1, help="並列数（既定1。メモリに余裕があれば 2〜4）")
     args = ap.parse_args(argv)
 
+    if not args.no_raw_merge:
+        from shisu import raw_merge
+        if raw_merge.pending_files(args.raw_dir):
+            print(f"[INFO] {args.raw_dir} に未統合の基本CSVがあるので、csv_files/全場_*.csv に統合します（最大10年分）")
+            raw_merge.merge_raw(args.raw_dir, args.csv_dir)
     files = sorted(p for p in Path(args.csv_dir).glob("*.csv"))
     if not files:
         print(f"[INFO] 入力CSVがありません: {args.csv_dir}")

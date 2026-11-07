@@ -149,10 +149,10 @@ def ref_year_of(df: pd.DataFrame) -> int | None:
 
 def ref_columns_for(fam) -> tuple[str, ...]:
     """成績表の 場所・芝・ダ・距離・芝(内・外) に値を入れる列。family がその部品で絞っているときだけ
-    （コースを含む family は4つとも、芝・ダ だけを含む family は 芝・ダ だけ。ほかは空。画面の絞り込み用）。"""
+    （コースを含む family は4つとも、場所・芝・ダ・距離・芝(内・外) を部品に持つ family はその列だけ。ほかは空。画面の絞り込み用）。"""
     if fam_registry.COURSE in fam.parts:
         return tuple(REF_COLUMNS)
-    return ("芝・ダ",) if "芝・ダ" in fam.parts else ()
+    return tuple(c for c in REF_COLUMNS if c in fam.parts)        # 場所・芝・ダ・距離・芝(内・外) を部品に持つときだけ
 
 
 def aggregate_frame(df: pd.DataFrame, ref_year: int | None = None, wedge_opts: dict | None = None,

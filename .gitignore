@@ -20,6 +20,7 @@ entries_out/
 ingest_in/
 ingest_out/
 ext_indices/
+raw_csv/
 selected_families.json
 *.xlsx
 *.xlsm

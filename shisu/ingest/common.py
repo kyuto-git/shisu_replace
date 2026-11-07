@@ -221,6 +221,7 @@ class Outputs:
     matched: int = 0
     total: int = 0
     notes: list[str] = field(default_factory=list)      # 画面のジョブ結果に出す案内
+    ext_files: list[Path] = field(default_factory=list)  # ext_indices/ に置いた TARGET 取込用CSV
 
     def extend(self, other: "Outputs") -> None:
         self.files += other.files

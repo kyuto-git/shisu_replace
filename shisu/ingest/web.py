@@ -266,7 +266,8 @@ FORM_BODY = """
     <input name="interval_{{ s.name }}" value="{{ q['interval_' ~ s.name] or s.default_interval }}" style="width:100%"></div>{% endfor %}
 </div>
 <div class="muted" style="margin-top:6px">アクセス間隔は {{ min_interval }} 秒未満にできません。keibaAI は muryou-keiba-ai.jp の連番ID（URL の最後の数字）を範囲で指定します。</div>
-<label class="cb" style="margin-top:8px"><input type="checkbox" name="yasui_to_entries" value="1" {{ 'checked' if q.yasui_to_entries else '' }}>安井の出馬表用CSV（yasui_YYYYMMDD.csv）を entries_in/ にも置く</label>
+<input type="hidden" name="to_ext_shown" value="1">
+<label class="cb" style="margin-top:8px"><input type="checkbox" name="to_ext" value="1" {{ 'checked' if q.get('to_ext', True) else '' }}>TARGET 取込用CSVを <code>ext_indices/</code> にも置く（過去レースの replace と出馬表の calc_entry_hensachi が自動で結び付けます。Ω・吉馬・かよちん・keibaAI・安井）</label>
 </div>
 <div class="card"><h1>2. 入力ファイル</h1>
 {% for kind, (label, exts) in kinds.items() %}
@@ -278,10 +279,32 @@ FORM_BODY = """
 {% endfor %}
 <div style="margin-top:12px"><button type="submit" {{ 'disabled' if busy else '' }}>実行</button></div>
 </div></form>
+<div class="card" id="raw"><h1>過去基本CSV（タイムM・対戦M）の統合</h1>
+<div class="muted">TARGET ★6タブで追加抽出した基本CSVを <code>csv_files/全場_タイムM.csv</code>・<code>全場_対戦M.csv</code> に統合します。
+レースID(新) が重なる行は新しいファイルを優先し、最大10年分（データの最新年の9年前以降）を残します。
+ファイル名に「タイム」「マイニング」または「対戦」を入れてください。統合したファイルは <code>raw_csv/merged_done/</code> に移ります。
+（replace_csv_ver3.py も、raw_csv/ に未統合のファイルがあれば先に統合します）</div>
+{% for e in raw_errors %}<div class="warn" style="margin-top:6px">{{ e }}</div>{% endfor %}
+<form method="post" action="{{ url_for('ingest.raw_merge') }}" enctype="multipart/form-data" style="margin-top:8px">
+<input type="file" name="raw_files" multiple accept=".csv">
+{% if raw_listed %}<div class="muted" style="margin-top:4px">raw_csv/ にあるファイル（統合するものにチェック）:</div><div class="cbs">
+{% for f in raw_listed %}<label class="cb"><input type="checkbox" name="raw_pick" value="{{ f }}" checked>{{ f }}</label>{% endfor %}</div>
+{% else %}<div class="muted">（raw_csv/ にファイルを置くと、ここから選べます）</div>{% endif %}
+<div style="margin-top:8px"><button type="submit">統合する</button></div></form></div>
 {% if past %}<div class="card"><h1>これまでの実行</h1><table><thead><tr><th>実行</th><th>状態</th><th>ファイル数</th></tr></thead><tbody>
 {% for p in past %}<tr><td><a href="{{ url_for('ingest.job', run_id=p.id) }}">{{ p.id }}</a></td><td>{{ p.status }}</td><td class="num">{{ p.n }}</td></tr>{% endfor %}
 </tbody></table></div>{% endif %}
 """
+
+RAW_BODY = """
+<div class="card"><h1>過去基本CSVの統合：{{ '完了' if results else '統合したファイルはありません' }}</h1>
+{% for r in results %}<div style="margin-top:4px">{{ r.summary() }}</div>{% endfor %}
+{% for r in results if r.moved %}<div class="muted" style="margin-top:4px">{{ r.kind }}: {{ r.moved|length }} 本を raw_csv/merged_done/ に移しました</div>{% endfor %}
+<div style="margin-top:8px"><a href="{{ url_for('ingest.index') }}#raw">戻る</a></div></div>
+<div class="card"><h1>ログ</h1><pre style="font-size:12px;white-space:pre-wrap">{{ lines|join('\n') }}</pre></div>
+"""
+RAW_LOCK = threading.Lock()
+
 
 JOB_BODY = """
 {% if job_running %}<meta http-equiv="refresh" content="2">{% endif %}
@@ -314,7 +337,11 @@ def make_blueprint(render) -> Blueprint:
         if not allowed_host():
             abort(403)
 
-    def form(errors=(), q=None, status=200):
+    def raw_listed() -> list[str]:
+        from ..raw_merge import pending_files
+        return [p.name for p in pending_files(config.raw_dir()) if _utf8_ok(p.name)]
+
+    def form(errors=(), q=None, status=200, raw_errors=()):
         q = q or {}
         root = config.ingest_out_dir()
         past = []
@@ -331,7 +358,40 @@ def make_blueprint(render) -> Blueprint:
                                      for n in bad_names]
         return render("指数の取得", FORM_BODY, sources=[SOURCES[n] for n in ORDER], kinds=INPUT_KINDS,
                       listed=listed, errors=list(errors), running=running_job(), busy=busy(), past=past,
-                      q=q, q_src=set(q.get("src", [])), q_pick=picks, min_interval=MIN_INTERVAL), status
+                      q=q, q_src=set(q.get("src", [])), q_pick=picks, min_interval=MIN_INTERVAL,
+                      raw_listed=raw_listed(), raw_errors=list(raw_errors)), status
+
+    @bp.route("/raw_merge", methods=["POST"])
+    def raw_merge():
+        """追加の過去基本CSVをアップロード（または raw_csv/ から選び）、csv_files/全場_*.csv に統合する（最大10年分）。"""
+        from .. import raw_merge as rm
+        if not same_origin():
+            abort(403)
+        if not RAW_LOCK.acquire(blocking=False):
+            return form(raw_errors=["ほかの統合を実行中です。終わってからやり直してください"], status=409)
+        try:
+            raw = config.raw_dir()
+            listed = set(raw_listed())
+            picked = [raw / n for n in request.form.getlist("raw_pick") if n in listed]   # 一覧にある名前だけ
+            uploads = [f for f in request.files.getlist("raw_files") if f and f.filename]
+            bad = [f.filename for f in uploads if not f.filename.lower().endswith(".csv")
+                   or rm.kind_of(rm.safe_upload_name(f.filename)) is None]
+            if bad:
+                return form(raw_errors=[f"CSV で、名前に「タイム」「マイニング」または「対戦」を含むファイルにしてください: {n}"
+                                        for n in bad], status=400)
+            raw.mkdir(parents=True, exist_ok=True)
+            taken: set[Path] = set()
+            for f in uploads:
+                dest = unique_path(raw / rm.safe_upload_name(f.filename), taken)
+                f.save(dest)
+                picked.append(dest)
+            if not picked:
+                return form(raw_errors=["統合するファイルを選ぶかアップロードしてください"], status=400)
+            lines: list[str] = []
+            results = rm.merge_raw(raw, config.csv_dir(), files=picked, log=lines.append)
+            return render("過去基本CSVの統合", RAW_BODY, results=[r for r in results if r.files], lines=lines)
+        finally:
+            RAW_LOCK.release()
 
     @bp.route("", methods=["GET"])
     def index():
@@ -341,7 +401,9 @@ def make_blueprint(render) -> Blueprint:
     def run():
         f = request.form
         q = {"src": f.getlist("src"), "keibaai_start": f.get("keibaai_start", ""),
-             "keibaai_end": f.get("keibaai_end", ""), "yasui_to_entries": bool(f.get("yasui_to_entries"))}
+             "keibaai_end": f.get("keibaai_end", ""),
+             # チェックを外して送ったときだけ置かない（フォームを経ない POST は既定どおり置く）
+             "to_ext": bool(f.get("to_ext")) or not f.get("to_ext_shown")}
         for n in ORDER:
             q[f"interval_{n}"] = f.get(f"interval_{n}", "")
         for k in INPUT_KINDS:
@@ -406,8 +468,7 @@ def make_blueprint(render) -> Blueprint:
             bad.append("keibaAI の開始ID・終了IDは数で入れてください")
         req = IngestRequest(sources=[s for s in q["src"] if s in SOURCES], base_paths=paths["base"],
                             lap_paths=paths["lap"], yasui_paths=paths["yasui"], keibaai_start=ks, keibaai_end=ke,
-                            intervals=intervals,
-                            yasui_entries_dir=config.entries_in_dir() if q["yasui_to_entries"] else None)
+                            intervals=intervals, ext_dir=config.ext_dir() if q["to_ext"] else None)
         return bad + validate(req), req, paths
 
     @bp.route("/job/<run_id>", methods=["GET"])

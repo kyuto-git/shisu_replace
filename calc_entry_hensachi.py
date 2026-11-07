@@ -14,6 +14,12 @@
   python calc_entry_hensachi.py --merge-only  # 統合のみ（推奨。DB の xjoin が1本で済む）
   --clean を付けると entries_out の古い CSV を消してから出力する
 統合は レースID(新) で全ファイルを横に結合する（空欄は後続ファイルの値で埋める。行は和集合）。
+
+外部指数の自動結合（ext_indices/。過去側の replace_csv_ver3.py と同じ shisu.ext_indices.attach_filled）:
+  entries_in/ に置く出馬表CSVは マイニング値・対戦型マイニング値 だけの1本（test.csv の形）でよい。
+  ext_indices/ の指数（形式A〜D）を レースID(新)・レースID(旧) で各馬に結び付けてから偏差値・順位を計算する。
+  出馬表CSVにすでに値のある指数（0・空欄以外の値が1頭でもある列）は出馬表の値を使い、ext_indices では補わない。
+  ファイルに無い馬は値 0・最下位（過去側と同じ）。--no-ext で結合しない。--ext-dir で場所を変える
 """
 from __future__ import annotations
 
@@ -106,8 +112,11 @@ def race_key(df: pd.DataFrame) -> pd.Series:
     raise RuntimeError("レースID列が見つかりません（レースID(新) / レースID(新/馬番無) / 場 R）")
 
 
-def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True) -> pd.DataFrame:
+def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True,
+               last_masks: dict[str, pd.Series] | None = None) -> pd.DataFrame:
+    """last_masks: 指数列 → 値から順位を付けるとき最下位にする馬（ext_indices のファイルに無かった馬）。"""
     df = df.copy()
+    last_masks = last_masks or {}
     rk = race_key(df)
     cls = df["クラス名"] if "クラス名" in df.columns else df.get("クラス", pd.Series("", index=df.index))
     shin = shinba_mask(cls)
@@ -125,7 +134,7 @@ def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True) -> pd
         given = df[rank_map[col]] if col in rank_map else None
         if given is None and verbose:
             print(f"[INFO] {name}: {canon} の順位列が無いため、指数から順位を計算します")
-        r = compute_indicator(df[col], rk, spec_for(canon), shin, given)
+        r = compute_indicator(df[col], rk, spec_for(canon), shin, given, last_masks.get(col))
         if verbose and r.attrs.get("direction") == "rank" and r.attrs.get("reverse") != spec_for(canon).reverse:
             print(f"[INFO] {name}: {canon} は TARGET の順位に合わせて偏差値の向きを「"
                   + ("小さいほど上" if r.attrs["reverse"] else "大きいほど上") + "」にしました（台帳の既定と逆）")
@@ -143,6 +152,75 @@ def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True) -> pd
         for i, (c, s) in enumerate(derived.items()):
             df.insert(pos + i, c, s)
     return df
+
+
+def has_values(s: pd.Series) -> bool:
+    """指数の列に、0・空欄以外の値が1頭でもあるか（TARGET は読み込んでいない指数を 0 で出す）。"""
+    v = pd.to_numeric(norm_series(s), errors="coerce")
+    return bool((v.notna() & (v != 0)).any())
+
+
+def present_indicators(frames: list[pd.DataFrame]) -> set[str]:
+    """出馬表CSV（全ファイル）に値のある指数の正式名。"""
+    out: set[str] = set()
+    for df in frames:
+        for c in find_indicator_columns(df):
+            if has_values(df[c]):
+                out.add(canonical_indicator(c))
+    return out
+
+
+def load_ext(ext_root: Path, skip: set[str], log=print) -> dict:
+    """ext_indices/ の指数（skip にあるもの・廃止したものを除く）→ {正式名: ExtLookup}。"""
+    from shisu import ext_indices
+    from shisu.indicators import is_discontinued
+    if not Path(ext_root).is_dir():
+        return {}
+    sources, _skipped = ext_indices.discover(ext_root, log=lambda m: None)
+    out = {}
+    for name, src in sources.items():
+        if name in skip:
+            log(f"[INFO] {name}: 出馬表CSVの値を使います（ext_indices は使いません）")
+            continue
+        if is_discontinued(name):
+            continue
+        out[name] = ext_indices.load_source(src, log=lambda m: None)
+    return out
+
+
+def attach_ext(df: pd.DataFrame, lookups: dict, name: str = "(df)", log=print) -> tuple[pd.DataFrame, dict]:
+    """出馬表1本に ext_indices の指数を付ける。戻り値: (DataFrame, 指数列 → ファイルに無かった馬)。
+
+    出馬表に同じ指数の列が値なし（0・空欄だけ）で残っていれば、その列（と対応する順位の列）を上書きする
+    （列を消すと 指数順位N の対応がずれるため）。無ければ末尾に「{正式名}」と、順位があれば「{正式名}順位」を足す。"""
+    from shisu import ext_indices
+    if not lookups:
+        return df, {}
+    df = df.copy()
+    idx_cols = find_indicator_columns(df)
+    rank_map = build_rank_source_map(df, idx_cols)
+    masks: dict[str, pd.Series] = {}
+    for canon, lookup in lookups.items():
+        try:
+            att = ext_indices.attach_filled(df, lookup)
+        except KeyError as e:
+            log(f"[WARN] {name}: 外部指数を結び付けられません（{e}）")
+            return df, masks
+        existing = [c for c in idx_cols if canonical_indicator(c) == canon]
+        col = existing[0] if existing else canon
+        df[col] = att.values
+        if col in rank_map:
+            df[rank_map[col]] = att.ranks if att.ranks is not None else ""
+        elif att.ranks is not None:
+            df[f"{col}順位"] = att.ranks
+        masks[col] = att.absent
+        note = ""
+        if att.rank_column_empty:
+            note = "（順位の列が空なので値から順位を計算）"
+        elif att.norank_races:
+            note = f"（順位の無いレース {att.norank_races} 件は値から順位を計算）"
+        log(f"[INFO] {name}: 外部指数 {canon} を ext_indices から付けました（値のある馬 {att.hit}/{len(df)}）{note}")
+    return df, masks
 
 
 def merge_frames(dfs: list[pd.DataFrame]) -> pd.DataFrame:
@@ -186,6 +264,8 @@ def main(argv=None) -> int:
     ap.add_argument("--merge-only", action="store_true", help="統合1ファイルだけ出力")
     ap.add_argument("--merge-name", default=DEFAULT_MERGED_NAME)
     ap.add_argument("--clean", action="store_true", help="出力先 entries_out の CSV を消してから実行（古い出馬表を DB に入れないため）")
+    ap.add_argument("--ext-dir", default=str(config.ext_dir()), help="外部指数CSV群のフォルダ（既定 ext_indices）")
+    ap.add_argument("--no-ext", action="store_true", help="ext_indices の外部指数を結び付けない")
     args = ap.parse_args(argv)
 
     files = sorted(Path(args.in_dir).glob("*.csv"))
@@ -199,9 +279,18 @@ def main(argv=None) -> int:
             old.unlink()
 
     processed, rc = [], 0
+    raws: dict[Path, pd.DataFrame] = {}
     for p in files:
         try:
-            df = process_df(read_csv_any(p), p.name)
+            raws[p] = read_csv_any(p)
+        except Exception as e:
+            print(f"[ERROR] {p.name}: {type(e).__name__}: {e}")
+            rc = 1
+    lookups = {} if args.no_ext else load_ext(Path(args.ext_dir), present_indicators(list(raws.values())))
+    for p, raw in raws.items():
+        try:
+            raw, masks = attach_ext(raw, lookups, p.name)
+            df = process_df(raw, p.name, last_masks=masks)
         except Exception as e:
             print(f"[ERROR] {p.name}: {type(e).__name__}: {e}")
             rc = 1

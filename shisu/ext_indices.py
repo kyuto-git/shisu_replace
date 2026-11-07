@@ -623,7 +623,43 @@ def attach(base: pd.DataFrame, lookup: ExtLookup) -> tuple[pd.Series, pd.Series 
     return values, ranks
 
 
+@dataclass
+class Attached:
+    """attach_filled の結果（過去側 replace と出馬表側 calc_entry_hensachi で同じ扱いにするための形）。"""
+    values: pd.Series               # 値。ファイルに無い馬は "0"（TARGET が取り込んでいない馬に出す値と同じ）
+    ranks: pd.Series | None         # 形式B・C の順位（無ければ None）。ファイルに無い馬はそのレースの最下位
+    absent: pd.Series               # ファイルに無い馬（値から順位を付けるときも最下位にする）
+    hit: int                        # ファイルに値があった馬の数
+    norank_races: int = 0           # 値はあるが順位が1頭も無いレースの数（値から順位を付ける）
+    rank_column_empty: bool = False  # 順位の列が全部空（ranks を None にした）
+
+
+def attach_filled(base: pd.DataFrame, lookup: ExtLookup) -> Attached:
+    """attach に、TARGET と同じ数え方の後処理を足したもの。
+    - ファイルに無い馬は値 0（出馬表・従来の ★8 の過去CSVで TARGET が出す値）
+    - 形式B・C でファイルに無い馬の順位は、そのレースに順位のある馬がいればレースの最下位（同順位）
+    - 順位の列が全部空なら ranks=None（値から順位を作る）。レースごとに順位が無いときは compute_indicator が値から付ける
+    """
+    values, ranks = attach(base, lookup)
+    absent = values == ""
+    hit = int((~absent).sum())
+    empty = False
+    norank = 0
+    if ranks is not None and not (ranks != "").any():
+        ranks, empty = None, True
+    if ranks is not None:
+        race = _rid18_series(base).str.slice(0, 16)
+        has = ranks != ""
+        if absent.any():
+            last = has.groupby(race).transform("sum") + 1
+            fill = absent & has.groupby(race).transform("any")
+            ranks = ranks.where(~fill, last.astype(int).astype(str))
+        no_rank = (~absent).groupby(race).transform("any") & ~has.groupby(race).transform("any")
+        norank = int(race[no_rank].nunique())
+    return Attached(values.where(~absent, "0"), ranks, absent, hit, norank, empty)
+
+
 __all__ = [
-    "ExtSource", "ExtLookup", "SUPPORTED", "PATTERN_OF", "YOSHIUMA_KEYS", "YASUI_KEYS", "STRIDE_PREFIXES",
-    "discover", "load_source", "attach", "old_id_from_new", "normalize_old_id", "normalize_old_race_id",
+    "ExtSource", "ExtLookup", "Attached", "SUPPORTED", "PATTERN_OF", "YOSHIUMA_KEYS", "YASUI_KEYS", "STRIDE_PREFIXES",
+    "discover", "load_source", "attach", "attach_filled", "old_id_from_new", "normalize_old_id", "normalize_old_race_id",
 ]

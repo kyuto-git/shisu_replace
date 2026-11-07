@@ -47,6 +47,10 @@ def selected_families_path() -> Path:  # screen_families.py の選抜結果。�
     return Path(env) if env else base_dir() / "selected_families.json"
 
 
+def raw_dir() -> Path:          # 未統合の過去基本CSV（★6タブの追加分）。replace が csv_files/全場_*.csv に統合する
+    return base_dir() / "raw_csv"
+
+
 def ingest_in_dir() -> Path:   # 指数取得（/ingest・ingest.py）の入力（ベースCSV・ラップCSV・安井Excel）
     return base_dir() / "ingest_in"
 

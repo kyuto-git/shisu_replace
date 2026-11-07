@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import re
+import shutil
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -20,7 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from .. import config
-from .common import Cancelled, Fetcher, Logger, Outputs, default_log, read_base
+from .common import RID as RID_HEADER, Cancelled, Fetcher, Logger, Outputs, default_log, read_base
 
 MIN_INTERVAL = 1.0      # スクレイピングのアクセス間隔の下限（秒）
 
@@ -48,6 +50,38 @@ ORDER = tuple(SOURCES)
 DISCONTINUED = {"ittai": "⑤ 一隊（結果分析スピード指数）はサイト側の仕様変更で取得できなくなったため廃止しました"}
 
 
+# ext_indices/ の置き場所（取得元 → ext_indices の下のフォルダ。shisu.ext_indices が指数を見分けられる名前）
+EXT_FOLDERS = {"omega": "OMEGA", "kichiuma": "kichiuma", "kayochin": "kayochin", "keibaai": "keibaAI", "yasui": "yasui"}
+_TARGET_FILE = re.compile(r"^\d{8}_.+\.csv$", re.IGNORECASE)
+
+
+def copy_to_ext(files: list[Path], src_root: Path, ext_root: Path) -> list[Path]:
+    """TARGET 取込用の日付別CSV（{YYYYMMDD}_{名前}.csv。レースID(新), ワーク1 の2列）を ext_indices/ に置く（上書き）。
+    マージ完全版（*_merged.csv）・照合できなかった馬（*_noid.csv）・ベースCSVの無い日の 日付・場所… の形は置かない。
+    フォルダの形は取得元の出力と同じ（kichiuma/kichiuma_{key}/、yasui/yasui_{key}/）。"""
+    out = []
+    for f in files:
+        f = Path(f)
+        name = f.name.lower()
+        if not _TARGET_FILE.match(f.name) or name.endswith("_merged.csv") or name.endswith("_noid.csv"):
+            continue
+        try:
+            head = f.read_bytes()[:200].decode("cp932", errors="replace").lstrip("\ufeff")
+        except OSError:
+            continue
+        if not head.startswith(RID_HEADER):           # 日付, 場所, … の形（ベースCSVの無い日）は TARGET に取り込めない
+            continue
+        try:
+            rel = f.relative_to(src_root)
+        except ValueError:
+            rel = Path(f.name)
+        dst = Path(ext_root) / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(f, dst)
+        out.append(dst)
+    return out
+
+
 @dataclass
 class IngestRequest:
     sources: list[str]
@@ -57,7 +91,7 @@ class IngestRequest:
     keibaai_start: int | None = None
     keibaai_end: int | None = None
     intervals: dict[str, float] = field(default_factory=dict)
-    yasui_entries_dir: Path | None = None     # 安井の出馬表用CSVを entries_in/ にも置くとき
+    ext_dir: Path | None = None               # TARGET 取込用CSVを ext_indices/ にも置く（None なら置かない）
 
     def interval_for(self, name: str) -> float:
         v = self.intervals.get(name, SOURCES[name].default_interval)
@@ -137,11 +171,17 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
                 res = lap.run(req.lap_paths, dest, log)
             else:
                 # ベースCSVの指定が無い開催日は ingest_in/base/ と entries_in/ の CSV から探す
-                res = yasui_extractor.run(req.yasui_paths, base, dest, log, entries_dir=req.yasui_entries_dir,
+                res = yasui_extractor.run(req.yasui_paths, base, dest, log,
                                           search_dirs=(config.ingest_in_dir() / "base", config.entries_in_dir()),
                                           exclude_paths=req.base_paths)
             results[name] = res
             log(f"[DONE] {info.label}: {len(res.files)} ファイル")
+            if req.ext_dir is not None and name in EXT_FOLDERS:
+                copied = copy_to_ext(res.files, dest, Path(req.ext_dir) / EXT_FOLDERS[name])
+                res.ext_files = copied
+                if copied:
+                    log(f"[INFO] {info.label}: TARGET 取込用CSV {len(copied)} 本を {Path(req.ext_dir) / EXT_FOLDERS[name]} に置きました"
+                        "（replace・calc_entry_hensachi が自動で結び付けます）")
         except Cancelled:
             log("[INFO] 中止しました")
             results[name] = "CANCELLED"

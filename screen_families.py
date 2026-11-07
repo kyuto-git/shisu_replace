@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """family（集計キーの型）の候補を、DB を作らずにメモリ上で一括採点し、実戦で使える条件を選び出す。
 
-  python screen_families.py                         # 候補（初期セット＋単一条件＋2条件ペア＋コース/距離帯×1条件）を採点
-  python screen_families.py --space all             # コース/距離帯×2条件も入れる（数千通り。時間がかかる）
+  python screen_families.py                         # 候補（初期セット＋単一条件・2条件ペア・因果トリオ・各骨格×1条件）を採点
+  python screen_families.py --space all             # ＋芝・ダ×(ペア・トリオ)・骨格×2条件（約2,400テンプレート。時間がかかる）
   python screen_families.py --export-selected       # 選抜した family を selected_families.json に書く（以後の本番で使われる）
   python screen_families.py --indicators タイムM,対戦M --workers 4
 
@@ -16,15 +16,26 @@ shisu.classify.classify）でオッズ帯4区分を集計し、master を通し�
     coverage                  件数10以上のグループに入る馬の割合（指数のある馬のうち）
     adj_groups                adjusted_WEDGE が付いたグループ数
     wedge_top / wedge_bottom / wedge_spread  指数上位帯と下位帯の平均 WEDGE（件数で重み付け）とその差
-    fuku_top / fuku_bottom / fuku_spread     同じく複勝率（頻度）
+    adj_wedge_top / adj_wedge_bottom / adj_wedge_spread  同じく adjusted_WEDGE（付いたグループだけ）
+    fuku_top / fuku_bottom / fuku_spread     同じく複勝率（頻度。%）
       上位帯・下位帯: 指数順位帯 s1 = 1位 / 10位~、s2 = 1~3位 / 6位~、偏差値帯 = 71以上 / 40以下、指数順位 = 1 / 10以上
     monotonic                 帯の順に平均 WEDGE が下がっていく割合（隣り合う帯の組のうち、上の帯の方が高い割合。1が理想）
   基準B（本番の判定で絶対軸・軸候補などが生まれるか）
     abs_*, axis_*, opp_*, keshi_*   オッズ帯ごと（normal/odds10u/odds10_50/odds50p）の該当キー数と合計（*_total）
 選抜（--export-selected）: 次のどちらかを満たす候補（family 単位。指数順位帯はスキーム s1/s2 ごとに）
   ① 絶対軸＋軸候補のキーが --min-axis 個以上
-  ② 基準A: groups_ge10 >= --min-groups かつ coverage >= --min-coverage かつ wedge_spread >= --min-spread、
+  ② 基準A: groups_ge10 >= --min-groups（10）かつ coverage >= --min-coverage（0.2）かつ
+     fuku_spread >= --min-fuku-spread（20.0 ＝ 複勝率の差20%ポイント）かつ wedge_spread >= --min-spread（0.10）、
      そのうち wedge_spread の大きい順に上位 --top-a 個
+候補の空間（--space）: 骨格（舞台）× 条件。条件は 重量種別・クラス名・枠番グループ・騎手 と 22条件（28種）
+  骨格0（コース不問）: 単一条件・2条件ペア・因果トリオ（騎手×ローテ×前走、物理属性×前走R印3/脚質×前走着順/上り、
+                       前走人気×前走着順×今走条件、枠番グループ×初角帯/F係数帯×前走脚質）
+  骨格1 芝・ダ / 骨格2 場所×芝・ダ / 骨格3 芝・ダ×距離 / 骨格4 芝・ダ×距離帯 / 骨格5 場所×芝・ダ×距離帯 /
+  骨格6 COURSE、COURSE×重量種別×クラス名（normal）
+  default = 骨格0 の単一・ペア・トリオ ＋ 骨格2〜6 × 単一条件、all = ＋ 骨格1 ×(ペア・トリオ) ＋ 骨格2・3・4・6 × ペア
+            ＋ 骨格5 × 主要ペア
+  同じグループにしかならない組み合わせは除く（redundant(): COURSE＋コースの物理属性、場所＋左右・坂、距離＋距離帯、
+  左右遷移＋左右 など）。部品の集合が同じ候補は1つにまとめる
 """
 from __future__ import annotations
 
@@ -49,9 +60,10 @@ from shisu.naming import file_stem
 from shisu.odds import ODDS_MODES
 
 HENSACHI_ORDER = ("71以上", "66~70", "61~65", "51~60", "41~50", "40以下")
-# 候補を作るときに組み合わせる条件（コース・芝ダ以外の部品）
-POOL = ("重量種別", "クラス名", "枠番グループ", "騎手") + tuple(c for c in CONDITION_COLUMNS if c != "左右")
+# 候補を作るときに組み合わせる条件（28種 = 重量種別・クラス名・枠番グループ・騎手 ＋ 22条件の24列）
+POOL = ("重量種別", "クラス名", "枠番グループ", "騎手") + tuple(CONDITION_COLUMNS)
 PART_CODES = {"COURSE": "crs", "重量種別": "wt", "クラス名": "cls", "枠番グループ": "frm", "騎手": "jk", "芝・ダ": "sd",
+              "場所": "plc", "距離": "dist", "芝(内・外)": "io",
               "時期": "season", "輸送距離": "trans", "間隔帯": "intv", "叩き": "tataki", "R値帯": "rv", "直線帯": "strt",
               "初角帯": "corner", "CFS帯": "cfs", "F係数帯": "fco", "今走クワドラント": "quad", "左右": "lr",
               "左右遷移": "lrchg", "距離帯": "distb", "坂": "slope", "前走クワドラント": "pquad", "斤量帯": "kin",
@@ -59,41 +71,99 @@ PART_CODES = {"COURSE": "crs", "重量種別": "wt", "クラス名": "cls", "枠
               "前走上り3F順": "pagari", "前走脚質": "pstyle", "前走R印3": "pr3"}
 CLASSES = ("abs", "axis", "opp", "keshi")
 
+# コースだけで決まる物理属性（COURSE と掛け合わせても同じグループになる）
+COURSE_ATTRS = ("R値帯", "直線帯", "初角帯", "CFS帯", "F係数帯", "今走クワドラント", "左右", "坂", "距離帯")
+PLACE_ATTRS = ("左右", "坂")                       # 場所だけで決まる
+# 因果関係の強い3条件（骨格0・骨格1 のトリオ）
+ROTATION = ("間隔帯", "叩き", "斤量帯", "斤量増減", "距離増減", "輸送距離")          # ローテ・馬の状態
+PREV = ("前走着順", "前走人気", "前走上り3F順", "前走脚質", "前走R印3", "前走クワドラント")  # 前走の条件
+PHYSICAL = COURSE_ATTRS                                                          # コースの物理属性
+NOW = ("時期", "輸送距離", "間隔帯", "叩き", "斤量帯", "斤量増減", "牝馬限定", "距離増減", "枠番グループ", "騎手",
+       "重量種別", "クラス名", "左右遷移")                                        # 今走の条件
+# 骨格5（場所×芝・ダ×距離帯）の「主要2条件ペア」に使う条件
+MAJOR = ("騎手", "枠番グループ", "重量種別", "クラス名", "間隔帯", "叩き", "斤量帯", "距離増減", "前走着順",
+         "前走人気", "前走上り3F順", "前走脚質", "前走R印3")
+SKELETONS = {                                       # 骨格（舞台）→ 部品
+    "s0": (), "s1": ("芝・ダ",), "s2": ("場所", "芝・ダ"), "s3": ("芝・ダ", "距離"), "s4": ("芝・ダ", "距離帯"),
+    "s5": ("場所", "芝・ダ", "距離帯"), "s6": (F.COURSE,), "s6n": (F.COURSE, "重量種別", "クラス名"),
+}
 
-# ---------------------------------------------------------------------------
-# 候補
-# ---------------------------------------------------------------------------
+
+def redundant(parts: tuple[str, ...]) -> bool:
+    """同じグループにしかならない（または部品が重なる）無意味な組み合わせ。
+    - COURSE（または 場所・芝・ダ・距離 がすべて）＋ コースだけで決まる物理属性（R値帯・直線帯・初角帯・CFS帯・F係数帯・
+      今走クワドラント・左右・坂・距離帯）
+    - 場所 ＋ 左右・坂、距離 ＋ 距離帯、左右遷移 ＋ 左右
+    - COURSE ＋ 場所・芝・ダ・距離・芝(内・外)（部品の重なり）"""
+    ps = set(parts)
+    if len(ps) != len(parts):
+        return True
+    full_course = F.COURSE in ps or {"場所", "芝・ダ", "距離"} <= ps
+    if full_course and ps & set(COURSE_ATTRS):
+        return True
+    if F.COURSE in ps and ps & {"場所", "芝・ダ", "距離", "芝(内・外)"}:
+        return True
+    if "場所" in ps and ps & set(PLACE_ATTRS):
+        return True
+    if "距離" in ps and "距離帯" in ps:
+        return True
+    return "左右遷移" in ps and "左右" in ps
+
+
+def causal_trios(pool: tuple[str, ...] = POOL) -> list[tuple[str, ...]]:
+    """因果関係の強い3条件:
+    ① 騎手 × ローテ・馬の状態 × 前走の条件  ② コースの物理属性 × [前走R印3/前走脚質] × [前走着順/前走上り3F順]
+    ③ 前走人気 × 前走着順 × 今走の条件  ④ 枠番グループ × [初角帯/F係数帯] × 前走脚質"""
+    out = []
+    out += [("騎手", r, p) for r in ROTATION for p in PREV]
+    out += [(c, a, b) for c in PHYSICAL for a in ("前走R印3", "前走脚質") for b in ("前走着順", "前走上り3F順")]
+    out += [("前走人気", "前走着順", n) for n in NOW]
+    out += [("枠番グループ", c, "前走脚質") for c in ("初角帯", "F係数帯")]
+    order = {p: i for i, p in enumerate(pool)}
+    return [tuple(sorted(t, key=lambda p: order.get(p, 99))) for t in out if all(p in order for p in t)]
+
+
+def templates(space: str = "default", pool: tuple[str, ...] = POOL) -> list[tuple[tuple[str, ...], str]]:
+    """(部品, 種類) の候補。default は 単一条件・2条件ペア・因果トリオ・各骨格×単一条件、
+    all はさらに 芝・ダ×(ペア・トリオ)、骨格2〜4×ペア、骨格5×主要ペア、COURSE×ペア。"""
+    singles = [(p,) for p in pool]
+    pairs = list(itertools.combinations(pool, 2))
+    trios = causal_trios(pool)
+    out: list[tuple[tuple[str, ...], str]] = []
+    add = lambda skel, conds, kind: out.extend((SKELETONS[skel] + c, f"{skel}:{kind}") for c in conds)
+    add("s0", singles, "single")
+    add("s0", pairs, "pair")
+    add("s0", trios, "trio")
+    for skel in ("s2", "s3", "s4", "s5", "s6", "s6n"):
+        add(skel, singles, "single")
+    if space == "all":
+        add("s1", pairs, "pair")
+        add("s1", trios, "trio")
+        for skel in ("s2", "s3", "s4", "s6"):
+            add(skel, pairs, "pair")
+        add("s5", list(itertools.combinations(MAJOR, 2)), "pair")
+    return [(parts, kind) for parts, kind in out if not redundant(parts)]
+
+
 def candidate_name(parts: tuple[str, ...], tail: str) -> str:
     return "X_" + "_".join(PART_CODES[p] for p in parts) + {"RBAND": "", "HBAND": "_hen", "RANK": "_rank"}[tail]
 
 
 def make_candidates(space: str = "default", tails: tuple[str, ...] = ("RBAND", "HBAND"),
                     pool: tuple[str, ...] = POOL) -> list[F.Family]:
-    """候補の family。初期セット（49種）は名前をそのまま使い、新しい組み合わせは X_… の名前にする。"""
+    """候補の family。初期セット（49種）は名前をそのまま使い、新しい組み合わせは X_… の名前にする。
+    部品の集合が同じもの（並びだけ違う）は1つにまとめる（初期セットを優先）。"""
     out: dict[tuple, F.Family] = {}
     for f in F.default_families():
-        out[(f.parts, f.tail)] = f
-    templates: list[tuple[tuple[str, ...], str]] = []
-    for p in pool:
-        templates.append(((p,), "single"))
-    for a, b in itertools.combinations(pool, 2):
-        templates.append(((a, b), "pair"))
-    for p in pool:
-        templates.append(((F.COURSE, p), "course1"))
-        if p != "距離帯":
-            templates.append((("芝・ダ", "距離帯", p), "distband1"))
-    if space == "all":
-        for a, b in itertools.combinations(pool, 2):
-            templates.append(((F.COURSE, a, b), "course2"))
-            if "距離帯" not in (a, b):
-                templates.append((("芝・ダ", "距離帯", a, b), "distband2"))
-    for parts, layer in templates:
+        out[(frozenset(f.parts), f.tail)] = f
+    for parts, layer in templates(space, pool):
         for t in tails:
-            if (parts, t) in out:
+            key = (frozenset(parts), t)
+            if key in out:
                 continue
             f = F.Family(candidate_name(parts, t), parts, t, layer=f"X:{layer}")
             F.validate(f)
-            out[(parts, t)] = f
+            out[key] = f
     return list(out.values())
 
 
@@ -165,6 +235,10 @@ def score_master(path: str, fam_dicts: list[dict], wedge_opts: dict | None, mode
                 else:
                     t_rows, b_rows = ge10[ge10["_tail"] == top], ge10[ge10["_tail"] == bottom]
                 for name, part_rows in (("top", t_rows), ("bottom", b_rows)):
+                    cnt = part_rows["件数"].astype(float)
+                    adj = pd.to_numeric(part_rows["adjusted_WEDGE"], errors="coerce")
+                    rec[f"a_{name}_sum"] = float((adj.fillna(0) * cnt).sum())        # adjusted_WEDGE（年10件以上）
+                    rec[f"na_{name}"] = float(cnt[adj.notna()].sum())
                     rec[f"w_{name}_sum"] = float((pd.to_numeric(part_rows["WEDGE"], errors="coerce").fillna(0)
                                                   * part_rows["件数"].astype(float)).sum())
                     rec[f"f_{name}_sum"] = float((part_rows["_fuku"].fillna(0) * part_rows["件数"].astype(float)).sum())
@@ -212,7 +286,7 @@ def summarize(rows: list[dict], fams: list[F.Family], modes: tuple[str, ...]) ->
             return pd.Series(np.nan, index=g.index)
         return (g[num] / g[den].replace(0, np.nan)).round(4)
 
-    for name, k, n in (("wedge", "w", "n"), ("fuku", "f", "nf")):
+    for name, k, n in (("wedge", "w", "n"), ("adj_wedge", "a", "na"), ("fuku", "f", "nf")):
         out[f"{name}_top"] = ratio(f"{k}_top_sum", f"{n}_top")
         out[f"{name}_bottom"] = ratio(f"{k}_bottom_sum", f"{n}_bottom")
         out[f"{name}_spread"] = (out[f"{name}_top"] - out[f"{name}_bottom"]).round(4)
@@ -235,10 +309,11 @@ def summarize(rows: list[dict], fams: list[F.Family], modes: tuple[str, ...]) ->
 
 
 def select(report: pd.DataFrame, min_axis: int, min_groups: int, min_coverage: float, min_spread: float,
-           top_a: int) -> pd.DataFrame:
+           top_a: int, min_fuku_spread: float = 20.0) -> pd.DataFrame:
     r = report.copy()
     r["select_B"] = (r["abs_total"] + r["axis_total"]) >= min_axis
-    ok_a = (r["groups_ge10"] >= min_groups) & (r["coverage"] >= min_coverage) & (r["wedge_spread"] >= min_spread)
+    ok_a = ((r["groups_ge10"] >= min_groups) & (r["coverage"] >= min_coverage)
+            & (r["fuku_spread"] >= min_fuku_spread) & (r["wedge_spread"] >= min_spread))
     rank_a = r[ok_a].sort_values("wedge_spread", ascending=False).head(top_a).index
     r["select_A"] = r.index.isin(rank_a)
     r["selected"] = r["select_A"] | r["select_B"]
@@ -274,6 +349,8 @@ def main(argv=None) -> int:
     ap.add_argument("--min-groups", type=int, default=10, help="選抜②: 件数10以上のグループ数の下限（既定10）")
     ap.add_argument("--min-coverage", type=float, default=0.2, help="選抜②: カバー率の下限（既定0.2）")
     ap.add_argument("--min-spread", type=float, default=0.10, help="選抜②: wedge_spread の下限（既定0.10）")
+    ap.add_argument("--min-fuku-spread", type=float, default=20.0,
+                    help="選抜②: fuku_spread（上位帯と下位帯の複勝率の差。%ポイント）の下限（既定20.0）")
     ap.add_argument("--top-a", type=int, default=30, help="選抜②で採る数の上限（既定30）")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--wedge-min-year-count", type=int, default=None)
@@ -328,7 +405,7 @@ def main(argv=None) -> int:
         print("[ERROR] 採点できた master がありません", file=sys.stderr)
         return 2
     report = select(summarize(rows, fams, modes), args.min_axis, args.min_groups, args.min_coverage,
-                    args.min_spread, args.top_a)
+                    args.min_spread, args.top_a, args.min_fuku_spread)
     report = report.sort_values(["selected", "abs_total", "axis_total", "wedge_spread"], ascending=False)
     write_csv(report, Path(args.report))
     n_sel = int(report["selected"].sum())
@@ -346,7 +423,9 @@ def main(argv=None) -> int:
         F.save_families(args.export_selected, sel, {"source": "screen_families.py", "space": args.space,
                                                     "criteria": {"min_axis": args.min_axis, "min_groups": args.min_groups,
                                                                  "min_coverage": args.min_coverage,
-                                                                 "min_spread": args.min_spread, "top_a": args.top_a}})
+                                                                 "min_spread": args.min_spread,
+                                                                 "min_fuku_spread": args.min_fuku_spread,
+                                                                 "top_a": args.top_a}})
         print(f"[INFO] {len(sel)} family を {args.export_selected} に書きました。"
               "以後の aggregate_stats_ver2.py・build_db.py・照合はこの family を使います")
     return 0

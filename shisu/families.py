@@ -2,6 +2,7 @@
 
 family = 部品（parts）の並び ＋ 末尾の指数の部品（tail）
   部品: COURSE（場所×芝・ダ×距離×[芝(内・外)]。内外は空なら省く）、重量種別、クラス名、枠番グループ、騎手、芝・ダ、
+        場所・距離・芝(内・外)（コースの要素を1つずつ。COURSE とは同時に使わない）、
         shisu/conditions.py の条件（時期・輸送距離・間隔帯・叩き・R値帯・…・前走R印3）
   tail: RANK（指数順位そのもの）/ RBAND（指数順位帯。スキーム s1=細5帯・s2=広3帯）/ HBAND（偏差値帯6種）
   キー = 部品の値を「×」でつないだもの。部品が1つでも空なら作らない
@@ -35,7 +36,9 @@ COURSE = "COURSE"
 COURSE_FIELDS = ("場所", "芝・ダ", "距離")
 INNER_FIELD = "芝(内・外)"
 BASE_PARTS = ("重量種別", "クラス名", "枠番グループ", "騎手", "芝・ダ")
-PART_TOKENS = (COURSE,) + BASE_PARTS + tuple(CONDITION_COLUMNS)
+# コースの要素を COURSE とは別に1つずつ使う部品（場所×芝・ダ・芝・ダ×距離 などの骨格。COURSE とは同時に使えない）
+COURSE_PARTS = ("場所", "距離", INNER_FIELD)
+PART_TOKENS = (COURSE,) + BASE_PARTS + COURSE_PARTS + tuple(CONDITION_COLUMNS)
 TAILS = ("RANK", "RBAND", "HBAND")
 TAIL_LABELS = {"RANK": "指数順位", "RBAND": "指数順位帯", "HBAND": "偏差値帯"}
 PART_LABELS = {COURSE: "コース", "間隔帯": "レース間隔", "叩き": "叩き良化", "左右遷移": "左右回り遷移",
@@ -121,6 +124,9 @@ def validate(f: Family) -> None:
         raise ValueError(f"family {f.name}: 知らない部品 {bad}（使えるのは {list(PART_TOKENS)}）")
     if len(set(f.parts)) != len(f.parts):
         raise ValueError(f"family {f.name}: 同じ部品が2回あります: {list(f.parts)}")
+    if COURSE in f.parts and set(f.parts) & ({"芝・ダ"} | set(COURSE_PARTS)):
+        raise ValueError(f"family {f.name}: COURSE（場所×芝・ダ×距離×内外）と、その要素（場所・芝・ダ・距離・芝(内・外)）は"
+                         f"同時に使えません: {list(f.parts)}")
     if any(sc not in ("s1", "s2") for sc in f.only) or len(set(f.only)) != len(f.only):
         raise ValueError(f"family {f.name}: schemes は s1・s2 のどれか: {list(f.only)}")
     if f.only and not f.uses_schemes:
@@ -400,6 +406,11 @@ def entry_keys(fields: Mapping, fam: Family | str, scheme: str = "") -> list[str
             vs = [base + (SEP + io if io else "") for io in inner_variants(str(fields.get(INNER_FIELD) or ""))]
         elif p in BANDED_CONDITIONS:
             vs = band_labels(fields.get(p) or None, _scheme_for_part(fam, scheme), BANDED_CONDITIONS[p])
+        elif p == INNER_FIELD:
+            # 芝(内・外) だけを部品にしたとき: 出馬表で内外が分からなければ 内・外・内外 を試す（COURSE と同じ考え方。
+            # 過去側で空のレース（ダートなど）はこの部品のキーを作らない）
+            v = str(fields.get(p) or "")
+            vs = [v] if v else ["内", "外", "内外"]
         else:
             v = str(fields.get(p) or "")
             vs = [v] if v else []
