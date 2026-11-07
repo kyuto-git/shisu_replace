@@ -14,15 +14,17 @@
 from __future__ import annotations
 
 import re
-import shutil
 import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+import pandas as pd
+
 from .. import config
-from .common import RID as RID_HEADER, Cancelled, Fetcher, Logger, Outputs, default_log, read_base
+from ..csvio import read_csv_any, write_csv
+from .common import RID as RID_HEADER, WORK, Cancelled, Fetcher, Logger, Outputs, default_log, read_base
 
 MIN_INTERVAL = 1.0      # スクレイピングのアクセス間隔の下限（秒）
 
@@ -55,29 +57,68 @@ EXT_FOLDERS = {"omega": "OMEGA", "kichiuma": "kichiuma", "kayochin": "kayochin",
 _TARGET_FILE = re.compile(r"^\d{8}_.+\.csv$", re.IGNORECASE)
 
 
-def copy_to_ext(files: list[Path], src_root: Path, ext_root: Path) -> list[Path]:
-    """TARGET 取込用の日付別CSV（{YYYYMMDD}_{名前}.csv。レースID(新), ワーク1 の2列）を ext_indices/ に置く（上書き）。
+def _read_target_csv(path: Path) -> pd.DataFrame | None:
+    """TARGET 取込用CSV（レースID(新), ワーク1）→ 文字列の2列。形が違えば None。"""
+    try:
+        df = read_csv_any(path)
+    except Exception:
+        return None
+    if RID_HEADER not in df.columns or WORK not in df.columns:
+        return None
+    df = df[[RID_HEADER, WORK]].astype(object).where(df[[RID_HEADER, WORK]].notna(), "")
+    return df.apply(lambda s: s.map(lambda v: str(v).strip()))
+
+
+def copy_to_ext(files: list[Path], src_root: Path, ext_root: Path, log: Logger | None = None) -> list[Path]:
+    """TARGET 取込用の日付別CSV（{YYYYMMDD}_{名前}.csv。レースID(新), ワーク1 の2列）を ext_indices/ に置く。
     マージ完全版（*_merged.csv）・照合できなかった馬（*_noid.csv）・ベースCSVの無い日の 日付・場所… の形は置かない。
-    フォルダの形は取得元の出力と同じ（kichiuma/kichiuma_{key}/、yasui/yasui_{key}/）。"""
+    フォルダの形は取得元の出力と同じ（kichiuma/kichiuma_{key}/、yasui/yasui_{key}/）。
+
+    同じ名前のファイルがすでにあれば、丸ごと上書きせず レースID(新) ごとに足し合わせる: 今回値の取れた馬だけ
+    新しい値にし、取れなかった馬（空欄）は前の値を残す（取得できなかった日・別の場所や範囲で取り直したときに、
+    前に取った値を消さない）。新しいファイルの値が全部空欄なら、新しく作らない。"""
+    log = log or (lambda m: None)
     out = []
     for f in files:
         f = Path(f)
         name = f.name.lower()
         if not _TARGET_FILE.match(f.name) or name.endswith("_merged.csv") or name.endswith("_noid.csv"):
             continue
-        try:
-            head = f.read_bytes()[:200].decode("cp932", errors="replace").lstrip("\ufeff")
-        except OSError:
-            continue
-        if not head.startswith(RID_HEADER):           # 日付, 場所, … の形（ベースCSVの無い日）は TARGET に取り込めない
+        new = _read_target_csv(f)
+        if new is None:                  # 日付, 場所, … の形（ベースCSVの無い日）は TARGET に取り込めない
             continue
         try:
             rel = f.relative_to(src_root)
         except ValueError:
             rel = Path(f.name)
         dst = Path(ext_root) / rel
+        has = new[WORK] != ""
+        if dst.exists():
+            old = _read_target_csv(dst)
+            if old is None:
+                log(f"[WARN] {dst} は レースID(新), ワーク1 の形ではないので上書きしません（今回の {f.name} は置きません）")
+                continue
+            vals = dict(zip(old[RID_HEADER], old[WORK]))
+            order = list(dict.fromkeys(old[RID_HEADER]))
+            for rid, v, h in zip(new[RID_HEADER], new[WORK], has):
+                if rid not in vals:
+                    order.append(rid)
+                    vals[rid] = v
+                elif h:
+                    vals[rid] = v
+            merged = pd.DataFrame({RID_HEADER: order, WORK: [vals[r] for r in order]})
+            kept = int(((old[WORK] != "") & ~old[RID_HEADER].isin(new.loc[has, RID_HEADER])).sum())
+            if kept:
+                log(f"[INFO] {dst.name}: 今回値の取れなかった {kept} 頭は前の値を残しました")
+        else:
+            if not has.any():
+                log(f"[INFO] {f.name}: 値が1頭も無いので ext_indices には置きません")
+                continue
+            merged = new
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(f, dst)
+        tmp = dst.with_name(f".{dst.name}.tmp")
+        write_csv(merged, tmp)
+        tmp.replace(dst)
         out.append(dst)
     return out
 
@@ -177,10 +218,16 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
             results[name] = res
             log(f"[DONE] {info.label}: {len(res.files)} ファイル")
             if req.ext_dir is not None and name in EXT_FOLDERS:
-                copied = copy_to_ext(res.files, dest, Path(req.ext_dir) / EXT_FOLDERS[name])
+                ext_to = Path(req.ext_dir) / EXT_FOLDERS[name]
+                try:
+                    copied = copy_to_ext(res.files, dest, ext_to, log)
+                except OSError as e:     # 置けなくても取得の結果（ingest_out）は残っているので、失敗扱いにしない
+                    log(f"[WARN] {info.label}: ext_indices に置けませんでした（{type(e).__name__}: {e}）。"
+                        f"ingest_out の TARGET 取込用CSVを手で {ext_to} に置いてください")
+                    copied = []
                 res.ext_files = copied
                 if copied:
-                    log(f"[INFO] {info.label}: TARGET 取込用CSV {len(copied)} 本を {Path(req.ext_dir) / EXT_FOLDERS[name]} に置きました"
+                    log(f"[INFO] {info.label}: TARGET 取込用CSV {len(copied)} 本を {ext_to} に置きました"
                         "（replace・calc_entry_hensachi が自動で結び付けます）")
         except Cancelled:
             log("[INFO] 中止しました")

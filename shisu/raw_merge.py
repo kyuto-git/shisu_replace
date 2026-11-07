@@ -3,8 +3,10 @@
 半年〜1年に1回、TARGET ★6タブで追加分を出したら raw_csv/ に置く（または /ingest 画面からアップロード）。
   - 種類はファイル名で決める: 「対戦」「match」→ 対戦M、「タイム」「time」「マイニング」「mining」→ タイムM
     （「対戦型マイニング」はマイニングも含むので、対戦を先に見る）。どちらでもないファイルは触らない
-  - 既存の csv_files/全場_{種類}.csv と、raw_csv のファイル（更新日時の古い順）を縦につなぎ、レースID(新) が同じ行は
-    後のファイルの行を使う（追加抽出した新しいファイルが優先）。レースID(新) の無い行はそのまま残す
+  - 既存の csv_files/全場_{種類}.csv と、raw_csv のファイル（更新日時の古い順）を縦につなぎ、レースID(新) が同じ馬の行は
+    後のファイルの行を使う（追加抽出した新しいファイルが優先）。レース単位（16桁）の ID は 馬番 を付けて馬単位で比べる。
+    レースID(新) の無い行・16桁で馬番の読めない行はそのまま残す
+  - 書き出しは一時ファイルに書いてから置き換える（途中で止まっても既存の 全場_*.csv を壊さない）
   - 最大10年分を残す: 基準年（既定はデータの中の最新年。ref_year で指定もできる）の9年前以降。
     例: 2026年が基準なら 2017〜2026年を残し、2016年以前は消す。年は レースID(新) の先頭4桁（無ければ 日付S）
   - 統合したファイルは raw_csv/merged_done/ に移す（同じ名前があれば _2 などを付ける。次回また統合しない）
@@ -12,6 +14,7 @@ replace_csv_ver3.py は raw_csv/ に未統合のCSVがあれば、master を作�
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import unicodedata
@@ -22,6 +25,7 @@ from typing import Callable, Iterable
 import pandas as pd
 
 from .csvio import norm_series, read_csv_any, write_csv
+from .normalize import horse_race_id
 
 KINDS = ("タイムM", "対戦M")
 MERGED_NAME = "全場_{kind}.csv"
@@ -109,9 +113,11 @@ def merge_kind(kind: str, files: list[Path], csv_dir: Path | str, years: int = D
         cols += [c for c in f.columns if c not in cols]
     df = pd.concat([f.reindex(columns=cols) for f in frames], ignore_index=True)
     df = df.astype(object).where(df.notna(), "")
-    rid = norm_series(df[RID])
-    has = rid != ""
-    dup = has & rid.duplicated(keep="last")            # 後のファイルの行を残す
+    # 重複の判定は馬単位（18桁）で。レース単位（16桁）の ID は 馬番 を付けてそろえる（そのままだと1レースが1頭に潰れる）。
+    # 16桁のまま馬番の読めない行は判定しない（残す）
+    rid = horse_race_id(df[RID], df["馬番"] if "馬番" in df.columns else pd.Series("", index=df.index))
+    has = ((rid != "") & ~rid.str.fullmatch(r"\d{16}").fillna(False)).astype(bool)
+    dup = has & rid.where(has, None).duplicated(keep="last")            # 後のファイルの行を残す
     res.replaced = int(dup.sum())
     df = df[~dup]
     y = _year(df)
@@ -125,7 +131,10 @@ def merge_kind(kind: str, files: list[Path], csv_dir: Path | str, years: int = D
         kept = y[~old].dropna()
         res.years = (int(kept.min()), int(kept.max())) if len(kept) else None
     res.after = len(df)
-    write_csv(df[cols], out)
+    # 一時ファイルに書いてから置き換える（途中で止まっても 全場_*.csv の履歴を壊さない）
+    tmp = out.with_name(f".{out.name}.tmp")
+    write_csv(df[cols], tmp)
+    os.replace(tmp, out)
     if res.no_year:
         log(f"[WARN] {out.name}: 年の分からない行 {res.no_year} 行は残しました（レースID(新)・日付S が無い）")
     return res

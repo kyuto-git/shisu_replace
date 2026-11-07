@@ -23,7 +23,7 @@ def rows(year: int, races: int = 1, heads: int = 10, value: int = 50, day: str =
             out.append({"日付S": f"{year}{day}", "場所": "東京", "Ｒ": str(r), "距離": "芝1600", "頭数": str(heads),
                         "枠番": str(min(8, (u + 1) // 2)), "馬番": str(u), "騎手": f"騎手{u}", "クラス名": "1勝",
                         "着順": str(u), "単勝オッズ": "5.0", "指数": str(value + u), "指数順位": str(heads - u + 1),
-                        "レースID(新)": f"{year}{day}05040{r % 10}{r:02d}{r:02d}{u:02d}"})
+                        "レースID(新)": f"{year}{day}050401{r:02d}{u:02d}"})
     return pd.DataFrame(out)
 
 
@@ -126,3 +126,54 @@ def test_web_upload_and_merge(client, tmp_path):
     assert client.post("/ingest/raw_merge", data={}).status_code == 400
     r = client.post("/ingest/raw_merge", data={}, headers={"Origin": "http://evil.example"})
     assert r.status_code == 403
+
+
+def test_race_level_ids_are_deduped_per_horse(tmp_path):
+    """レース単位（16桁）の レースID(新) でも、馬番を付けて馬ごとに比べる（1レースが1頭に潰れない）。"""
+    csv_dir, raw = tmp_path / "csv_files", tmp_path / "raw_csv"
+    old = rows(2025, races=3)
+    old["レースID(新)"] = old["レースID(新)"].str[:16]                                  # 既存も16桁
+    _write(old, csv_dir / "全場_タイムM.csv")
+    new = rows(2025, races=1, value=80)                                                 # R1 を18桁で出し直し
+    add16 = rows(2026, races=1)
+    add16["レースID(新)"] = add16["レースID(新)"].str[:16]
+    _write(pd.concat([new, add16], ignore_index=True), raw / "タイム_追加.csv")
+    r = rm.merge_raw(raw, csv_dir, log=lambda m: None)[0]
+    out = pd.read_csv(csv_dir / "全場_タイムM.csv", encoding="cp932", dtype=str, keep_default_na=False)
+    assert r.replaced == 10 and len(out) == 3 * 10 + 10 == r.after                     # R1 の10頭だけ置き換え
+    r1 = out[(out["レースID(新)"].str[:16] == old["レースID(新)"].iloc[0]) | (out["レースID(新)"].str[:16] ==
+                                                                              new["レースID(新)"].str[:16].iloc[0])]
+    assert set(r1["指数"].astype(int)) == set(range(81, 91))
+    assert (out["レースID(新)"].str.len() == 16).sum() == 20 + 10                         # 元の表記のまま書く
+
+
+def test_failed_write_keeps_existing_history(tmp_path, monkeypatch):
+    """書き込みが途中で失敗しても、既存の 全場_*.csv は元のまま（一時ファイルに書いてから置き換える）。"""
+    csv_dir, raw = tmp_path / "csv_files", tmp_path / "raw_csv"
+    _write(pd.concat([rows(y) for y in range(2020, 2026)], ignore_index=True), csv_dir / "全場_タイムM.csv")
+    before = (csv_dir / "全場_タイムM.csv").read_bytes()
+    _write(rows(2026), raw / "タイム_追加.csv")
+
+    def boom(df, path):
+        Path(path).write_bytes(b"partial")
+        raise OSError("No space left on device")
+    monkeypatch.setattr(rm, "write_csv", boom)
+    with pytest.raises(OSError):
+        rm.merge_raw(raw, csv_dir, log=lambda m: None)
+    assert (csv_dir / "全場_タイムM.csv").read_bytes() == before
+    assert (raw / "タイム_追加.csv").exists()                                               # 移さない
+
+
+def test_replace_default_raw_dir_follows_csv_dir(tmp_path, monkeypatch):
+    """--csv-dir を別の場所にしたら、--raw-dir の既定はその隣の raw_csv（本物の raw_csv を取り込んで動かさない）。"""
+    import replace_csv_ver3
+    monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path / "base"))
+    real = tmp_path / "base" / "raw_csv"
+    _write(rows(2026), real / "タイムM_本番.csv")
+    other = tmp_path / "work"
+    _write(pd.concat([rows(2025, races=2), rows(2026, races=2)], ignore_index=True), other / "raw_csv" / "タイムM_試し.csv")
+    assert replace_csv_ver3.main(["--csv-dir", str(other / "csv_files"), "--no-ext",
+                                  "--master-dir", str(other / "m")]) == 0
+    assert (real / "タイムM_本番.csv").exists() and not (real / "merged_done").exists()
+    assert (other / "raw_csv" / "merged_done" / "タイムM_試し.csv").exists()
+    assert (other / "csv_files" / "全場_タイムM.csv").exists()

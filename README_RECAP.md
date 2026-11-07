@@ -17,7 +17,7 @@ entries_in/（マイニング値だけの出馬表1本でよい）＋ ext_indice
            ─ build_db.py --mode entries ─> racing.db（entries_*, entries_xjoin_*）
 app.py（http://localhost:8000）: 横断検索 / 出馬表 / 条件ヒット馬 / レース別 WEDGE 一覧 / 指数の取得（/ingest）
 ingest_in/ ─ ingest.py（または /ingest）─> ingest_out/実行日時/（Ω・吉馬6・かよちん・keibaAI・ラップ6・安井 → TARGET 取込用CSV ＝ ext_indices の形式A。一隊は廃止）
-           ─> ext_indices/ にもコピー（既定。--no-ext-copy で止める。ラップ6は台帳に未登録なのでコピーしない）
+           ─> ext_indices/ にもコピー（既定。同じ名前は馬ごとに足し合わせ。--no-ext-copy で止める。ラップ6は台帳に未登録なのでコピーしない）
 ```
 
 正規化・22条件・family・キー・偏差値・分類・照合は共通パッケージ `shisu/` にある。**キーに関わる変更は必ず `shisu/` で行う**（過去側と出馬表側で同じ関数を使うことで一致を保証している）。
@@ -47,6 +47,6 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - 条件ヒット馬: 消し → 絶対軸 → 軸候補 → 相手 の順で最初に当てはまった区分（閾値は `shisu/classify.py`）。screen_families の基準B はこの判定のキー数。基準A は groups_ge10・coverage・wedge_spread・fuku_spread（既定20%ポイント）。候補は 骨格（コース不問〜COURSE）× 条件28種 × 因果トリオ（default 2,098通り・all 7,557通り。master 1本30万行で 1.4時間・5時間）
 - WEDGE = WIN（決定力）+ EDGE（オッズから見た期待着順を上回った割合）。adjusted_WEDGE は年10件以上の年すべて（最大10年）を新しい年ほど重い指数減衰（0.65）で加重
 - 外部指数の取得は `shisu/ingest/` と `shisu/yasui_extractor.py`（安井 8指数。指数ごとのフォルダ。ベースCSV未指定でも ingest_in/base/・entries_in/ から該当日を探す。出馬表用の entries_in/yasui_*.csv は廃止）
-- 出馬表の外部指数: 出馬表に値のある指数は出馬表の値、無い指数は ext_indices から過去側と同じ関数（`ext_indices.attach_filled`）で付ける → 同じ馬なら master と順位・偏差値が一致
+- 出馬表の外部指数: 出馬表に値のある指数は出馬表の値（ファイル・レースごとに判定）、無い・0 だけのレースは ext_indices から過去側と同じ関数（`ext_indices.attach_filled`）で付ける → 同じ馬なら master と順位・偏差値が一致
 - レース単位（16桁）の レースID(新) は replace が馬番を付けて18桁にする（旧版の band 系の件数膨張の再発防止。tests/test_band_regression.py）
 - family・集計条件だけ変えたときは aggregate → build_db だけでよい（master はそのまま）

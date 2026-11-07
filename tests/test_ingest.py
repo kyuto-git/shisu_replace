@@ -548,7 +548,7 @@ def test_run_ingest_yasui_uses_ingest_in_base(tmp_path, monkeypatch):
     assert (tmp_path / "out" / "yasui" / "yasui_speed" / "今週_speed_merged.csv").exists()
 
 
-def test_yasui_entries_file_feeds_calc_entry_hensachi(tmp_path):
+def test_yasui_ext_copy_feeds_calc_entry_hensachi(tmp_path):
     """安井の TARGET 取込用CSVを ext_indices/yasui/ に置けば、calc_entry_hensachi が出馬表に結び付けて 安井_* の偏差値・順位が付く。
     順位は値から計算する（過去側は TARGET に取り込んだ値から順位を出すので、Excel の丸数字は使わない）。"""
     import calc_entry_hensachi as c
@@ -567,12 +567,12 @@ def test_yasui_entries_file_feeds_calc_entry_hensachi(tmp_path):
     copy_to_ext(res.files, tmp_path / "o", tmp_path / "ext" / "yasui")      # /ingest が ext_indices/yasui/ に置く
     main = pd.DataFrame([{"レースID(新)": f"2025110105040101{u:02d}", "場 R": "東1", "場所": "東京", "馬番": str(u),
                           "馬名S": f"ウマ{u}", "SAV": str(50 + u)} for u in range(1, 11)])
-    lookups = c.load_ext(tmp_path / "ext", c.present_indicators([main]))
+    lookups = c.load_ext(tmp_path / "ext", log=lambda m: None)
     assert set(lookups) == {"安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー", "安井_根性", "安井_賢さ",
                             "安井_体力", "安井_やる気"}
-    yas, masks = c.attach_ext(main, lookups, "main", log=lambda m: None)
+    yas, masks, added = c.attach_ext(main, lookups, "main", log=lambda m: None)
     assert not [col for col in yas.columns if col.startswith("安井") and col.endswith("順位")]   # 順位は値から
-    out = c.process_df(yas, "main", verbose=False, last_masks=masks)
+    out = c.process_df(yas, "main", verbose=False, last_masks=masks, ext_cols=added)
     assert {"安井_スピード_偏差値", "安井_スピード_順位", "安井_ランク_順位帯_s1", "SAV_順位"} <= set(out.columns)
     sp_rank = out.set_index("馬番")["安井_スピード_順位"].astype(str)
     assert sp_rank["3"] == "1" and sp_rank["1"] == "2"
@@ -851,7 +851,7 @@ def test_zero_missing_parity_between_target_history_and_entries(tmp_path):
     copy_to_ext(res.files, tmp_path / "o", tmp_path / "ext" / "yasui")
     main = base.drop(columns=["ワーク1"])
     lookups = calc.load_ext(tmp_path / "ext", set(), log=lambda m: None)
-    ent, masks = calc.attach_ext(main, {"安井_スピード": lookups["安井_スピード"]}, log=lambda m: None)
+    ent, masks, _added = calc.attach_ext(main, {"安井_スピード": lookups["安井_スピード"]}, log=lambda m: None)
     hist_vals = target["ワーク1"].where(target["ワーク1"] != "", "0")            # TARGET の出力（無い馬は 0）
     hv = pd.to_numeric(hist_vals)
     target_rank = hv.rank(ascending=False, method="min").astype(int).astype(str)   # TARGET の順位は 0 も数える
@@ -1042,3 +1042,47 @@ def test_copy_to_ext_layout_is_found_by_ext_indices(tmp_path):
     sources, _ = ext_indices.discover(ext, log=lambda m: None)
     assert {"吉馬_SP能力値", "吉馬_末脚力", "かよちん指数", "keibaAI指数"} <= set(sources)
     assert not list(ext.rglob("*_merged.csv"))
+
+
+def test_copy_to_ext_merges_by_horse_instead_of_overwriting(tmp_path):
+    """取り直しで値の取れなかった馬（空欄）は、ext_indices にある前の値を残す。値が1頭も無いファイルは新しく置かない。
+    レースID(新), ワーク1 の形でないファイルは上書きしない。"""
+    from shisu.ingest import copy_to_ext
+    src, ext = tmp_path / "out" / "omega", tmp_path / "ext" / "OMEGA"
+    rid = [f"2025110105040101{u:02d}" for u in range(1, 5)]
+
+    def put(path, vals):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(("レースID(新),ワーク1\r\n" + "".join(f"{r},{v}\r\n" for r, v in zip(rid, vals))).encode("cp932"))
+    put(src / "20251101_omega.csv", ["50", "60", "70", "80"])
+    assert copy_to_ext([src / "20251101_omega.csv"], src, ext) == [ext / "20251101_omega.csv"]
+    put(src / "20251101_omega.csv", ["55", "", "", ""])                     # 2回目は1頭だけ取れた
+    logs = []
+    copy_to_ext([src / "20251101_omega.csv"], src, ext, logs.append)
+    d = out_csv(ext / "20251101_omega.csv").set_index("レースID(新)")["ワーク1"]
+    assert d.tolist() == ["55", "60", "70", "80"] and any("前の値を残しました" in m for m in logs)
+    put(src / "20251102_omega.csv", ["", "", "", ""])                       # サイトが落ちていた日
+    assert copy_to_ext([src / "20251102_omega.csv"], src, ext) == [] and not (ext / "20251102_omega.csv").exists()
+    (ext / "20251103_omega.csv").write_bytes("0520380101,54\r\n".encode("cp932"))   # 手で置いた別の形
+    put(src / "20251103_omega.csv", ["1", "2", "3", "4"])
+    assert copy_to_ext([src / "20251103_omega.csv"], src, ext, logs.append) == []
+    assert (ext / "20251103_omega.csv").read_bytes() == "0520380101,54\r\n".encode("cp932")
+
+
+def test_ext_copy_failure_does_not_fail_the_source(tmp_path, monkeypatch):
+    """ext_indices に置けなくても（フォルダの場所にファイルがある等）、取得は成功のまま・警告だけ出す。"""
+    import shisu.ingest as ing
+    monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path))
+    base = write_base(tmp_path / "b.csv")
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    (ext / "OMEGA").write_text("not a folder")
+
+    def fake_run(base_df, fetcher, out_dir, log):
+        from shisu.ingest.common import write_outputs
+        return write_outputs(base_df, pd.Series("50", index=base_df.index), out_dir, "omega", log)
+    monkeypatch.setattr("shisu.ingest.omega.run", fake_run)
+    logs = []
+    req = ing.IngestRequest(["omega"], base_paths=[base], ext_dir=ext)
+    res = ing.run_ingest(req, tmp_path / "o", log=logs.append)
+    assert not isinstance(res["omega"], str) and any("ext_indices に置けませんでした" in m for m in logs)

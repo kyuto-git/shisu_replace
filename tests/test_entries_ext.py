@@ -13,7 +13,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
 import synth  # noqa: E402
-from test_replace_ext import HEADS, RACES, REGION, base_frame, write_ext  # noqa: E402
+from test_replace_ext import HEADS, REGION, base_frame, write_ext  # noqa: E402
 
 EXT_INDICATORS = ("オメガ指数", "ST指数", "Gold", "BC", "ZI")
 
@@ -98,3 +98,83 @@ def test_no_ext_flag_and_entries_without_race_ids(tmp_path, capsys):
     assert calc_entry_hensachi.main(["--in-dir", str(tmp_path / "ein2"), "--out-dir", str(tmp_path / "eout2"),
                                      "--ext-dir", str(tmp_path / "ext")]) == 0     # 個別出力（統合は レースID が要る）
     assert "外部指数を結び付けられません" in capsys.readouterr().out
+
+
+def _replace_once(tmp: Path) -> Path:
+    import replace_csv_ver3
+    csv_dir, ext = tmp / "csv", tmp / "ext"
+    synth.write_cp932(base_frame(), csv_dir / f"{REGION}_タイムM.csv")
+    write_ext(ext)
+    assert replace_csv_ver3.main(["--csv-dir", str(csv_dir), "--ext-dir", str(ext), "--master-dir", str(tmp / "m"),
+                                  "--clean"]) == 0
+    return ext
+
+
+def _calc(tmp: Path, ext: Path, frames: dict[str, pd.DataFrame], merge: bool = True) -> pd.DataFrame:
+    import calc_entry_hensachi
+    ein, eout = tmp / "ein", tmp / "eout"
+    for name, f in frames.items():
+        synth.write_cp932(f, ein / name)
+    args = ["--in-dir", str(ein), "--out-dir", str(eout), "--clean", "--ext-dir", str(ext)]
+    assert calc_entry_hensachi.main(args + (["--merge-only"] if merge else [])) == 0
+    return pd.read_csv(eout / "entries_merged_hensachi.csv", encoding="cp932", dtype=str, keep_default_na=False)
+
+
+def _gold_master(tmp: Path) -> pd.DataFrame:
+    m = master(tmp, "Gold")
+    return m.set_index("レースID(新)")
+
+
+def test_entries_value_priority_is_decided_per_file_and_per_race(tmp_path, capsys):
+    """出馬表の値を使うかどうかはレースごと。別のファイルに Gold の値があっても、Gold の列が無いファイルのレース、
+    同じファイルでも Gold が 0 だけのレースは ext_indices から付ける（どれも過去側と同じ順位）。"""
+    ext = _replace_once(tmp_path)
+    gm = _gold_master(tmp_path)
+    e = entries_frame()
+    r11 = e[e["Ｒ"] == "11"].copy()
+    r12 = e[e["Ｒ"] == "12"].copy()
+    r1 = e[e["Ｒ"] == "1"].copy()
+    # 1本目: R11・R12 は TARGET で Gold を読み込み済み（値と順位は過去側と同じ）。ただし R12 は全頭 0（読み込めていない）
+    with_gold = pd.concat([r11, r12], ignore_index=True)
+    vals = with_gold["レースID(新)"].map(lambda k: gm.loc[k, "指数"] if k in gm.index else "0")
+    ranks = with_gold["レースID(新)"].map(lambda k: gm.loc[k, "指数順位_元"] if k in gm.index else "0")
+    vals[with_gold["Ｒ"] == "12"] = "0"
+    ranks[with_gold["Ｒ"] == "12"] = "0"
+    with_gold.insert(with_gold.columns.get_loc("マイニング値"), "GoldAirplane", vals.values)
+    with_gold.insert(with_gold.columns.get_loc("マイニング値"), "指数順位1", ranks.values)
+    out = _calc(tmp_path, ext, {"shisu_a.csv": with_gold, "shisu_b.csv": r1.reset_index(drop=True)})
+    log = capsys.readouterr().out
+    assert "出馬表に値のあるレース 1/2 は出馬表の値を使用" in log          # 1本目: R11 は出馬表、R12 は ext
+    valid = gm[gm["指数有効"] == "1"]
+    o = out.set_index("レースID(新)").loc[valid.index]
+    assert o["Gold_順位"].tolist() == valid["順位"].tolist()            # R11（出馬表）・R12（ext）・R1（2本目・ext）
+    assert set(o.index.str[14:16]) == {"11", "12", "01"}
+
+
+def test_appended_ext_columns_do_not_take_unregistered_rank_columns(tmp_path):
+    """台帳に無い指数（ラップ2F など）と 指数順位1 が出馬表にあっても、ext から末尾に足した オメガ指数 の順位にしない。"""
+    ext = _replace_once(tmp_path)
+    e = entries_frame()
+    e.insert(e.columns.get_loc("マイニング値"), "ラップ2F", [str(30 + (i * 7) % 11) for i in range(len(e))])
+    e.insert(e.columns.get_loc("マイニング値"), "指数順位1", [str(1 + (i * 3) % 10) for i in range(len(e))])
+    out = _calc(tmp_path, ext, {"shisu_x.csv": e})
+    for ind in ("オメガ指数", "BC"):
+        m = master(tmp_path, ind)
+        m = m[m["指数有効"] == "1"].set_index("レースID(新)")
+        o = out.set_index("レースID(新)").loc[m.index]
+        for c in ("順位", "偏差値", "順位帯_s1"):
+            assert o[f"{ind}_{c}"].tolist() == m[c].tolist(), (ind, c)
+
+
+def test_rank_map_ignores_ext_columns_for_numbered_and_plain_ranks():
+    import calc_entry_hensachi as c
+    # TARGET の並び（マイニング順位は明示）: 台帳に無い指数の 指数順位1 を、足した オメガ指数 に回さない
+    df = pd.DataFrame({"ラップ2F": ["1"], "指数順位1": ["2"], "マイニング値": ["3"], "マイニング順位": ["1"],
+                       "オメガ指数": ["5"]})
+    idx = c.find_indicator_columns(df)
+    assert c.build_rank_source_map(df, idx) == {"マイニング値": "マイニング順位", "オメガ指数": "指数順位1"}   # 足す前の数え方
+    assert c.build_rank_source_map(df, idx, ext_cols={"オメガ指数"}) == {"マイニング値": "マイニング順位"}
+    # 指数が1種類（マイニング値）で無印の 指数順位: 足した列があっても1種類と数える
+    df2 = pd.DataFrame({"マイニング値": ["3"], "指数順位": ["1"], "オメガ指数": ["5"]})
+    idx2 = c.find_indicator_columns(df2)
+    assert c.build_rank_source_map(df2, idx2, ext_cols={"オメガ指数"}) == {"マイニング値": "指数順位"}

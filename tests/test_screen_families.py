@@ -316,3 +316,22 @@ def test_families_json_roundtrip(tmp_path):
     F.save_to_db(con, back)
     assert [(f.name, f.parts, f.tail, f.only) for f in F.load_from_db(con)] == [(f.name, f.parts, f.tail, f.only)
                                                                                 for f in fams]
+
+
+def test_standalone_inner_part_matches_past_side_only():
+    """単独の 芝(内・外): 過去側は値の空のレース（ダート・内外の区別の無い芝）でキーを作らないので、出馬表側も作らない。
+    出馬表で内外が分からない芝は、コース属性マスタでその場所・距離にある内外だけを試す。"""
+    fam = F.Family("X_io_t", ("芝(内・外)",), "HBAND")
+    F.validate(fam)
+    base = {"偏差値帯": "51~60", "順位": "2"}
+    k = lambda **f: F.entry_keys({**base, **f}, fam)
+    assert k(**{"芝・ダ": "ダ", "場所": "京都", "距離_raw": "1800", "芝(内・外)": ""}) == []
+    assert k(**{"芝・ダ": "芝", "場所": "東京", "距離_raw": "1600", "芝(内・外)": ""}) == []
+    assert k(**{"芝・ダ": "芝", "場所": "阪神", "距離_raw": "1600", "芝(内・外)": ""}) == ["外×51~60"]
+    assert k(**{"芝・ダ": "芝", "場所": "中山", "距離_raw": "2000", "芝(内・外)": ""}) == ["内×51~60"]
+    assert k(**{"芝・ダ": "芝", "場所": "京都", "距離_raw": "1600", "芝(内・外)": "外"}) == ["外×51~60"]
+    # 過去側（build_keys）: 空の行はキーを作らない
+    hist = pd.DataFrame({"芝(内・外)": ["", "外", ""], "芝・ダ": ["ダ", "芝", "芝"], "偏差値帯": ["51~60"] * 3,
+                         "順位": [2, 2, 2]})
+    keys = F.build_keys(hist, fam)
+    assert keys.tolist() == ["外×51~60"] and keys.index.tolist() == [1]

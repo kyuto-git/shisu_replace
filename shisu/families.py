@@ -407,10 +407,17 @@ def entry_keys(fields: Mapping, fam: Family | str, scheme: str = "") -> list[str
         elif p in BANDED_CONDITIONS:
             vs = band_labels(fields.get(p) or None, _scheme_for_part(fam, scheme), BANDED_CONDITIONS[p])
         elif p == INNER_FIELD:
-            # 芝(内・外) だけを部品にしたとき: 出馬表で内外が分からなければ 内・外・内外 を試す（COURSE と同じ考え方。
-            # 過去側で空のレース（ダートなど）はこの部品のキーを作らない）
+            # 芝(内・外) だけを部品にしたとき: 過去側は値の空のレース（ダート・内外の区別の無い芝）でキーを作らないので、
+            # 出馬表側も 芝 のときだけ。内外が分からなければ、コース属性マスタでその場所・距離にある内外の値だけを試す
+            # （中山・阪神の芝など。区別の無いコースは試さない）
             v = str(fields.get(p) or "")
-            vs = [v] if v else ["内", "外", "内外"]
+            if str(fields.get("芝・ダ") or "") != "芝":
+                vs = []
+            elif v:
+                vs = [v]
+            else:
+                from .course import inner_values
+                vs = inner_values(fields.get("場所"), "芝", fields.get("距離_raw") or "")
         else:
             v = str(fields.get(p) or "")
             vs = [v] if v else []

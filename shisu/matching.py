@@ -54,7 +54,7 @@ def rank_text(v) -> str:
     return str(int(f)) if f == f and f >= 1 else ""
 
 
-PART_FIELDS = ("場所", "芝・ダ", "距離", "芝(内・外)", "重量種別", "クラス名", "枠番グループ", "騎手") + CONDITION_COLUMNS
+PART_FIELDS = ("場所", "芝・ダ", "距離", "距離_raw", "芝(内・外)", "重量種別", "クラス名", "枠番グループ", "騎手") + CONDITION_COLUMNS
 
 
 def is_jump_row(row: Mapping) -> bool:

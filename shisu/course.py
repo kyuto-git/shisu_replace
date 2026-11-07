@@ -97,6 +97,34 @@ def resolve_courses(place: pd.Series, surface: pd.Series, distance: pd.Series, i
     return out.fillna("").astype(object)
 
 
+@functools.lru_cache(maxsize=1)
+def _inner_index() -> tuple[dict, dict]:
+    """(場, 芝ダ, 距離) → マスタにある 芝(内・外) の値（空を除く）、(場, 芝ダ) → 同じく場ごと。"""
+    by_dist: dict[tuple, list[str]] = {}
+    by_place: dict[tuple, list[str]] = {}
+    for row in course_table().to_dict("records"):
+        v = row["内外"]
+        if not v:
+            continue
+        for d, k in ((by_dist, (row["場"], row["芝ダ"], row["距離"])), (by_place, (row["場"], row["芝ダ"]))):
+            d.setdefault(k, [])
+            if v not in d[k]:
+                d[k].append(v)
+    return by_dist, by_place
+
+
+def inner_values(place, surface, distance="") -> list[str]:
+    """コース属性マスタで内回り・外回りの区別がある (場所, 芝・ダ, 距離) の 芝(内・外) の値（区別が無ければ []）。
+    距離が無ければ場所ごとの値。出馬表で内外が分からない馬に、単独の 芝(内・外) の部品で試す値に使う。"""
+    by_dist, by_place = _inner_index()
+    p, s, d = _n(place), _n(surface), _dist_text(distance)
+    if not (p and s):
+        return []
+    if d:
+        return list(by_dist.get((p, s, d), []))
+    return list(by_place.get((p, s), []))
+
+
 def ambiguous_courses() -> set[tuple[str, str, str]]:
     """内外が分からないと引けない (場所, 芝・ダ, 距離)。"""
     _exact, by_dist = _course_index()

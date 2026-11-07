@@ -291,8 +291,9 @@ def main(argv=None) -> int:
     ap.add_argument("--csv-dir", default=str(config.csv_dir()))
     ap.add_argument("--ext-dir", default=str(config.ext_dir()), help="外部指数CSV群のフォルダ（既定 ext_indices）")
     ap.add_argument("--no-ext", action="store_true", help="ext_indices を使わない")
-    ap.add_argument("--raw-dir", default=str(config.raw_dir()),
-                    help="未統合の過去基本CSVのフォルダ（既定 raw_csv）。あれば csv_files/全場_タイムM.csv・全場_対戦M.csv に統合してから進む")
+    ap.add_argument("--raw-dir", default=None,
+                    help="未統合の過去基本CSVのフォルダ（既定は --csv-dir と同じ階層の raw_csv。ふつうは リポジトリ直下の raw_csv）。"
+                         "あれば csv_files/全場_タイムM.csv・全場_対戦M.csv に統合してから進む")
     ap.add_argument("--no-raw-merge", action="store_true", help="raw_csv の統合をしない")
     ap.add_argument("--master-dir", default=str(config.master_dir()))
     ap.add_argument("--processed-dir", default=str(config.processed_dir()))
@@ -301,6 +302,8 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=1, help="並列数（既定1。メモリに余裕があれば 2〜4）")
     args = ap.parse_args(argv)
 
+    if args.raw_dir is None:            # --csv-dir を別の場所にしたとき、本物の raw_csv を取り込んで動かさない
+        args.raw_dir = str(Path(args.csv_dir).parent / config.raw_dir().name)
     if not args.no_raw_merge:
         from shisu import raw_merge
         if raw_merge.pending_files(args.raw_dir):
