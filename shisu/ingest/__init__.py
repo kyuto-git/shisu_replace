@@ -23,7 +23,7 @@ from typing import Callable
 import pandas as pd
 
 from .. import config
-from ..csvio import read_csv_any, write_csv
+from ..csvio import write_csv
 from .common import RID as RID_HEADER, WORK, Cancelled, Fetcher, Logger, Outputs, default_log, read_base
 
 MIN_INTERVAL = 1.0      # スクレイピングのアクセス間隔の下限（秒）
@@ -58,15 +58,23 @@ _TARGET_FILE = re.compile(r"^\d{8}_.+\.csv$", re.IGNORECASE)
 
 
 def _read_target_csv(path: Path) -> pd.DataFrame | None:
-    """TARGET 取込用CSV（レースID(新), ワーク1）→ 文字列の2列。形が違えば None。"""
+    """ext_indices の形式A（18桁の レースID(新), 値。見出しは有っても無くても良い）→ 文字列の2列。形が違えば None。
+    読み方は ext_indices と同じ（BOM → UTF-8 → cp932 の順に符号化を決める。BOM の無い UTF-8 も読める）。"""
+    import csv
+    from .. import ext_indices as X
+    path = Path(path)
     try:
-        df = read_csv_any(path)
-    except Exception:
+        if X._content_reason(path, "A") is not None:
+            return None
+        rids, vals = [], []
+        for _line, row in X._rows(path):
+            key = X._digits(row[0], 18)
+            if key:
+                rids.append(key)
+                vals.append(str(row[1]).strip() if len(row) > 1 else "")
+    except (OSError, csv.Error, UnicodeError):
         return None
-    if RID_HEADER not in df.columns or WORK not in df.columns:
-        return None
-    df = df[[RID_HEADER, WORK]].astype(object).where(df[[RID_HEADER, WORK]].notna(), "")
-    return df.apply(lambda s: s.map(lambda v: str(v).strip()))
+    return pd.DataFrame({RID_HEADER: rids, WORK: vals}, dtype=object)
 
 
 def copy_to_ext(files: list[Path], src_root: Path, ext_root: Path, log: Logger | None = None) -> list[Path]:
@@ -84,43 +92,58 @@ def copy_to_ext(files: list[Path], src_root: Path, ext_root: Path, log: Logger |
         name = f.name.lower()
         if not _TARGET_FILE.match(f.name) or name.endswith("_merged.csv") or name.endswith("_noid.csv"):
             continue
-        new = _read_target_csv(f)
-        if new is None:                  # 日付, 場所, … の形（ベースCSVの無い日）は TARGET に取り込めない
-            continue
         try:
-            rel = f.relative_to(src_root)
-        except ValueError:
-            rel = Path(f.name)
-        dst = Path(ext_root) / rel
-        has = new[WORK] != ""
-        if dst.exists():
-            old = _read_target_csv(dst)
-            if old is None:
-                log(f"[WARN] {dst} は レースID(新), ワーク1 の形ではないので上書きしません（今回の {f.name} は置きません）")
-                continue
-            vals = dict(zip(old[RID_HEADER], old[WORK]))
-            order = list(dict.fromkeys(old[RID_HEADER]))
-            for rid, v, h in zip(new[RID_HEADER], new[WORK], has):
-                if rid not in vals:
-                    order.append(rid)
-                    vals[rid] = v
-                elif h:
-                    vals[rid] = v
-            merged = pd.DataFrame({RID_HEADER: order, WORK: [vals[r] for r in order]})
-            kept = int(((old[WORK] != "") & ~old[RID_HEADER].isin(new.loc[has, RID_HEADER])).sum())
-            if kept:
-                log(f"[INFO] {dst.name}: 今回値の取れなかった {kept} 頭は前の値を残しました")
-        else:
-            if not has.any():
-                log(f"[INFO] {f.name}: 値が1頭も無いので ext_indices には置きません")
-                continue
-            merged = new
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dst.with_name(f".{dst.name}.tmp")
-        write_csv(merged, tmp)
-        tmp.replace(dst)
-        out.append(dst)
+            placed = _place_one(f, src_root, ext_root, log)
+        except OSError as e:             # 1本置けなくても残りは続ける
+            log(f"[WARN] {f.name} を ext_indices に置けませんでした（{type(e).__name__}: {e}）")
+            continue
+        if placed is not None:
+            out.append(placed)
     return out
+
+
+def _place_one(f: Path, src_root: Path, ext_root: Path, log: Logger) -> Path | None:
+    """1本を ext_indices に置く（足し合わせ）。置いたら置き先、置かなければ None。"""
+    new = _read_target_csv(f)
+    if new is None:                  # 日付, 場所, … の形（ベースCSVの無い日）は TARGET に取り込めない
+        return None
+    try:
+        rel = f.relative_to(src_root)
+    except ValueError:
+        rel = Path(f.name)
+    dst = Path(ext_root) / rel
+    has = new[WORK] != ""
+    if dst.exists():
+        old = _read_target_csv(dst)
+        if old is None:
+            log(f"[WARN] {dst} は形式A（レースID(新), 値）として読めないので上書きしません（今回の {f.name} は置きません）")
+            return None
+        vals: dict[str, str] = {}
+        for rid, v in zip(old[RID_HEADER], old[WORK]):     # 同じ馬が2行あれば値のある方
+            if rid not in vals or (not vals[rid] and v):
+                vals[rid] = v
+        order = list(vals)
+        for rid, v, h in zip(new[RID_HEADER], new[WORK], has):
+            if rid not in vals:
+                order.append(rid)
+                vals[rid] = v
+            elif h:
+                vals[rid] = v
+        merged = pd.DataFrame({RID_HEADER: order, WORK: [vals[r] for r in order]})
+        got, again = set(new.loc[has, RID_HEADER]), set(new[RID_HEADER])
+        kept = sum(1 for r in order if vals[r] != "" and r not in got and r in again)
+        if kept:
+            log(f"[INFO] {dst.name}: 今回値の取れなかった {kept} 頭は前の値を残しました")
+    else:
+        if not has.any():
+            log(f"[INFO] {f.name}: 値が1頭も無いので ext_indices には置きません")
+            return None
+        merged = new
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp")
+    write_csv(merged, tmp)
+    tmp.replace(dst)
+    return dst
 
 
 @dataclass

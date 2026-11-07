@@ -1086,3 +1086,36 @@ def test_ext_copy_failure_does_not_fail_the_source(tmp_path, monkeypatch):
     req = ing.IngestRequest(["omega"], base_paths=[base], ext_dir=ext)
     res = ing.run_ingest(req, tmp_path / "o", log=logs.append)
     assert not isinstance(res["omega"], str) and any("ext_indices に置けませんでした" in m for m in logs)
+
+
+def test_copy_to_ext_reads_existing_files_like_ext_indices(tmp_path, monkeypatch):
+    """ext_indices にある同じ名前のファイルが BOM の無い UTF-8・見出しなし・同じ馬の2行（後が空欄）でも、
+    ext_indices と同じ読み方で読んで足し合わせる。1本置けなくても残りは置く。"""
+    from shisu.ingest import copy_to_ext
+    src, ext = tmp_path / "out" / "omega", tmp_path / "ext" / "OMEGA"
+    rid = [f"2025110105040101{u:02d}" for u in range(1, 4)]
+    src.mkdir(parents=True)
+    ext.mkdir(parents=True)
+    for day in ("20251101", "20251102", "20251103"):
+        (src / f"{day}_omega.csv").write_bytes(
+            ("レースID(新),ワーク1\r\n" + f"{rid[0]},55\r\n{rid[1]},\r\n{rid[2]},\r\n").encode("cp932"))
+    (ext / "20251101_omega.csv").write_bytes(f"レースID(新),ワーク1\n{rid[0]},50\n{rid[1]},60\n".encode("utf-8"))
+    (ext / "20251102_omega.csv").write_bytes(f"{rid[0]},50\n{rid[1]},60\n{rid[1]},\n".encode("cp932"))
+    import shisu.ingest as ing
+    real_write = ing.write_csv
+
+    def flaky(df, path):                                                  # 2本目だけ書けない（容量不足など）
+        if "20251102" in Path(path).name:
+            raise OSError("No space left on device")
+        real_write(df, path)
+    monkeypatch.setattr(ing, "write_csv", flaky)
+    files = [src / f"{d}_omega.csv" for d in ("20251102", "20251101", "20251103")]
+    logs = []
+    placed = copy_to_ext(files, src, ext, logs.append)
+    assert placed == [ext / "20251101_omega.csv", ext / "20251103_omega.csv"]
+    assert any("20251102_omega.csv を ext_indices に置けませんでした" in m for m in logs)
+    monkeypatch.setattr(ing, "write_csv", real_write)
+    assert copy_to_ext([src / "20251102_omega.csv"], src, ext) == [ext / "20251102_omega.csv"]
+    for day in ("20251101", "20251102"):
+        d = out_csv(ext / f"{day}_omega.csv").set_index("レースID(新)")["ワーク1"]
+        assert d.to_dict() == {rid[0]: "55", rid[1]: "60", rid[2]: ""}, day

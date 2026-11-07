@@ -234,6 +234,9 @@ def attach_ext(df: pd.DataFrame, lookups: dict, name: str = "(df)",
             total = int(fill.sum())
             if kept:
                 note = f"（出馬表に値のあるレース {kept}/{n_races} は出馬表の値を使用）"
+            norank = 0
+            if att.ranks is not None and not att.rank_column_empty:     # 順位の無いレースは ext で埋めたレースだけ数える
+                norank = int(rk[fill & ~att.absent & (norm_series(att.ranks) == "")].nunique())
         else:
             col = canon
             df[col] = att.values
@@ -242,10 +245,11 @@ def attach_ext(df: pd.DataFrame, lookups: dict, name: str = "(df)",
             masks[col] = att.absent
             added.add(col)
             hit, total = att.hit, len(df)
+            norank = att.norank_races
         if att.rank_column_empty:
             note += "（順位の列が空なので値から順位を計算）"
-        elif att.norank_races:
-            note += f"（順位の無いレース {att.norank_races} 件は値から順位を計算）"
+        elif norank:
+            note += f"（順位の無いレース {norank} 件は値から順位を計算）"
         log(f"[INFO] {name}: 外部指数 {canon} を ext_indices から付けました（値のある馬 {hit}/{total}）{note}")
     return df, masks, added
 
