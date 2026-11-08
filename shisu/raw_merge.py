@@ -7,7 +7,9 @@
     後のファイルの行を使う（追加抽出した新しいファイルが優先）。レース単位（16桁）の ID は 馬番 を付けて馬単位で比べる。
     レースID(新) の無い行・16桁で馬番の読めない行はそのまま残す
   - 前走の列（前走場所〜前走レースID(新)・間隔・休み明け～戦目）が全部空の行（TARGET で前走データ読込をせずに出した行）は、
-    統合した全期間の 血統登録番号 ごとの履歴から補って書く（shisu.conditions.fill_previous_runs。10年より古い行を消す前に）
+    統合した全期間の 血統登録番号 ごとの履歴から補って書く（shisu.conditions.fill_previous_runs。10年より古い行を消す前に。
+    補った行には 前走補完=1 の印を付け、次の統合で作り直す）。重複の置き換えで後の行が前走の列を全部空で、前の行に TARGET の
+    前走の値があれば、その値を残す（TARGET の値を優先。地方・海外の前走は履歴から作れない）
   - 書き出しは一時ファイルに書いてから置き換える（途中で止まっても既存の 全場_*.csv を壊さない）
   - 最大10年分を残す: 基準年（既定はデータの中の最新年。ref_year で指定もできる）の9年前以降。
     例: 2026年が基準なら 2017〜2026年を残し、2016年以前は消す。年は レースID(新) の先頭4桁（無ければ 日付S）
@@ -26,7 +28,7 @@ from typing import Callable, Iterable
 
 import pandas as pd
 
-from .conditions import fill_previous_runs
+from .conditions import PREV_FILLED_MARK, fill_previous_runs, previous_columns, previous_loaded
 from .csvio import norm_series, read_csv_any, write_csv
 from .normalize import horse_race_id
 
@@ -69,14 +71,16 @@ class MergeResult:
     no_year: int = 0                                      # 年の分からない行（残す）
     after: int = 0
     years: tuple[int, int] | None = None                  # 残した年の範囲
-    prev_filled: int = 0                                  # 前走の列を履歴から補った行
+    prev_filled: int = 0                                  # 前走の列を履歴から補った行（10年の窓に残った行）
+    prev_kept: int = 0                                    # 重複の置き換えで、前の行の TARGET の前走の値を残した行
     moved: list[Path] = field(default_factory=list)
 
     def summary(self) -> str:
         span = f"{self.years[0]}〜{self.years[1]}年" if self.years else "年の分からない行だけ"
         return (f"{self.kind}: 既存 {self.before} 行 ＋ 追加 {len(self.files)} 本 {self.added_rows} 行 → "
                 f"{self.after} 行（{span}。重複の置き換え {self.replaced} 行・10年より古い行の削除 {self.dropped_old} 行"
-                + (f"・前走の列を履歴から補った {self.prev_filled} 行" if self.prev_filled else "") + "）"
+                + (f"・前走の列を履歴から補った {self.prev_filled} 行" if self.prev_filled else "")
+                + (f"・重なった行で TARGET の前走の値を残した {self.prev_kept} 行" if self.prev_kept else "") + "）"
                 f" → {self.out_path.name}")
 
 
@@ -124,11 +128,13 @@ def merge_kind(kind: str, files: list[Path], csv_dir: Path | str, years: int = D
     has = ((rid != "") & ~rid.str.fullmatch(r"\d{16}").fillna(False)).astype(bool)
     dup = has & rid.where(has, None).duplicated(keep="last")            # 後のファイルの行を残す
     res.replaced = int(dup.sum())
+    # 残す（後の）行が前走を読み込まずに出した行（前走の12列が全部空）で、捨てる（前の）行に TARGET の前走の値があれば、
+    # その値を残す行に写す（TARGET の値を優先する。地方・海外の前走などは履歴から作り直せない）
+    res.prev_kept = _carry_previous(df, rid, has, dup)
     df = df[~dup]
     # 前走の列が空の行（TARGET で前走データ読込をせずに出した行）を、統合した全期間の 血統登録番号 の履歴から補う
     # （10年より古い行を消す前に。窓の最初の年の馬も、その前の走りから補える）
     df = fill_previous_runs(df, log=log)
-    res.prev_filled = int(df.attrs.get("prev_filled", {}).get("filled", 0))
     cols += [c for c in df.columns if c not in cols]
     y = _year(df)
     res.no_year = int(y.isna().sum())
@@ -141,6 +147,8 @@ def merge_kind(kind: str, files: list[Path], csv_dir: Path | str, years: int = D
         kept = y[~old].dropna()
         res.years = (int(kept.min()), int(kept.max())) if len(kept) else None
     res.after = len(df)
+    if PREV_FILLED_MARK in df.columns:
+        res.prev_filled = int((df[PREV_FILLED_MARK].astype(str) == "1").sum())
     # 一時ファイルに書いてから置き換える（途中で止まっても 全場_*.csv の履歴を壊さない）
     tmp = out.with_name(f".{out.name}.tmp")
     write_csv(df[cols], tmp)
@@ -148,6 +156,30 @@ def merge_kind(kind: str, files: list[Path], csv_dir: Path | str, years: int = D
     if res.no_year:
         log(f"[WARN] {out.name}: 年の分からない行 {res.no_year} 行は残しました（レースID(新)・日付S が無い）")
     return res
+
+
+def _carry_previous(df: pd.DataFrame, rid: pd.Series, has: pd.Series, dup: pd.Series) -> int:
+    """重複の置き換えで、前の行の前走の12列を、前走の列が全部空の後の行に写す（df をその場で書き換える）。写した行数。"""
+    cols = previous_columns(df)
+    if not cols or not dup.any():
+        return 0
+    loaded = previous_loaded(df)
+    empty = pd.Series(True, index=df.index)
+    for c in cols:
+        empty &= df[c].astype(str).str.strip() == ""
+    donors = df.index[dup & loaded]
+    if not len(donors):
+        return 0
+    last_donor = pd.Series(donors, index=rid[donors].to_numpy()).groupby(level=0).last()   # 同じ馬の行が3本以上なら最後の
+    kept = df.index[has & ~dup & empty & rid.isin(last_donor.index)]
+    if not len(kept):
+        return 0
+    src = last_donor.loc[rid[kept].to_numpy()].to_numpy()
+    for c in cols:
+        df.loc[kept, c] = df.loc[src, c].to_numpy()
+    if PREV_FILLED_MARK in df.columns:
+        df.loc[kept, PREV_FILLED_MARK] = ""
+    return len(kept)
 
 
 def _unique(dest: Path) -> Path:

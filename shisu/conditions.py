@@ -158,6 +158,9 @@ REST_BREAK_INTERVAL = 8
 # 間隔 = 木曜始まりの週の番号の差（連闘=1、中1週=2…）。同じ出力の 2,920頭すべてで TARGET の 間隔 と一致した
 # （日数 // 7 では 13日 → 1 になるなど 792頭が食い違う）
 _WEEK_ORIGIN = pd.Timestamp("2000-01-06")       # 木曜日
+# 履歴から補った行の印（"1"）。TARGET が読み込んだ値と区別し、次に補うとき（raw_csv の統合で古い履歴が増えたときなど）
+# 作り直せるようにする。作り直せなければ前の値を残す
+PREV_FILLED_MARK = "前走補完"
 
 
 def _first_col(df: pd.DataFrame, names: tuple[str, ...]) -> str | None:
@@ -168,6 +171,22 @@ def _blank(df: pd.DataFrame, col: str | None) -> pd.Series:
     if col is None:
         return pd.Series(True, index=df.index)
     return df[col].astype(object).where(df[col].notna(), "").map(_n) == ""
+
+
+def previous_columns(df: pd.DataFrame) -> list[str]:
+    """df にある前走の12列（前走場所〜前走レースID(新)・間隔・休み明け～戦目）の実際の列名。"""
+    names = [n for n, _src in PREV_SOURCES] + [INTERVAL_NAMES, REST_NAMES]
+    return [c for c in (_first_col(df, n) for n in names) if c]
+
+
+def previous_loaded(df: pd.DataFrame) -> pd.Series:
+    """TARGET が前走を読み込んだ行（前走の12列のどれかに値があり、履歴から補った印の無い行）。"""
+    any_value = pd.Series(False, index=df.index)
+    for c in previous_columns(df):
+        any_value |= ~_blank(df, c)
+    if PREV_FILLED_MARK in df.columns:
+        any_value &= _col(df, PREV_FILLED_MARK) != "1"
+    return any_value
 
 
 def _week_no(d: pd.Series) -> pd.Series:
@@ -188,6 +207,7 @@ def fill_previous_runs(raw: pd.DataFrame, log: Callable[[str], None] | None = No
     - キャリア（出走数）の列があれば、今走 − 1つ前の走り が 1（間にCSVの取消・除外があればその数まで多くてよい。TARGET の
       キャリアは除外のレースも数える）のときだけ補う。それより大きければCSVに無いレース（9頭以下・障害・地方・海外など）を
       はさんでいるので、CSVの中の1つ前は本当の前走ではない。キャリア 0（デビュー）は補わない
+    - 補った行には 前走補完=1 の印を付ける。印のある行は次に補うときに作り直す（作り直せなければ前の値を残す）
     - 血統登録番号・レースID(新) の列が無ければ何もしない
     """
     stats = {"blank": 0, "filled": 0, "no_history": 0, "gap": 0}
@@ -201,6 +221,9 @@ def fill_previous_runs(raw: pd.DataFrame, log: Callable[[str], None] | None = No
     unloaded = _blank(raw, iv_col) & _blank(raw, rest_col)
     for col in targets.values():
         unloaded &= _blank(raw, col)
+    marked = (_col(raw, PREV_FILLED_MARK) == "1") if PREV_FILLED_MARK in raw.columns else \
+        pd.Series(False, index=raw.index)
+    unloaded |= marked                               # 前に履歴から補った行は作り直す
     hid = raw[HORSE_ID].astype(object).where(raw[HORSE_ID].notna(), "").map(_n)
     uma = raw["馬番"] if "馬番" in raw.columns else pd.Series("", index=raw.index)
     rid = horse_race_id(raw["レースID(新)"], uma).astype(object)
@@ -231,7 +254,8 @@ def fill_previous_runs(raw: pd.DataFrame, log: Callable[[str], None] | None = No
     hit = hit.set_index("pos")
     prev_pos = hit["prev_pos"]
     # 1つ前の走りの値
-    surface, dist = split_surface_distance(raw["芝・ダ"] if "芝・ダ" in raw.columns else pd.Series("", index=raw.index),
+    sd_col = _first_col(raw, ("芝・ダ", "芝ダ"))
+    surface, dist = split_surface_distance(raw[sd_col] if sd_col else pd.Series("", index=raw.index),
                                            raw["距離"] if "距離" in raw.columns else pd.Series("", index=raw.index))
     dist = dist.map(lambda v: (re.match(r"\d+", _n(v)) or [""])[0])
     src_vals: dict[str, np.ndarray] = {}
@@ -254,6 +278,7 @@ def fill_previous_runs(raw: pd.DataFrame, log: Callable[[str], None] | None = No
         h: np.sort(g.to_numpy()) for h, g in frame.loc[~frame["ran"], "date"].groupby(frame.loc[~frame["ran"], "hid"])}
     hid_arr = hid.to_numpy()
     rest_given = (_col(raw, rest_col) if rest_col else pd.Series("", index=raw.index)).map(_int_text).to_numpy()
+    marked_arr = marked.to_numpy()
     fill: dict[int, dict[str, str]] = {}
     prev_of: dict[int, int] = {}
     for p_cur, p_prev in prev_pos.items():
@@ -285,7 +310,7 @@ def fill_previous_runs(raw: pd.DataFrame, log: Callable[[str], None] | None = No
             continue
         row = fill.get(p)
         if row is None:
-            rest_of[p] = ""
+            rest_of[p] = rest_given[p] if marked_arr[p] else ""     # 作り直せない印の行は前の値のまま
             continue
         if int(row["間隔"]) >= REST_BREAK_INTERVAL:
             r = "1"
@@ -305,6 +330,10 @@ def fill_previous_runs(raw: pd.DataFrame, log: Callable[[str], None] | None = No
                     else pd.Series("", index=out.index, dtype=object)).to_numpy(copy=True)
             vals[positions] = [fill[int(q)].get(key, "") for q in positions]
             out[col] = vals
+        mark = (out[PREV_FILLED_MARK].astype(object).where(out[PREV_FILLED_MARK].notna(), "")
+                if PREV_FILLED_MARK in out.columns else pd.Series("", index=out.index, dtype=object)).to_numpy(copy=True)
+        mark[positions] = "1"
+        out[PREV_FILLED_MARK] = mark
     out.attrs["prev_filled"] = stats
     if log and stats["blank"]:
         log(f"[INFO] 前走の列が空の行 {stats['blank']} 行: 血統登録番号 の履歴から {stats['filled']} 行を補いました"

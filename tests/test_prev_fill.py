@@ -255,3 +255,39 @@ def test_raw_merge_fills_from_rows_older_than_the_window(tmp_path):
     first = out[out["日付S"] == "20170108"].iloc[0]
     assert (first["前走場所"], first["前距離"], first["前走着順"], first["休み明け～戦目"]) == ("阪神", "2400", "２", "1")
     assert any("血統登録番号 の履歴から 2 行を補いました" in m for m in logs)
+
+
+def test_raw_merge_keeps_target_values_when_reexported_without_previous(tmp_path):
+    """前走を読み込んだ既存の行と、前走を読み込まずに出し直した同じ行が重なったら、TARGET の前走の値を残す
+    （地方の前走などは履歴から作れない）。"""
+    from shisu import raw_merge as rm
+    old = frame([run_row("H9", "20261004", "東京", 1, 3, "ダ1600", career=8),
+                 run_row("H9", "20261018", "東京", 2, 3, "ダ1400", career=10)])
+    old.loc[1, PREV_COLS] = ["大井", "ダ", "1600", " 56 ", "", "３", "先行", "4", "", "202610104412020103", "2", "4"]
+    synth.write_cp932(old, tmp_path / "csv_files" / "全場_タイムM.csv")
+    again = old.copy()
+    again.loc[:, PREV_COLS] = ""                                         # 前走を読み込まずに出し直した
+    synth.write_cp932(again, tmp_path / "raw_csv" / "タイムM_出し直し.csv")
+    r = rm.merge_raw(tmp_path / "raw_csv", tmp_path / "csv_files", log=lambda m: None)[0]
+    out = pd.read_csv(tmp_path / "csv_files" / "全場_タイムM.csv", encoding="cp932", dtype=str, keep_default_na=False)
+    row = out[out["日付S"] == "20261018"].iloc[0]
+    assert row[PREV_COLS].tolist() == old.loc[1, PREV_COLS].tolist() and row.get("前走補完", "") == ""
+    assert r.replaced == 2 and r.prev_kept == 1 and "TARGET の前走の値を残した 1 行" in r.summary()
+
+
+def test_raw_merge_result_does_not_depend_on_merge_order(tmp_path):
+    """新しい期間を先に、古い期間をあとから統合しても、一度に補ったときと同じ（補った行は印を付けて作り直す）。"""
+    from shisu import raw_merge as rm
+    df = season()
+    one = fill_previous_runs(df)
+    late, early = df[df["日付S"] >= "20251001"], df[df["日付S"] < "20251001"]
+    csv_dir, raw = tmp_path / "csv_files", tmp_path / "raw_csv"
+    synth.write_cp932(late, raw / "タイムM_後半.csv")
+    rm.merge_raw(raw, csv_dir, log=lambda m: None)
+    synth.write_cp932(early, raw / "タイムM_前半.csv")
+    rm.merge_raw(raw, csv_dir, log=lambda m: None)
+    out = pd.read_csv(csv_dir / "全場_タイムM.csv", encoding="cp932", dtype=str, keep_default_na=False)
+    a = out.set_index("レースID(新)").loc[one["レースID(新)"], PREV_COLS]
+    b = one.set_index("レースID(新)")[PREV_COLS]
+    assert (a.to_numpy() == b.to_numpy()).all()
+    assert (out["休み明け～戦目"] != "").sum() > 50
