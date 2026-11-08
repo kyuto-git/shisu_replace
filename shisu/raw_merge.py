@@ -14,7 +14,9 @@
     基本CSVではなく列パッチとして扱う。全部のパッチを読み、レースID(新)（18桁。16桁なら馬番を付ける）ごとに、
     パッチにある列（レースID(新) 以外）の空でない値で csv_files/全場_タイムM.csv・全場_対戦M.csv の両方の同じ馬の行を
     上書き・補完する（無い列は足す。複数のパッチで同じ馬・同じ列なら後のファイルの値）。基本CSVの統合のあとに当てる。
-    当てたパッチは merged_done/ に移す。全場_*.csv が無い・1行も当たらないパッチは raw_csv に残す
+    全部の行が 全場_タイムM・全場_対戦M の両方に当たったパッチだけ merged_done/ に移す（片方の 全場_*.csv が無い・
+    そこに無い行があるパッチは、当たった分は反映して raw_csv に残す。次に回すとまた当てる。値は同じなので害は無い）。
+    指数順位 の列はタイムM・対戦M で値が違うので、パッチにあっても書き換えない
 replace_csv_ver3.py は raw_csv/ に未統合のCSVがあれば、master を作る前にこれを実行する。
 """
 from __future__ import annotations
@@ -112,31 +114,44 @@ def file_role(path: Path | str) -> str | None:
 class PatchResult:
     """列パッチ（§3.9）の結果。"""
     kind: str = PATCH_KIND
-    files: list[Path] = field(default_factory=list)            # 当てたパッチ
+    files: list[Path] = field(default_factory=list)            # 当てたパッチ（読めたもの）
+    complete: list[Path] = field(default_factory=list)         # 全部の行が 全場_タイムM・全場_対戦M の両方に当たったパッチ
     rows: int = 0                                               # パッチの行（18桁の レースID(新) がある行）
     bad_ids: int = 0                                            # レースID(新) が18桁にならない行（当てない）
-    unmatched: int = 0                                          # どの 全場_*.csv にも無い馬（当てない）
+    missing: dict[str, int] = field(default_factory=dict)      # 全場_*.csv → その中に無い（当たらない）パッチの行
     updated: dict[str, int] = field(default_factory=dict)      # 全場_*.csv → 値が変わった行
     columns: dict[str, dict[str, int]] = field(default_factory=dict)   # 全場_*.csv → 列 → 値が変わったセル
     moved: list[Path] = field(default_factory=list)
+
+    @property
+    def unmatched(self) -> int:
+        return max(self.missing.values(), default=0)
 
     def summary(self) -> str:
         targets = "・".join(f"{name} 更新 {n} 行" for name, n in self.updated.items()) or "当てる 全場_*.csv がありません"
         cols: list[str] = []
         for per in self.columns.values():
             cols += [c for c in per if c not in cols]
-        extra = f"・全場_*.csv に無い {self.unmatched} 行" if self.unmatched else ""
+        extra = "".join(f"・{name} に無い {n} 行" for name, n in self.missing.items() if n)
         extra += f"・レースID(新) が18桁でない {self.bad_ids} 行" if self.bad_ids else ""
         return (f"前走・追加列パッチを反映しました: {targets}（パッチ {len(self.files)} 本 {self.rows} 行{extra}。"
                 f"対象列: {'・'.join(cols) if cols else 'なし（値の変わる列なし）'}）")
+
+
+PATCH_PROTECTED = (RID, "指数", "指数順位")         # パッチで書き換えない列（キーと、タイムM・対戦M で値の違う列）
 
 
 def _blank(s: pd.Series) -> pd.Series:
     return s.astype(object).where(s.notna(), "").astype(str).str.strip() == ""
 
 
+def _col_norm(name) -> str:
+    return unicodedata.normalize("NFKC", str(name)).strip()
+
+
 def apply_patches(files: list[Path], csv_dir: Path | str, log: Logger = print) -> PatchResult:
-    """列パッチ（files。古い順）を csv_files/全場_タイムM.csv・全場_対戦M.csv に当てる（パッチのファイルは動かさない）。"""
+    """列パッチ（files。古い順）を csv_files/全場_タイムM.csv・全場_対戦M.csv に当てる（パッチのファイルは動かさない）。
+    res.complete は、全部の行が両方の 全場_*.csv に当たったパッチ（merge_raw はこれだけを merged_done/ に移す）。"""
     res = PatchResult()
     frames = []
     for p in files:
@@ -145,9 +160,11 @@ def apply_patches(files: list[Path], csv_dir: Path | str, log: Logger = print) -
         except Exception as e:
             log(f"[WARN] raw_csv/{p.name} を読めないのでパッチを当てません（{type(e).__name__}: {e}）")
             continue
+        df.columns = [str(c).strip() for c in df.columns]
         if RID not in df.columns:
             log(f"[WARN] raw_csv/{p.name} に {RID} 列が無いのでパッチを当てません")
             continue
+        df["__src__"] = len(res.files)
         frames.append(df)
         res.files.append(p)
     if not frames:
@@ -156,29 +173,36 @@ def apply_patches(files: list[Path], csv_dir: Path | str, log: Logger = print) -
     for f in frames:
         cols += [c for c in f.columns if c not in cols]
     patch = pd.concat([f.reindex(columns=cols) for f in frames], ignore_index=True)
+    src = patch.pop("__src__").astype(int)
     patch = patch.astype(object).where(patch.notna(), "")
     uma = patch["馬番"] if "馬番" in patch.columns else pd.Series("", index=patch.index)
     key = horse_race_id(patch[RID], uma)
     ok = key.str.fullmatch(r"\d{18}").fillna(False).astype(bool)
     res.bad_ids = int((~ok).sum())
     res.rows = int(ok.sum())
-    patch, key = patch[ok], key[ok]
-    targets_cols = [c for c in cols if c != RID and not str(c).startswith("Unnamed:")]
+    patch, key, src = patch[ok], key[ok], src[ok]
+    protected = {_col_norm(c) for c in PATCH_PROTECTED}
+    patch_cols = [c for c in patch.columns if _col_norm(c) not in protected and not str(c).startswith("Unnamed:")]
     values: dict[str, pd.Series] = {}                 # 列 → (馬 → 値)。空の値は当てない。同じ馬は後のファイルの値
-    for c in targets_cols:
+    for c in patch_cols:
         has = ~_blank(patch[c])
         if has.any():
             v = pd.Series(patch.loc[has, c].to_numpy(), index=key[has].to_numpy())
             values[c] = v[~v.index.duplicated(keep="last")]
-    found: set[str] = set()
+    landed = pd.Series(True, index=key.index)         # 両方の 全場_*.csv にある行
     for kind in KINDS:
         out = Path(csv_dir) / MERGED_NAME.format(kind=kind)
         if not out.exists():
+            res.missing[out.name] = res.rows
+            landed[:] = False
             continue
         df = read_csv_any(out)
         tuma = df["馬番"] if "馬番" in df.columns else pd.Series("", index=df.index)
         tkey = horse_race_id(df[RID], tuma) if RID in df.columns else pd.Series("", index=df.index)
-        found |= set(tkey[tkey.isin(set(key))])
+        here = key.isin(set(tkey))
+        res.missing[out.name] = int((~here).sum())
+        landed &= here
+        by_norm = {_col_norm(c): c for c in df.columns}   # 見出しの空白・全角半角のゆれは、全場_*.csv の列に合わせる
         changed_rows = pd.Series(False, index=df.index)
         per: dict[str, int] = {}
         for c, v in values.items():
@@ -186,13 +210,15 @@ def apply_patches(files: list[Path], csv_dir: Path | str, log: Logger = print) -
             hit = new.notna()
             if not hit.any():
                 continue
-            if c not in df.columns:
-                df[c] = ""
-            cur = df[c].astype(object).where(df[c].notna(), "")
+            name = by_norm.get(_col_norm(c), c)
+            if name not in df.columns:
+                df[name] = ""
+                by_norm[_col_norm(name)] = name
+            cur = df[name].astype(object).where(df[name].notna(), "")
             diff = hit & (cur.astype(str) != new.astype(str))
             if diff.any():
-                df[c] = cur.where(~diff, new)
-                per[c] = int(diff.sum())
+                df[name] = cur.where(~diff, new)
+                per[name] = per.get(name, 0) + int(diff.sum())
                 changed_rows |= diff
         res.updated[out.name] = int(changed_rows.sum())
         res.columns[out.name] = per
@@ -200,13 +226,26 @@ def apply_patches(files: list[Path], csv_dir: Path | str, log: Logger = print) -
             tmp = out.with_name(f".{out.name}.tmp")          # 一時ファイルに書いてから置き換える
             write_csv(df, tmp)
             os.replace(tmp, out)
-    res.unmatched = int((~key.isin(found)).sum()) if res.updated else res.rows
+    for i, p in enumerate(res.files):
+        mine = src == i
+        if mine.any() and landed[mine].all():
+            res.complete.append(p)
+        elif mine.any():
+            detail = []
+            for kind in KINDS:
+                name = MERGED_NAME.format(kind=kind)
+                if name not in res.updated:
+                    detail.append(f"{name} がありません")
+            n_left = int((~landed[mine]).sum())
+            log(f"[WARN] 列パッチ {p.name}: {int(mine.sum())} 行のうち {n_left} 行が 全場_タイムM.csv・全場_対戦M.csv の"
+                f"両方には当たっていません{('（' + '・'.join(detail) + '）') if detail else ''}。raw_csv に残します"
+                "（そのレースの基本CSVを統合したあとに、もう一度回すと当たります。当たらないのが基本CSVに無いレースだけなら、"
+                "このファイルは手で merged_done/ に移すか消してください）")
+        else:
+            log(f"[WARN] 列パッチ {p.name}: レースID(新) が18桁の行がありません。raw_csv に残します")
     if not res.updated:
         log(f"[WARN] {MERGED_NAME.format(kind='タイムM')}・{MERGED_NAME.format(kind='対戦M')} が無いので、列パッチ "
             f"{len(res.files)} 本を当てられません（基本CSVを先に統合してください。パッチは raw_csv に残します）")
-    elif res.unmatched:
-        log(f"[WARN] 列パッチの {res.unmatched} 行は 全場_*.csv に無いレース（馬）なので当てていません"
-            "（そのレースの基本CSVを統合してから、パッチを raw_csv に置き直してください）")
     return res
 
 
@@ -330,13 +369,11 @@ def merge_raw(raw_dir: Path | str, csv_dir: Path | str, files: Iterable[Path | s
         results.append(res)
     if patches:                             # 基本CSVを統合したあとに当てる（今回統合した行にも当たる）
         res = apply_patches(patches, csv_dir, log)
-        if res.updated and res.unmatched < res.rows:
-            move_done(res)
+        if res.updated:
             log(f"[INFO] {res.summary()}")
-        else:                               # 当たらなかったパッチは raw_csv に残す
-            if res.updated and res.files:
-                log(f"[WARN] 列パッチ {len(res.files)} 本は 全場_*.csv の行に1行も当たらないので、raw_csv に残します")
-            res.files = []
+        done_files, res.files = res.files, res.complete     # 両方に全部当たったパッチだけ merged_done/ に移す
+        move_done(res)
+        res.files = done_files
         results.append(res)
     return results
 

@@ -265,25 +265,80 @@ def test_patch_without_targets_or_matches_stays_in_raw_csv(tmp_path):
     _write(patch_rows(rows(2026), 前走場所="東京"), raw / "前走.csv")
     logs = []
     r = rm.merge_raw(raw, csv_dir, log=logs.append)[0]
-    assert not r.files and (raw / "前走.csv").exists() and any("当てられません" in m for m in logs)
+    assert not r.moved and (raw / "前走.csv").exists() and any("当てられません" in m for m in logs)
     _write(rows(2025), csv_dir / "全場_タイムM.csv")                                   # 別の年だけ
+    _write(rows(2025), csv_dir / "全場_対戦M.csv")
     logs.clear()
     r = rm.merge_raw(raw, csv_dir, log=logs.append)[0]
-    assert not r.files and (raw / "前走.csv").exists() and r.unmatched == 10
-    assert any("1行も当たらない" in m for m in logs) and not (raw / "merged_done").exists()
+    assert not r.moved and (raw / "前走.csv").exists() and r.missing == {"全場_タイムM.csv": 10, "全場_対戦M.csv": 10}
+    assert any("前走.csv: 10 行のうち 10 行" in m and "raw_csv に残します" in m for m in logs)
+    assert not (raw / "merged_done").exists()
 
 
 def test_base_and_patch_in_one_run_and_partial_match(tmp_path):
-    """同じ回に置いた基本CSVを先に統合してからパッチを当てる。当たらない行があっても当たった分は反映して移す（WARN）。"""
+    """同じ回に置いた基本CSVを先に統合してからパッチを当てる。当たらない行があれば、当たった分は反映して raw_csv に残す
+    （WARN）。あとでその基本CSVを統合すると、残ったパッチが当たって移る。"""
     csv_dir, raw = tmp_path / "csv_files", tmp_path / "raw_csv"
     _write(rows(2026), raw / "タイムM_2026.csv")
+    _write(rows(2026), raw / "対戦M_2026.csv")
     _write(patch_rows(pd.concat([rows(2026), rows(2027)], ignore_index=True), 前走場所="京都"), raw / "前走.csv")
     logs = []
     res = {r.kind: r for r in rm.merge_raw(raw, csv_dir, log=logs.append)}
-    assert res["タイムM"].after == 10 and res[rm.PATCH_KIND].updated == {"全場_タイムM.csv": 10}
-    assert res[rm.PATCH_KIND].unmatched == 10 and any("全場_*.csv に無いレース" in m for m in logs)
+    p = res[rm.PATCH_KIND]
+    assert res["タイムM"].after == 10 and p.updated == {"全場_タイムM.csv": 10, "全場_対戦M.csv": 10}
+    assert p.unmatched == 10 and not p.moved and (raw / "前走.csv").exists()
+    assert any("前走.csv: 20 行のうち 10 行" in m for m in logs)
     assert set(read(csv_dir / "全場_タイムM.csv")["前走場所"]) == {"京都"}
-    assert (raw / "merged_done" / "前走.csv").exists()
+    _write(rows(2027), raw / "タイムM_2027.csv")
+    _write(rows(2027), raw / "対戦M_2027.csv")
+    res = {r.kind: r for r in rm.merge_raw(raw, csv_dir, log=lambda m: None)}
+    assert res[rm.PATCH_KIND].unmatched == 0 and (raw / "merged_done" / "前走.csv").exists()
+    for name in ("全場_タイムM.csv", "全場_対戦M.csv"):
+        assert read(csv_dir / name)["前走場所"].tolist() == ["京都"] * 20
+
+
+def test_patch_waits_for_the_other_merged_file(tmp_path):
+    """全場_対戦M.csv がまだ無い（タイムM の基本CSVとパッチを先に置いた）ときは、タイムM に当ててパッチを残す。
+    対戦M の基本CSVを統合した回に対戦M にも当たり、そこで移す。"""
+    csv_dir, raw = tmp_path / "csv_files", tmp_path / "raw_csv"
+    _write(rows(2026), raw / "タイムM_2026.csv")
+    _write(patch_rows(rows(2026), 前走場所="新潟"), raw / "前走.csv")
+    logs = []
+    p = {r.kind: r for r in rm.merge_raw(raw, csv_dir, log=logs.append)}[rm.PATCH_KIND]
+    assert p.updated == {"全場_タイムM.csv": 10} and p.missing["全場_対戦M.csv"] == 10 and not p.moved
+    assert any("全場_対戦M.csv がありません" in m for m in logs) and (raw / "前走.csv").exists()
+    _write(rows(2026), raw / "対戦M_2026.csv")
+    p = {r.kind: r for r in rm.merge_raw(raw, csv_dir, log=lambda m: None)}[rm.PATCH_KIND]
+    assert p.updated == {"全場_タイムM.csv": 0, "全場_対戦M.csv": 10} and p.moved
+    assert set(read(csv_dir / "全場_対戦M.csv")["前走場所"]) == {"新潟"}
+
+
+def test_only_fully_applied_patch_files_are_moved(tmp_path):
+    """同じ回の複数のパッチで、当たらないパッチは（ほかのパッチが当たっても）raw_csv に残す。"""
+    csv_dir, raw = tmp_path / "csv_files", tmp_path / "raw_csv"
+    for kind in ("タイムM", "対戦M"):
+        _write(rows(2026), csv_dir / f"全場_{kind}.csv")
+    _write(patch_rows(rows(2026), 前走場所="東京"), raw / "前走_2026.csv")
+    _write(patch_rows(rows(2027), 前走場所="東京"), raw / "前走_2027.csv")      # 2027 の基本CSVはまだ
+    logs = []
+    p = rm.merge_raw(raw, csv_dir, log=logs.append)[0]
+    assert [x.name for x in p.moved] == ["前走_2026.csv"] and (raw / "前走_2027.csv").exists()
+    assert any("前走_2027.csv: 10 行のうち 10 行" in m for m in logs)
+
+
+def test_patch_headers_follow_existing_columns_and_rank_is_protected(tmp_path):
+    """パッチの見出しの空白・全角半角のゆれは 全場_*.csv の列に合わせる。指数順位（タイムM と対戦M で違う）は書き換えない。"""
+    csv_dir, raw = tmp_path / "csv_files", tmp_path / "raw_csv"
+    base = rows(2026)
+    base["前走レース印３"] = ""
+    for kind in ("タイムM", "対戦M"):
+        _write(base, csv_dir / f"全場_{kind}.csv")
+    p = patch_rows(base, **{" 前走レース印3 ": " Ｈ ", "指数順位": "1"})
+    _write(p, raw / "前走.csv")
+    rm.merge_raw(raw, csv_dir, log=lambda m: None)
+    out = read(csv_dir / "全場_タイムM.csv")
+    assert set(out["前走レース印３"]) == {" Ｈ "} and "前走レース印3" not in out.columns
+    assert out["指数順位"].tolist() == base["指数順位"].tolist()
 
 
 def test_replace_uses_patched_previous_columns(tmp_path):
@@ -292,6 +347,7 @@ def test_replace_uses_patched_previous_columns(tmp_path):
     csv_dir, raw = tmp_path / "csv_files", tmp_path / "raw_csv"
     base = rows(2026)
     _write(base, csv_dir / "全場_タイムM.csv")
+    _write(base, csv_dir / "全場_対戦M.csv")
     _write(patch_rows(base, 前走着順="２", 間隔="3", 前走場所="中山"), raw / "前走パッチ.csv")
     assert replace_csv_ver3.main(["--csv-dir", str(csv_dir), "--raw-dir", str(raw), "--no-ext",
                                   "--master-dir", str(tmp_path / "m")]) == 0
@@ -302,6 +358,7 @@ def test_replace_uses_patched_previous_columns(tmp_path):
 
 def test_web_accepts_patch_upload(client, tmp_path):
     _write(rows(2026), tmp_path / "csv_files" / "全場_タイムM.csv")
+    _write(rows(2026), tmp_path / "csv_files" / "全場_対戦M.csv")
     up = patch_rows(rows(2026), 前走場所="東京").to_csv(index=False).encode("cp932")
     r = client.post("/ingest/raw_merge", data={"raw_files": [(io.BytesIO(up), "前走だけ.csv")]},
                     content_type="multipart/form-data")
