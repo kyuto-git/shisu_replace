@@ -1,4 +1,4 @@
-"""オッズ帯（過去レースの確定単勝オッズで素材を絞り込む4パターン）。
+"""オッズ帯（過去レースの確定単勝オッズで master の馬を絞り込む4パターン）。
 
   normal    : 絞り込みなし
   odds10u   : 10倍未満
@@ -18,7 +18,11 @@ LEGACY_MODES = ("odds5p",)                               # 旧仕様。build_db 
 
 def odds_mask(odds: pd.Series, mode: str) -> pd.Series:
     """mode に入る行。オッズ欠損の行は normal 以外には入らない。"""
-    o = pd.to_numeric(odds, errors="coerce")
+    return odds_mask_numeric(pd.to_numeric(odds, errors="coerce"), mode)
+
+
+def odds_mask_numeric(o: pd.Series, mode: str) -> pd.Series:
+    """odds_mask の数値版（オッズを数にしたもの。欠損は NaN）。"""
     if mode == "normal":
         return pd.Series(True, index=o.index)
     if mode == "odds10u":

@@ -11,15 +11,25 @@
 
   python calc_entry_hensachi.py               # 個別出力 {元名}_hensachi.csv
   python calc_entry_hensachi.py --merge-one   # 個別＋統合 entries_merged_hensachi.csv
-  python calc_entry_hensachi.py --merge-only  # 統合のみ
+  python calc_entry_hensachi.py --merge-only  # 統合のみ（推奨。DB の xjoin が1本で済む）
+  --clean を付けると entries_out の古い CSV を消してから出力する
 統合は レースID(新) で全ファイルを横に結合する（空欄は後続ファイルの値で埋める。行は和集合）。
+
+外部指数の自動結合（ext_indices/。過去側の replace_csv_ver3.py と同じ shisu.ext_indices.attach_filled）:
+  entries_in/ に置く出馬表CSVは マイニング値・対戦型マイニング値 だけの1本（test.csv の形）でよい。
+  ext_indices/ の指数（形式A〜D）を レースID(新)・レースID(旧) で各馬に結び付けてから偏差値・順位を計算する。
+  出馬表CSVの値を優先する（レースごと: そのレースに 0・空欄以外の値が1頭でもあれば出馬表の値と TARGET の順位、
+  列が無い・0・空欄だけのレースは ext_indices の値で埋める）。
+  ファイルに無い馬は値 0・最下位（過去側と同じ）。--no-ext で結合しない。--ext-dir で場所を変える
 """
 from __future__ import annotations
 
 import argparse
 import re
 import sys
+import unicodedata
 from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
 
@@ -35,6 +45,7 @@ DERIVED_SUFFIXES = ("_偏差値", "_偏差値帯", "_順位") + tuple(f"_順位�
 # 元ファイルの順位列（明示）: 正式名 → 列名候補
 EXPLICIT_RANK_COLUMNS = {"タイムM": ("マイニング順位",), "対戦M": ("対戦型マイニング順位",)}
 _NUMBERED_RANK = re.compile(r"^指数順位([0-9０-９]+)$")
+_UNNAMED_SLOT = re.compile(r"^指数[0-9０-９]+$")   # 指数を読み込んでいない枠の見出し
 
 
 def find_indicator_columns(df: pd.DataFrame) -> list[str]:
@@ -48,12 +59,18 @@ def find_indicator_columns(df: pd.DataFrame) -> list[str]:
     return out
 
 
-def build_rank_source_map(df: pd.DataFrame, idx_cols: list[str]) -> dict[str, str]:
-    """列名 → 元順位の列名。
+def build_rank_source_map(df: pd.DataFrame, idx_cols: list[str], ext_cols: Iterable[str] = ()) -> dict[str, str]:
+    """指数列 → 元順位の列名。ext_cols は ext_indices から末尾に足した指数列（2〜4 の対応付けに使わない。
+    TARGET が出した 指数順位N は出馬表にもとからある指数の順位なので、足した列に回さない）。
+
     1) 明示列（マイニング順位 / {列}順位 / {正式名}順位 / {正式名}_順位 / {列}_順位）
-    2) 番号付き「指数順位N」を、明示列の無い指数列に出現順で対応させる
-    3) 無印「指数順位」は指数が1種類のときだけ対応させる
+    2) 「指数順位N」が指数列のすぐ右にあれば、その指数列の順位（TARGET の出力は 指数列, 指数順位N の並び）
+    3) 2 で決まらないものは、N 番目の「枠」に対応させる。枠 = 台帳にある指数列（1 で専用の順位列が
+       見つかったものを除く）と、指数を読み込んでいない枠の見出し「指数N」を出現順に並べたもの
+    4) 指数が1種類で無印「指数順位」があれば、それを使う
+    どれにも当たらなければ未対応（順位は指数から計算し直す）。
     """
+    cols = [str(c) for c in df.columns]
     rank_map: dict[str, str] = {}
     for col in idx_cols:
         canon = canonical_indicator(col)
@@ -61,12 +78,29 @@ def build_rank_source_map(df: pd.DataFrame, idx_cols: list[str]) -> dict[str, st
         hit = next((c for c in cands if c in df.columns), None)
         if hit:
             rank_map[col] = hit
-    remaining = [c for c in idx_cols if c not in rank_map]
-    numbered = [c for c in df.columns if _NUMBERED_RANK.match(str(c))]
-    for col, rcol in zip(remaining, numbered):
-        rank_map[col] = rcol
-    still = [c for c in idx_cols if c not in rank_map]
-    if "指数順位" in df.columns and len(idx_cols) == 1 and still:
+    explicit = set(rank_map)
+    used = set(rank_map.values())
+    ext_cols = set(ext_cols)
+    own = [c for c in idx_cols if c not in ext_cols]
+    for i, c in enumerate(cols):
+        if _NUMBERED_RANK.match(c) and c not in used and i > 0:
+            left = cols[i - 1]
+            if left in own and left not in rank_map:
+                rank_map[left] = c
+                used.add(c)
+    slots = [c for c in cols if (c in own and c not in explicit) or _UNNAMED_SLOT.match(c)]
+    for c in cols:
+        m = _NUMBERED_RANK.match(c)
+        if not m or c in used:
+            continue
+        n = int(unicodedata.normalize("NFKC", m.group(1)))
+        if 1 <= n <= len(slots):
+            slot = slots[n - 1]
+            if slot in idx_cols and slot not in rank_map:
+                rank_map[slot] = c
+                used.add(c)
+    still = [c for c in own if c not in rank_map]
+    if "指数順位" in df.columns and len(own) == 1 and still:
         rank_map[still[0]] = "指数順位"
     return rank_map
 
@@ -83,15 +117,19 @@ def race_key(df: pd.DataFrame) -> pd.Series:
     raise RuntimeError("レースID列が見つかりません（レースID(新) / レースID(新/馬番無) / 場 R）")
 
 
-def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True) -> pd.DataFrame:
+def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True,
+               last_masks: dict[str, pd.Series] | None = None, ext_cols: Iterable[str] = ()) -> pd.DataFrame:
+    """last_masks: 指数列 → 値から順位を付けるとき最下位にする馬（ext_indices のファイルに無かった馬）。
+    ext_cols: attach_ext が末尾に足した指数列（build_rank_source_map を参照）。"""
     df = df.copy()
+    last_masks = last_masks or {}
     rk = race_key(df)
     cls = df["クラス名"] if "クラス名" in df.columns else df.get("クラス", pd.Series("", index=df.index))
     shin = shinba_mask(cls)
     idx_cols = find_indicator_columns(df)
     if not idx_cols and verbose:
         print(f"[WARN] {name}: 指数列が見つかりません")
-    rank_map = build_rank_source_map(df, idx_cols)
+    rank_map = build_rank_source_map(df, idx_cols, ext_cols)
     seen: set[str] = set()
     for col in idx_cols:
         canon = canonical_indicator(col)
@@ -100,7 +138,12 @@ def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True) -> pd
             continue
         seen.add(canon)
         given = df[rank_map[col]] if col in rank_map else None
-        r = compute_indicator(df[col], rk, spec_for(canon), shin, given)
+        if given is None and verbose:
+            print(f"[INFO] {name}: {canon} の順位列が無いため、指数から順位を計算します")
+        r = compute_indicator(df[col], rk, spec_for(canon), shin, given, last_masks.get(col))
+        if verbose and r.attrs.get("direction") == "rank" and r.attrs.get("reverse") != spec_for(canon).reverse:
+            print(f"[INFO] {name}: {canon} は TARGET の順位に合わせて偏差値の向きを「"
+                  + ("小さいほど上" if r.attrs["reverse"] else "大きいほど上") + "」にしました（台帳の既定と逆）")
         derived = {
             f"{canon}_偏差値": int_text_series(r["偏差値"]),
             f"{canon}_偏差値帯": r["偏差値帯"].fillna(""),
@@ -115,6 +158,100 @@ def process_df(df: pd.DataFrame, name: str = "(df)", verbose: bool = True) -> pd
         for i, (c, s) in enumerate(derived.items()):
             df.insert(pos + i, c, s)
     return df
+
+
+def load_ext(ext_root: Path, skip: Iterable[str] = (), log=print) -> dict:
+    """ext_indices/ の指数（skip にあるもの・廃止したものを除く）→ {正式名: ExtLookup}。
+    出馬表に値のある指数かどうかは attach_ext がファイル・レースごとに決める（ここでは読み込むだけ）。"""
+    skip = set(skip)
+    from shisu import ext_indices
+    from shisu.indicators import is_discontinued
+    if not Path(ext_root).is_dir():
+        return {}
+    sources, _skipped = ext_indices.discover(ext_root, log=lambda m: None)
+    out = {}
+    for name, src in sources.items():
+        if name in skip:
+            continue
+        if is_discontinued(name):
+            continue
+        out[name] = ext_indices.load_source(src, log=lambda m: None)
+    return out
+
+
+def _nonzero(s: pd.Series) -> pd.Series:
+    v = pd.to_numeric(norm_series(s), errors="coerce")
+    return v.notna() & (v != 0)
+
+
+def attach_ext(df: pd.DataFrame, lookups: dict, name: str = "(df)",
+               log=print) -> tuple[pd.DataFrame, dict, set[str]]:
+    """出馬表1本に ext_indices の指数を付ける。戻り値: (DataFrame, 指数列 → ファイルに無かった馬, 末尾に足した指数列)。
+
+    出馬表の値を優先する。判定はレースごと: 出馬表に同じ指数の列があり、そのレースに 0・空欄以外の値が1頭でもあれば
+    そのレースは出馬表の値（と TARGET の順位）を使う。列が無い・そのレースが 0・空欄だけ（TARGET が読み込んでいない）なら
+    ext の値で埋める。列があればその列（と対応する順位の列）の該当レースの行を書き換え（列を消すと 指数順位N の対応が
+    ずれるため）、無ければ末尾に「{正式名}」と、順位があれば「{正式名}順位」を足す。"""
+    from shisu import ext_indices
+    if not lookups:
+        return df, {}, set()
+    df = df.copy()
+    idx_cols = find_indicator_columns(df)
+    rank_map = build_rank_source_map(df, idx_cols)
+    masks: dict[str, pd.Series] = {}
+    added: set[str] = set()
+    rk = None
+    for canon, lookup in lookups.items():
+        try:
+            att = ext_indices.attach_filled(df, lookup)
+        except KeyError as e:
+            log(f"[WARN] {name}: 外部指数を結び付けられません（{e}）")
+            return df, masks, added
+        existing = [c for c in idx_cols if canonical_indicator(c) == canon]
+        note = ""
+        if existing:
+            col = existing[0]
+            if rk is None:
+                rk = race_key(df)
+            has = _nonzero(df[col]).groupby(rk).transform("any").astype(bool)
+            fill = ~has
+            n_races = rk.nunique()
+            kept = rk[has].nunique()
+            if not fill.any():
+                log(f"[INFO] {name}: {canon}: 出馬表CSVの値を使います（ext_indices は使いません）")
+                continue
+            df[col] = df[col].astype(object)
+            df.loc[fill, col] = att.values[fill]
+            if col in rank_map:
+                rc = rank_map[col]
+                df[rc] = df[rc].astype(object)
+                df.loc[fill, rc] = att.ranks[fill] if att.ranks is not None else ""
+            elif att.ranks is not None:
+                rc = f"{col}順位"
+                df[rc] = att.ranks.where(fill, "")
+            masks[col] = att.absent & fill
+            hit = int((~att.absent & fill).sum())
+            total = int(fill.sum())
+            if kept:
+                note = f"（出馬表に値のあるレース {kept}/{n_races} は出馬表の値を使用）"
+            norank = 0
+            if att.ranks is not None and not att.rank_column_empty:     # 順位の無いレースは ext で埋めたレースだけ数える
+                norank = int(rk[fill & ~att.absent & (norm_series(att.ranks) == "")].nunique())
+        else:
+            col = canon
+            df[col] = att.values
+            if att.ranks is not None:
+                df[f"{col}順位"] = att.ranks
+            masks[col] = att.absent
+            added.add(col)
+            hit, total = att.hit, len(df)
+            norank = att.norank_races
+        if att.rank_column_empty:
+            note += "（順位の列が空なので値から順位を計算）"
+        elif norank:
+            note += f"（順位の無いレース {norank} 件は値から順位を計算）"
+        log(f"[INFO] {name}: 外部指数 {canon} を ext_indices から付けました（値のある馬 {hit}/{total}）{note}")
+    return df, masks, added
 
 
 def merge_frames(dfs: list[pd.DataFrame]) -> pd.DataFrame:
@@ -157,6 +294,9 @@ def main(argv=None) -> int:
     ap.add_argument("--merge-one", action="store_true", help="個別出力に加えて統合1ファイルも出力")
     ap.add_argument("--merge-only", action="store_true", help="統合1ファイルだけ出力")
     ap.add_argument("--merge-name", default=DEFAULT_MERGED_NAME)
+    ap.add_argument("--clean", action="store_true", help="出力先 entries_out の CSV を消してから実行（古い出馬表を DB に入れないため）")
+    ap.add_argument("--ext-dir", default=str(config.ext_dir()), help="外部指数CSV群のフォルダ（既定 ext_indices）")
+    ap.add_argument("--no-ext", action="store_true", help="ext_indices の外部指数を結び付けない")
     args = ap.parse_args(argv)
 
     files = sorted(Path(args.in_dir).glob("*.csv"))
@@ -165,11 +305,23 @@ def main(argv=None) -> int:
         return 0
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.clean:
+        for old in out_dir.glob("*.csv"):
+            old.unlink()
 
     processed, rc = [], 0
+    raws: dict[Path, pd.DataFrame] = {}
     for p in files:
         try:
-            df = process_df(read_csv_any(p), p.name)
+            raws[p] = read_csv_any(p)
+        except Exception as e:
+            print(f"[ERROR] {p.name}: {type(e).__name__}: {e}")
+            rc = 1
+    lookups = {} if args.no_ext else load_ext(Path(args.ext_dir))
+    for p, raw in raws.items():
+        try:
+            raw, masks, added = attach_ext(raw, lookups, p.name)
+            df = process_df(raw, p.name, last_masks=masks, ext_cols=added)
         except Exception as e:
             print(f"[ERROR] {p.name}: {type(e).__name__}: {e}")
             rc = 1

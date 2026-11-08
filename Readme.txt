@@ -1,605 +1,719 @@
-★8タブにて、以下の（１）〜（３）作業を行う。
-※集計の際、頭数は１０以上、障害レースは含めないようにする
+================================================================================
+■ docker_shisu_replace 統合システム 運用・仕様マニュアル（最新版 2026-11-06）
+================================================================================
 
-（１）ファイル→外部指数の読み込み
-（２）レース検索画面の真ん中上部にある「出力」ボタン→左側にある「レース一覧★画面イメージ（csv形式）」から「地名_外部指数名.csv」の形式のファイル名にして保存。
-（３）（１）（２）の繰り返し
-（４）GoogleDrive（Dropbox）に保存
-（５）Macでdocker_shisu_replaceの処理を実行
-
+--------------------------------------------------------------------------------
+0. ディレクトリ構成
+--------------------------------------------------------------------------------
 docker_shisu_replace/
-├─ csv_files/       入力（元CSV）
-├─ replace_csv/     置換確認用（processed_*）
-├─ foragg_csv/      集計素材→集計後の最終成果物（foragg_* 上書き）
-├─ entries_in/      エントリー用入力（偏差値帯付与ユーティリティ）
-├─ entries_out/     同出力
-├─ Dockerfile       実行環境（Python3.11 + pandas/numpy/flask + ja_JP.UTF-8）
-├─ replace_csv_ver3.py  置換/正規化 + 結合キー生成 + foragg素材 + 帯展開 + per-row回収寄与
-├─ aggregate_stats_ver2.py  foragg_* をグループ集計＆ベイズ推定で上書き保存
-├─ build_db.py      foragg_* を各1テーブル化→unified_all 構築（*_val 付与・インデックス）
-├─ app.py           横断検索UI（family×indicator×条件、`*_val`でソート）
-└─calc_entry_hensachi.py  エントリーCSVに各指数の「偏差値帯」を追記（独立ユーティリティ）
+├─ csv_files/          [入力] 過去レースの基本CSV（TARGET ★6タブ：{地域}_タイムM.csv / {地域}_対戦M.csv）
+│                             ※従来の「{地域}_{指数名}.csv」（★8タブで1指数ずつ出力）もそのまま読めます
+├─ ext_indices/        [入力] 外部指数CSV群（Ω・かよちん・keibaAI・吉馬6・安井8・StridePlus 12・Gold・BC・ZI）
+├─ master_csv/         [中間] 1頭1行の正規化済みマスター（*.csv.gz：キーの部品・22条件・偏差値・順位・成績）
+├─ agg_csv/            [成果物] ベイズ集計＋WEDGE算出済みの成績表（family × s1/s2 × オッズ4区分）＋ families.json
+├─ selected_families.json  [設定] screen_families.py で選抜した family（あれば初期セット49種の代わりに使われる）
+├─ screening_report.csv    [成果物] screen_families.py の採点レポート
+├─ replace_csv/        [任意] 結合キー確認ファイル（--processed 指定時のみ出力）
+├─ entries_in/         [入力] 今週の出馬表CSV（TARGET ★4タブ出力 ＋ 安井出馬表CSV）
+├─ entries_out/        [中間] 偏差値・順位・順位帯(s1/s2)付与済みの統合出馬表（entries_merged_hensachi.csv）
+├─ ingest_in/          [入力] 指数取得（/ingest）用の入力置き場（base/ lap/ yasui/）
+├─ ingest_out/         [成果物] 指数取得（/ingest）の出力先（実行日時 YYYYMMDD_HHMMSS/ ごとに保存）
+├─ shisu/              [コア] 共通Pythonパッケージ（正規化・22条件・family・キー生成・分類・WEDGE・外部指数の結合・ingest群）
+│   └─ data/           コース属性_帯つき / 輸送距離マスタ / quadrant_link（マスタ。リポジトリに含む）
+├─ tests/              [検証] 自動テスト群（pytest）
+├─ replace_csv_ver3.py     [Step 1] 基本CSV＋外部指数の結合・正規化・偏差値化・22条件 → master_csv/
+├─ screen_families.py      [Step 1.5] 全掛け合わせ候補の一括採点 → screening_report.csv / selected_families.json
+├─ aggregate_stats_ver2.py [Step 2] family × オッズ4区分のグループ集計・ベイズ推定・WEDGE算出（agg_csv/）
+├─ calc_entry_hensachi.py  [Step 3] 出馬表CSVの偏差値・順位・帯計算＆横結合（entries_out/）
+├─ build_db.py         [Step 4] SQLite（racing.db）構築（unified_all ＋ __families__ ＋ entries_xjoin_* 事前照合）
+├─ ingest.py           [CLI]  外部指数スクレイピング・ラップ計算・安井Excel抽出のCLI実行スクリプト
+├─ app.py              [Web]  横断検索・出馬表・条件ヒット馬・WEDGE一覧・指数取得（/ingest）統合Web UI
+└─ racing.db           [DB]   SQLiteデータベース本体
+  ※foragg_csv/ は旧版の集計素材の置き場です。今は作りません（残っていても使われないので削除してOK）。
 
 
+--------------------------------------------------------------------------------
+1. 週末・定期運用の基本コマンド手順
+--------------------------------------------------------------------------------
 
+# 0) プロジェクト直下へ移動
+cd ~/Downloads/self-dev/docker/shisu/docker_shisu_replace
 
-# 0) プロジェクト直下へ
-cd Downloads/self-dev/docker/shisu/docker_shisu_replace
-
-# 1) 置換対象の元CSVを置く（Shift_JIS 推奨）
-#    - foragg 用：csv_files/ に配置
-#    - エントリー用：entries_in/ に配置（出馬表→偏差値計算）
-
-# 2) ビルド（初回/更新時だけ）
+# 1) Dockerイメージのビルド（初回、または Dockerfile / requirements.txt 更新時のみ）
 docker build -t csv_processor_shisu .
 
-# 3) 置換/正規化＋foragg素材生成（foragg_* → foragg_csv/、processed_* → replace_csv/）
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/replace_csv_ver3.py
-
-# 4) （任意/推奨）foragg_* をベイズ集計で上書き保存
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/aggregate_stats_ver2.py
-
-
-# 5) DB 作成（CSV → SQLite /app/racing.db）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu \
-  python /app/build_db.py
-
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/build_db.py
-
-# -> /app/racing.db が生成されます
-
-※foragg_csv/ にローカル5場しか無い状態で実行すると、unified_all から主5場のデータは“見えなくなります”（DBから物理削除ではないが、ビュー/検索の母集団から外れる）。
-
-
-※DB を作り直すのは、
-①CSVを更新した、
-②build_db.py を更新してスキーマ/加工を変えた、
-③DB を消してしまった、
-のいずれかだけでOK。ビルドし直しても、上記に該当しないなら作り直ししなくても大丈夫
-
-# 完全作り直し（DB初期化）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu \
-  python /app/build_db.py --mode both --fresh
-
-# 今回作らなかった古いテーブルを掃除（整理用）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu \
-  python /app/build_db.py --mode entries --prune
-
-
-
-# 6-1) エントリー偏差値（entries_in → entries_out）
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py
-
-	•	これまで通り：個別出力のみ
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py
-
-	•	個別＋統合の両方を出力
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py \
-  --merge-one
-
-	•	統合のみ出力
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py \
-  --merge-only
-
-	•	統合の出力名を変更
-docker run --rm -v "$(pwd)":/app --entrypoint python \
-  csv_processor_shisu /app/calc_entry_hensachi.py \
-  --merge-one --merge-name entries_20251012_merged_hensachi.csv
-
-
-# 6-2)
-# entries だけ再構築（unified_all は触らない）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu \
-  python /app/build_db.py --mode entries
-
-
-
-
-# 7) Web UI 起動（http://localhost:8000）
-docker run --rm -p 8000:8000 -v "$(pwd)":/app \
-  -e DB_PATH=/app/racing.db \
-  csv_processor_shisu python /app/app.py
-
-
-DB をブラウザで確認（任意）
-Datasette（ビュー作成/JSON/CSV ダウンロード等）
-docker run --rm -p 8001:8001 -v "$(pwd)":/data --platform linux/amd64 \
-  datasetteproject/datasette \
-  datasette serve /data/racing.db \
-  --host 0.0.0.0 --port 8001 --setting sql_time_limit_ms 20000
-# http://localhost:8001
-
-
-
-1) 単一テーブルを削除（メタ情報も掃除）
-
-環境変数 TBL に削除したいテーブル名を渡し、DROP TABLE と tables_meta の行削除を同時実行します。
-（※インジェクション防止のため、テーブル名は英数とアンダースコアのみ許容）
-# 単一テーブルを削除（メタ情報も掃除）
-docker run --rm -v "$(pwd)":/app -e TBL=entries_xjoin_syutsubahyou_20251011_hensachi \
-  csv_processor_shisu \
-  python -c "import os,re,sqlite3; tbl=os.environ['TBL']; assert re.match(r'^[A-Za-z0-9_]+$', tbl); \
-con=sqlite3.connect('/app/racing.db');cur=con.cursor(); \
-cur.execute(f'DROP TABLE IF EXISTS \"{tbl}\"'); \
-cur.execute('DELETE FROM __tables_meta__ WHERE table_name=?',(tbl,)); \
-con.commit(); con.close(); print('Dropped:', tbl)"
-
-
-
-削除確認（オプション）
-docker run --rm -v "$(pwd)":/app csv_processor_shisu \
-  python -c "import sqlite3;con=sqlite3.connect('/app/racing.db');cur=con.cursor();
-print(cur.execute('SELECT COUNT(*) FROM sqlite_master WHERE type=\"table\" AND name=?', ('entries_xjoin_syutsubahyou_20251011_hensachi',)).fetchone()[0]);
-con.close()"
-# 0 が返れば削除済み
-
-
-
-2) 複数テーブルを一括削除（前方一致など）
-# 前方一致で一括削除（例：entries_xjoin_ で始まる）
-docker run --rm -v "$(pwd)":/app -e PREFIX=entries_xjoin_ \
-  csv_processor_shisu \
-  python -c "import os,sqlite3,re; pre=os.environ.get('PREFIX',''); assert re.match(r'^[A-Za-z0-9_]*$', pre); \
-con=sqlite3.connect('/app/racing.db');cur=con.cursor(); \
-tbs=[r[0] for r in cur.execute('SELECT name FROM sqlite_master WHERE type=\"table\" AND name LIKE ?',(pre+'%',)).fetchall()]; \
-[ (cur.execute(f'DROP TABLE IF EXISTS \"{t}\"'), cur.execute('DELETE FROM __tables_meta__ WHERE table_name=?',(t,))) for t in tbs ]; \
-con.commit(); con.close(); print('Dropped:', len(tbs),'tables')"
-
-
-# 例：
-entries_xjoin_shisu_20251108_4_hensachi
-entries_xjoin_shisu_20251108_3_hensachi
-entries_xjoin_shisu_20251108_2_hensachi
-entries_xjoin_shisu_20251108_1_hensachi
-entries_shisu_20251108_4_hensachi
-entries_shisu_20251108_3_hensachi
-entries_shisu_20251108_2_hensachi
-entries_shisu_20251108_1_hensachi
-entries_xjoin_shisu_20251109_4_hensachi
-entries_xjoin_shisu_20251109_3_hensachi
-entries_xjoin_shisu_20251109_2_hensachi
-entries_xjoin_shisu_20251109_1_hensachi
-entries_xjoin_shisu_20251109_5_hensachi
-entries_shisu_20251109_4_hensachi
-entries_shisu_20251109_3_hensachi
-entries_shisu_20251109_2_hensachi
-entries_shisu_20251109_1_hensachi
-entries_shisu_20251109_5_hensachi
-entries_xjoin_shisu_20251116_5_hensachi
-entries_xjoin_shisu_20251116_4_hensachi
-entries_xjoin_shisu_20251116_3_hensachi
-entries_xjoin_shisu_20251116_2_hensachi
-entries_xjoin_shisu_20251116_1_hensachi
-entries_shisu_20251116_5_hensachi
-entries_shisu_20251116_4_hensachi
-entries_shisu_20251116_3_hensachi
-entries_shisu_20251116_2_hensachi
-entries_shisu_20251116_1_hensachi
- を同時に削除
-
-
-entries_xjoin_shisu_20251206_8_hensachi
-entries_xjoin_shisu_20251206_7_hensachi
-entries_xjoin_shisu_20251206_6_hensachi
-entries_xjoin_shisu_20251206_5_hensachi
-entries_xjoin_shisu_20251206_4_hensachi
-entries_xjoin_shisu_20251206_3_hensachi
-entries_xjoin_shisu_20251206_2_hensachi
-entries_xjoin_shisu_20251206_1_hensachi
-entries_shisu_20251206_8_hensachi
-entries_shisu_20251206_7_hensachi
-entries_shisu_20251206_6_hensachi
-entries_shisu_20251206_5_hensachi
-entries_shisu_20251206_4_hensachi
-entries_shisu_20251206_3_hensachi
-entries_shisu_20251206_2_hensachi
-entries_shisu_20251206_1_hensachi
-
-
-
-docker run --rm -v "$(pwd)":/app \
-  -e TBLS="entries_xjoin_shisu_20251108_4_hensachi entries_xjoin_shisu_20251108_3_hensachi entries_xjoin_shisu_20251108_2_hensachi entries_xjoin_shisu_20251108_1_hensachi entries_shisu_20251108_4_hensachi entries_shisu_20251108_3_hensachi entries_shisu_20251108_2_hensachi entries_shisu_20251108_1_hensachi entries_xjoin_shisu_20251109_4_hensachi entries_xjoin_shisu_20251109_3_hensachi entries_xjoin_shisu_20251109_2_hensachi entries_xjoin_shisu_20251109_1_hensachi entries_xjoin_shisu_20251109_5_hensachi entries_shisu_20251109_4_hensachi entries_shisu_20251109_3_hensachi entries_shisu_20251109_2_hensachi entries_shisu_20251109_1_hensachi entries_shisu_20251109_5_hensachi entries_xjoin_shisu_20251116_5_hensachi entries_xjoin_shisu_20251116_4_hensachi entries_xjoin_shisu_20251116_3_hensachi entries_xjoin_shisu_20251116_2_hensachi entries_xjoin_shisu_20251116_1_hensachi entries_shisu_20251116_5_hensachi entries_shisu_20251116_4_hensachi entries_shisu_20251116_3_hensachi entries_shisu_20251116_2_hensachi entries_shisu_20251116_1_hensachi " \
-  csv_processor_shisu \
-  python -c "import os,re,sqlite3,sys; \
-raw=os.environ.get('TBLS','').strip() or sys.exit('set TBLS'); \
-names=[n for n in re.split(r'[,\s]+',raw) if n]; \
-pat=re.compile('[A-Za-z0-9_\\u3040-\\u30FF\\u3400-\\u9FFF\\u30FB\\u30FC\\-]+$'); \
-bad=next((n for n in names if not (pat.match(n) and '\"' not in n and ';' not in n)), None); \
-bad and sys.exit(f'invalid table name: {bad}'); \
-con=sqlite3.connect('/app/racing.db'); cur=con.cursor(); \
-script=';'.join([f'DROP TABLE IF EXISTS \"{t}\"; DELETE FROM __tables_meta__ WHERE table_name=\"{t}\"' for t in names]); \
-cur.executescript(script); con.commit(); con.close(); print('Dropped:', ', '.join(names))"
-
-
-
-
-削除できたかの確認（任意）
-# ここでは同じ2テーブルを例に確認します（結果が空なら削除済み）
-docker run --rm -v "$(pwd)":/data keinos/sqlite3 /data/racing.db \
-"SELECT name FROM sqlite_master WHERE type='table' AND name IN ('entries_xjoin_20251011_hensachi','unified_all_backup');"
-
-------------------------------------
-＜entries_inのCSVファイル作成＞
-開催ひらく→JV一括取得→マイニング予想
-↓
-外部指数用ファイル出力→この開催の全レースのZI値の外部指数ファイルを出力する
-↓
-出馬表分析→★4タブ→ファイル→外部指数１〜４をファイルから読み込む→マイニングの読み込み
-↓
-右クリック→全て選択する→選択範囲をファイルに出力（CSV）
-
-以下はファイル名称
-shisu_YYYYMMDD_1
-shisu_YYYYMMDD_2
-shisu_YYYYMMDD_3
-shisu_YYYYMMDD_4
-shisu_YYYYMMDD_5(マイニング、カツラキ、持久)
-------------------------------------
-
-
-
-
-
-全体像（なにをしているか）
-	1.	元CSV（過去レース×指数つき明細）を読む
-	2.	置換・正規化（場所/距離レンジ/クラス名などの統一、スペース除去、NaN→空文字 等）
-	3.	結合キー（“×”で連結した条件文字列）を作る
-	4.	processed_*（置換済みのキーのみ）を出力
-	5.	foragg_*（集計素材：結合キー＋着順/払戻/オッズ 等）を出力
-	6.	aggregate_stats.py が foragg_* を読み込み、勝率・連対率・複勝率・回収値などを集計
-	•	併せて Jeffreys（Beta(0.5,0.5)） に基づくベイズ推定の確率も並記
-	•	foragg_* を 集計結果で上書き（＝最終成果物）
-
-⸻
-
-出力ファイルの種類
-	•	processed_*（/replace_csv/）
-	•	例：processed_rankB_主５場_対戦M.csv
-	•	中身：レースID(新), 結合データ
-	•	結合データは「場所×（重量種別）×（クラス名）×（内外）×芝ダ×距離×（騎手/枠/偏差値帯/指数順位…）」の10パターンを出力
-	•	foragg_*（/foragg_csv/）
-	•	例：foragg_rankB_主５場_対戦M.csv
-	•	置換直後は“素材版”（結合データ＋着順/払戻/オッズ）
-	•	aggregate_stats.py 実行後に上書き → 最終成果物へ
-	•	中身（最終版）：結合キーごとに
-	•	着別度数、勝率/連対率/複勝率/2着率/3着率（％）
-	•	平均着順
-	•	単勝回収値/複勝回収値/単勝適正回収値
-	•	上記確率のJeffreys ベイズ推定（同列の隣に並記）
-
-⸻
-
-各ファイルの役割と主な処理
-
-1) replace_csv.py（ver1：置換中心）
-	•	目的：既存の置換・整形に絞った処理。
-	•	主な処理：
-	•	スペース除去（全角/半角）・NaN→空文字・×× 縮約・末尾 × 除去
-	•	重量種別：「別定」「ハンデ」→「別ハ」
-	•	クラス名：「500万/1000万/1勝/2勝 → 1・2_勝」「1600万/3勝/ｵｰﾌﾟﾝ/OP(L) → 準OP・OP」「Ｇ２/Ｇ３ → 重賞」
-	•	馬齢×クラス特例：「馬齢×(1・2_勝/準OP・OP) → 馬齢×1勝・OP」
-	•	距離レンジ統一：場所/芝ダ/距離の組合せルールに基づく置換
-（※札幌・中京の芝はコメントアウトで停止）
-	•	コース区分：A/B/C/D（および ,A など）→ 空
-	•	指数順位：小数化されていても整数文字列へ（5.0 → "5"）
-	•	枠番グループ：頭数に応じて「内/中/外」
-	•	順位帯（1〜2位/1〜3位/…/6位以下）
-	•	結合キー（“×” 連結）：10パターンの processed_* を出力
-	•	ベイズ/回収値の集計はしない（別スクリプト）。
-
-2) replace_csv_ver2.py（ver2：置換＋偏差値＋素材出力）
-	•	目的：ver1 を踏襲しつつ、偏差値系と foragg 素材を追加。
-	•	ver1 に 加えて：
-	•	偏差値化（レースID(新/馬番無) 単位）
-	•	“低いほど良い”の自動判定：ファイル名に
-["タイムM","想定前半","想定後半","展開"] のいずれかが含まれたら 反転して偏差値化
-→ 設定は LOWER_IS_BETTER_TOKENS で調整可
-	•	ZI 特例（ファイル名に「ZI」）
-	•	クラス名「新馬」は偏差値計算から除外（空）
-	•	指数=0 は同一レース内の非ゼロ平均で置換（偏差値50寄せ）
-	•	偏差値帯：
-71以上 / 66~70 / 61~65 / 51~60 / 41~50 / 40以下
-	•	foragg_*（集計素材）の出力：
-結合キーに 着順・単勝配当（払戻）・複勝配当・単勝オッズ などを併記
-→ aggregate_stats.py がこれを読んで集計・上書き
-	•	そのほかは ver1 と同様（置換・整形・結合キー10パターン）。
-
-3) aggregate_stats.py（集計＆ベイズ）
-	•	目的：foragg_* を読み、グルーピング集計＋ベイズ推定を付与して上書き保存。
-	•	主な処理：
-	•	**グループ単位（結合データごと）**で
-	•	件数（N）、1着/2着/3着/着外の度数
-	•	勝率/連対率/複勝率/2着率/3着率（％）
-	•	平均着順
-	•	回収値：単勝/複勝/単勝“適正”回収値
-	•	単勝適正回収値 は実装上、一定のベースで正規化した適正化版（詳細はコードコメントに説明）
-	•	Jeffreys（Beta(0.5,0.5)） を用いたベイズ推定
-	•	二項比率の事後平均（≒次に同条件で起こる確率の最良推定）を、頻度ベースの隣にカッコ（）で併記
-	•	サンプル小のとき過度な跳ねを抑える効果（ゼロ割れ防止・過学習抑制）
-	•	サンプル数フィルタ：N<5 のグループは出力対象外（要望反映）
-	•	foragg_* を 同名で上書き保存（＝素材版 → 最終版に昇格）
-
-
-⸻
-
-10種類の出力パターン（processed_* / foragg_* 共通の“形”）
-	1.	normal
-場所×重量種別×クラス名×(内外)×芝ダ×距離×指数順位
-	2.	rankB
-場所×(内外)×芝ダ×距離×枠番グループ×指数順位
-	3.	hensachiA
-場所×重量種別×クラス名×(内外)×芝ダ×距離×偏差値帯
-	4.	hensachiB
-場所×(内外)×芝ダ×距離×枠番グループ×偏差値帯
-	5.	rankJ
-場所×(内外)×芝ダ×距離×騎手×指数順位
-	6.	hensachiJ
-場所×(内外)×芝ダ×距離×騎手×偏差値帯
-	7.	rankBJ
-場所×(内外)×芝ダ×距離×枠番グループ×騎手×指数順位
-	8.	hensachiBJ
-場所×(内外)×芝ダ×距離×枠番グループ×騎手×偏差値帯
-	9.	normalJ
-場所×重量種別×クラス名×(内外)×芝ダ×距離×騎手×指数順位
-	10.	hensachiAJ
-場所×重量種別×クラス名×(内外)×芝ダ×距離×騎手×偏差値帯
-⸻
-
-拡張・調整のポイント
-	•	“低いほど良い”の対象追加/変更
-replace_csv_ver2.py の先頭付近：
-
-LOWER_IS_BETTER_TOKENS = ["タイムM","想定前半","想定後半","展開"]
-→ 名称を追加/削除するだけで、ファイル名に含まれた場合に自動反転します。
-
-	•	距離レンジ置換のルール拡張
-PLACE_DISTANCE_RULES に辞書を足すだけ（データ駆動）。
-札幌/中京の芝はコメントアウト中（必要ならコメント解除）。
-	•	列名のゆらぎ対応
-払戻・オッズ・着順列は候補名のどれか1つがあれば拾えるようにしています
-（単勝配当/単勝払戻金/単勝 など）。
-
-⸻
-
-よくあるつまずき＆チェックリスト
-	•	foragg_* が“素材版のまま”に見える
-→ aggregate_stats.py の実行が必要です（最終版で上書き）。
-	•	指数順位が 5.0 などの小数で出る
-→ 置換時に整数文字列に正規化済み（5.0 → "5"）。もし残る場合は元CSVが文字列ではない可能性を確認。
-	•	空欄に “nan” が出る
-→ 置換側・集計側とも NaN→空文字 の統一を実施。元データの**空白（スペースのみ）**は正規表現で空に置換してから NaN 判定→削除→空文字化の順で処理。
-	•	“××” が残る・末尾に “×” が残る
-→ 結合後に縮約＆トリムを実施（後処理入っています）。
-	•	ZI=0 の扱い
-→ ver2 は 同レース平均で置換して偏差値50寄せ。ファイル名に「ZI」を含まない場合はこの特例は使いません。
-	•	新馬の偏差値
-→ ファイル名に「ZI」が含まれる場合は クラス名「新馬」を偏差値の計算から除外（空のまま）。
-
-⸻
-
-これで“何が嬉しい？”
-	•	ターゲットへの大量インポート不要：最終版 foragg_* をそのまま成果物として使える
-	•	偏差値・順位・枠・騎手×条件の多視点で集計：10パターンで漏れなく比較
-	•	ベイズ推定（Jeffreys）併記：サンプル小でもブレに強い確率を同時に確認
-	•	ルール追加が容易：距離レンジ・“低いほど良い”対象などはリストとテーブルで拡張可能
-
-
-このまとめで「どのファイルを見れば何がわかるか」がイメージできると思います。
-
-
-
-
-
-了解です。ここまで“置換（正規化）”と“集計（横断用の統合）”でやっていることを、実装レベルで漏れなく整理します。
-（対象は build_db.py の処理系です。UI側は除きます）
-
-⸻
-
-置換（CSV→DB投入前の正規化／型そろえ）
-
-1) 入力の読み込みと保険
-	•	pandas.read_csv() で Shift_JIS を優先読込、失敗時はエンコ未指定で再読込（混在ファイル対策）。
-	•	列名・値の前後空白は pandas 側既定を利用（特別なトリムは不要なため未実施）。
-
-2) テーブル名の正規化（sanitize）
-	•	目的：SQLiteの識別子として安全にする。
-	•	変換ルール：
-	•	CSVファイル名（拡張子除去）→ 英数字とアンダースコア以外は _ に置換。
-	•	先頭文字が数字なら t_ を先頭に付与。
-	•	例：
-foragg_hensachiAJ_主５場（中山、東京...）_BC.csv
-→ foragg_hensachiAJ_主５場_中山_東京_中京_京都_阪神__BC
-
-3) 列名のゆらぎ吸収（芝の内外表記）
-	•	生CSVでは 芝(内・外) と 芝(内外) が混在。
-	•	DB作成時はそのまま保持（列名を壊さない）。
-	•	以降の検索・集計では COALESCE("芝(内・外)","芝(内外)") で 両対応。
-
-4) 率カラム（文字列）→ 数値列 _val の新設
-	•	対象カラム：
-勝率 / 連対率 / 複勝率 / 2着率 / 3着率
-	•	元データの代表的表記：
-	•	45.00%（47.10%） のように 素の値 + ベイズ推定値(括弧内) のパターン
-	•	0.00% だけの 括弧なし
-	•	まれな欠損・空文字
-	•	取り込み方針：
-	•	_val には 括弧内のベイズ推定値 がある場合はそれを採用（例：47.10）。
-	•	括弧内が無い場合は、外側の値（例：45.00 や 0.00）を採用。
-	•	どちらも取れなければ NULL。
-	•	抽出ロジック（概念）：
-	1.	全角カッコ （ ）／半角カッコ ( ) のどちらも検出。
-	2.	まず カッコ内の [\d.]+% を正規表現で探す。
-	3.	見つからない場合は 先頭側の % 付き数値 を探す。
-	4.	% を剥がし 小数として float 化（例："47.10%" → 47.10）。
-	•	生成カラム：
-	•	勝率_val, 連対率_val, 複勝率_val, 2着率_val, 3着率_val（REAL型）
-	•	備考：
-	•	_val は 0–100 の百分率のまま（0.0〜100.0）。
-テンプレ等で「小数点2桁表示」は画面側で行う。
-	•	元の文字列カラムは そのまま保持（例：45.00%（47.10%））。
-
-5) 数値型の維持・キャスト
-	•	単勝回収値 / 複勝回収値 / 単勝適正回収値 / 平均着順 は、CSVに数値で入っている限り REAL型 として保持（pandas→SQLite の推論に従う）。
-文字列混入や空欄は SQLite 側で NULL または TEXT にならないよう、to_sql(replace) で列ごとの型は固定化されます（unified では最初のスキーマに合わせる—後述）。
-
-6) 欠損・異常値の扱い
-	•	対象の率カラムで、数値抽出できない・% が無い・括弧ペア不整合・空文字等は _val = NULL。
-	•	元の文字列カラムは欠損でもそのまま保存（UI/SQLでフィルタ可能）。
-
-7) インデックスの付与（単表）
-	•	検索で多用する列に 軽いインデックス を作成：
-場所 / 芝・ダ / 距離 / 芝(内・外) / 芝(内外) / 結合データ
-	•	列名のインデックス名は英数字化して衝突回避。
-	•	SQLite PRAGMA（WAL/NORMAL）で速度と安全性のバランス最適化。
-
-⸻
-
-集計（全テーブル横断の“統合”）
-
-1) メタテーブル __tables_meta__
-	•	目的：どのCSV→どのテーブルを作ったか履歴管理。
-	•	カラム：table_name（PK）, source_file（CSV名）
-
-2) 各CSV→個別テーブル作成
-	•	df.to_sql(tname, if_exists="replace", index=False) で 毎回作り直し。
-これにより、列型はCSVの推論に従って安定。
-	•	作成後に（前項）単表インデックスを作成。
-
-3) 横断検索用の“統合実体テーブル” unified_all
-
-ビューではなく実体にして、検索レスポンスとフィルタを高速化。
-
-	•	共通列（不足はNULLで埋める）
-
-COMMON_COLS = [
-  場所, 芝・ダ, 距離, 芝(内・外), 結合データ,
-  件数, 勝率, 連対率, 複勝率, 2着率, 3着率,
-  平均着順, 単勝回収値, 複勝回収値, 単勝適正回収値,
-  提案勝率, 提案連対率, 提案複勝率, 提案2着率, 提案3着率,
-  （※ _val 系5列も実装版では追加済み）
-]
-
-	•	実装版では _val 5列（勝率_val 等）も COMMON_COLS に追加済み。
-	•	これにより unified_all にも _val が揃い、UI側のソート基準を全テーブルで共通化。
-
-	•	スキーマ確定手順（型の安定化）
-	1.	すべての foragg_* テーブルに対し、COMMON_COLS を並べる SELECT ... を用意。
-	•	ない列は NULL AS "列名" を追加。
-	•	末尾に AS "テーブル名" で由来を付与。
-	2.	DROP TABLE IF EXISTS unified_all →
-CREATE TABLE unified_all AS (最初のSELECT) WHERE 0 で空スキーマ作成。
-（この最初のSELECTの列型が unified の型の物差しになります）
-	3.	2番目以降のSELECTについて INSERT INTO unified_all SELECT ... を順次投入。
-	•	型の注意点
-	•	_val は Python 側で float にしてから to_sql 済みなので、基本 REAL で統一されます。
-	•	率の文字列列（勝率などの元列）は TEXT。
-回収値や平均着順は REAL を保つ（「最初のSELECT」による）。
-	•	統合テーブルのインデックス
-	•	場所 / 芝・ダ / 距離 / 芝(内・外) / 芝(内外) / 結合データ に作成。
-	•	芝(内外) は列が無いケースもあるため try/except で護送。
-	•	行数・品質確認
-	•	作成後に SELECT COUNT(*) FROM unified_all; で行数チェック（例：5,773,352 行）。
-	•	PRAGMA table_info(unified_all); で列型を確認（_val は REAL）。
-
-4) パフォーマンス・耐障害性
-	•	PRAGMA journal_mode=WAL;（同時読込の安定化）
-	•	PRAGMA synchronous=NORMAL;（書込速度バランス）
-	•	UNION ALL 相当の 逐次 INSERT にして、メモリ使用を抑制（巨大SELECT一発生成を回避）。
-
-⸻
-
-参考：この構成で得られるメリット
-	•	検索の一貫性：全テーブルに _val があり、数値ソートが正しく効く。
-	•	拡張容易：CSVが増えても、foragg_*.csv を置いて build_db.py を回すだけで自動で統合。
-	•	ラベルゆらぎ吸収：芝(内・外)/芝(内外) の混在を吸収。
-	•	速度：単表＆統合表のインデックス、WAL設定、段階的INSERTで実用レスポンス。
-
-
-⸻
-
-DB作成（build_db.py）
-	•	CSV読み込み→テーブル作成
-	•	foragg_csv/ 配下のCSVを一括で読み込んでテーブル化。
-	•	文字コードは基本 Shift_JIS、失敗時に再読込保険あり。
-	•	メタ情報テーブル __tables_meta__
-	•	どのファイルからどのテーブルを作ったか記録。
-	•	_val列の付与（この会話で追加したポイント）
-	•	5つの率カラムに対して対応する _val カラムを REAL で追加（ベイズ推定値=括弧内を採用）。
-	•	これにより 数値ソート・集計が正しく効く ように。
-	•	unified_all の作成
-	•	全 foragg_* を SELECT ... UNION ALL ... 相当で順次 INSERT し、1テーブルに集約。
-	•	主要列のインデックスも作成。
-	•	実行コマンド（例）
-
-docker run --rm -v "$(pwd)":/app csv_processor_shisu python /app/build_db.py
-
-→ /app/racing.db を生成/更新
-
-⸻
-
-ブラウザ表示（Flask app.py）
-	•	初期表示では検索結果を描画しない（軽量化）。
-→ フォームで条件を選んで「検索」してからテーブル表示。
-	•	表示対象の絞り込みUI（チェックボックス）
-	1.	指数表の種類（family） を複数選択
-	•	normal / normal_band / normalJ / normalJ_band / rankB / rankB_band / rankJ / rankJ_band / hensachiA / hensachiB / hensachiJ / rankBJ / rankBJ_band / hensachiBJ / hensachiAJ
-	•	DB内の foragg_* を走査して自動検出（band 系も含む）。
-	2.	指数の種類（indicator） を複数選択
-	•	カツラキ / Gold / BC / ZI / SAV / ST指数 / 合計値 / 展開 / 仕上り / 先行 / 追走 / 持久 / 持続 / 瞬発 / 想定前半 / 想定後半 / タイムM / 対戦M
-	•	テーブル名末尾の __XXXX から自動抽出。未知の種別も表示対象に入る。
-	3.	odds3p 切替
-	•	両方 / 通常のみ / odds3pのみ を切替可能（テーブル名の接頭辞 foragg_odds3p_ で判定）。
-	•	デフォルト並び順
-	•	複勝率_val の降順（DESC） を既定。
-	•	_val カラム見出しをクリックすると 昇順/降順 を切替。
-	•	列順の固定（表示順）
-	•	左から：
-結合データ, 件数, 勝率_val, 勝率, 連対率_val, 連対率, 複勝率_val, 複勝率, 2着率_val, 2着率, 3着率_val, 3着率, 平均着順, 単勝回収値, 複勝回収値, 単勝適正回収値, 提案勝率, 提案連対率, 提案複勝率, 提案2着率, 提案3着率, 場所, 芝・ダ, 距離, 芝(内・外)
-	•	テーブルに存在しない列は自動スキップ。
-	•	テーブル見出しのラベル変換（foragg_ を隠して人間可読に）
-	•	normal →「重量種別×クラス名×指数順位」
-	•	rankB →「枠番グループ×指数順位」
-	•	hensachiA →「重量種別×クラス名×偏差値帯」
-	•	hensachiB →「枠番グループ×偏差値帯」
-	•	rankJ →「騎手×指数順位」
-	•	hensachiJ →「騎手×偏差値帯」
-	•	rankBJ →「枠番グループ×騎手×指数順位」
-	•	hensachiBJ →「枠番グループ×騎手×偏差値帯」
-	•	normalJ →「重量種別×クラス名×騎手×指数順位」
-	•	hensachiAJ →「重量種別×クラス名×騎手×偏差値帯」
-	•	*_band は末尾に「（band）」を付与
-	•	odds3p テーブルには「（odds3p）」タグを付与
-	•	起動方法
-
-# Flaskアプリ（コードはホストを直マウント）
-docker run --rm -p 8000:8000 -v "$(pwd)":/app csv_processor_shisu
-# ブラウザ: http://localhost:8000
-
-
-	•	（補助）DBブラウザ
-	•	sqlite-web か datasette を別コンテナで起動可能（今回は datasette も稼働確認済み）。
-
-⸻
-
-運用上の補足
-	•	DBの再作成が必要なとき
-	•	CSVの中身が変わった／build_db.py を更新した → build_db.py を再実行して racing.db を更新してください。
-	•	Flaskアプリの再ビルド
-	•	-v "$(pwd)":/app でホストの app.py を直マウントしているため、ビルドし直し不要（ファイル差し替え→再起動で反映）。
-	•	パフォーマンス
-	•	初回非表示・family/indicatorの絞り込み・LIMIT 200・インデックスで応答性を確保。
-	•	さらに速くしたい場合は WHERE による条件を増やす／LIMIT を縮める／unified_all の活用範囲を拡張…なども可能です。
-
-他にも「この family だけ常に既定でON」「既定の indicator セットを用意」などの細かい挙動も調整できます。気づいた点があれば何でも言ってください！
-
-
+# 2) 自動テストの実行（コード改修時の健全性チェック）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
+
+
+■ A. 過去レース集計データを更新したときのフルリビルド手順
+------------------------------------------------------------------------
+※csv_files/ に地域ごとの基本CSV（タイムM・対戦M）を置き、ext_indices/ に外部指数CSV群を置く（→ 2章）。
+
+# Step 1: 基本CSV＋外部指数の結合・正規化・偏差値・22条件（csv_files/ ＋ ext_indices/ → master_csv/）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python replace_csv_ver3.py --clean
+  ・ログで「外部指数が付いた馬 x/y」と「使わないファイル」の WARN を確認（x が極端に少ない指数はファイルの置き方を疑う）
+
+# Step 1.5（推奨）: 全掛け合わせ候補を採点して、使う family を選ぶ（→ 5章）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --indicators タイムM,対戦M --workers 4 --export-selected
+  ・screening_report.csv を見て、selected_families.json の中身（選ばれた family）を確認
+  ・selected_families.json が無ければ、Step 2 は初期セット49種（83 family・129通り）で集計します
+
+# Step 2: ベイズ集計＋WEDGE算出（master_csv/ → agg_csv/）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4
+
+# Step 3: 出馬表の偏差値計算・1ファイル統合（entries_in/ → entries_out/entries_merged_hensachi.csv）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --merge-only --clean
+
+# Step 4: DBの完全再構築（agg_csv/ ＋ entries_out/ → racing.db）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
+
+※注意1：主5場＋ローカル5場の両方の基本CSVを csv_files/ に入れて実行してください（片方だけで --fresh すると
+  unified_all はその地域だけになります）。
+※注意2：初期セットのまま全指数を集計すると、成績表・DB は旧版（20パターン）の約8〜9倍になります
+  （実サンプル1か月分で unified_all 33,210行 ／ 旧版相当の15種だけなら 3,847行）。Step 1.5 で絞るのが前提です。
+※注意3：selected_families.json を作り直した・消したときは、Step 2（--clean）と Step 4（--fresh）をやり直してください
+  （Step 1 のやり直しは不要）。
+
+
+■ B. 毎週末の出馬表（entries_in/）だけを更新するときの高速手順（過去集計はそのまま）
+------------------------------------------------------------------------
+※過去データ（unified_all）は作り直さず、今週の出馬表と事前照合（xjoin）だけを更新します。
+※照合に使う family は、DB を作ったときの family（DB の __families__）です。
+※「--merge-only --clean」と「--mode entries --prune」を使うため、古い週の出馬表テーブルは自動的に掃除されます。
+
+# 1) entries_in/ に今週の出馬表CSV（shisu_YYYYMMDD_1.csv 等）を配置して統合計算
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --merge-only --clean
+
+# 2) DBの出馬表テーブルと xjoin だけを更新（古い entries_* テーブルは --prune で自動削除）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --mode entries --prune
+
+
+■ C. Web UI の起動（ブラウザ操作）
+------------------------------------------------------------------------
+docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu python app.py
+
+  ・http://localhost:8000          : 横断検索（表ごと表示 ／ 全表横断WEDGEランキング）
+  ・http://localhost:8000/entries  : 出馬表一覧 →「出馬表」「条件ヒット馬」「WEDGE一覧」
+  ・http://localhost:8000/ingest   : 外部指数の取得（スクレイピング・ラップ計算・安井Excel抽出）
+
+
+--------------------------------------------------------------------------------
+2. TARGETからの入力CSV作成手順と、外部指数CSVの置き方
+--------------------------------------------------------------------------------
+
+＜A. 過去レースの基本CSV（csv_files/ に置くファイル）＞ ※2026-11-06 から新方式
+  これまでの「★8タブで1指数ずつ読み込んでCSV出力（1本約1時間 × 約30指数）」は不要になりました。
+  TARGETから出すのは地域ごとに次の2本だけです（★6タブ形式。サンプル 202610.csv の列＋配当2列）。
+  （1）レース検索 → ★6タブ（頭数10頭以上・障害レースを含めない条件で検索）
+  （2）外部指数の欄に ①マイニング（タイムM）を読み込んで「レース一覧★画面イメージ（csv形式）」で出力
+         → csv_files/主５場（中山、東京、中京、京都、阪神）_タイムM.csv
+            csv_files/ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM.csv
+  （3）同じく ②対戦型マイニング（対戦M）で出力
+         → csv_files/主５場（中山、東京、中京、京都、阪神）_対戦M.csv ／ ローカル５場…_対戦M.csv
+  ・出力する列に「単勝配当」（単勝オッズの隣）と「複勝配当」（複勝シェアの隣）を追加しておくこと
+    （列が無くてもエラーにはなりませんが、回収値が 0 になります）
+  ・「芝・ダ」列が無く「距離」が「ダ1200」「芝2000」の形でも、プログラム側で 芝・ダ と距離 に分けます
+  ・障害レースが混ざっても（距離が「障…」、トラックコード51以上）プログラム側で除きます
+  ・22条件に使う列（所属・間隔・休み明け～戦目・斤量・前走斤量・性別限定・前走場所・前芝・ダ・前距離・
+    前走着順・前走人気・前走上り3F順・前走脚質・前走レース印３・前走レースID(新)）は ★6タブの標準の列です
+
+  [後方互換] 従来の「{地域}_{指数名}.csv」（★8タブで1指数ずつ出したもの）も csv_files/ に置けば読みます。
+             同じ地域×指数が ext_indices/ にもある場合は csv_files/ の方を使います。
+
+  [廃止した指数] カツラキ、HPRTV5C、成績ST指数、結果分析スピード指数（一隊）、33rap、上がり1F、上がり2F
+                 （csv_files/ にあっても ext_indices/ にあっても読みません）
+
+＜B. 外部指数CSV群（ext_indices/ に置くファイル）＞
+  ext_indices/ の下に、フォルダ名かファイル名で指数が分かるように置きます（階層は自由。大文字・小文字、
+  「-」と「_」の違いは問いません）。地域ごとの基本CSV（タイムMを優先、無ければ対戦M）の各馬に、
+  レースID(新) / レースID(旧) で値を結び付けます。
+
+  ┌──────┬────────────────────────────┬──────────────────────────────────┐
+  │ 形式 │ ファイルの中身                         │ 対象の指数（置き方の例）                             │
+  ├──────┼────────────────────────────┼──────────────────────────────────┤
+  │  A   │ レースID(新)18桁, 指数値               │ オメガ指数（OMEGA/ または *_omega.csv）             │
+  │      │ （見出し行は有っても無くてもOK）       │ かよちん指数（kayochin/）、keibaAI指数（keibaAI/）  │
+  │      │ ※/ingest の TARGET 取込用CSVと同じ形   │ 吉馬6指数（kichiuma_sp_ability/、kichiuma-senkou/、 │
+  │      │                                        │   kichiuma/kichiuma_sp_max/ など）                  │
+  │      │                                        │ 安井8指数（yasui_rank/、yasui_speed/ など）         │
+  ├──────┼────────────────────────────┼──────────────────────────────────┤
+  │  B   │ 旧ID10桁, 指数値, 順位（見出しなし）   │ StridePlus/ の下でファイル名の先頭で判定：          │
+  │      │ 例 0520380101,54,6                     │  sav=SAV, st=ST指数（st_se_ は廃止）, gokei=合計値,  │
+  │      │                                        │  tenkai=展開, siagari=仕上り, senko=先行,            │
+  │      │                                        │  tsuiso=追走, jikyu=持久, jizoku=持続,               │
+  │      │                                        │  shunpatsu=瞬発, mae_stime=想定前半, ato_stime=想定後半│
+  ├──────┼────────────────────────────┼──────────────────────────────────┤
+  │  C   │ 12桁レースID, 馬番1の指数, 馬番1の順位,│ Gold（GoldAirplane/ または gold*.csv）              │
+  │      │  馬番2の指数, 馬番2の順位, …           │ 12桁 = YYYYMMDD + 場所2桁 + R2桁                    │
+  ├──────┼────────────────────────────┼──────────────────────────────────┤
+  │  D   │ 旧8桁レースID, 馬番1の指数, 馬番2の…   │ BC（BCindex/ または BC*.csv。先頭の RX は除く）     │
+  │      │ 例 RX06262301,50.19 ,59.26 ,…          │ ZI（ZI_DATA/ または ZI*.CSV）                        │
+  └──────┴────────────────────────────┴──────────────────────────────────┘
+  ・旧ID10桁 = 場所2 + 年下2桁 + 回1 + 日1（10日=A, 11日=B, 12日=C）+ R2 + 馬番2（例 0426441206）。
+    先頭の0が落ちて9桁になっていても自動で補います。基本CSVに レースID(旧) が無ければ レースID(新) から作ります。
+  ・順位：形式B・C はファイルの順位を使い、形式A・D は値から計算します（想定前半・想定後半は値から付け直し）。
+    形式B は3列目（順位）が必要です（2列だけのファイルは使わず、ログに WARN が出ます。欄があって空なら、そのレースは値から順位を作ります）。
+    ファイルに無い馬は値 0・そのレースの最下位として扱います（TARGET が出馬表で出すのと同じ。順位を値から作るレースでも、
+    「小さいほど良い」指数でも最下位）。
+    ただし 0 を「値なし」とする指数（想定前半・想定後半・安井のランク・5ステータス）では、その馬は値なし（順位なし）です。
+  ・同じ指数のファイルが複数あれば全部読みます（同じ馬が重なったら、パスの順で後のファイルの値を優先）。
+  ・使わないファイル：*_merged.csv（マージ完全版）、yasui_extract.csv、*_noid.csv、CSVでないもの、
+    どの指数か分からないもの（replace のログに WARN で出ます）。
+
+＜C. 今週の出馬表CSV（entries_in/ に置くファイル）＞
+  開催ひらく → JV一括取得 → マイニング予想
+  → 外部指数用ファイル出力（この開催の全レースのZI値の外部指数ファイルを出力）
+  → 出馬表分析 → ★4タブ → ファイル → 外部指数1〜4をファイルから読み込む → マイニングの読み込み
+  → 右クリック → 全て選択する → 選択範囲をファイルに出力（CSV）
+  （ファイル名例：shisu_YYYYMMDD_1.csv 〜 shisu_YYYYMMDD_5.csv）
+  ・22条件に使う列（サンプル test.csv の形）：所属、間隔、休明戦目、斤量、性、前場所、前芝ダ、前距離、
+    前走開催（例「260816 2新8  1R」）、前着順、前人気、前3F順、前脚質、前レース印3、前斤量
+
+＜D. 外部指数スクレイピング用のベースCSV（ingest_in/base/ に置くファイル）＞
+  ・過去走取得時：レース検索の★7タブ（障害除く）で出力。
+  ・今週分取得時：出馬表分析の★5タブで全選択して出力。
+  ・必須列：「レースID(新), 日付S, 枠番, 馬番, ワーク1」（※他の列が混ざっていても可）
+  ・/ingest で作った過去分の TARGET 取込用CSV（YYYYMMDD_omega.csv など）は、そのまま ext_indices/ に置けば
+    Step 1 で結び付きます（TARGET に取り込んで★8タブで出し直す必要はありません）。
+
+＜E. ラップ指数計算用のラップCSV（ingest_in/lap/ に置くファイル）＞
+  ・レース検索（障害除く）→ ★5タブで編集 → ワークデータ1に「レースのラップタイム」を読み込みCSV出力。
+  ・必須列：「レースID(新), 日付S, 場所, 芝・ダ, 距離, クラス名, 年齢限定, 着順, 着差, 補正, レース印２, ワーク1」
+    （※取消・中止・着順空白の行はプログラム側で自動除外されるため、事前の手動行削除は不要）
+
+
+--------------------------------------------------------------------------------
+3. システム全体像（内部で何をしているか）
+--------------------------------------------------------------------------------
+本システムは、過去データ側（replace / aggregate）と当日の出馬表側（calc_entry_hensachi / build_db）で
+【完全に同一の共通パッケージ（shisu/）】を通して正規化・偏差値化・22条件・キー生成を行うことで、
+表記ゆれの無いキー突合を実現しています（同じ馬なら22条件とキーが一致することを自動テストで確認）。
+
+  [Step 1] replace_csv_ver3.py（外部指数の結合・正規化・偏差値化・22条件）
+    ・地域ごとの基本CSV（タイムM・対戦M）の各馬に、ext_indices/ の外部指数を結び付けて
+      「地域×指数」ごとに1本の master（master_csv/master_{地域}_{指数名}.csv.gz、1頭1行）を作る。
+    ・文字コードは CP932（拡張Shift_JIS）で書き出し、「髙」等の異体字欠落を防止。NFKC正規化で全角英数などを統一。
+    ・レース単位で各指数の偏差値・偏差値帯・順位・順位帯（s1/s2）を計算。
+    ・22条件（時期・輸送距離・レース間隔・叩き・コース属性・前走成績など。→ 4章(4)）を付ける。
+    ・family ごとの素材ファイルは作らない（キーは Step 2 がメモリ上で作る）。
+
+  [Step 1.5] screen_families.py（全掛け合わせ候補の採点・選抜。→ 5章）
+
+  [Step 2] aggregate_stats_ver2.py（family × オッズ4区分集計・ベイズ推定・WEDGE算出）
+    ・使う family：selected_families.json があればその定義、無ければ初期セット49種（→ 4章(3)）。
+    ・master 1本ごとに、family（指数順位帯は s1/s2 の2通り）でキーを作り、単勝オッズで4区分に分けて集計：
+        1. 通常（全オッズ）  2. odds10u（10.0倍未満）  3. odds10_50（10.0〜50.0倍未満）  4. odds50p（50.0倍以上）
+    ・結合データごとに「件数（N≥5のみ出力）、勝率、連対率、複勝率、2着率、3着率、掲示板率、
+      平均着順、単勝回収値、複勝回収値、単勝適正回収値（オッズ逆数重み）」を算出。
+    ・Jeffreys事前分布 Beta(0.5, 0.5) に基づく片側分位（下限10% / 複勝率20%以下は上限90%）を推定値（*_val）に。
+    ・各結合データの「WIN」「EDGE」「WEDGE」および時系列加重「adjusted_WEDGE」を算出。
+    ・使った family の定義を agg_csv/families.json に書く。
+
+  [Step 3] calc_entry_hensachi.py（出馬表の偏差値・帯付与＆横結合）
+    ・entries_in/ 内の複数CSVを個別に偏差値・順位計算した上で、レースID(新) をキーに1つのテーブル
+      （entries_merged_hensachi.csv）へ横結合。空文字は後続ファイルの値で埋める。
+
+  [Step 4] build_db.py（SQLite化・unified_all 統合・xjoin 事前構築）
+    ・agg_csv/ の全成績表を SQLite（racing.db）に格納し、全テーブルを縦結合した「unified_all」を構築。
+      family の定義は __families__ テーブルに入る（画面・照合はこれを使う）。
+    ・出馬表の全出走馬×全指数×全 family の検索キー候補（s2 の重なり・内外の候補も含む）を事前展開し、
+      unified_all と突合した結果テーブル「entries_xjoin_merged_hensachi」を構築。
+
+
+--------------------------------------------------------------------------------
+4. 正規化ルール・順位帯・22条件・family（詳細リファレンス）
+--------------------------------------------------------------------------------
+
+(1) コース・クラス・重量・枠番の正規化ルール（shisu/normalize.py）
+------------------------------------------------------------------------
+  ■ 重量種別
+    ・「別定」→「定量」に統合（結果、「定量」「ハンデ」「馬齢」の3種）。
+    ・出馬表側で重量種別列が無い場合は、レース名・クラス・年限定から自動推定
+      （レース名のＨ・ＳＨ（ステークス＋ハンデ）→ハンデ、3歳以上・4歳以上→定量、2・3歳限定のオープン・リステッド→定量（別定）、
+        その他の2・3歳限定（菊花賞・秋華賞などのG1も）→馬齢。NHKマイルCやHTB賞など英字の中のHはハンデにしない）。
+      ※★6サンプルの264レースで TARGET の重量種別と全件一致。出馬表に重量種別の列を足せばその列を使います
+
+  ■ クラス名
+    ・「500万 / 1000万 / 1勝 / 2勝」 → 「1・2_勝」
+    ・「1600万 / 3勝 / ｵｰﾌﾟﾝ / OP(L)」 → 「準OP・OP」
+    ・「G2 / G3（全角Ｇ２/Ｇ３含む）」 → 「重賞」
+    ・「G1（全角Ｇ１含む）」          → 「G1」
+    ・【馬齢特例】重量種別が「馬齢」かつクラスが「1・2_勝」または「準OP・OP」の場合 → 「1勝・OP」
+
+  ■ 枠番グループ（頭数に応じた内/中/外）
+    ・9頭以下   ：対象外（過去集計では頭数10頭未満のレースは除外）
+    ・10〜13頭  ：1〜5枠＝「内枠」 ／ 6〜8枠＝「外枠」
+    ・14〜16頭  ：1〜4枠＝「内枠」 ／ 5〜8枠＝「外枠」
+    ・17〜18頭  ：1〜3枠＝「内枠」 ／ 4〜6枠＝「中枠」 ／ 7〜8枠＝「外枠」
+
+  ■ 距離（「ダ1200」の形は 芝・ダ と 1200 に分ける）とレンジ統合ルール（場所×芝・ダ×内外×距離）
+    ・福島：芝 1700/1800 →「17-18」
+    ・新潟：芝・内 1200/1400 →「12-14」 ／ 芝・外 1600/1800 →「16-18」
+            芝・内 2000/2200/2400 →「20-24」 ／ 芝・外 3000/3200 →「30-32」
+    ・中山：ダ 2400/2500 →「24-25」
+    ・東京：芝 1600/1800 →「16-18」 ／ 芝 2300/2400 →「23-24」 ／ ダ 1300/1400 →「13-14」
+    ・中京：ダ 1800/1900 →「18-19」
+    ・京都：芝・内 1400/1600 →「14-16」 ／ 芝・外 1400/1600/1800 →「14-18」
+            芝・内および外 2000 → 距離「2000」・内外を「内外」に統合
+            芝・外 2200/2400 →「22-24」 ／ 芝・外 3000/3200 →「30-32」 ／ ダ 1800/1900 →「18-19」
+    ・阪神：芝 1600/1800 →「16-18」 ／ 芝 2400/2600 →「24-26」 ／ 芝 3000/3200 →「30-32」
+    ・小倉：芝 1700/1800 →「17-18」
+    ※コース属性・距離帯・距離増減は、統合前の実際の距離で判定します。
+
+
+(2) 指数の偏差値計算・欠損・新馬除外ルールと順位帯（shisu/indicators.py, hensachi.py）
+------------------------------------------------------------------------
+  ■ 小さいほど良い指数（符号を反転してから偏差値・順位を計算）
+    ・展開（展開力）、想定前半（想定前半3F）、想定後半（想定後半3F）
+      ※想定前半・想定後半は秒数なので 0 は「値なし」として扱い、順位は値から付け直します（同じ値は同順位）
+    ・タイムM（マイニング値）は TARGET では値の大きい馬が1位なので「大きいほど良い」（旧版は反転していました）
+
+  ■ 新馬戦を除外する指数
+    ・ZI、吉馬6指数（SP能力値, 先行力, SP信頼, SP調整, SP最大, 末脚力）
+
+  ■ ZI特例と安井0欠損ルール
+    ・ZI：指数値が 0 または欠損の馬は「同レース内の非ゼロ平均」に置換（偏差値50相当）。
+    ・安井サロン（ランク・5大ステータス）：TARGETが未登録馬を 0 で出力する仕様に対応するため、
+      「0 ＝ 欠損」として扱い、順位は値から再計算して過去側と出馬表側を完全一致させる
+      （※安井_体力、安井_やる気は 0 が実在するため 0 を有効値として扱う）。
+
+  ■ レース除外ルール（重要）
+    ・同一レース内で指数欠損が「2頭以上」ある場合 → そのレース全頭を該当指数の集計から除外。
+    ・同一レース内で指数欠損が「1頭だけ」の場合 → その1頭のみ順位・偏差値を空欄にし、他馬は計算。
+    ・同一レース内の全頭が同じ値（標準偏差0、未取得で全頭0のレース等） → レースごと除外。
+    ・取消・除外の馬（★6 の着順「消」「外」）は偏差値・順位の計算に入れません（TARGET はこの馬に 指数 0 を出すため）。
+    ・外部指数のファイルに値の無い馬は 0 として扱います（TARGET が取り込んでいない馬を 0 で出すのと同じ）。
+
+  ■ 偏差値の向き
+    ・偏差値は TARGET の順位と同じ向きにします（1位の馬が最大値なら「大きいほど上」）。順位が無い指数は上の「小さいほど良い」の一覧に従う。
+      （上の「小さいほど良い」の一覧と TARGET の順位の向きが食い違ったときは、順位に合わせて replace・calc のログに出します）
+    ・ZI の順位を値から作るとき（ext_indices の ZI_DATA）は、0 の馬を最下位にします（TARGET と同じ）。
+
+  ■ 偏差値帯（6区分）： 71以上 / 66~70 / 61~65 / 51~60 / 41~50 / 40以下
+
+  ■ 順位帯（新8区分。指数順位・前走着順・前走人気・前走上がり3F順で共通）
+    ・s1（細区分5帯・排他）  ： 1位 / 2~3位 / 4~5位 / 6~9位 / 10位~
+    ・s2（広区分3帯・重複あり）： 1~3位 / 1~5位 / 6位~
+      ※s2 では 1〜3位の馬は「1~3位」と「1~5位」の両方に入り、過去集計でも出馬表の照合でも両方のキーを作ります。
+    ・前走の帯の名前の例：前走2~3着、前走1~3人気、前走上り6位~（上がり3F順の 0 は「なし」扱い）
+
+
+(3) 結合データ（キー）の構成と family（集計の型）
+------------------------------------------------------------------------
+キー ＝ 部品の値を「×」でつないだもの ＋ 末尾の [指数帯]（指数順位 / 指数順位帯 s1・s2 / 偏差値帯）。
+部品が1つでも空の馬はそのキーを作りません（不完全なキーの混入防止）。
+「コース」＝ 場所×芝・ダ×距離×(内外)（ダート等で内外が空なら詰める）。
+
+  ■ 初期セット（49の型 → 83 family・s1/s2 込みで129通り）
+     ※前走着順・前走人気・前走上がり3F順を含む family は、末尾が偏差値帯でも前走の帯を s1/s2 の両方で集計します
+  【レイヤーA：コース固定（15種）】 ※旧版の15種。順位帯は新8区分
+     normal       : コース×重量種別×クラス名×指数順位        normal_band   : 同 ×指数順位帯(s1/s2)
+     rankB        : コース×枠番グループ×指数順位            rankB_band    : 同 ×指数順位帯
+     rankJ        : コース×騎手×指数順位                    rankJ_band    : 同 ×指数順位帯
+     rankBJ       : コース×枠番グループ×騎手×指数順位       rankBJ_band   : 同 ×指数順位帯
+     normalJ      : コース×重量種別×クラス名×騎手×指数順位  normalJ_band  : 同 ×指数順位帯
+     hensachiA/B/J/BJ/AJ : 上の5つの部品 ×偏差値帯
+  【レイヤーB：コース不問・騎手×個別条件（9種）】 各 ×[指数順位帯(s1/s2) と 偏差値帯（名前の末尾 _hen）]
+     B_jk_prevfin（騎手×前走着順）, B_jk_prevpop（×前走人気）, B_jk_prevagari（×前走上がり3F順）,
+     B_jk_prevstyle（×前走脚質）, B_jk_distchg（×距離増減）, B_jk_interval（×レース間隔）,
+     B_jk_tataki（×叩き良化）, B_jk_wtchg（×斤量増減）, B_sd_frame_jk（芝・ダ×枠番グループ×騎手）
+  【レイヤーC：全国コース属性の掛け合わせ（10種）】
+     C_sd_dist_cfs / C_sd_dist_f / C_sd_dist_r（芝・ダ×距離帯×CFS帯 / F係数帯 / R値帯）,
+     C_sd_straight_slope（芝・ダ×直線距離帯×坂）, C_sd_corner_frame（芝・ダ×初角距離帯×枠番グループ）,
+     C_sd_f_style（芝・ダ×F係数帯×前走脚質）, C_sd_straight_agari（芝・ダ×直線距離帯×前走上がり3F順）,
+     C_sd_r3_style（芝・ダ×前走R印3×前走脚質）, C_sd_distchg_style（芝・ダ×距離増減×前走脚質）,
+     C_quad_prevquad（今走クワドラント×前走クワドラント）
+  【レイヤーD：コース×個別条件（15種）】
+     D_season（時期）, D_transport（輸送距離）, D_interval（レース間隔）, D_tataki（叩き良化）,
+     D_lr（左右回り遷移）, D_prevquad（前走クワドラント）, D_weight（当日斤量）, D_wtchg（斤量増減）,
+     D_mare（牝馬限定）, D_distchg（距離増減）, D_prevfin（前走着順）, D_prevpop（前走人気）,
+     D_prevstyle（前走脚質）, D_prevagari（前走上がり3F順）, D_r3（前走R印3）
+
+  ■ キーの例
+     東京×芝×16-18×定量×1・2_勝×3           （normal：指数3位）
+     東京×ダ×1600×前走2~3着×4~5位          （D_prevfin・s1）
+     ルメール×前走上り1~3位×1~5位            （B_jk_prevagari・s2）
+     芝×芝マイル×高×61~65                    （C_sd_dist_cfs_hen）
+
+  ■ selected_families.json による置き換え
+     screen_families.py で選抜した family（任意の1〜3条件 ＋ [指数帯]）が selected_families.json に入っていると、
+     Step 2 以降（集計・DB・出馬表の照合・画面）は初期セットの代わりにそれだけを使います。
+
+
+(4) 22条件の導出ルール（過去CSV・出馬表の両方で同じ関数を通す。shisu/conditions.py）
+------------------------------------------------------------------------
+   1. 時期          ：開催月 → 12-2月 / 3-5月 / 6-9月 / 10-11月
+   2. 輸送距離      ：所属（美浦/栗東。地方・外国は対象外）× 場所 → 110km以内 / 111-350 / 351-500 / 501-600 /
+                      600km超 / 滞在（輸送距離マスタ）
+   3. レース間隔    ：列「間隔」（TARGETの週数。1=連闘、2=中1週…）→ 連闘 / 中2-3 / 中4-6 / 中7-9 / 中10-20 / 中21週以上
+                      ※TARGET の値そのもので区切っています（例：値3 → 中2-3）
+   4. 叩き良化      ：休み明け～戦目 / 休明戦目 → 休み明け(1戦) / 叩き2戦 / 叩き3戦 / 叩き4戦 / 叩き5戦以上
+   5. コース属性    ：コース属性_帯つき マスタを (場所, 芝・ダ, 距離, 内外) で引く
+                      R値帯（200以上 / 180-200 / 160-180 / 140-160 / 120-140 / 100-120）、
+                      直線距離帯（短(-299) / 中(300-399) / 長(400-)）、
+                      初角距離帯（かなり短い(-149) / 短い(150-249) / やや短い(250-299) / 普通(300-399) / 長い(400-)）、
+                      CFS帯・F係数帯（高 / 中 / 低）、今走クワドラント（S / H / T / O / ST / OT / SH / OH / N）
+                      ※内外が無くても距離で一意に決まるコースは引けます。京都芝1400/1600・新潟芝2000 は内外が必要
+   6. 左右回り      ：左（東京・中京・新潟）/ 右、前走との遷移 左→左 / 右→左 / 左→右 / 右→右
+   7. 距離帯        ：芝短(1000-1399) / 芝マイル(1400-1799) / 芝中(1800-2299) / 芝クラシック(2300-2599) / 芝長(2600-)
+                      ダ短(-1399) / ダマイル(1400-1799) / ダ中(1800-2099) / ダ長(2100-)
+   8. 坂            ：坂あり（東京・中山・阪神・福島・中京）/ 坂なし（京都・新潟・小倉・函館・札幌）
+   9. 前走クワドラント：前走のコースのクワドラント。内外が要る京都芝1400/1600 などは、前走レースID が過去データに
+                      あればそこから内外を引く（出馬表は「前走開催」からレースIDを作って引く）。分からなければ空
+  10. 当日斤量      ：減量記号（◇△▲★☆）を除いた斤量 → 51以下 / 51.5-53 / 53.5-55 / 55.5-57 / 57.5-59 / 59.5以上
+  11. 斤量増減      ：今走 − 前走 → 同じ / +0.5~+1.5 / +2kg以上 / -0.5~-1.5 / -2kg以下
+  12. 牝馬限定      ：牝馬限定 / 混合（過去は「性別限定」列。出馬表は レース名の「牝」か、全出走馬が牝）
+  13. 距離増減      ：同距離 / 延長200 / 延長400 / 延長400超 / 短縮200 / 短縮400 / 短縮400超
+  14. 前走着順・前走人気・前走上がり3F順：上の新8区分（s1 / s2）で帯にする
+  15. 前走脚質      ：逃げ / 先行 / 中団 / 後方（出馬表の 逃/先/中/後 も同じに。マクリは「なし」扱い）
+  16. 前走R印3      ：HHH~HH / H / M / S / SS~SSS
+
+
+--------------------------------------------------------------------------------
+5. 全掛け合わせ候補の自動選抜（screen_families.py）と本番反映の運用フロー
+--------------------------------------------------------------------------------
+DB を作らずにメモリ上で、family の候補を「本番と同じ集計・判定」で一括採点し、実戦で使える条件を選びます。
+
+(1) 候補の範囲（--space）
+  ・initial ：初期セット49種（129通り）だけ
+  ・default ：初期セット ＋ 単一条件×[指数帯] ＋ 任意の2条件ペア×[指数帯] ＋ コース×1条件×[指数帯]
+              ＋ 芝・ダ×距離帯×1条件×[指数帯]（887 family・1,413通り。既定）
+  ・all     ：default ＋ コース×2条件・芝・ダ×距離帯×2条件（2,235 family・3,582通り）
+  ※条件の候補：重量種別・クラス名・枠番グループ・騎手 と 22条件。新しい組み合わせは「X_…」の名前になります
+    （例 X_jk_season = 騎手×時期×指数順位帯、X_sd_distb_jk = 芝・ダ×距離帯×騎手×指数順位帯、
+          X_trans_intv_hen = 輸送距離×レース間隔×偏差値帯。初期セットと同じ組み合わせは初期セットの名前のまま）
+
+(2) 評価（screening_report.csv。1行 ＝ 候補 × s1/s2）
+  【基準A：サンプル数と識別力】
+    ・groups / groups_ge10 ：成績表のグループ数 / 件数10以上のグループ数
+    ・coverage             ：件数10以上のグループに入る馬の割合
+    ・adj_groups           ：adjusted_WEDGE（年10件以上）が付いたグループ数
+    ・wedge_top / wedge_bottom / wedge_spread：指数上位帯と下位帯の平均WEDGEとその差（識別力）
+    ・fuku_top / fuku_bottom / fuku_spread    ：同じく平均複勝率とその差
+        上位帯・下位帯：s1 = 1位 / 10位~、s2 = 1~3位 / 6位~、偏差値帯 = 71以上 / 40以下
+    ・monotonic            ：帯の順に平均WEDGEが下がっていく割合（1が理想）
+  【基準B：絶対軸・軸候補などの輩出数（★重要）】
+    ・abs_* / axis_* / opp_* / keshi_*：オッズ帯（normal / odds10u / odds10_50 / odds50p）ごとに、
+      classify の基準（6章）で 絶対軸 / 軸候補 / 相手候補 / 消し候補 になるキーの数と合計（*_total）
+      ※本番の DB を同じ family で作って判定した数と一致することを自動テストで確認しています
+
+(3) 選抜（--export-selected）
+  次のどちらかを満たす候補を selected_families.json に書きます（指数順位帯は s1/s2 ごとに判定）：
+    ① 絶対軸＋軸候補のキーが --min-axis 個以上（既定1）
+       → 全体の識別力が微妙でも、絶対軸・軸候補が実際に生まれる掛け合わせは必ず残す
+    ② groups_ge10 ≥ --min-groups（既定10）かつ coverage ≥ --min-coverage（既定0.2）かつ
+       wedge_spread ≥ --min-spread（既定0.10）を満たす中で、wedge_spread の大きい順に上位 --top-a 個（既定30）
+
+(4) 本番反映までの手順
+  1) Step 1（replace）で master_csv/ を作る
+  2) 採点と選抜（例：代表の指数で default の候補を採点し、選抜結果を書き出す）
+       docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --indicators タイムM,対戦M --workers 4 --export-selected
+  3) screening_report.csv を開き、selected=True の行（reason 列に「B:軸が出る」「A:識別力」）と件数・スプレッドを確認。
+     必要なら基準を変えて 2) をやり直す（--min-axis 3、--top-a 50 など）。selected_families.json を手で編集してもよい
+  4) 集計と DB の作り直し（selected_families.json が自動で使われます）
+       docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4
+       docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
+  5) 初期セットに戻すときは selected_families.json を削除（または名前を変えて）から 4) を実行
+
+(5) 所要時間の目安（検証環境・1プロセス、10年分相当＝30万行の master 1本）
+  ・initial 約5分、default 約1時間。全指数（2地域 × 約34指数 ≒ 68本）を default で採点すると1プロセスで2日以上
+    かかるため、--indicators で代表の指数に絞るか、--workers で並列にしてください（1プロセスのメモリは0.5GB前後）。
+  ・本番の集計（Step 2）は初期セットで master 1本あたり約3分。family を絞るとその分短くなります。
+
+(6) selected_families.json の形（手で書く・直すとき）
+  {"families": [
+     {"name": "X_jk_pfin_season", "parts": ["騎手", "前走着順", "時期"], "tail": "RBAND", "schemes": ["s2"]},
+     {"name": "X_crs_mare_hen",   "parts": ["COURSE", "牝馬限定"],      "tail": "HBAND"},
+     {"name": "normal",           "parts": ["COURSE", "重量種別", "クラス名"], "tail": "RANK"}
+  ]}
+  ・tail：RANK（指数順位）/ RBAND（指数順位帯。schemes で s1・s2 を絞れる。省略すると両方）/ HBAND（偏差値帯）
+  ・parts に使える名前：COURSE、重量種別、クラス名、枠番グループ、騎手、芝・ダ、時期、輸送距離、間隔帯、叩き、R値帯、
+    直線帯、初角帯、CFS帯、F係数帯、今走クワドラント、左右、左右遷移、距離帯、坂、前走クワドラント、斤量帯、斤量増減、
+    牝馬限定、距離増減、前走着順、前走人気、前走上り3F順、前走脚質、前走R印3
+
+
+--------------------------------------------------------------------------------
+6. 条件ヒット馬の分類基準と WEDGE の見方
+--------------------------------------------------------------------------------
+
+(1) 条件ヒット馬（/entries/hits）の4分類ロジック（上から順に判定）
+------------------------------------------------------------------------
+※複勝率・連対率はベイズ推定値（*_val）、掲示板率は頻度（掲示板率_val）を使用。
+
+  1. 消し候補（keshi）
+     ・[全オッズ帯] 件数 ≥ 20 かつ 複勝率_val < 5% かつ 掲示板率_val < 10%
+     ・[odds10uのみ] 件数 ≥ 20 かつ 複勝率_val < 20%
+
+  2. 絶対軸（abs）
+     ・件数 ≥ 10 かつ 連対率_val ≥ 80% かつ（複勝回収値 ≥ 100 または 単勝適正回収値 ≥ 100）
+
+  3. 軸候補（axis）※以下のいずれか
+     ・件数 ≥ 10 かつ 複勝率_val ≥ 80% かつ 掲示板率_val ≥ 90%
+     ・件数 ≥ 10 かつ 連対率_val ≥ 60% かつ 掲示板率_val ≥ 90%
+     ・件数 ≥ 10 かつ 複勝率_val ≥ 70% かつ 掲示板率_val ≥ 80% かつ 複勝回収値 ≥ 100
+     ・件数 ≥ 10 かつ 連対率_val ≥ 50% かつ 掲示板率_val ≥ 80% かつ 複勝回収値 ≥ 100
+
+  4. 相手候補（opp）※以下のいずれか
+     ・件数 ≥ 30 かつ 複勝率_val ≥ 60% かつ 掲示板率_val ≥ 70%
+     ・件数 ≥ 30 かつ 連対率_val ≥ 50% かつ 掲示板率_val ≥ 70%
+     ・件数 ≥ 30 かつ 複勝率_val ≥ 33% かつ 複勝回収値 ≥ 150 かつ 掲示板率_val ≥ 50%
+
+
+(2) WEDGE / adjusted_WEDGE（/entries/wedge）の定義と見方
+------------------------------------------------------------------------
+  ・WIN （決定力）      = (1着×3.0 + 2着×1.5 + 3着×1.0) / (件数 × 3.0)
+  ・EDGE（期待値超え率）= 単勝オッズ帯別の期待着順以内に入った馬の割合
+                          [1.0〜2.9倍: 1着 / 3.0〜4.9倍: 2着以内 / 5.0〜9.9倍: 3着以内 /
+                           10.0〜19.9倍: 4着以内 / 20.0〜49.9倍: 6着以内 / 50.0〜100倍: 8着以内]
+  ・WEDGE（通算）       = WIN + EDGE
+                          （目安：1.00以上=トップ級[濃緑] / 0.80以上=優秀[薄緑] / 0.62=平均 / 0.50未満=下位）
+  ・adjusted_WEDGE（旬）= 直近最大10年のうち「年間10件以上」ある年のみを対象に、
+                          新しい年ほど重い指数減衰ウェイト（decay=0.65）で加重平均した値。
+
+  【「馬 × 指数」マトリクスのセルの見方】
+    ・セル上段（太字）：その馬×その指数でヒットした全条件（使っている family・s1/s2 の全キー）の adjusted_WEDGE 最大値
+    ・セル下段（小字）：同 通算WEDGE の最大値 ・ ヒットした条件数（件）
+
+
+--------------------------------------------------------------------------------
+7. よくあるつまずき＆トラブルシューティング
+--------------------------------------------------------------------------------
+  Q. Web画面に「DB が旧形式です」と警告が出る
+  A. aggregate_stats_ver2.py --clean と build_db.py --fresh を実行してDBを更新してください。
+
+  Q. 主5場（またはローカル5場）のデータが検索に出ない
+  A. csv_files/ に片方の地域の基本CSVしか無い状態で replace → aggregate → build_db --fresh を
+     実行すると、その地域のテーブルだけで unified_all が構築されます。両地域のCSVを置いて実行してください。
+
+  Q. ある外部指数の master ができない／件数が極端に少ない
+  A. replace のログを見てください。「使わないファイル」の WARN にファイル名が出ていれば、フォルダ名・ファイル名から
+     指数が分からなかったか、中身の形が違います（2章B）。「外部指数が付いた馬 x/y」の x が少なければ、ファイルの
+     レースIDの形（18桁・旧10桁・12桁・旧8桁）が指数の形式と合っているかを確認してください。
+
+  Q. 集計（Step 2）や DB が大きすぎる・時間がかかる
+  A. 初期セット（129通り）のまま全指数を集計しているためです。5章の手順で family を絞ってください。
+
+  Q. adjusted_WEDGE のパラメータ（年間最低件数や減衰率）を変えて試したい
+  A. Step 1（replace）のやり直しは不要です。以下のオプションで Step 2 と Step 4 だけ実行してください：
+     docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --wedge-min-year-count 10 --wedge-decay 0.65
+     docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
+================================================================================
+
+
+================================================================================
+■ shisu_replace 統合システム 見方・使い方マニュアル
+================================================================================
+
+--------------------------------------------------------------------------------
+1. パターン名に出てくる「（s1）」と「（s2）」とは何か？
+--------------------------------------------------------------------------------
+指数順位そのもの（1位、2位…）だけでなく、順位を幅で括（くく）った「順位帯（band）」で
+過去成績を集計する際の「2種類の区切り方（スキーム）」のことです（2026-11-06 から新8区分）。
+
+  ・（s1）＝ 細区分5帯（排他：1頭は必ず1つの帯）
+      [ 1位 ]  [ 2~3位 ]  [ 4~5位 ]  [ 6~9位 ]  [ 10位~ ]
+
+  ・（s2）＝ 広区分3帯（重なりあり）
+      [ 1~3位 ]  [ 1~5位 ]  [ 6位~ ]
+      ※1〜3位の馬は「1~3位」と「1~5位」の両方に入ります（過去の集計でも、当日の照合でも両方）。
+
+同じ区切りを、前走着順（前走2~3着 など）・前走人気（前走1~3人気 など）・前走上がり3F順（前走上り6位~ など）にも使います。
+
+【具体例】
+当日の出馬表で、ある馬の「オメガ指数」が【 3位 】、前走が【 2着 】だったとします。
+この馬を「コース×前走着順×順位帯」（D_prevfin）の過去データと照合するとき、システムは次の検索を行います。
+
+  ・（s1） → 過去その条件で「前走2~3着」かつ「指数 2~3位」だった馬の成績と照合
+  ・（s2） → 「前走1~3着」「前走1~5着」×「指数 1~3位」「指数 1~5位」の4通りの成績と照合
+
+ピンポイントの順位で見たいときは（s1）、上位3頭・5頭まで広げてサンプル数を稼ぎたいときは（s2）を見ます。
+
+
+--------------------------------------------------------------------------------
+2. WEDGE一覧画面（/entries/wedge）と「馬 × 指数」パネルの見方・算出ロジック
+--------------------------------------------------------------------------------
+
+(1) どうやって数値を算出しているのか？（指数値や偏差値を直接計算しているのか？）
+------------------------------------------------------------------------
+当日の指数値（例：指数65）そのものを計算式に入れているのではありません。
+「当日のその馬の『指数順位・順位帯・偏差値帯』を使って過去の集計DBを検索し、
+合致した過去条件の成績から算出したWEDGEスコア」を表示しています。
+
+【算出ステップの図解】
+  [当日の出馬表]
+  例：11番 ヘインズポイント（東京・芝2000m・1・2_勝・定量・レーン騎手）
+      かよちん指数：当日「1位」／ 偏差値「68（偏差値帯 66~70）」
+         │
+         ▼ 使っている family（初期セットは83種）＋ s1/s2 で【検索キー】を自動生成
+  ┌────────────────────────────────────────────┐
+  │ キー1(normal)   : 東京×芝×2000×定量×1・2_勝×1             → WEDGE 0.92 / adj 0.88 │
+  │ キー2(rankJ)    : 東京×芝×2000×レーン×1                   → WEDGE 1.50 / adj 1.356│
+  │ キー3(hensachiA): 東京×芝×2000×定量×1・2_勝×66~70         → WEDGE 0.85 / adj 0.81 │
+  │ ・・・（ヒットした過去条件がすべて並ぶ）                                             │
+  └────────────────────────────────────────────┘
+         │
+         ▼ ヒット結果の「最大値」と「件数」を1マスに要約！
+  [馬 × 指数パネルの「かよちん指数」のマス]
+  ┌──────────────┐
+  │        1.356 │ ← ヒットした条件の中で一番高い adjusted_WEDGE（旬スコア）
+  │  1.500・20件 │ ← ヒットした条件の中で一番高い 通算WEDGE ・ ヒットした条件数
+  └──────────────┘
+
+
+(2) 「WEDGE」と「adjusted_WEDGE」の違いと基準値
+------------------------------------------------------------------------
+  ■ WEDGE（全期間の通算スコア） ＝ WIN ＋ EDGE
+    ・WIN （決定力）      ： (1着×3点 ＋ 2着×1.5点 ＋ 3着×1点) ÷ (件数 × 3)
+                             ※すべて1着なら最大 1.000
+    ・EDGE（期待値超え率）： 単勝オッズから算出した「期待着順」以上に好走した割合
+                             [成功となる着順の基準]
+                             1.0〜2.9倍 ＝ 1着のみ成功
+                             3.0〜4.9倍 ＝ 2着以内で成功
+                             5.0〜9.9倍 ＝ 3着以内で成功
+                             10.0〜19.9倍＝ 4着以内で成功
+                             20.0〜49.9倍＝ 6着以内で成功
+                             50.0倍以上  ＝ 8着以内で成功（100倍超は100倍扱い）
+
+  ■ adjusted_WEDGE（直近重視の「旬」スコア）
+    ・過去の通算成績だと「5年前はよく当たったが、最近2年は全く来ない条件」も高く出ます。
+    ・そこで、直近最大10年間のうち【年間10件以上】データがある年だけを抽出し、
+      新しい年ほど重くなるウェイト（減衰率0.65：1年古くなるごとに重みが0.65倍に減衰）を
+      掛けて加重平均した「今まさに買い時のスコア」が adjusted_WEDGE です。
+    ・もし細かい条件（枠番×騎手など）で「1年間に10件以上走った年が1つも無い」場合は、
+      マグレ当たりによるノイズを防ぐため計算せず「—（空欄）」になります。
+
+  ■ スコアと背景色の目安
+    ・1.000 以上 ：【濃い緑】トップ級（決定力・オッズ期待超えともに抜群）
+    ・0.800 以上 ：【薄い緑】優秀（積極的に狙える好条件）
+    ・0.620 前後 ：【極薄緑】平均的
+    ・0.500 未満 ：【グレー】下位（期待値を下回る条件）
+
+
+(3) パネルと一覧表の実戦的な見方
+------------------------------------------------------------------------
+  【上部パネル（馬 × 指数）の左4列】
+    ・該当数    ：その馬が全指数合計でいくつの過去条件キーにヒットしたか（例：242件）
+    ・adj 最大  ：その馬の全ヒット条件の中で最も高い adjusted_WEDGE
+    ・adj 平均  ：その馬の全ヒット条件の adjusted_WEDGE の平均値
+    ・WEDGE 最大：その馬の全ヒット条件の中で最も高い 通算WEDGE
+    ・WEDGE 平均：その馬の全ヒット条件の 通算WEDGE の平均値
+
+  【使い方の手順】
+    ステップ1：上部パネルを見て、横一列に「濃い緑（1.00以上）」が多く並んでいる馬や、
+               特定の勝負指数で「1.00以上」が光っている馬を見つける。
+    ステップ2：画面中段の「馬番」プルダウンでその馬を選ぶ（またはそのまま下にスクロール）。
+    ステップ3：下部「全該当キー」の表で、どのパターン（騎手×順位なのか、偏差値帯なのか）で
+               高いスコアが出ているのか、裏付けとなる「件数」「年数」「複勝率_val」を確認する。
+
+
+--------------------------------------------------------------------------------
+3. 「指数の取得（/ingest 画面）」の使い方とファイル仕様
+--------------------------------------------------------------------------------
+これまで別々のDockerコンテナで動かしていたシステム（Ω・吉馬・かよちん・keibaAI・ラップ）と安井サロンExcel抽出を、
+ブラウザ画面（ http://localhost:8000/ingest ）から一括実行する機能です。
+※⑤ 一隊（結果分析スピード指数）は、サイト側の仕様変更でスクレイピングできなくなったため廃止しました
+  （画面・CLIの選択肢から外しています。番号はこれまでどおり ⑥ ラップのままです）。
+
+(1) 入力ファイルは3つとも毎回アップロードする必要があるか？
+------------------------------------------------------------------------
+いいえ。「今回チェックを入れた取得元」に必要なファイルだけで動きます。
+もちろん、3種類すべてを同時に指定して、全チェックボックスをONで一括実行も可能です。
+
+  ┌─────────────────────────┬──────────────────────────────┐
+  │ 実行したい取得元        │ 必要な入力ファイル           │
+  ├─────────────────────────┼──────────────────────────────┤
+  │ ① Ω指数（競馬ラボ）     │ ベースCSV                    │
+  │ ② 吉馬6指数             │ ベースCSV                    │
+  │ ③ かよちん指数          │ ベースCSV                    │
+  │ ④ keibaAI指数           │ ベースCSV ＋ 開始ID・終了ID  │
+  │ ⑥ ラップ6指数（計算）   │ ラップCSV                    │
+  │ 安井サロン Excel        │ 安井Excel（＋ベースCSV推奨） │
+  └─────────────────────────┴──────────────────────────────┘
+  ※安井サロンExcelは、吉馬6指数と同じく「8指数ごとのフォルダ」に日付別CSVを出力します
+    （yasui_rank / yasui_speed / yasui_stamina / yasui_power / yasui_konjo / yasui_kashikosa /
+      yasui_tairyoku / yasui_yaruki）。日付は「ファイル名の年・月」＋「シート名のMMDD」で決めます
+    （年またぎのシートや、2025年11月ファイルの 1029・1030 → 11/29・11/30 の読み替えも自動）。
+    ・ベースCSVを一緒に指定した場合：レースID(新)（18桁）を照合して、TARGET取込用の
+      YYYYMMDD_yasui_{指数}.csv（レースID(新), ワーク1）と {元ファイル名}_{指数}_merged.csv を出力。
+    ・ベースCSVを選び忘れた場合（または選んだベースCSVに無い開催日・場所がある場合）：
+      ingest_in/base/ と entries_in/ に該当開催日・場所のCSV（ベースCSVやTARGETの出馬表CSV）があれば、
+      自動でそこから18桁のレースID(新)を引き当てます（読めないCSVは警告して飛ばします）。
+    ・どこにもベースCSVが無い開催日：レースID(新)の代わりに「日付, 場所, 場所コード, R, 馬番, 馬名, ワーク1」
+      の指数別・日付別CSVを出力し、画面とログに「TARGET取込用の18桁レースIDを付与するには
+      ベースCSVも一緒に指定してください」と案内します（このCSVはそのままではTARGETに取り込めません）。
+      ベースCSVがある日でも、ある場所の行が無い馬は YYYYMMDD_yasui_{指数}_noid.csv に同じ形で出します。
+
+  ★ヒント：毎回ブラウザからファイルを選択しなくても、Macの以下のフォルダにファイルを
+            置いておけば、画面上にチェックボックスが出てクリックだけで選べます。
+            ・ingest_in/base/  （ベースCSV置き場）
+            ・ingest_in/lap/   （ラップCSV置き場）
+            ・ingest_in/yasui/ （安井Excel置き場）
+
+
+(2) ベースCSV・ラップCSVに必要な列（他の列が混ざっていても大丈夫か？）
+------------------------------------------------------------------------
+結論：【他の余分な列が何十列混ざっていても全く問題ありません】
+プログラムが必要な列名だけを自動で探し出し、TARGET取込用のファイルには
+「レースID(新), ワーク1」の2列だけを綺麗に切り出して出力します。
+
+  ■ ベースCSV（①〜④・安井の照合用）の必須列
+    ・必須：「レースID(新)」（18桁）、「枠番」、「馬番」
+    ・任意：「日付S」、「ワーク1」
+      ※「日付S」列が無い、または空欄でも、「レースID(新)」の先頭8桁から自動で日付を補完します。
+      ※「ワーク1」列が無くても自動で作成されます。
+      ※従来のTARGET出力（レースID(新), 日付S, 枠番, 馬番, ワーク1）のままでOKです。
+
+  ■ ラップCSV（⑥ ラップ6指数用）の必須列
+    ・必須：「レースID(新)」、「着順」、「着差」、「距離」、「ワーク1（ハイフン区切りラップ）」
+    ・補正計算で使用する列：「芝・ダ」、「クラス名」、「年齢限定」、「補正」、「レース印２」
+      ※従来の lastXF-calculate に渡していたCSVと全く同じ形式で動きます。
+
+
+(3) 出力されたファイルはどこに保存されるか？
+------------------------------------------------------------------------
+実行ボタンを押すごとに、Macの `docker_shisu_replace` フォルダ内の
+`ingest_out/YYYYMMDD_HHMMSS/`（実行日時フォルダ）の中に整理されて出力されます。
+また、実行完了画面の「出力をまとめて ZIP」リンクからブラウザで一括ダウンロードも可能です。
+
+  docker_shisu_replace/
+  ├── entries_in/
+  │   └── yasui_YYYYMMDD.csv  ※「安井の出馬表用CSVをentries_in/にも置く」チェック時に自動配置
+  │
+  └── ingest_out/
+      └── 20261105_183000/               （実行日時ごとのフォルダ）
+          ├── ingest.log                 （処理ログ全文）
+          ├── omega/
+          │   ├── YYYYMMDD_omega.csv     （TARGET取込用：レースID(新), ワーク1）
+          │   └── 元ファイル名_merged.csv（マージ完全版）
+          ├── kichiuma/
+          │   └── kichiuma_{sp_ability, senkou, sp_trust, sp_control, sp_max, sueashi}/
+          │       ├── YYYYMMDD_kichiuma_*.csv     （TARGET取込用：レースID(新), ワーク1）
+          │       └── 元ファイル名_*_merged.csv   （マージ完全版。* は指数のキー）
+          ├── kayochin/
+          │   └── YYYYMMDD_kayochin.csv
+          ├── keibaAI/
+          │   └── YYYYMMDD_keibaAI.csv
+          ├── lap/
+          │   └── {2F, 1F, 4F, 33rap, rabbit_2F, rabbit_1F, pace}/
+          └── yasui/
+              ├── yasui_extract.csv      （全シートの抽出データ一覧）
+              ├── yasui_{rank, speed, stamina, power, konjo, kashikosa, tairyoku, yaruki}/
+              │   ├── YYYYMMDD_yasui_*.csv（TARGET取込用 8指数分。ベースCSVが無い日は 日付・場所・R・馬番つき）
+              │   └── 元ファイル名_*_merged.csv（マージ完全版。ベースCSVがあるとき）
+              └── entries_in/
+                  └── yasui_YYYYMMDD.csv （出馬表 calc_entry_hensachi 投入用）
+================================================================================
+
+
+
+
+
+================================================================================
+■ 旧方式の備忘録（2026-11-06 までの手順。今は使いません）
+================================================================================
+※過去データは ★6タブの基本CSV＋ext_indices/ に変わりました（運用マニュアル 2章）。以下は記録として残しています。
+  旧手順の processed_*（10パターン）やワーク1への読み込みは、今の family・22条件とは対応しません。
 
 ------------------------------------
 
@@ -708,7 +822,8 @@ docker inspect [コンテナ名]
 -------------------------------------------------------------------------------
 
 
-＜置換前CSV　名称＞
+＜置換前CSV　名称＞（旧方式で csv_files/ に置いていたファイル名。今も読めますが、カツラキは廃止のため読みません。
+                    今は基本CSV「{地域}_タイムM.csv」「{地域}_対戦M.csv」の2本＋ext_indices/ で足ります）
 
 主５場（中山、東京、中京、京都、阪神）_カツラキ
 主５場（中山、東京、中京、京都、阪神）_Gold
@@ -768,2205 +883,3 @@ docker inspect [コンテナ名]
 ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M
 
 
-------------------------------------
-------------------------------------
-＜TARGET取り込み後　名称＞
-
-指数順位_クラス　→　
-指数順位_枠番　→　rankB
-偏差値帯_クラス　→　hensachiA
-偏差値帯_枠番　→　hensachiB
-騎手_指数順位　→　rankJ
-騎手_偏差値帯　→　hensachiJ
-騎手_指数順位_枠番　→　rankBJ
-騎手_偏差値帯_枠番　→　hensachiBJ
-騎手_指数順位_クラス　→　normalJ
-騎手_偏差値帯_クラス　→　hensachiAJ
-
-
-
-主５場（中山、東京、中京、京都、阪神）_カツラキ_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_カツラキ_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_カツラキ_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_カツラキ_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_カツラキ_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_カツラキ_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_カツラキ_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_カツラキ_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_カツラキ_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_カツラキ_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_Gold_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_Gold_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_Gold_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_Gold_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_Gold_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_Gold_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_Gold_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_Gold_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_Gold_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_Gold_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_BC_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_BC_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_BC_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_BC_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_BC_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_BC_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_BC_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_BC_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_BC_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_BC_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_ZI_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_ZI_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_ZI_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_ZI_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_ZI_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_ZI_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_ZI_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_ZI_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_ZI_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_ZI_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_SAV_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_SAV_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_SAV_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_SAV_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_SAV_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_SAV_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_SAV_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_SAV_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_SAV_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_SAV_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_ST指数_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_ST指数_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_ST指数_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_ST指数_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_ST指数_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_ST指数_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_ST指数_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_ST指数_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_ST指数_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_ST指数_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_合計値_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_合計値_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_合計値_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_合計値_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_合計値_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_合計値_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_合計値_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_合計値_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_合計値_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_合計値_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_展開_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_展開_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_展開_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_展開_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_展開_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_展開_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_展開_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_展開_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_展開_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_展開_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_仕上り_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_仕上り_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_仕上り_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_仕上り_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_仕上り_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_仕上り_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_仕上り_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_仕上り_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_仕上り_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_仕上り_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_先行_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_先行_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_先行_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_先行_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_先行_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_先行_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_先行_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_先行_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_先行_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_先行_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_追走_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_追走_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_追走_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_追走_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_追走_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_追走_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_追走_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_追走_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_追走_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_追走_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_持久_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_持久_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_持久_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_持久_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_持久_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_持久_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_持久_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_持久_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_持久_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_持久_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_持続_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_持続_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_持続_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_持続_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_持続_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_持続_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_持続_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_持続_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_持続_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_持続_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_瞬発_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_瞬発_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_瞬発_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_瞬発_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_瞬発_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_瞬発_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_瞬発_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_瞬発_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_瞬発_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_瞬発_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_想定前半_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_想定前半_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_想定前半_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_想定前半_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_想定前半_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_想定前半_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_想定前半_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_想定前半_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_想定前半_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_想定前半_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_想定後半_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_想定後半_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_想定後半_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_想定後半_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_想定後半_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_想定後半_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_想定後半_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_想定後半_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_想定後半_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_想定後半_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_タイムM_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_タイムM_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_タイムM_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_タイムM_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_タイムM_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_タイムM_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_タイムM_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_タイムM_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_タイムM_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_タイムM_騎手_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_対戦M_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_対戦M_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_対戦M_偏差値帯_クラス
-主５場（中山、東京、中京、京都、阪神）_対戦M_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_対戦M_騎手_指数順位
-主５場（中山、東京、中京、京都、阪神）_対戦M_騎手_偏差値帯
-主５場（中山、東京、中京、京都、阪神）_対戦M_騎手_指数順位_枠番
-主５場（中山、東京、中京、京都、阪神）_対戦M_騎手_偏差値帯_枠番
-主５場（中山、東京、中京、京都、阪神）_対戦M_騎手_指数順位_クラス
-主５場（中山、東京、中京、京都、阪神）_対戦M_騎手_偏差値帯_クラス
-
-
-
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_カツラキ_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_Gold_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_BC_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_ZI_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_SAV_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_ST指数_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_合計値_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_展開_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_仕上り_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_先行_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_追走_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_持久_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_持続_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_瞬発_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定前半_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_想定後半_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_タイムM_騎手_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_偏差値帯_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_騎手_指数順位
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_騎手_偏差値帯
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_騎手_指数順位_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_騎手_偏差値帯_枠番
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_騎手_指数順位_クラス
-ローカル５場（札幌、函館、福島、新潟、小倉）_対戦M_騎手_偏差値帯_クラス
-
-
-### 札幌
-札幌_カツラキ_指数順位_クラス
-札幌_カツラキ_指数順位_枠番
-札幌_カツラキ_偏差値帯_クラス
-札幌_カツラキ_偏差値帯_枠番
-札幌_カツラキ_騎手_指数順位
-札幌_カツラキ_騎手_偏差値帯
-札幌_カツラキ_騎手_指数順位_枠番
-札幌_カツラキ_騎手_偏差値帯_枠番
-札幌_カツラキ_騎手_指数順位_クラス
-札幌_カツラキ_騎手_偏差値帯_クラス
-札幌_Gold_指数順位_クラス
-札幌_Gold_指数順位_枠番
-札幌_Gold_偏差値帯_クラス
-札幌_Gold_偏差値帯_枠番
-札幌_Gold_騎手_指数順位
-札幌_Gold_騎手_偏差値帯
-札幌_Gold_騎手_指数順位_枠番
-札幌_Gold_騎手_偏差値帯_枠番
-札幌_Gold_騎手_指数順位_クラス
-札幌_Gold_騎手_偏差値帯_クラス
-札幌_BC_指数順位_クラス
-札幌_BC_指数順位_枠番
-札幌_BC_偏差値帯_クラス
-札幌_BC_偏差値帯_枠番
-札幌_BC_騎手_指数順位
-札幌_BC_騎手_偏差値帯
-札幌_BC_騎手_指数順位_枠番
-札幌_BC_騎手_偏差値帯_枠番
-札幌_BC_騎手_指数順位_クラス
-札幌_BC_騎手_偏差値帯_クラス
-札幌_ZI_指数順位_クラス
-札幌_ZI_指数順位_枠番
-札幌_ZI_偏差値帯_クラス
-札幌_ZI_偏差値帯_枠番
-札幌_ZI_騎手_指数順位
-札幌_ZI_騎手_偏差値帯
-札幌_ZI_騎手_指数順位_枠番
-札幌_ZI_騎手_偏差値帯_枠番
-札幌_ZI_騎手_指数順位_クラス
-札幌_ZI_騎手_偏差値帯_クラス
-札幌_SAV_指数順位_クラス
-札幌_SAV_指数順位_枠番
-札幌_SAV_偏差値帯_クラス
-札幌_SAV_偏差値帯_枠番
-札幌_SAV_騎手_指数順位
-札幌_SAV_騎手_偏差値帯
-札幌_SAV_騎手_指数順位_枠番
-札幌_SAV_騎手_偏差値帯_枠番
-札幌_SAV_騎手_指数順位_クラス
-札幌_SAV_騎手_偏差値帯_クラス
-札幌_ST指数_指数順位_クラス
-札幌_ST指数_指数順位_枠番
-札幌_ST指数_偏差値帯_クラス
-札幌_ST指数_偏差値帯_枠番
-札幌_ST指数_騎手_指数順位
-札幌_ST指数_騎手_偏差値帯
-札幌_ST指数_騎手_指数順位_枠番
-札幌_ST指数_騎手_偏差値帯_枠番
-札幌_ST指数_騎手_指数順位_クラス
-札幌_ST指数_騎手_偏差値帯_クラス
-札幌_合計値_指数順位_クラス
-札幌_合計値_指数順位_枠番
-札幌_合計値_偏差値帯_クラス
-札幌_合計値_偏差値帯_枠番
-札幌_合計値_騎手_指数順位
-札幌_合計値_騎手_偏差値帯
-札幌_合計値_騎手_指数順位_枠番
-札幌_合計値_騎手_偏差値帯_枠番
-札幌_合計値_騎手_指数順位_クラス
-札幌_合計値_騎手_偏差値帯_クラス
-札幌_展開_指数順位_クラス
-札幌_展開_指数順位_枠番
-札幌_展開_偏差値帯_クラス
-札幌_展開_偏差値帯_枠番
-札幌_展開_騎手_指数順位
-札幌_展開_騎手_偏差値帯
-札幌_展開_騎手_指数順位_枠番
-札幌_展開_騎手_偏差値帯_枠番
-札幌_展開_騎手_指数順位_クラス
-札幌_展開_騎手_偏差値帯_クラス
-札幌_仕上り_指数順位_クラス
-札幌_仕上り_指数順位_枠番
-札幌_仕上り_偏差値帯_クラス
-札幌_仕上り_偏差値帯_枠番
-札幌_仕上り_騎手_指数順位
-札幌_仕上り_騎手_偏差値帯
-札幌_仕上り_騎手_指数順位_枠番
-札幌_仕上り_騎手_偏差値帯_枠番
-札幌_仕上り_騎手_指数順位_クラス
-札幌_仕上り_騎手_偏差値帯_クラス
-札幌_先行_指数順位_クラス
-札幌_先行_指数順位_枠番
-札幌_先行_偏差値帯_クラス
-札幌_先行_偏差値帯_枠番
-札幌_先行_騎手_指数順位
-札幌_先行_騎手_偏差値帯
-札幌_先行_騎手_指数順位_枠番
-札幌_先行_騎手_偏差値帯_枠番
-札幌_先行_騎手_指数順位_クラス
-札幌_先行_騎手_偏差値帯_クラス
-札幌_追走_指数順位_クラス
-札幌_追走_指数順位_枠番
-札幌_追走_偏差値帯_クラス
-札幌_追走_偏差値帯_枠番
-札幌_追走_騎手_指数順位
-札幌_追走_騎手_偏差値帯
-札幌_追走_騎手_指数順位_枠番
-札幌_追走_騎手_偏差値帯_枠番
-札幌_追走_騎手_指数順位_クラス
-札幌_追走_騎手_偏差値帯_クラス
-札幌_持久_指数順位_クラス
-札幌_持久_指数順位_枠番
-札幌_持久_偏差値帯_クラス
-札幌_持久_偏差値帯_枠番
-札幌_持久_騎手_指数順位
-札幌_持久_騎手_偏差値帯
-札幌_持久_騎手_指数順位_枠番
-札幌_持久_騎手_偏差値帯_枠番
-札幌_持久_騎手_指数順位_クラス
-札幌_持久_騎手_偏差値帯_クラス
-札幌_持続_指数順位_クラス
-札幌_持続_指数順位_枠番
-札幌_持続_偏差値帯_クラス
-札幌_持続_偏差値帯_枠番
-札幌_持続_騎手_指数順位
-札幌_持続_騎手_偏差値帯
-札幌_持続_騎手_指数順位_枠番
-札幌_持続_騎手_偏差値帯_枠番
-札幌_持続_騎手_指数順位_クラス
-札幌_持続_騎手_偏差値帯_クラス
-札幌_瞬発_指数順位_クラス
-札幌_瞬発_指数順位_枠番
-札幌_瞬発_偏差値帯_クラス
-札幌_瞬発_偏差値帯_枠番
-札幌_瞬発_騎手_指数順位
-札幌_瞬発_騎手_偏差値帯
-札幌_瞬発_騎手_指数順位_枠番
-札幌_瞬発_騎手_偏差値帯_枠番
-札幌_瞬発_騎手_指数順位_クラス
-札幌_瞬発_騎手_偏差値帯_クラス
-札幌_想定前半_指数順位_クラス
-札幌_想定前半_指数順位_枠番
-札幌_想定前半_偏差値帯_クラス
-札幌_想定前半_偏差値帯_枠番
-札幌_想定前半_騎手_指数順位
-札幌_想定前半_騎手_偏差値帯
-札幌_想定前半_騎手_指数順位_枠番
-札幌_想定前半_騎手_偏差値帯_枠番
-札幌_想定前半_騎手_指数順位_クラス
-札幌_想定前半_騎手_偏差値帯_クラス
-札幌_想定後半_指数順位_クラス
-札幌_想定後半_指数順位_枠番
-札幌_想定後半_偏差値帯_クラス
-札幌_想定後半_偏差値帯_枠番
-札幌_想定後半_騎手_指数順位
-札幌_想定後半_騎手_偏差値帯
-札幌_想定後半_騎手_指数順位_枠番
-札幌_想定後半_騎手_偏差値帯_枠番
-札幌_想定後半_騎手_指数順位_クラス
-札幌_想定後半_騎手_偏差値帯_クラス
-札幌_タイムM_指数順位_クラス
-札幌_タイムM_指数順位_枠番
-札幌_タイムM_偏差値帯_クラス
-札幌_タイムM_偏差値帯_枠番
-札幌_タイムM_騎手_指数順位
-札幌_タイムM_騎手_偏差値帯
-札幌_タイムM_騎手_指数順位_枠番
-札幌_タイムM_騎手_偏差値帯_枠番
-札幌_タイムM_騎手_指数順位_クラス
-札幌_タイムM_騎手_偏差値帯_クラス
-札幌_対戦M_指数順位_クラス
-札幌_対戦M_指数順位_枠番
-札幌_対戦M_偏差値帯_クラス
-札幌_対戦M_偏差値帯_枠番
-札幌_対戦M_騎手_指数順位
-札幌_対戦M_騎手_偏差値帯
-札幌_対戦M_騎手_指数順位_枠番
-札幌_対戦M_騎手_偏差値帯_枠番
-札幌_対戦M_騎手_指数順位_クラス
-札幌_対戦M_騎手_偏差値帯_クラス
-
-### 函館
-函館_カツラキ_指数順位_クラス
-函館_カツラキ_指数順位_枠番
-函館_カツラキ_偏差値帯_クラス
-函館_カツラキ_偏差値帯_枠番
-函館_カツラキ_騎手_指数順位
-函館_カツラキ_騎手_偏差値帯
-函館_カツラキ_騎手_指数順位_枠番
-函館_カツラキ_騎手_偏差値帯_枠番
-函館_カツラキ_騎手_指数順位_クラス
-函館_カツラキ_騎手_偏差値帯_クラス
-函館_Gold_指数順位_クラス
-函館_Gold_指数順位_枠番
-函館_Gold_偏差値帯_クラス
-函館_Gold_偏差値帯_枠番
-函館_Gold_騎手_指数順位
-函館_Gold_騎手_偏差値帯
-函館_Gold_騎手_指数順位_枠番
-函館_Gold_騎手_偏差値帯_枠番
-函館_Gold_騎手_指数順位_クラス
-函館_Gold_騎手_偏差値帯_クラス
-函館_BC_指数順位_クラス
-函館_BC_指数順位_枠番
-函館_BC_偏差値帯_クラス
-函館_BC_偏差値帯_枠番
-函館_BC_騎手_指数順位
-函館_BC_騎手_偏差値帯
-函館_BC_騎手_指数順位_枠番
-函館_BC_騎手_偏差値帯_枠番
-函館_BC_騎手_指数順位_クラス
-函館_BC_騎手_偏差値帯_クラス
-函館_ZI_指数順位_クラス
-函館_ZI_指数順位_枠番
-函館_ZI_偏差値帯_クラス
-函館_ZI_偏差値帯_枠番
-函館_ZI_騎手_指数順位
-函館_ZI_騎手_偏差値帯
-函館_ZI_騎手_指数順位_枠番
-函館_ZI_騎手_偏差値帯_枠番
-函館_ZI_騎手_指数順位_クラス
-函館_ZI_騎手_偏差値帯_クラス
-函館_SAV_指数順位_クラス
-函館_SAV_指数順位_枠番
-函館_SAV_偏差値帯_クラス
-函館_SAV_偏差値帯_枠番
-函館_SAV_騎手_指数順位
-函館_SAV_騎手_偏差値帯
-函館_SAV_騎手_指数順位_枠番
-函館_SAV_騎手_偏差値帯_枠番
-函館_SAV_騎手_指数順位_クラス
-函館_SAV_騎手_偏差値帯_クラス
-函館_ST指数_指数順位_クラス
-函館_ST指数_指数順位_枠番
-函館_ST指数_偏差値帯_クラス
-函館_ST指数_偏差値帯_枠番
-函館_ST指数_騎手_指数順位
-函館_ST指数_騎手_偏差値帯
-函館_ST指数_騎手_指数順位_枠番
-函館_ST指数_騎手_偏差値帯_枠番
-函館_ST指数_騎手_指数順位_クラス
-函館_ST指数_騎手_偏差値帯_クラス
-函館_合計値_指数順位_クラス
-函館_合計値_指数順位_枠番
-函館_合計値_偏差値帯_クラス
-函館_合計値_偏差値帯_枠番
-函館_合計値_騎手_指数順位
-函館_合計値_騎手_偏差値帯
-函館_合計値_騎手_指数順位_枠番
-函館_合計値_騎手_偏差値帯_枠番
-函館_合計値_騎手_指数順位_クラス
-函館_合計値_騎手_偏差値帯_クラス
-函館_展開_指数順位_クラス
-函館_展開_指数順位_枠番
-函館_展開_偏差値帯_クラス
-函館_展開_偏差値帯_枠番
-函館_展開_騎手_指数順位
-函館_展開_騎手_偏差値帯
-函館_展開_騎手_指数順位_枠番
-函館_展開_騎手_偏差値帯_枠番
-函館_展開_騎手_指数順位_クラス
-函館_展開_騎手_偏差値帯_クラス
-函館_仕上り_指数順位_クラス
-函館_仕上り_指数順位_枠番
-函館_仕上り_偏差値帯_クラス
-函館_仕上り_偏差値帯_枠番
-函館_仕上り_騎手_指数順位
-函館_仕上り_騎手_偏差値帯
-函館_仕上り_騎手_指数順位_枠番
-函館_仕上り_騎手_偏差値帯_枠番
-函館_仕上り_騎手_指数順位_クラス
-函館_仕上り_騎手_偏差値帯_クラス
-函館_先行_指数順位_クラス
-函館_先行_指数順位_枠番
-函館_先行_偏差値帯_クラス
-函館_先行_偏差値帯_枠番
-函館_先行_騎手_指数順位
-函館_先行_騎手_偏差値帯
-函館_先行_騎手_指数順位_枠番
-函館_先行_騎手_偏差値帯_枠番
-函館_先行_騎手_指数順位_クラス
-函館_先行_騎手_偏差値帯_クラス
-函館_追走_指数順位_クラス
-函館_追走_指数順位_枠番
-函館_追走_偏差値帯_クラス
-函館_追走_偏差値帯_枠番
-函館_追走_騎手_指数順位
-函館_追走_騎手_偏差値帯
-函館_追走_騎手_指数順位_枠番
-函館_追走_騎手_偏差値帯_枠番
-函館_追走_騎手_指数順位_クラス
-函館_追走_騎手_偏差値帯_クラス
-函館_持久_指数順位_クラス
-函館_持久_指数順位_枠番
-函館_持久_偏差値帯_クラス
-函館_持久_偏差値帯_枠番
-函館_持久_騎手_指数順位
-函館_持久_騎手_偏差値帯
-函館_持久_騎手_指数順位_枠番
-函館_持久_騎手_偏差値帯_枠番
-函館_持久_騎手_指数順位_クラス
-函館_持久_騎手_偏差値帯_クラス
-函館_持続_指数順位_クラス
-函館_持続_指数順位_枠番
-函館_持続_偏差値帯_クラス
-函館_持続_偏差値帯_枠番
-函館_持続_騎手_指数順位
-函館_持続_騎手_偏差値帯
-函館_持続_騎手_指数順位_枠番
-函館_持続_騎手_偏差値帯_枠番
-函館_持続_騎手_指数順位_クラス
-函館_持続_騎手_偏差値帯_クラス
-函館_瞬発_指数順位_クラス
-函館_瞬発_指数順位_枠番
-函館_瞬発_偏差値帯_クラス
-函館_瞬発_偏差値帯_枠番
-函館_瞬発_騎手_指数順位
-函館_瞬発_騎手_偏差値帯
-函館_瞬発_騎手_指数順位_枠番
-函館_瞬発_騎手_偏差値帯_枠番
-函館_瞬発_騎手_指数順位_クラス
-函館_瞬発_騎手_偏差値帯_クラス
-函館_想定前半_指数順位_クラス
-函館_想定前半_指数順位_枠番
-函館_想定前半_偏差値帯_クラス
-函館_想定前半_偏差値帯_枠番
-函館_想定前半_騎手_指数順位
-函館_想定前半_騎手_偏差値帯
-函館_想定前半_騎手_指数順位_枠番
-函館_想定前半_騎手_偏差値帯_枠番
-函館_想定前半_騎手_指数順位_クラス
-函館_想定前半_騎手_偏差値帯_クラス
-函館_想定後半_指数順位_クラス
-函館_想定後半_指数順位_枠番
-函館_想定後半_偏差値帯_クラス
-函館_想定後半_偏差値帯_枠番
-函館_想定後半_騎手_指数順位
-函館_想定後半_騎手_偏差値帯
-函館_想定後半_騎手_指数順位_枠番
-函館_想定後半_騎手_偏差値帯_枠番
-函館_想定後半_騎手_指数順位_クラス
-函館_想定後半_騎手_偏差値帯_クラス
-函館_タイムM_指数順位_クラス
-函館_タイムM_指数順位_枠番
-函館_タイムM_偏差値帯_クラス
-函館_タイムM_偏差値帯_枠番
-函館_タイムM_騎手_指数順位
-函館_タイムM_騎手_偏差値帯
-函館_タイムM_騎手_指数順位_枠番
-函館_タイムM_騎手_偏差値帯_枠番
-函館_タイムM_騎手_指数順位_クラス
-函館_タイムM_騎手_偏差値帯_クラス
-函館_対戦M_指数順位_クラス
-函館_対戦M_指数順位_枠番
-函館_対戦M_偏差値帯_クラス
-函館_対戦M_偏差値帯_枠番
-函館_対戦M_騎手_指数順位
-函館_対戦M_騎手_偏差値帯
-函館_対戦M_騎手_指数順位_枠番
-函館_対戦M_騎手_偏差値帯_枠番
-函館_対戦M_騎手_指数順位_クラス
-函館_対戦M_騎手_偏差値帯_クラス
-
-### 福島
-福島_カツラキ_指数順位_クラス
-福島_カツラキ_指数順位_枠番
-福島_カツラキ_偏差値帯_クラス
-福島_カツラキ_偏差値帯_枠番
-福島_カツラキ_騎手_指数順位
-福島_カツラキ_騎手_偏差値帯
-福島_カツラキ_騎手_指数順位_枠番
-福島_カツラキ_騎手_偏差値帯_枠番
-福島_カツラキ_騎手_指数順位_クラス
-福島_カツラキ_騎手_偏差値帯_クラス
-福島_Gold_指数順位_クラス
-福島_Gold_指数順位_枠番
-福島_Gold_偏差値帯_クラス
-福島_Gold_偏差値帯_枠番
-福島_Gold_騎手_指数順位
-福島_Gold_騎手_偏差値帯
-福島_Gold_騎手_指数順位_枠番
-福島_Gold_騎手_偏差値帯_枠番
-福島_Gold_騎手_指数順位_クラス
-福島_Gold_騎手_偏差値帯_クラス
-福島_BC_指数順位_クラス
-福島_BC_指数順位_枠番
-福島_BC_偏差値帯_クラス
-福島_BC_偏差値帯_枠番
-福島_BC_騎手_指数順位
-福島_BC_騎手_偏差値帯
-福島_BC_騎手_指数順位_枠番
-福島_BC_騎手_偏差値帯_枠番
-福島_BC_騎手_指数順位_クラス
-福島_BC_騎手_偏差値帯_クラス
-福島_ZI_指数順位_クラス
-福島_ZI_指数順位_枠番
-福島_ZI_偏差値帯_クラス
-福島_ZI_偏差値帯_枠番
-福島_ZI_騎手_指数順位
-福島_ZI_騎手_偏差値帯
-福島_ZI_騎手_指数順位_枠番
-福島_ZI_騎手_偏差値帯_枠番
-福島_ZI_騎手_指数順位_クラス
-福島_ZI_騎手_偏差値帯_クラス
-福島_SAV_指数順位_クラス
-福島_SAV_指数順位_枠番
-福島_SAV_偏差値帯_クラス
-福島_SAV_偏差値帯_枠番
-福島_SAV_騎手_指数順位
-福島_SAV_騎手_偏差値帯
-福島_SAV_騎手_指数順位_枠番
-福島_SAV_騎手_偏差値帯_枠番
-福島_SAV_騎手_指数順位_クラス
-福島_SAV_騎手_偏差値帯_クラス
-福島_ST指数_指数順位_クラス
-福島_ST指数_指数順位_枠番
-福島_ST指数_偏差値帯_クラス
-福島_ST指数_偏差値帯_枠番
-福島_ST指数_騎手_指数順位
-福島_ST指数_騎手_偏差値帯
-福島_ST指数_騎手_指数順位_枠番
-福島_ST指数_騎手_偏差値帯_枠番
-福島_ST指数_騎手_指数順位_クラス
-福島_ST指数_騎手_偏差値帯_クラス
-福島_合計値_指数順位_クラス
-福島_合計値_指数順位_枠番
-福島_合計値_偏差値帯_クラス
-福島_合計値_偏差値帯_枠番
-福島_合計値_騎手_指数順位
-福島_合計値_騎手_偏差値帯
-福島_合計値_騎手_指数順位_枠番
-福島_合計値_騎手_偏差値帯_枠番
-福島_合計値_騎手_指数順位_クラス
-福島_合計値_騎手_偏差値帯_クラス
-福島_展開_指数順位_クラス
-福島_展開_指数順位_枠番
-福島_展開_偏差値帯_クラス
-福島_展開_偏差値帯_枠番
-福島_展開_騎手_指数順位
-福島_展開_騎手_偏差値帯
-福島_展開_騎手_指数順位_枠番
-福島_展開_騎手_偏差値帯_枠番
-福島_展開_騎手_指数順位_クラス
-福島_展開_騎手_偏差値帯_クラス
-福島_仕上り_指数順位_クラス
-福島_仕上り_指数順位_枠番
-福島_仕上り_偏差値帯_クラス
-福島_仕上り_偏差値帯_枠番
-福島_仕上り_騎手_指数順位
-福島_仕上り_騎手_偏差値帯
-福島_仕上り_騎手_指数順位_枠番
-福島_仕上り_騎手_偏差値帯_枠番
-福島_仕上り_騎手_指数順位_クラス
-福島_仕上り_騎手_偏差値帯_クラス
-福島_先行_指数順位_クラス
-福島_先行_指数順位_枠番
-福島_先行_偏差値帯_クラス
-福島_先行_偏差値帯_枠番
-福島_先行_騎手_指数順位
-福島_先行_騎手_偏差値帯
-福島_先行_騎手_指数順位_枠番
-福島_先行_騎手_偏差値帯_枠番
-福島_先行_騎手_指数順位_クラス
-福島_先行_騎手_偏差値帯_クラス
-福島_追走_指数順位_クラス
-福島_追走_指数順位_枠番
-福島_追走_偏差値帯_クラス
-福島_追走_偏差値帯_枠番
-福島_追走_騎手_指数順位
-福島_追走_騎手_偏差値帯
-福島_追走_騎手_指数順位_枠番
-福島_追走_騎手_偏差値帯_枠番
-福島_追走_騎手_指数順位_クラス
-福島_追走_騎手_偏差値帯_クラス
-福島_持久_指数順位_クラス
-福島_持久_指数順位_枠番
-福島_持久_偏差値帯_クラス
-福島_持久_偏差値帯_枠番
-福島_持久_騎手_指数順位
-福島_持久_騎手_偏差値帯
-福島_持久_騎手_指数順位_枠番
-福島_持久_騎手_偏差値帯_枠番
-福島_持久_騎手_指数順位_クラス
-福島_持久_騎手_偏差値帯_クラス
-福島_持続_指数順位_クラス
-福島_持続_指数順位_枠番
-福島_持続_偏差値帯_クラス
-福島_持続_偏差値帯_枠番
-福島_持続_騎手_指数順位
-福島_持続_騎手_偏差値帯
-福島_持続_騎手_指数順位_枠番
-福島_持続_騎手_偏差値帯_枠番
-福島_持続_騎手_指数順位_クラス
-福島_持続_騎手_偏差値帯_クラス
-福島_瞬発_指数順位_クラス
-福島_瞬発_指数順位_枠番
-福島_瞬発_偏差値帯_クラス
-福島_瞬発_偏差値帯_枠番
-福島_瞬発_騎手_指数順位
-福島_瞬発_騎手_偏差値帯
-福島_瞬発_騎手_指数順位_枠番
-福島_瞬発_騎手_偏差値帯_枠番
-福島_瞬発_騎手_指数順位_クラス
-福島_瞬発_騎手_偏差値帯_クラス
-福島_想定前半_指数順位_クラス
-福島_想定前半_指数順位_枠番
-福島_想定前半_偏差値帯_クラス
-福島_想定前半_偏差値帯_枠番
-福島_想定前半_騎手_指数順位
-福島_想定前半_騎手_偏差値帯
-福島_想定前半_騎手_指数順位_枠番
-福島_想定前半_騎手_偏差値帯_枠番
-福島_想定前半_騎手_指数順位_クラス
-福島_想定前半_騎手_偏差値帯_クラス
-福島_想定後半_指数順位_クラス
-福島_想定後半_指数順位_枠番
-福島_想定後半_偏差値帯_クラス
-福島_想定後半_偏差値帯_枠番
-福島_想定後半_騎手_指数順位
-福島_想定後半_騎手_偏差値帯
-福島_想定後半_騎手_指数順位_枠番
-福島_想定後半_騎手_偏差値帯_枠番
-福島_想定後半_騎手_指数順位_クラス
-福島_想定後半_騎手_偏差値帯_クラス
-福島_タイムM_指数順位_クラス
-福島_タイムM_指数順位_枠番
-福島_タイムM_偏差値帯_クラス
-福島_タイムM_偏差値帯_枠番
-福島_タイムM_騎手_指数順位
-福島_タイムM_騎手_偏差値帯
-福島_タイムM_騎手_指数順位_枠番
-福島_タイムM_騎手_偏差値帯_枠番
-福島_タイムM_騎手_指数順位_クラス
-福島_タイムM_騎手_偏差値帯_クラス
-福島_対戦M_指数順位_クラス
-福島_対戦M_指数順位_枠番
-福島_対戦M_偏差値帯_クラス
-福島_対戦M_偏差値帯_枠番
-福島_対戦M_騎手_指数順位
-福島_対戦M_騎手_偏差値帯
-福島_対戦M_騎手_指数順位_枠番
-福島_対戦M_騎手_偏差値帯_枠番
-福島_対戦M_騎手_指数順位_クラス
-福島_対戦M_騎手_偏差値帯_クラス
-
-### 新潟
-新潟_カツラキ_指数順位_クラス
-新潟_カツラキ_指数順位_枠番
-新潟_カツラキ_偏差値帯_クラス
-新潟_カツラキ_偏差値帯_枠番
-新潟_カツラキ_騎手_指数順位
-新潟_カツラキ_騎手_偏差値帯
-新潟_カツラキ_騎手_指数順位_枠番
-新潟_カツラキ_騎手_偏差値帯_枠番
-新潟_カツラキ_騎手_指数順位_クラス
-新潟_カツラキ_騎手_偏差値帯_クラス
-新潟_Gold_指数順位_クラス
-新潟_Gold_指数順位_枠番
-新潟_Gold_偏差値帯_クラス
-新潟_Gold_偏差値帯_枠番
-新潟_Gold_騎手_指数順位
-新潟_Gold_騎手_偏差値帯
-新潟_Gold_騎手_指数順位_枠番
-新潟_Gold_騎手_偏差値帯_枠番
-新潟_Gold_騎手_指数順位_クラス
-新潟_Gold_騎手_偏差値帯_クラス
-新潟_BC_指数順位_クラス
-新潟_BC_指数順位_枠番
-新潟_BC_偏差値帯_クラス
-新潟_BC_偏差値帯_枠番
-新潟_BC_騎手_指数順位
-新潟_BC_騎手_偏差値帯
-新潟_BC_騎手_指数順位_枠番
-新潟_BC_騎手_偏差値帯_枠番
-新潟_BC_騎手_指数順位_クラス
-新潟_BC_騎手_偏差値帯_クラス
-新潟_ZI_指数順位_クラス
-新潟_ZI_指数順位_枠番
-新潟_ZI_偏差値帯_クラス
-新潟_ZI_偏差値帯_枠番
-新潟_ZI_騎手_指数順位
-新潟_ZI_騎手_偏差値帯
-新潟_ZI_騎手_指数順位_枠番
-新潟_ZI_騎手_偏差値帯_枠番
-新潟_ZI_騎手_指数順位_クラス
-新潟_ZI_騎手_偏差値帯_クラス
-新潟_SAV_指数順位_クラス
-新潟_SAV_指数順位_枠番
-新潟_SAV_偏差値帯_クラス
-新潟_SAV_偏差値帯_枠番
-新潟_SAV_騎手_指数順位
-新潟_SAV_騎手_偏差値帯
-新潟_SAV_騎手_指数順位_枠番
-新潟_SAV_騎手_偏差値帯_枠番
-新潟_SAV_騎手_指数順位_クラス
-新潟_SAV_騎手_偏差値帯_クラス
-新潟_ST指数_指数順位_クラス
-新潟_ST指数_指数順位_枠番
-新潟_ST指数_偏差値帯_クラス
-新潟_ST指数_偏差値帯_枠番
-新潟_ST指数_騎手_指数順位
-新潟_ST指数_騎手_偏差値帯
-新潟_ST指数_騎手_指数順位_枠番
-新潟_ST指数_騎手_偏差値帯_枠番
-新潟_ST指数_騎手_指数順位_クラス
-新潟_ST指数_騎手_偏差値帯_クラス
-新潟_合計値_指数順位_クラス
-新潟_合計値_指数順位_枠番
-新潟_合計値_偏差値帯_クラス
-新潟_合計値_偏差値帯_枠番
-新潟_合計値_騎手_指数順位
-新潟_合計値_騎手_偏差値帯
-新潟_合計値_騎手_指数順位_枠番
-新潟_合計値_騎手_偏差値帯_枠番
-新潟_合計値_騎手_指数順位_クラス
-新潟_合計値_騎手_偏差値帯_クラス
-新潟_展開_指数順位_クラス
-新潟_展開_指数順位_枠番
-新潟_展開_偏差値帯_クラス
-新潟_展開_偏差値帯_枠番
-新潟_展開_騎手_指数順位
-新潟_展開_騎手_偏差値帯
-新潟_展開_騎手_指数順位_枠番
-新潟_展開_騎手_偏差値帯_枠番
-新潟_展開_騎手_指数順位_クラス
-新潟_展開_騎手_偏差値帯_クラス
-新潟_仕上り_指数順位_クラス
-新潟_仕上り_指数順位_枠番
-新潟_仕上り_偏差値帯_クラス
-新潟_仕上り_偏差値帯_枠番
-新潟_仕上り_騎手_指数順位
-新潟_仕上り_騎手_偏差値帯
-新潟_仕上り_騎手_指数順位_枠番
-新潟_仕上り_騎手_偏差値帯_枠番
-新潟_仕上り_騎手_指数順位_クラス
-新潟_仕上り_騎手_偏差値帯_クラス
-新潟_先行_指数順位_クラス
-新潟_先行_指数順位_枠番
-新潟_先行_偏差値帯_クラス
-新潟_先行_偏差値帯_枠番
-新潟_先行_騎手_指数順位
-新潟_先行_騎手_偏差値帯
-新潟_先行_騎手_指数順位_枠番
-新潟_先行_騎手_偏差値帯_枠番
-新潟_先行_騎手_指数順位_クラス
-新潟_先行_騎手_偏差値帯_クラス
-新潟_追走_指数順位_クラス
-新潟_追走_指数順位_枠番
-新潟_追走_偏差値帯_クラス
-新潟_追走_偏差値帯_枠番
-新潟_追走_騎手_指数順位
-新潟_追走_騎手_偏差値帯
-新潟_追走_騎手_指数順位_枠番
-新潟_追走_騎手_偏差値帯_枠番
-新潟_追走_騎手_指数順位_クラス
-新潟_追走_騎手_偏差値帯_クラス
-新潟_持久_指数順位_クラス
-新潟_持久_指数順位_枠番
-新潟_持久_偏差値帯_クラス
-新潟_持久_偏差値帯_枠番
-新潟_持久_騎手_指数順位
-新潟_持久_騎手_偏差値帯
-新潟_持久_騎手_指数順位_枠番
-新潟_持久_騎手_偏差値帯_枠番
-新潟_持久_騎手_指数順位_クラス
-新潟_持久_騎手_偏差値帯_クラス
-新潟_持続_指数順位_クラス
-新潟_持続_指数順位_枠番
-新潟_持続_偏差値帯_クラス
-新潟_持続_偏差値帯_枠番
-新潟_持続_騎手_指数順位
-新潟_持続_騎手_偏差値帯
-新潟_持続_騎手_指数順位_枠番
-新潟_持続_騎手_偏差値帯_枠番
-新潟_持続_騎手_指数順位_クラス
-新潟_持続_騎手_偏差値帯_クラス
-新潟_瞬発_指数順位_クラス
-新潟_瞬発_指数順位_枠番
-新潟_瞬発_偏差値帯_クラス
-新潟_瞬発_偏差値帯_枠番
-新潟_瞬発_騎手_指数順位
-新潟_瞬発_騎手_偏差値帯
-新潟_瞬発_騎手_指数順位_枠番
-新潟_瞬発_騎手_偏差値帯_枠番
-新潟_瞬発_騎手_指数順位_クラス
-新潟_瞬発_騎手_偏差値帯_クラス
-新潟_想定前半_指数順位_クラス
-新潟_想定前半_指数順位_枠番
-新潟_想定前半_偏差値帯_クラス
-新潟_想定前半_偏差値帯_枠番
-新潟_想定前半_騎手_指数順位
-新潟_想定前半_騎手_偏差値帯
-新潟_想定前半_騎手_指数順位_枠番
-新潟_想定前半_騎手_偏差値帯_枠番
-新潟_想定前半_騎手_指数順位_クラス
-新潟_想定前半_騎手_偏差値帯_クラス
-新潟_想定後半_指数順位_クラス
-新潟_想定後半_指数順位_枠番
-新潟_想定後半_偏差値帯_クラス
-新潟_想定後半_偏差値帯_枠番
-新潟_想定後半_騎手_指数順位
-新潟_想定後半_騎手_偏差値帯
-新潟_想定後半_騎手_指数順位_枠番
-新潟_想定後半_騎手_偏差値帯_枠番
-新潟_想定後半_騎手_指数順位_クラス
-新潟_想定後半_騎手_偏差値帯_クラス
-新潟_タイムM_指数順位_クラス
-新潟_タイムM_指数順位_枠番
-新潟_タイムM_偏差値帯_クラス
-新潟_タイムM_偏差値帯_枠番
-新潟_タイムM_騎手_指数順位
-新潟_タイムM_騎手_偏差値帯
-新潟_タイムM_騎手_指数順位_枠番
-新潟_タイムM_騎手_偏差値帯_枠番
-新潟_タイムM_騎手_指数順位_クラス
-新潟_タイムM_騎手_偏差値帯_クラス
-新潟_対戦M_指数順位_クラス
-新潟_対戦M_指数順位_枠番
-新潟_対戦M_偏差値帯_クラス
-新潟_対戦M_偏差値帯_枠番
-新潟_対戦M_騎手_指数順位
-新潟_対戦M_騎手_偏差値帯
-新潟_対戦M_騎手_指数順位_枠番
-新潟_対戦M_騎手_偏差値帯_枠番
-新潟_対戦M_騎手_指数順位_クラス
-新潟_対戦M_騎手_偏差値帯_クラス
-
-### 中山
-中山_カツラキ_指数順位_クラス
-中山_カツラキ_指数順位_枠番
-中山_カツラキ_偏差値帯_クラス
-中山_カツラキ_偏差値帯_枠番
-中山_カツラキ_騎手_指数順位
-中山_カツラキ_騎手_偏差値帯
-中山_カツラキ_騎手_指数順位_枠番
-中山_カツラキ_騎手_偏差値帯_枠番
-中山_カツラキ_騎手_指数順位_クラス
-中山_カツラキ_騎手_偏差値帯_クラス
-中山_Gold_指数順位_クラス
-中山_Gold_指数順位_枠番
-中山_Gold_偏差値帯_クラス
-中山_Gold_偏差値帯_枠番
-中山_Gold_騎手_指数順位
-中山_Gold_騎手_偏差値帯
-中山_Gold_騎手_指数順位_枠番
-中山_Gold_騎手_偏差値帯_枠番
-中山_Gold_騎手_指数順位_クラス
-中山_Gold_騎手_偏差値帯_クラス
-中山_BC_指数順位_クラス
-中山_BC_指数順位_枠番
-中山_BC_偏差値帯_クラス
-中山_BC_偏差値帯_枠番
-中山_BC_騎手_指数順位
-中山_BC_騎手_偏差値帯
-中山_BC_騎手_指数順位_枠番
-中山_BC_騎手_偏差値帯_枠番
-中山_BC_騎手_指数順位_クラス
-中山_BC_騎手_偏差値帯_クラス
-中山_ZI_指数順位_クラス
-中山_ZI_指数順位_枠番
-中山_ZI_偏差値帯_クラス
-中山_ZI_偏差値帯_枠番
-中山_ZI_騎手_指数順位
-中山_ZI_騎手_偏差値帯
-中山_ZI_騎手_指数順位_枠番
-中山_ZI_騎手_偏差値帯_枠番
-中山_ZI_騎手_指数順位_クラス
-中山_ZI_騎手_偏差値帯_クラス
-中山_SAV_指数順位_クラス
-中山_SAV_指数順位_枠番
-中山_SAV_偏差値帯_クラス
-中山_SAV_偏差値帯_枠番
-中山_SAV_騎手_指数順位
-中山_SAV_騎手_偏差値帯
-中山_SAV_騎手_指数順位_枠番
-中山_SAV_騎手_偏差値帯_枠番
-中山_SAV_騎手_指数順位_クラス
-中山_SAV_騎手_偏差値帯_クラス
-中山_ST指数_指数順位_クラス
-中山_ST指数_指数順位_枠番
-中山_ST指数_偏差値帯_クラス
-中山_ST指数_偏差値帯_枠番
-中山_ST指数_騎手_指数順位
-中山_ST指数_騎手_偏差値帯
-中山_ST指数_騎手_指数順位_枠番
-中山_ST指数_騎手_偏差値帯_枠番
-中山_ST指数_騎手_指数順位_クラス
-中山_ST指数_騎手_偏差値帯_クラス
-中山_合計値_指数順位_クラス
-中山_合計値_指数順位_枠番
-中山_合計値_偏差値帯_クラス
-中山_合計値_偏差値帯_枠番
-中山_合計値_騎手_指数順位
-中山_合計値_騎手_偏差値帯
-中山_合計値_騎手_指数順位_枠番
-中山_合計値_騎手_偏差値帯_枠番
-中山_合計値_騎手_指数順位_クラス
-中山_合計値_騎手_偏差値帯_クラス
-中山_展開_指数順位_クラス
-中山_展開_指数順位_枠番
-中山_展開_偏差値帯_クラス
-中山_展開_偏差値帯_枠番
-中山_展開_騎手_指数順位
-中山_展開_騎手_偏差値帯
-中山_展開_騎手_指数順位_枠番
-中山_展開_騎手_偏差値帯_枠番
-中山_展開_騎手_指数順位_クラス
-中山_展開_騎手_偏差値帯_クラス
-中山_仕上り_指数順位_クラス
-中山_仕上り_指数順位_枠番
-中山_仕上り_偏差値帯_クラス
-中山_仕上り_偏差値帯_枠番
-中山_仕上り_騎手_指数順位
-中山_仕上り_騎手_偏差値帯
-中山_仕上り_騎手_指数順位_枠番
-中山_仕上り_騎手_偏差値帯_枠番
-中山_仕上り_騎手_指数順位_クラス
-中山_仕上り_騎手_偏差値帯_クラス
-中山_先行_指数順位_クラス
-中山_先行_指数順位_枠番
-中山_先行_偏差値帯_クラス
-中山_先行_偏差値帯_枠番
-中山_先行_騎手_指数順位
-中山_先行_騎手_偏差値帯
-中山_先行_騎手_指数順位_枠番
-中山_先行_騎手_偏差値帯_枠番
-中山_先行_騎手_指数順位_クラス
-中山_先行_騎手_偏差値帯_クラス
-中山_追走_指数順位_クラス
-中山_追走_指数順位_枠番
-中山_追走_偏差値帯_クラス
-中山_追走_偏差値帯_枠番
-中山_追走_騎手_指数順位
-中山_追走_騎手_偏差値帯
-中山_追走_騎手_指数順位_枠番
-中山_追走_騎手_偏差値帯_枠番
-中山_追走_騎手_指数順位_クラス
-中山_追走_騎手_偏差値帯_クラス
-中山_持久_指数順位_クラス
-中山_持久_指数順位_枠番
-中山_持久_偏差値帯_クラス
-中山_持久_偏差値帯_枠番
-中山_持久_騎手_指数順位
-中山_持久_騎手_偏差値帯
-中山_持久_騎手_指数順位_枠番
-中山_持久_騎手_偏差値帯_枠番
-中山_持久_騎手_指数順位_クラス
-中山_持久_騎手_偏差値帯_クラス
-中山_持続_指数順位_クラス
-中山_持続_指数順位_枠番
-中山_持続_偏差値帯_クラス
-中山_持続_偏差値帯_枠番
-中山_持続_騎手_指数順位
-中山_持続_騎手_偏差値帯
-中山_持続_騎手_指数順位_枠番
-中山_持続_騎手_偏差値帯_枠番
-中山_持続_騎手_指数順位_クラス
-中山_持続_騎手_偏差値帯_クラス
-中山_瞬発_指数順位_クラス
-中山_瞬発_指数順位_枠番
-中山_瞬発_偏差値帯_クラス
-中山_瞬発_偏差値帯_枠番
-中山_瞬発_騎手_指数順位
-中山_瞬発_騎手_偏差値帯
-中山_瞬発_騎手_指数順位_枠番
-中山_瞬発_騎手_偏差値帯_枠番
-中山_瞬発_騎手_指数順位_クラス
-中山_瞬発_騎手_偏差値帯_クラス
-中山_想定前半_指数順位_クラス
-中山_想定前半_指数順位_枠番
-中山_想定前半_偏差値帯_クラス
-中山_想定前半_偏差値帯_枠番
-中山_想定前半_騎手_指数順位
-中山_想定前半_騎手_偏差値帯
-中山_想定前半_騎手_指数順位_枠番
-中山_想定前半_騎手_偏差値帯_枠番
-中山_想定前半_騎手_指数順位_クラス
-中山_想定前半_騎手_偏差値帯_クラス
-中山_想定後半_指数順位_クラス
-中山_想定後半_指数順位_枠番
-中山_想定後半_偏差値帯_クラス
-中山_想定後半_偏差値帯_枠番
-中山_想定後半_騎手_指数順位
-中山_想定後半_騎手_偏差値帯
-中山_想定後半_騎手_指数順位_枠番
-中山_想定後半_騎手_偏差値帯_枠番
-中山_想定後半_騎手_指数順位_クラス
-中山_想定後半_騎手_偏差値帯_クラス
-中山_タイムM_指数順位_クラス
-中山_タイムM_指数順位_枠番
-中山_タイムM_偏差値帯_クラス
-中山_タイムM_偏差値帯_枠番
-中山_タイムM_騎手_指数順位
-中山_タイムM_騎手_偏差値帯
-中山_タイムM_騎手_指数順位_枠番
-中山_タイムM_騎手_偏差値帯_枠番
-中山_タイムM_騎手_指数順位_クラス
-中山_タイムM_騎手_偏差値帯_クラス
-中山_対戦M_指数順位_クラス
-中山_対戦M_指数順位_枠番
-中山_対戦M_偏差値帯_クラス
-中山_対戦M_偏差値帯_枠番
-中山_対戦M_騎手_指数順位
-中山_対戦M_騎手_偏差値帯
-中山_対戦M_騎手_指数順位_枠番
-中山_対戦M_騎手_偏差値帯_枠番
-中山_対戦M_騎手_指数順位_クラス
-中山_対戦M_騎手_偏差値帯_クラス
-
-### 東京
-東京_カツラキ_指数順位_クラス
-東京_カツラキ_指数順位_枠番
-東京_カツラキ_偏差値帯_クラス
-東京_カツラキ_偏差値帯_枠番
-東京_カツラキ_騎手_指数順位
-東京_カツラキ_騎手_偏差値帯
-東京_カツラキ_騎手_指数順位_枠番
-東京_カツラキ_騎手_偏差値帯_枠番
-東京_カツラキ_騎手_指数順位_クラス
-東京_カツラキ_騎手_偏差値帯_クラス
-東京_Gold_指数順位_クラス
-東京_Gold_指数順位_枠番
-東京_Gold_偏差値帯_クラス
-東京_Gold_偏差値帯_枠番
-東京_Gold_騎手_指数順位
-東京_Gold_騎手_偏差値帯
-東京_Gold_騎手_指数順位_枠番
-東京_Gold_騎手_偏差値帯_枠番
-東京_Gold_騎手_指数順位_クラス
-東京_Gold_騎手_偏差値帯_クラス
-東京_BC_指数順位_クラス
-東京_BC_指数順位_枠番
-東京_BC_偏差値帯_クラス
-東京_BC_偏差値帯_枠番
-東京_BC_騎手_指数順位
-東京_BC_騎手_偏差値帯
-東京_BC_騎手_指数順位_枠番
-東京_BC_騎手_偏差値帯_枠番
-東京_BC_騎手_指数順位_クラス
-東京_BC_騎手_偏差値帯_クラス
-東京_ZI_指数順位_クラス
-東京_ZI_指数順位_枠番
-東京_ZI_偏差値帯_クラス
-東京_ZI_偏差値帯_枠番
-東京_ZI_騎手_指数順位
-東京_ZI_騎手_偏差値帯
-東京_ZI_騎手_指数順位_枠番
-東京_ZI_騎手_偏差値帯_枠番
-東京_ZI_騎手_指数順位_クラス
-東京_ZI_騎手_偏差値帯_クラス
-東京_SAV_指数順位_クラス
-東京_SAV_指数順位_枠番
-東京_SAV_偏差値帯_クラス
-東京_SAV_偏差値帯_枠番
-東京_SAV_騎手_指数順位
-東京_SAV_騎手_偏差値帯
-東京_SAV_騎手_指数順位_枠番
-東京_SAV_騎手_偏差値帯_枠番
-東京_SAV_騎手_指数順位_クラス
-東京_SAV_騎手_偏差値帯_クラス
-東京_ST指数_指数順位_クラス
-東京_ST指数_指数順位_枠番
-東京_ST指数_偏差値帯_クラス
-東京_ST指数_偏差値帯_枠番
-東京_ST指数_騎手_指数順位
-東京_ST指数_騎手_偏差値帯
-東京_ST指数_騎手_指数順位_枠番
-東京_ST指数_騎手_偏差値帯_枠番
-東京_ST指数_騎手_指数順位_クラス
-東京_ST指数_騎手_偏差値帯_クラス
-東京_合計値_指数順位_クラス
-東京_合計値_指数順位_枠番
-東京_合計値_偏差値帯_クラス
-東京_合計値_偏差値帯_枠番
-東京_合計値_騎手_指数順位
-東京_合計値_騎手_偏差値帯
-東京_合計値_騎手_指数順位_枠番
-東京_合計値_騎手_偏差値帯_枠番
-東京_合計値_騎手_指数順位_クラス
-東京_合計値_騎手_偏差値帯_クラス
-東京_展開_指数順位_クラス
-東京_展開_指数順位_枠番
-東京_展開_偏差値帯_クラス
-東京_展開_偏差値帯_枠番
-東京_展開_騎手_指数順位
-東京_展開_騎手_偏差値帯
-東京_展開_騎手_指数順位_枠番
-東京_展開_騎手_偏差値帯_枠番
-東京_展開_騎手_指数順位_クラス
-東京_展開_騎手_偏差値帯_クラス
-東京_仕上り_指数順位_クラス
-東京_仕上り_指数順位_枠番
-東京_仕上り_偏差値帯_クラス
-東京_仕上り_偏差値帯_枠番
-東京_仕上り_騎手_指数順位
-東京_仕上り_騎手_偏差値帯
-東京_仕上り_騎手_指数順位_枠番
-東京_仕上り_騎手_偏差値帯_枠番
-東京_仕上り_騎手_指数順位_クラス
-東京_仕上り_騎手_偏差値帯_クラス
-東京_先行_指数順位_クラス
-東京_先行_指数順位_枠番
-東京_先行_偏差値帯_クラス
-東京_先行_偏差値帯_枠番
-東京_先行_騎手_指数順位
-東京_先行_騎手_偏差値帯
-東京_先行_騎手_指数順位_枠番
-東京_先行_騎手_偏差値帯_枠番
-東京_先行_騎手_指数順位_クラス
-東京_先行_騎手_偏差値帯_クラス
-東京_追走_指数順位_クラス
-東京_追走_指数順位_枠番
-東京_追走_偏差値帯_クラス
-東京_追走_偏差値帯_枠番
-東京_追走_騎手_指数順位
-東京_追走_騎手_偏差値帯
-東京_追走_騎手_指数順位_枠番
-東京_追走_騎手_偏差値帯_枠番
-東京_追走_騎手_指数順位_クラス
-東京_追走_騎手_偏差値帯_クラス
-東京_持久_指数順位_クラス
-東京_持久_指数順位_枠番
-東京_持久_偏差値帯_クラス
-東京_持久_偏差値帯_枠番
-東京_持久_騎手_指数順位
-東京_持久_騎手_偏差値帯
-東京_持久_騎手_指数順位_枠番
-東京_持久_騎手_偏差値帯_枠番
-東京_持久_騎手_指数順位_クラス
-東京_持久_騎手_偏差値帯_クラス
-東京_持続_指数順位_クラス
-東京_持続_指数順位_枠番
-東京_持続_偏差値帯_クラス
-東京_持続_偏差値帯_枠番
-東京_持続_騎手_指数順位
-東京_持続_騎手_偏差値帯
-東京_持続_騎手_指数順位_枠番
-東京_持続_騎手_偏差値帯_枠番
-東京_持続_騎手_指数順位_クラス
-東京_持続_騎手_偏差値帯_クラス
-東京_瞬発_指数順位_クラス
-東京_瞬発_指数順位_枠番
-東京_瞬発_偏差値帯_クラス
-東京_瞬発_偏差値帯_枠番
-東京_瞬発_騎手_指数順位
-東京_瞬発_騎手_偏差値帯
-東京_瞬発_騎手_指数順位_枠番
-東京_瞬発_騎手_偏差値帯_枠番
-東京_瞬発_騎手_指数順位_クラス
-東京_瞬発_騎手_偏差値帯_クラス
-東京_想定前半_指数順位_クラス
-東京_想定前半_指数順位_枠番
-東京_想定前半_偏差値帯_クラス
-東京_想定前半_偏差値帯_枠番
-東京_想定前半_騎手_指数順位
-東京_想定前半_騎手_偏差値帯
-東京_想定前半_騎手_指数順位_枠番
-東京_想定前半_騎手_偏差値帯_枠番
-東京_想定前半_騎手_指数順位_クラス
-東京_想定前半_騎手_偏差値帯_クラス
-東京_想定後半_指数順位_クラス
-東京_想定後半_指数順位_枠番
-東京_想定後半_偏差値帯_クラス
-東京_想定後半_偏差値帯_枠番
-東京_想定後半_騎手_指数順位
-東京_想定後半_騎手_偏差値帯
-東京_想定後半_騎手_指数順位_枠番
-東京_想定後半_騎手_偏差値帯_枠番
-東京_想定後半_騎手_指数順位_クラス
-東京_想定後半_騎手_偏差値帯_クラス
-東京_タイムM_指数順位_クラス
-東京_タイムM_指数順位_枠番
-東京_タイムM_偏差値帯_クラス
-東京_タイムM_偏差値帯_枠番
-東京_タイムM_騎手_指数順位
-東京_タイムM_騎手_偏差値帯
-東京_タイムM_騎手_指数順位_枠番
-東京_タイムM_騎手_偏差値帯_枠番
-東京_タイムM_騎手_指数順位_クラス
-東京_タイムM_騎手_偏差値帯_クラス
-東京_対戦M_指数順位_クラス
-東京_対戦M_指数順位_枠番
-東京_対戦M_偏差値帯_クラス
-東京_対戦M_偏差値帯_枠番
-東京_対戦M_騎手_指数順位
-東京_対戦M_騎手_偏差値帯
-東京_対戦M_騎手_指数順位_枠番
-東京_対戦M_騎手_偏差値帯_枠番
-東京_対戦M_騎手_指数順位_クラス
-東京_対戦M_騎手_偏差値帯_クラス
-
-### 中京
-中京_カツラキ_指数順位_クラス
-中京_カツラキ_指数順位_枠番
-中京_カツラキ_偏差値帯_クラス
-中京_カツラキ_偏差値帯_枠番
-中京_カツラキ_騎手_指数順位
-中京_カツラキ_騎手_偏差値帯
-中京_カツラキ_騎手_指数順位_枠番
-中京_カツラキ_騎手_偏差値帯_枠番
-中京_カツラキ_騎手_指数順位_クラス
-中京_カツラキ_騎手_偏差値帯_クラス
-中京_Gold_指数順位_クラス
-中京_Gold_指数順位_枠番
-中京_Gold_偏差値帯_クラス
-中京_Gold_偏差値帯_枠番
-中京_Gold_騎手_指数順位
-中京_Gold_騎手_偏差値帯
-中京_Gold_騎手_指数順位_枠番
-中京_Gold_騎手_偏差値帯_枠番
-中京_Gold_騎手_指数順位_クラス
-中京_Gold_騎手_偏差値帯_クラス
-中京_BC_指数順位_クラス
-中京_BC_指数順位_枠番
-中京_BC_偏差値帯_クラス
-中京_BC_偏差値帯_枠番
-中京_BC_騎手_指数順位
-中京_BC_騎手_偏差値帯
-中京_BC_騎手_指数順位_枠番
-中京_BC_騎手_偏差値帯_枠番
-中京_BC_騎手_指数順位_クラス
-中京_BC_騎手_偏差値帯_クラス
-中京_ZI_指数順位_クラス
-中京_ZI_指数順位_枠番
-中京_ZI_偏差値帯_クラス
-中京_ZI_偏差値帯_枠番
-中京_ZI_騎手_指数順位
-中京_ZI_騎手_偏差値帯
-中京_ZI_騎手_指数順位_枠番
-中京_ZI_騎手_偏差値帯_枠番
-中京_ZI_騎手_指数順位_クラス
-中京_ZI_騎手_偏差値帯_クラス
-中京_SAV_指数順位_クラス
-中京_SAV_指数順位_枠番
-中京_SAV_偏差値帯_クラス
-中京_SAV_偏差値帯_枠番
-中京_SAV_騎手_指数順位
-中京_SAV_騎手_偏差値帯
-中京_SAV_騎手_指数順位_枠番
-中京_SAV_騎手_偏差値帯_枠番
-中京_SAV_騎手_指数順位_クラス
-中京_SAV_騎手_偏差値帯_クラス
-中京_ST指数_指数順位_クラス
-中京_ST指数_指数順位_枠番
-中京_ST指数_偏差値帯_クラス
-中京_ST指数_偏差値帯_枠番
-中京_ST指数_騎手_指数順位
-中京_ST指数_騎手_偏差値帯
-中京_ST指数_騎手_指数順位_枠番
-中京_ST指数_騎手_偏差値帯_枠番
-中京_ST指数_騎手_指数順位_クラス
-中京_ST指数_騎手_偏差値帯_クラス
-中京_合計値_指数順位_クラス
-中京_合計値_指数順位_枠番
-中京_合計値_偏差値帯_クラス
-中京_合計値_偏差値帯_枠番
-中京_合計値_騎手_指数順位
-中京_合計値_騎手_偏差値帯
-中京_合計値_騎手_指数順位_枠番
-中京_合計値_騎手_偏差値帯_枠番
-中京_合計値_騎手_指数順位_クラス
-中京_合計値_騎手_偏差値帯_クラス
-中京_展開_指数順位_クラス
-中京_展開_指数順位_枠番
-中京_展開_偏差値帯_クラス
-中京_展開_偏差値帯_枠番
-中京_展開_騎手_指数順位
-中京_展開_騎手_偏差値帯
-中京_展開_騎手_指数順位_枠番
-中京_展開_騎手_偏差値帯_枠番
-中京_展開_騎手_指数順位_クラス
-中京_展開_騎手_偏差値帯_クラス
-中京_仕上り_指数順位_クラス
-中京_仕上り_指数順位_枠番
-中京_仕上り_偏差値帯_クラス
-中京_仕上り_偏差値帯_枠番
-中京_仕上り_騎手_指数順位
-中京_仕上り_騎手_偏差値帯
-中京_仕上り_騎手_指数順位_枠番
-中京_仕上り_騎手_偏差値帯_枠番
-中京_仕上り_騎手_指数順位_クラス
-中京_仕上り_騎手_偏差値帯_クラス
-中京_先行_指数順位_クラス
-中京_先行_指数順位_枠番
-中京_先行_偏差値帯_クラス
-中京_先行_偏差値帯_枠番
-中京_先行_騎手_指数順位
-中京_先行_騎手_偏差値帯
-中京_先行_騎手_指数順位_枠番
-中京_先行_騎手_偏差値帯_枠番
-中京_先行_騎手_指数順位_クラス
-中京_先行_騎手_偏差値帯_クラス
-中京_追走_指数順位_クラス
-中京_追走_指数順位_枠番
-中京_追走_偏差値帯_クラス
-中京_追走_偏差値帯_枠番
-中京_追走_騎手_指数順位
-中京_追走_騎手_偏差値帯
-中京_追走_騎手_指数順位_枠番
-中京_追走_騎手_偏差値帯_枠番
-中京_追走_騎手_指数順位_クラス
-中京_追走_騎手_偏差値帯_クラス
-中京_持久_指数順位_クラス
-中京_持久_指数順位_枠番
-中京_持久_偏差値帯_クラス
-中京_持久_偏差値帯_枠番
-中京_持久_騎手_指数順位
-中京_持久_騎手_偏差値帯
-中京_持久_騎手_指数順位_枠番
-中京_持久_騎手_偏差値帯_枠番
-中京_持久_騎手_指数順位_クラス
-中京_持久_騎手_偏差値帯_クラス
-中京_持続_指数順位_クラス
-中京_持続_指数順位_枠番
-中京_持続_偏差値帯_クラス
-中京_持続_偏差値帯_枠番
-中京_持続_騎手_指数順位
-中京_持続_騎手_偏差値帯
-中京_持続_騎手_指数順位_枠番
-中京_持続_騎手_偏差値帯_枠番
-中京_持続_騎手_指数順位_クラス
-中京_持続_騎手_偏差値帯_クラス
-中京_瞬発_指数順位_クラス
-中京_瞬発_指数順位_枠番
-中京_瞬発_偏差値帯_クラス
-中京_瞬発_偏差値帯_枠番
-中京_瞬発_騎手_指数順位
-中京_瞬発_騎手_偏差値帯
-中京_瞬発_騎手_指数順位_枠番
-中京_瞬発_騎手_偏差値帯_枠番
-中京_瞬発_騎手_指数順位_クラス
-中京_瞬発_騎手_偏差値帯_クラス
-中京_想定前半_指数順位_クラス
-中京_想定前半_指数順位_枠番
-中京_想定前半_偏差値帯_クラス
-中京_想定前半_偏差値帯_枠番
-中京_想定前半_騎手_指数順位
-中京_想定前半_騎手_偏差値帯
-中京_想定前半_騎手_指数順位_枠番
-中京_想定前半_騎手_偏差値帯_枠番
-中京_想定前半_騎手_指数順位_クラス
-中京_想定前半_騎手_偏差値帯_クラス
-中京_想定後半_指数順位_クラス
-中京_想定後半_指数順位_枠番
-中京_想定後半_偏差値帯_クラス
-中京_想定後半_偏差値帯_枠番
-中京_想定後半_騎手_指数順位
-中京_想定後半_騎手_偏差値帯
-中京_想定後半_騎手_指数順位_枠番
-中京_想定後半_騎手_偏差値帯_枠番
-中京_想定後半_騎手_指数順位_クラス
-中京_想定後半_騎手_偏差値帯_クラス
-中京_タイムM_指数順位_クラス
-中京_タイムM_指数順位_枠番
-中京_タイムM_偏差値帯_クラス
-中京_タイムM_偏差値帯_枠番
-中京_タイムM_騎手_指数順位
-中京_タイムM_騎手_偏差値帯
-中京_タイムM_騎手_指数順位_枠番
-中京_タイムM_騎手_偏差値帯_枠番
-中京_タイムM_騎手_指数順位_クラス
-中京_タイムM_騎手_偏差値帯_クラス
-中京_対戦M_指数順位_クラス
-中京_対戦M_指数順位_枠番
-中京_対戦M_偏差値帯_クラス
-中京_対戦M_偏差値帯_枠番
-中京_対戦M_騎手_指数順位
-中京_対戦M_騎手_偏差値帯
-中京_対戦M_騎手_指数順位_枠番
-中京_対戦M_騎手_偏差値帯_枠番
-中京_対戦M_騎手_指数順位_クラス
-中京_対戦M_騎手_偏差値帯_クラス
-
-### 京都
-京都_カツラキ_指数順位_クラス
-京都_カツラキ_指数順位_枠番
-京都_カツラキ_偏差値帯_クラス
-京都_カツラキ_偏差値帯_枠番
-京都_カツラキ_騎手_指数順位
-京都_カツラキ_騎手_偏差値帯
-京都_カツラキ_騎手_指数順位_枠番
-京都_カツラキ_騎手_偏差値帯_枠番
-京都_カツラキ_騎手_指数順位_クラス
-京都_カツラキ_騎手_偏差値帯_クラス
-京都_Gold_指数順位_クラス
-京都_Gold_指数順位_枠番
-京都_Gold_偏差値帯_クラス
-京都_Gold_偏差値帯_枠番
-京都_Gold_騎手_指数順位
-京都_Gold_騎手_偏差値帯
-京都_Gold_騎手_指数順位_枠番
-京都_Gold_騎手_偏差値帯_枠番
-京都_Gold_騎手_指数順位_クラス
-京都_Gold_騎手_偏差値帯_クラス
-京都_BC_指数順位_クラス
-京都_BC_指数順位_枠番
-京都_BC_偏差値帯_クラス
-京都_BC_偏差値帯_枠番
-京都_BC_騎手_指数順位
-京都_BC_騎手_偏差値帯
-京都_BC_騎手_指数順位_枠番
-京都_BC_騎手_偏差値帯_枠番
-京都_BC_騎手_指数順位_クラス
-京都_BC_騎手_偏差値帯_クラス
-京都_ZI_指数順位_クラス
-京都_ZI_指数順位_枠番
-京都_ZI_偏差値帯_クラス
-京都_ZI_偏差値帯_枠番
-京都_ZI_騎手_指数順位
-京都_ZI_騎手_偏差値帯
-京都_ZI_騎手_指数順位_枠番
-京都_ZI_騎手_偏差値帯_枠番
-京都_ZI_騎手_指数順位_クラス
-京都_ZI_騎手_偏差値帯_クラス
-京都_SAV_指数順位_クラス
-京都_SAV_指数順位_枠番
-京都_SAV_偏差値帯_クラス
-京都_SAV_偏差値帯_枠番
-京都_SAV_騎手_指数順位
-京都_SAV_騎手_偏差値帯
-京都_SAV_騎手_指数順位_枠番
-京都_SAV_騎手_偏差値帯_枠番
-京都_SAV_騎手_指数順位_クラス
-京都_SAV_騎手_偏差値帯_クラス
-京都_ST指数_指数順位_クラス
-京都_ST指数_指数順位_枠番
-京都_ST指数_偏差値帯_クラス
-京都_ST指数_偏差値帯_枠番
-京都_ST指数_騎手_指数順位
-京都_ST指数_騎手_偏差値帯
-京都_ST指数_騎手_指数順位_枠番
-京都_ST指数_騎手_偏差値帯_枠番
-京都_ST指数_騎手_指数順位_クラス
-京都_ST指数_騎手_偏差値帯_クラス
-京都_合計値_指数順位_クラス
-京都_合計値_指数順位_枠番
-京都_合計値_偏差値帯_クラス
-京都_合計値_偏差値帯_枠番
-京都_合計値_騎手_指数順位
-京都_合計値_騎手_偏差値帯
-京都_合計値_騎手_指数順位_枠番
-京都_合計値_騎手_偏差値帯_枠番
-京都_合計値_騎手_指数順位_クラス
-京都_合計値_騎手_偏差値帯_クラス
-京都_展開_指数順位_クラス
-京都_展開_指数順位_枠番
-京都_展開_偏差値帯_クラス
-京都_展開_偏差値帯_枠番
-京都_展開_騎手_指数順位
-京都_展開_騎手_偏差値帯
-京都_展開_騎手_指数順位_枠番
-京都_展開_騎手_偏差値帯_枠番
-京都_展開_騎手_指数順位_クラス
-京都_展開_騎手_偏差値帯_クラス
-京都_仕上り_指数順位_クラス
-京都_仕上り_指数順位_枠番
-京都_仕上り_偏差値帯_クラス
-京都_仕上り_偏差値帯_枠番
-京都_仕上り_騎手_指数順位
-京都_仕上り_騎手_偏差値帯
-京都_仕上り_騎手_指数順位_枠番
-京都_仕上り_騎手_偏差値帯_枠番
-京都_仕上り_騎手_指数順位_クラス
-京都_仕上り_騎手_偏差値帯_クラス
-京都_先行_指数順位_クラス
-京都_先行_指数順位_枠番
-京都_先行_偏差値帯_クラス
-京都_先行_偏差値帯_枠番
-京都_先行_騎手_指数順位
-京都_先行_騎手_偏差値帯
-京都_先行_騎手_指数順位_枠番
-京都_先行_騎手_偏差値帯_枠番
-京都_先行_騎手_指数順位_クラス
-京都_先行_騎手_偏差値帯_クラス
-京都_追走_指数順位_クラス
-京都_追走_指数順位_枠番
-京都_追走_偏差値帯_クラス
-京都_追走_偏差値帯_枠番
-京都_追走_騎手_指数順位
-京都_追走_騎手_偏差値帯
-京都_追走_騎手_指数順位_枠番
-京都_追走_騎手_偏差値帯_枠番
-京都_追走_騎手_指数順位_クラス
-京都_追走_騎手_偏差値帯_クラス
-京都_持久_指数順位_クラス
-京都_持久_指数順位_枠番
-京都_持久_偏差値帯_クラス
-京都_持久_偏差値帯_枠番
-京都_持久_騎手_指数順位
-京都_持久_騎手_偏差値帯
-京都_持久_騎手_指数順位_枠番
-京都_持久_騎手_偏差値帯_枠番
-京都_持久_騎手_指数順位_クラス
-京都_持久_騎手_偏差値帯_クラス
-京都_持続_指数順位_クラス
-京都_持続_指数順位_枠番
-京都_持続_偏差値帯_クラス
-京都_持続_偏差値帯_枠番
-京都_持続_騎手_指数順位
-京都_持続_騎手_偏差値帯
-京都_持続_騎手_指数順位_枠番
-京都_持続_騎手_偏差値帯_枠番
-京都_持続_騎手_指数順位_クラス
-京都_持続_騎手_偏差値帯_クラス
-京都_瞬発_指数順位_クラス
-京都_瞬発_指数順位_枠番
-京都_瞬発_偏差値帯_クラス
-京都_瞬発_偏差値帯_枠番
-京都_瞬発_騎手_指数順位
-京都_瞬発_騎手_偏差値帯
-京都_瞬発_騎手_指数順位_枠番
-京都_瞬発_騎手_偏差値帯_枠番
-京都_瞬発_騎手_指数順位_クラス
-京都_瞬発_騎手_偏差値帯_クラス
-京都_想定前半_指数順位_クラス
-京都_想定前半_指数順位_枠番
-京都_想定前半_偏差値帯_クラス
-京都_想定前半_偏差値帯_枠番
-京都_想定前半_騎手_指数順位
-京都_想定前半_騎手_偏差値帯
-京都_想定前半_騎手_指数順位_枠番
-京都_想定前半_騎手_偏差値帯_枠番
-京都_想定前半_騎手_指数順位_クラス
-京都_想定前半_騎手_偏差値帯_クラス
-京都_想定後半_指数順位_クラス
-京都_想定後半_指数順位_枠番
-京都_想定後半_偏差値帯_クラス
-京都_想定後半_偏差値帯_枠番
-京都_想定後半_騎手_指数順位
-京都_想定後半_騎手_偏差値帯
-京都_想定後半_騎手_指数順位_枠番
-京都_想定後半_騎手_偏差値帯_枠番
-京都_想定後半_騎手_指数順位_クラス
-京都_想定後半_騎手_偏差値帯_クラス
-京都_タイムM_指数順位_クラス
-京都_タイムM_指数順位_枠番
-京都_タイムM_偏差値帯_クラス
-京都_タイムM_偏差値帯_枠番
-京都_タイムM_騎手_指数順位
-京都_タイムM_騎手_偏差値帯
-京都_タイムM_騎手_指数順位_枠番
-京都_タイムM_騎手_偏差値帯_枠番
-京都_タイムM_騎手_指数順位_クラス
-京都_タイムM_騎手_偏差値帯_クラス
-京都_対戦M_指数順位_クラス
-京都_対戦M_指数順位_枠番
-京都_対戦M_偏差値帯_クラス
-京都_対戦M_偏差値帯_枠番
-京都_対戦M_騎手_指数順位
-京都_対戦M_騎手_偏差値帯
-京都_対戦M_騎手_指数順位_枠番
-京都_対戦M_騎手_偏差値帯_枠番
-京都_対戦M_騎手_指数順位_クラス
-京都_対戦M_騎手_偏差値帯_クラス
-
-### 阪神
-阪神_カツラキ_指数順位_クラス
-阪神_カツラキ_指数順位_枠番
-阪神_カツラキ_偏差値帯_クラス
-阪神_カツラキ_偏差値帯_枠番
-阪神_カツラキ_騎手_指数順位
-阪神_カツラキ_騎手_偏差値帯
-阪神_カツラキ_騎手_指数順位_枠番
-阪神_カツラキ_騎手_偏差値帯_枠番
-阪神_カツラキ_騎手_指数順位_クラス
-阪神_カツラキ_騎手_偏差値帯_クラス
-阪神_Gold_指数順位_クラス
-阪神_Gold_指数順位_枠番
-阪神_Gold_偏差値帯_クラス
-阪神_Gold_偏差値帯_枠番
-阪神_Gold_騎手_指数順位
-阪神_Gold_騎手_偏差値帯
-阪神_Gold_騎手_指数順位_枠番
-阪神_Gold_騎手_偏差値帯_枠番
-阪神_Gold_騎手_指数順位_クラス
-阪神_Gold_騎手_偏差値帯_クラス
-阪神_BC_指数順位_クラス
-阪神_BC_指数順位_枠番
-阪神_BC_偏差値帯_クラス
-阪神_BC_偏差値帯_枠番
-阪神_BC_騎手_指数順位
-阪神_BC_騎手_偏差値帯
-阪神_BC_騎手_指数順位_枠番
-阪神_BC_騎手_偏差値帯_枠番
-阪神_BC_騎手_指数順位_クラス
-阪神_BC_騎手_偏差値帯_クラス
-阪神_ZI_指数順位_クラス
-阪神_ZI_指数順位_枠番
-阪神_ZI_偏差値帯_クラス
-阪神_ZI_偏差値帯_枠番
-阪神_ZI_騎手_指数順位
-阪神_ZI_騎手_偏差値帯
-阪神_ZI_騎手_指数順位_枠番
-阪神_ZI_騎手_偏差値帯_枠番
-阪神_ZI_騎手_指数順位_クラス
-阪神_ZI_騎手_偏差値帯_クラス
-阪神_SAV_指数順位_クラス
-阪神_SAV_指数順位_枠番
-阪神_SAV_偏差値帯_クラス
-阪神_SAV_偏差値帯_枠番
-阪神_SAV_騎手_指数順位
-阪神_SAV_騎手_偏差値帯
-阪神_SAV_騎手_指数順位_枠番
-阪神_SAV_騎手_偏差値帯_枠番
-阪神_SAV_騎手_指数順位_クラス
-阪神_SAV_騎手_偏差値帯_クラス
-阪神_ST指数_指数順位_クラス
-阪神_ST指数_指数順位_枠番
-阪神_ST指数_偏差値帯_クラス
-阪神_ST指数_偏差値帯_枠番
-阪神_ST指数_騎手_指数順位
-阪神_ST指数_騎手_偏差値帯
-阪神_ST指数_騎手_指数順位_枠番
-阪神_ST指数_騎手_偏差値帯_枠番
-阪神_ST指数_騎手_指数順位_クラス
-阪神_ST指数_騎手_偏差値帯_クラス
-阪神_合計値_指数順位_クラス
-阪神_合計値_指数順位_枠番
-阪神_合計値_偏差値帯_クラス
-阪神_合計値_偏差値帯_枠番
-阪神_合計値_騎手_指数順位
-阪神_合計値_騎手_偏差値帯
-阪神_合計値_騎手_指数順位_枠番
-阪神_合計値_騎手_偏差値帯_枠番
-阪神_合計値_騎手_指数順位_クラス
-阪神_合計値_騎手_偏差値帯_クラス
-阪神_展開_指数順位_クラス
-阪神_展開_指数順位_枠番
-阪神_展開_偏差値帯_クラス
-阪神_展開_偏差値帯_枠番
-阪神_展開_騎手_指数順位
-阪神_展開_騎手_偏差値帯
-阪神_展開_騎手_指数順位_枠番
-阪神_展開_騎手_偏差値帯_枠番
-阪神_展開_騎手_指数順位_クラス
-阪神_展開_騎手_偏差値帯_クラス
-阪神_仕上り_指数順位_クラス
-阪神_仕上り_指数順位_枠番
-阪神_仕上り_偏差値帯_クラス
-阪神_仕上り_偏差値帯_枠番
-阪神_仕上り_騎手_指数順位
-阪神_仕上り_騎手_偏差値帯
-阪神_仕上り_騎手_指数順位_枠番
-阪神_仕上り_騎手_偏差値帯_枠番
-阪神_仕上り_騎手_指数順位_クラス
-阪神_仕上り_騎手_偏差値帯_クラス
-阪神_先行_指数順位_クラス
-阪神_先行_指数順位_枠番
-阪神_先行_偏差値帯_クラス
-阪神_先行_偏差値帯_枠番
-阪神_先行_騎手_指数順位
-阪神_先行_騎手_偏差値帯
-阪神_先行_騎手_指数順位_枠番
-阪神_先行_騎手_偏差値帯_枠番
-阪神_先行_騎手_指数順位_クラス
-阪神_先行_騎手_偏差値帯_クラス
-阪神_追走_指数順位_クラス
-阪神_追走_指数順位_枠番
-阪神_追走_偏差値帯_クラス
-阪神_追走_偏差値帯_枠番
-阪神_追走_騎手_指数順位
-阪神_追走_騎手_偏差値帯
-阪神_追走_騎手_指数順位_枠番
-阪神_追走_騎手_偏差値帯_枠番
-阪神_追走_騎手_指数順位_クラス
-阪神_追走_騎手_偏差値帯_クラス
-阪神_持久_指数順位_クラス
-阪神_持久_指数順位_枠番
-阪神_持久_偏差値帯_クラス
-阪神_持久_偏差値帯_枠番
-阪神_持久_騎手_指数順位
-阪神_持久_騎手_偏差値帯
-阪神_持久_騎手_指数順位_枠番
-阪神_持久_騎手_偏差値帯_枠番
-阪神_持久_騎手_指数順位_クラス
-阪神_持久_騎手_偏差値帯_クラス
-阪神_持続_指数順位_クラス
-阪神_持続_指数順位_枠番
-阪神_持続_偏差値帯_クラス
-阪神_持続_偏差値帯_枠番
-阪神_持続_騎手_指数順位
-阪神_持続_騎手_偏差値帯
-阪神_持続_騎手_指数順位_枠番
-阪神_持続_騎手_偏差値帯_枠番
-阪神_持続_騎手_指数順位_クラス
-阪神_持続_騎手_偏差値帯_クラス
-阪神_瞬発_指数順位_クラス
-阪神_瞬発_指数順位_枠番
-阪神_瞬発_偏差値帯_クラス
-阪神_瞬発_偏差値帯_枠番
-阪神_瞬発_騎手_指数順位
-阪神_瞬発_騎手_偏差値帯
-阪神_瞬発_騎手_指数順位_枠番
-阪神_瞬発_騎手_偏差値帯_枠番
-阪神_瞬発_騎手_指数順位_クラス
-阪神_瞬発_騎手_偏差値帯_クラス
-阪神_想定前半_指数順位_クラス
-阪神_想定前半_指数順位_枠番
-阪神_想定前半_偏差値帯_クラス
-阪神_想定前半_偏差値帯_枠番
-阪神_想定前半_騎手_指数順位
-阪神_想定前半_騎手_偏差値帯
-阪神_想定前半_騎手_指数順位_枠番
-阪神_想定前半_騎手_偏差値帯_枠番
-阪神_想定前半_騎手_指数順位_クラス
-阪神_想定前半_騎手_偏差値帯_クラス
-阪神_想定後半_指数順位_クラス
-阪神_想定後半_指数順位_枠番
-阪神_想定後半_偏差値帯_クラス
-阪神_想定後半_偏差値帯_枠番
-阪神_想定後半_騎手_指数順位
-阪神_想定後半_騎手_偏差値帯
-阪神_想定後半_騎手_指数順位_枠番
-阪神_想定後半_騎手_偏差値帯_枠番
-阪神_想定後半_騎手_指数順位_クラス
-阪神_想定後半_騎手_偏差値帯_クラス
-阪神_タイムM_指数順位_クラス
-阪神_タイムM_指数順位_枠番
-阪神_タイムM_偏差値帯_クラス
-阪神_タイムM_偏差値帯_枠番
-阪神_タイムM_騎手_指数順位
-阪神_タイムM_騎手_偏差値帯
-阪神_タイムM_騎手_指数順位_枠番
-阪神_タイムM_騎手_偏差値帯_枠番
-阪神_タイムM_騎手_指数順位_クラス
-阪神_タイムM_騎手_偏差値帯_クラス
-阪神_対戦M_指数順位_クラス
-阪神_対戦M_指数順位_枠番
-阪神_対戦M_偏差値帯_クラス
-阪神_対戦M_偏差値帯_枠番
-阪神_対戦M_騎手_指数順位
-阪神_対戦M_騎手_偏差値帯
-阪神_対戦M_騎手_指数順位_枠番
-阪神_対戦M_騎手_偏差値帯_枠番
-阪神_対戦M_騎手_指数順位_クラス
-阪神_対戦M_騎手_偏差値帯_クラス
-
-### 小倉
-小倉_カツラキ_指数順位_クラス
-小倉_カツラキ_指数順位_枠番
-小倉_カツラキ_偏差値帯_クラス
-小倉_カツラキ_偏差値帯_枠番
-小倉_カツラキ_騎手_指数順位
-小倉_カツラキ_騎手_偏差値帯
-小倉_カツラキ_騎手_指数順位_枠番
-小倉_カツラキ_騎手_偏差値帯_枠番
-小倉_カツラキ_騎手_指数順位_クラス
-小倉_カツラキ_騎手_偏差値帯_クラス
-小倉_Gold_指数順位_クラス
-小倉_Gold_指数順位_枠番
-小倉_Gold_偏差値帯_クラス
-小倉_Gold_偏差値帯_枠番
-小倉_Gold_騎手_指数順位
-小倉_Gold_騎手_偏差値帯
-小倉_Gold_騎手_指数順位_枠番
-小倉_Gold_騎手_偏差値帯_枠番
-小倉_Gold_騎手_指数順位_クラス
-小倉_Gold_騎手_偏差値帯_クラス
-小倉_BC_指数順位_クラス
-小倉_BC_指数順位_枠番
-小倉_BC_偏差値帯_クラス
-小倉_BC_偏差値帯_枠番
-小倉_BC_騎手_指数順位
-小倉_BC_騎手_偏差値帯
-小倉_BC_騎手_指数順位_枠番
-小倉_BC_騎手_偏差値帯_枠番
-小倉_BC_騎手_指数順位_クラス
-小倉_BC_騎手_偏差値帯_クラス
-小倉_ZI_指数順位_クラス
-小倉_ZI_指数順位_枠番
-小倉_ZI_偏差値帯_クラス
-小倉_ZI_偏差値帯_枠番
-小倉_ZI_騎手_指数順位
-小倉_ZI_騎手_偏差値帯
-小倉_ZI_騎手_指数順位_枠番
-小倉_ZI_騎手_偏差値帯_枠番
-小倉_ZI_騎手_指数順位_クラス
-小倉_ZI_騎手_偏差値帯_クラス
-小倉_SAV_指数順位_クラス
-小倉_SAV_指数順位_枠番
-小倉_SAV_偏差値帯_クラス
-小倉_SAV_偏差値帯_枠番
-小倉_SAV_騎手_指数順位
-小倉_SAV_騎手_偏差値帯
-小倉_SAV_騎手_指数順位_枠番
-小倉_SAV_騎手_偏差値帯_枠番
-小倉_SAV_騎手_指数順位_クラス
-小倉_SAV_騎手_偏差値帯_クラス
-小倉_ST指数_指数順位_クラス
-小倉_ST指数_指数順位_枠番
-小倉_ST指数_偏差値帯_クラス
-小倉_ST指数_偏差値帯_枠番
-小倉_ST指数_騎手_指数順位
-小倉_ST指数_騎手_偏差値帯
-小倉_ST指数_騎手_指数順位_枠番
-小倉_ST指数_騎手_偏差値帯_枠番
-小倉_ST指数_騎手_指数順位_クラス
-小倉_ST指数_騎手_偏差値帯_クラス
-小倉_合計値_指数順位_クラス
-小倉_合計値_指数順位_枠番
-小倉_合計値_偏差値帯_クラス
-小倉_合計値_偏差値帯_枠番
-小倉_合計値_騎手_指数順位
-小倉_合計値_騎手_偏差値帯
-小倉_合計値_騎手_指数順位_枠番
-小倉_合計値_騎手_偏差値帯_枠番
-小倉_合計値_騎手_指数順位_クラス
-小倉_合計値_騎手_偏差値帯_クラス
-小倉_展開_指数順位_クラス
-小倉_展開_指数順位_枠番
-小倉_展開_偏差値帯_クラス
-小倉_展開_偏差値帯_枠番
-小倉_展開_騎手_指数順位
-小倉_展開_騎手_偏差値帯
-小倉_展開_騎手_指数順位_枠番
-小倉_展開_騎手_偏差値帯_枠番
-小倉_展開_騎手_指数順位_クラス
-小倉_展開_騎手_偏差値帯_クラス
-小倉_仕上り_指数順位_クラス
-小倉_仕上り_指数順位_枠番
-小倉_仕上り_偏差値帯_クラス
-小倉_仕上り_偏差値帯_枠番
-小倉_仕上り_騎手_指数順位
-小倉_仕上り_騎手_偏差値帯
-小倉_仕上り_騎手_指数順位_枠番
-小倉_仕上り_騎手_偏差値帯_枠番
-小倉_仕上り_騎手_指数順位_クラス
-小倉_仕上り_騎手_偏差値帯_クラス
-小倉_先行_指数順位_クラス
-小倉_先行_指数順位_枠番
-小倉_先行_偏差値帯_クラス
-小倉_先行_偏差値帯_枠番
-小倉_先行_騎手_指数順位
-小倉_先行_騎手_偏差値帯
-小倉_先行_騎手_指数順位_枠番
-小倉_先行_騎手_偏差値帯_枠番
-小倉_先行_騎手_指数順位_クラス
-小倉_先行_騎手_偏差値帯_クラス
-小倉_追走_指数順位_クラス
-小倉_追走_指数順位_枠番
-小倉_追走_偏差値帯_クラス
-小倉_追走_偏差値帯_枠番
-小倉_追走_騎手_指数順位
-小倉_追走_騎手_偏差値帯
-小倉_追走_騎手_指数順位_枠番
-小倉_追走_騎手_偏差値帯_枠番
-小倉_追走_騎手_指数順位_クラス
-小倉_追走_騎手_偏差値帯_クラス
-小倉_持久_指数順位_クラス
-小倉_持久_指数順位_枠番
-小倉_持久_偏差値帯_クラス
-小倉_持久_偏差値帯_枠番
-小倉_持久_騎手_指数順位
-小倉_持久_騎手_偏差値帯
-小倉_持久_騎手_指数順位_枠番
-小倉_持久_騎手_偏差値帯_枠番
-小倉_持久_騎手_指数順位_クラス
-小倉_持久_騎手_偏差値帯_クラス
-小倉_持続_指数順位_クラス
-小倉_持続_指数順位_枠番
-小倉_持続_偏差値帯_クラス
-小倉_持続_偏差値帯_枠番
-小倉_持続_騎手_指数順位
-小倉_持続_騎手_偏差値帯
-小倉_持続_騎手_指数順位_枠番
-小倉_持続_騎手_偏差値帯_枠番
-小倉_持続_騎手_指数順位_クラス
-小倉_持続_騎手_偏差値帯_クラス
-小倉_瞬発_指数順位_クラス
-小倉_瞬発_指数順位_枠番
-小倉_瞬発_偏差値帯_クラス
-小倉_瞬発_偏差値帯_枠番
-小倉_瞬発_騎手_指数順位
-小倉_瞬発_騎手_偏差値帯
-小倉_瞬発_騎手_指数順位_枠番
-小倉_瞬発_騎手_偏差値帯_枠番
-小倉_瞬発_騎手_指数順位_クラス
-小倉_瞬発_騎手_偏差値帯_クラス
-小倉_想定前半_指数順位_クラス
-小倉_想定前半_指数順位_枠番
-小倉_想定前半_偏差値帯_クラス
-小倉_想定前半_偏差値帯_枠番
-小倉_想定前半_騎手_指数順位
-小倉_想定前半_騎手_偏差値帯
-小倉_想定前半_騎手_指数順位_枠番
-小倉_想定前半_騎手_偏差値帯_枠番
-小倉_想定前半_騎手_指数順位_クラス
-小倉_想定前半_騎手_偏差値帯_クラス
-小倉_想定後半_指数順位_クラス
-小倉_想定後半_指数順位_枠番
-小倉_想定後半_偏差値帯_クラス
-小倉_想定後半_偏差値帯_枠番
-小倉_想定後半_騎手_指数順位
-小倉_想定後半_騎手_偏差値帯
-小倉_想定後半_騎手_指数順位_枠番
-小倉_想定後半_騎手_偏差値帯_枠番
-小倉_想定後半_騎手_指数順位_クラス
-小倉_想定後半_騎手_偏差値帯_クラス
-小倉_タイムM_指数順位_クラス
-小倉_タイムM_指数順位_枠番
-小倉_タイムM_偏差値帯_クラス
-小倉_タイムM_偏差値帯_枠番
-小倉_タイムM_騎手_指数順位
-小倉_タイムM_騎手_偏差値帯
-小倉_タイムM_騎手_指数順位_枠番
-小倉_タイムM_騎手_偏差値帯_枠番
-小倉_タイムM_騎手_指数順位_クラス
-小倉_タイムM_騎手_偏差値帯_クラス
-小倉_対戦M_指数順位_クラス
-小倉_対戦M_指数順位_枠番
-小倉_対戦M_偏差値帯_クラス
-小倉_対戦M_偏差値帯_枠番
-小倉_対戦M_騎手_指数順位
-小倉_対戦M_騎手_偏差値帯
-小倉_対戦M_騎手_指数順位_枠番
-小倉_対戦M_騎手_偏差値帯_枠番
-小倉_対戦M_騎手_指数順位_クラス
-小倉_対戦M_騎手_偏差値帯_クラス
-------------------------------------

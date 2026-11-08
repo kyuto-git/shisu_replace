@@ -6,6 +6,13 @@ agg_csv/
 master_csv/
 entries_in/
 entries_out/
+ingest_in/
+ingest_out/
+ext_indices/
+raw_csv/
+selected_families.json
+*.xlsx
+*.xlsm
 置換前CSV/
 *.csv
 *.db
@@ -18,3 +25,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.log
+
+# 同梱のマスタ（コース属性・輸送距離など）は追跡する
+!shisu/data/
+!shisu/data/*.csv

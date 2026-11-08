@@ -3,6 +3,11 @@ pandas==2.3.3
 numpy==2.3.5
 scipy==1.16.3
 Flask==3.1.2
+# 指数の取得（shisu/ingest: スクレイピング・安井 Excel）
+requests==2.32.5
+beautifulsoup4==4.14.2
+lxml==6.0.2
+openpyxl==3.1.5
 # 以下は上記の依存（固定）
 blinker==1.9.0
 click==8.5.0
@@ -13,3 +18,10 @@ python-dateutil==4.0.0
 pytz==2026.6
 tzdata==2026.6
 Werkzeug==3.1.9
+certifi==2026.10.23
+charset-normalizer==3.5.2
+idna==3.20
+urllib3==2.8.0
+soupsieve==4.0.1
+typing_extensions==4.16.0
+et_xmlfile==2.0.0

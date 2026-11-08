@@ -17,6 +17,13 @@ agg_csv/
 master_csv/
 entries_in/
 entries_out/
+ingest_in/
+ingest_out/
+ext_indices/
+raw_csv/
+selected_families.json
+*.xlsx
+*.xlsm
 置換前CSV/
 
 # --- 例外: 構造確認用のサンプル CSV だけは追跡する ---
@@ -27,3 +34,7 @@ entries_in/*
 !entries_out/
 entries_out/*
 !entries_out/entries_merged_hensachi.csv
+
+# 同梱のマスタ（コース属性・輸送距離など）は追跡する
+!shisu/data/
+!shisu/data/*.csv

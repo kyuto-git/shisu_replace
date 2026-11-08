@@ -21,12 +21,17 @@ class IndicatorSpec:
     reverse: bool = False           # 小さいほど良い指数（符号反転してから偏差値化）
     zi: bool = False                # ZI 特例: 0/欠損を同レース非ゼロ平均で埋める
     exclude_shinba: bool = False    # 新馬戦を除外する
+    zero_missing: bool = False      # 0 を欠損とみなし、順位は元の順位列を使わず値から計算する（両側で同じ扱い）
+                                    # TARGET は取り込んでいない馬の外部指数を 0 で出す（同梱サンプルの ZI で確認）ため、
+                                    # 0 がほぼ現れない指数で「値なし」を両側そろえて欠損にする
 
 
 _YOSHIUMA = ("吉馬_SP能力値", "吉馬_先行力", "吉馬_SP信頼", "吉馬_SP調整", "吉馬_SP最大", "吉馬_末脚力")
+# 0 を欠損とみなすもの（4ファイルで値0は 0.1〜0.3%）と、0 が普通に出るもの（体力・やる気は約14%が0）
+_YASUI_ZERO_MISSING = ("安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー", "安井_根性", "安井_賢さ")
+_YASUI_ZERO_VALUE = ("安井_体力", "安井_やる気")
 
 INDICATORS: tuple[IndicatorSpec, ...] = (
-    IndicatorSpec("カツラキ"),
     IndicatorSpec("Gold", ("GoldAirplane", "Gold指数", "Gold_Airplane")),
     IndicatorSpec("BC", ("BCindex", "BC指数")),
     IndicatorSpec("ZI", ("ZI指数",), zi=True, exclude_shinba=True),
@@ -44,15 +49,25 @@ INDICATORS: tuple[IndicatorSpec, ...] = (
     IndicatorSpec("持久", ("持久力",)),
     IndicatorSpec("持続", ("持続力",)),
     IndicatorSpec("瞬発", ("瞬発力",)),
-    IndicatorSpec("想定前半", ("想定前半3F",), reverse=True),
-    IndicatorSpec("想定後半", ("想定後半3F",), reverse=True),
-    IndicatorSpec("タイムM", ("マイニング値", "タイム指数", "TimeM"), reverse=True),
+    # 想定前半・想定後半は3Fの秒数（小さいほど良い）。0 はありえないので欠損（外部指数の無い馬に TARGET が出す 0 を最高値にしない）
+    IndicatorSpec("想定前半", ("想定前半3F",), reverse=True, zero_missing=True),
+    IndicatorSpec("想定後半", ("想定後半3F",), reverse=True, zero_missing=True),
+    # タイムM（TARGET のマイニング）は値の大きい馬が1位（★6 の過去CSV 255レース全部で、TARGET の 指数順位 1 がレースの最大値）。
+    # 旧版は「小さいほど良い」として反転していたが、順位と偏差値が逆向きになっていた
+    IndicatorSpec("タイムM", ("マイニング値", "タイム指数", "TimeM"), reverse=False),
     IndicatorSpec("対戦M", ("対戦型マイニング値", "MatchM")),
     IndicatorSpec("圧勝力"),
+    # 安井サロン（月別 Excel。shisu/yasui_extractor.py）
+    *(IndicatorSpec(n, zero_missing=True) for n in _YASUI_ZERO_MISSING),
+    *(IndicatorSpec(n) for n in _YASUI_ZERO_VALUE),
 )
 
 # 画面での並び順（台帳の順）
 INDICATOR_ORDER: tuple[str, ...] = tuple(s.name for s in INDICATORS)
+
+# 集計の対象から外した指数（2026-11-06）。csv_files・ext_indices・出馬表の列にあっても使わない
+DISCONTINUED: tuple[str, ...] = ("カツラキ", "HPRTV5C", "成績ST指数", "結果分析スピード指数", "一隊", "ittai",
+                                 "33rap", "上がり1F", "上がり2F", "1F", "2F")
 
 
 def _lookup_key(raw) -> str:
@@ -70,6 +85,19 @@ _SPEC_BY_NAME = {s.name: s for s in INDICATORS}
 
 def is_known_indicator(raw) -> bool:
     return _lookup_key(raw) in _BY_KEY
+
+
+_DISCONTINUED_KEYS = {_lookup_key(n) for n in DISCONTINUED}
+
+
+def is_discontinued(raw) -> bool:
+    """廃止した指数か（カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F）。
+    「結果分析スピード指数(ittai)」のように括弧で別名を添えた名前も、括弧の外・中のどちらかが廃止名なら廃止。"""
+    key = _lookup_key(raw)
+    if key in _DISCONTINUED_KEYS:
+        return True
+    m = re.fullmatch(r"(.*?)[(（](.*?)[)）]", key)
+    return bool(m) and (m.group(1) in _DISCONTINUED_KEYS or m.group(2) in _DISCONTINUED_KEYS)
 
 
 def canonical_indicator(raw) -> str:

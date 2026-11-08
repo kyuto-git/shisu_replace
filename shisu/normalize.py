@@ -60,21 +60,22 @@ def weight_series(raw: pd.Series) -> pd.Series:
     return norm_series(raw).map(lambda v: _WEIGHT_MAP.get(v, v)).astype(object)
 
 
-# レース名のハンデ記号。TARGET は「むらさＨ･3勝」「目黒記念ＨG2」「安土城Ｈ(L)」のように
-# 全角Ｈを付ける。NFKC 後に H となるので、前が英字でなく、後ろが 末尾/・/(/G/J/L/数字 の H を拾う。
+# レース名のハンデ記号。TARGET は「むらさＨ･3勝」「目黒記念ＨG2」「安土城Ｈ(L)」「北陸ＳＨ･3勝」のように
+# 全角Ｈを付ける（ＳＨ・ＣＨ・ＴＨ は ステークス・カップ・トロフィー の略＋ハンデ）。NFKC 後に H となるので、
+# 前が英字でない（または S・C・T の直後）で、後ろが 末尾/・/(/G/J/L/数字 の H を拾う。
 # 「NHKマイルC」「HTB賞」のような英字列中の H は拾わない（旧版は H を含むだけでハンデ扱いだった）。
-_HANDICAP_RE = re.compile(r"(?<![A-Za-z])H(?=$|[・(GJL0-9])")
+_HANDICAP_RE = re.compile(r"(?:(?<![A-Za-z])|(?<=[SCT]))H(?=$|[・(GJL0-9])")
 
 
 def infer_entry_weight(race_name, age_limit, class_norm: str) -> str:
-    """出馬表に重量種別の列が無いときの推定。
+    """出馬表に重量種別の列が無いときの推定（過去側は TARGET の 重量種別 列。別定は定量にまとめる）。
 
     - レース名にハンデ記号 → ハンデ
-    - 年限定に「上」（3歳以上・4歳以上）→ 定量
-    - 3歳限定の G1 → 定量（皐月賞・ダービー・桜花賞など 3歳G1 はすべて定量）
-    - それ以外の 2歳・3歳限定 → 馬齢
+    - 年限定に「上」（3歳以上・4歳以上）→ 定量（定量・別定）
+    - 2歳・3歳限定のオープン・リステッド（クラス 準OP・OP）→ 定量（TARGET では 別定。アイビーＳ(L)・萩Ｓ(L)・もみじＳ）
+    - それ以外の 2歳・3歳限定（新馬・未勝利・1勝・重賞・G1）→ 馬齢（菊花賞・秋華賞なども TARGET は 馬齢）
     - 年限定が空 → 判定不能として ""（重量種別を含むキーは作らない）
-    3歳限定の別定重賞などは過去側（定量）とずれる。正確にするには TARGET の出馬表出力に
+    2・3歳限定の別定重賞などは過去側（定量）とずれる。正確にするには TARGET の出馬表出力に
     重量種別の列を追加する（列があればそちらを優先する）。
     """
     if _HANDICAP_RE.search(norm_text(race_name)):
@@ -84,7 +85,7 @@ def infer_entry_weight(race_name, age_limit, class_norm: str) -> str:
         return ""
     if "上" in age:
         return "定量"
-    if class_norm == "G1" and age.startswith("3歳"):
+    if class_norm == "準OP・OP":
         return "定量"
     return "馬齢"
 
@@ -209,14 +210,44 @@ def entry_inner_outer(place: str, surface: str, gaimawari) -> str:
 # ---------------------------------------------------------------------------
 # レースID・日付
 # ---------------------------------------------------------------------------
+def split_surface_distance(surface: pd.Series, distance: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """芝・ダ 列が無い・空で、距離 が「ダ1200」「芝2000」の形（★6タブの過去レースCSV）なら分ける。
+    独立した 芝・ダ 列がある形（従来の形）はそのまま。障害は「障」。戻り値は (芝・ダ, 距離) の文字列。"""
+    s = norm_series(surface)
+    d = norm_series(distance)
+    m = d.str.extract(r"^(芝|ダ|障)(.+)$")
+    has = m[0].notna()
+    s = s.where(~(has & (s == "")), m[0])
+    d = d.where(~has, m[1])
+    return s.fillna("").astype(object), d.fillna("").astype(object)
+
+
 def race_id_without_horse(rid: pd.Series, given: pd.Series | None = None) -> pd.Series:
-    """レースID(新/馬番無)。列があればそれを使い、無ければ レースID(新) の末尾2桁（馬番）を落とす。"""
+    """レースID(新/馬番無)（16桁）。列があればそれを使う。無ければ レースID(新) から作る:
+    18桁 → 先頭16桁 / 16桁（もともとレース単位）→ そのまま / それ以外 → 末尾2桁を落とす（旧来の扱い）。
+    （16桁のレース単位IDから末尾2桁を落とすと R が消えて、同じ日・場の全レースが1レース扱いになる）
+    """
     rid = norm_series(rid)
-    derived = rid.where(rid.str.len() > 2, "").str.slice(0, -2)
+    legacy = rid.where(rid.str.len() > 2, "").str.slice(0, -2)
+    derived = rid.str.slice(0, 16).where(rid.str.fullmatch(r"\d{18}"), rid.where(rid.str.fullmatch(r"\d{16}"), legacy))
     if given is None:
         return derived.astype(object)
     g = norm_series(given)
     return g.where(g != "", derived).astype(object)
+
+
+def horse_race_id(rid: pd.Series, uma: pd.Series) -> pd.Series:
+    """レースID(新) を馬単位（18桁）にそろえる。16桁（レース単位）のIDには 馬番2桁 を付ける。
+
+    TARGET の出力設定によってはレースID(新) がレース単位になる。そのままだと同じレースの馬が
+    同じIDを持ち、レースID で突き合わせる処理で別の馬同士が掛け合わされる（旧版の band 系で
+    件数・勝率が膨らんだ不具合の原因）。馬番が読めない行はそのまま返す。
+    """
+    rid = norm_series(rid)
+    num = int_series(uma)
+    ok = rid.str.fullmatch(r"\d{16}") & num.between(1, 99).fillna(False).astype(bool)
+    pad = num.astype("float").map(lambda v: "" if v != v else f"{int(v):02d}")
+    return rid.where(~ok, rid + pad).astype(object)
 
 
 def race_date(rid: pd.Series) -> pd.Series:
