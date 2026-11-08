@@ -6,6 +6,8 @@
   - 既存の csv_files/全場_{種類}.csv と、raw_csv のファイル（更新日時の古い順）を縦につなぎ、レースID(新) が同じ馬の行は
     後のファイルの行を使う（追加抽出した新しいファイルが優先）。レース単位（16桁）の ID は 馬番 を付けて馬単位で比べる。
     レースID(新) の無い行・16桁で馬番の読めない行はそのまま残す
+  - 前走の列（前走場所〜前走レースID(新)・間隔・休み明け～戦目）が全部空の行（TARGET で前走データ読込をせずに出した行）は、
+    統合した全期間の 血統登録番号 ごとの履歴から補って書く（shisu.conditions.fill_previous_runs。10年より古い行を消す前に）
   - 書き出しは一時ファイルに書いてから置き換える（途中で止まっても既存の 全場_*.csv を壊さない）
   - 最大10年分を残す: 基準年（既定はデータの中の最新年。ref_year で指定もできる）の9年前以降。
     例: 2026年が基準なら 2017〜2026年を残し、2016年以前は消す。年は レースID(新) の先頭4桁（無ければ 日付S）
@@ -24,6 +26,7 @@ from typing import Callable, Iterable
 
 import pandas as pd
 
+from .conditions import fill_previous_runs
 from .csvio import norm_series, read_csv_any, write_csv
 from .normalize import horse_race_id
 
@@ -66,12 +69,14 @@ class MergeResult:
     no_year: int = 0                                      # 年の分からない行（残す）
     after: int = 0
     years: tuple[int, int] | None = None                  # 残した年の範囲
+    prev_filled: int = 0                                  # 前走の列を履歴から補った行
     moved: list[Path] = field(default_factory=list)
 
     def summary(self) -> str:
         span = f"{self.years[0]}〜{self.years[1]}年" if self.years else "年の分からない行だけ"
         return (f"{self.kind}: 既存 {self.before} 行 ＋ 追加 {len(self.files)} 本 {self.added_rows} 行 → "
-                f"{self.after} 行（{span}。重複の置き換え {self.replaced} 行・10年より古い行の削除 {self.dropped_old} 行）"
+                f"{self.after} 行（{span}。重複の置き換え {self.replaced} 行・10年より古い行の削除 {self.dropped_old} 行"
+                + (f"・前走の列を履歴から補った {self.prev_filled} 行" if self.prev_filled else "") + "）"
                 f" → {self.out_path.name}")
 
 
@@ -120,6 +125,11 @@ def merge_kind(kind: str, files: list[Path], csv_dir: Path | str, years: int = D
     dup = has & rid.where(has, None).duplicated(keep="last")            # 後のファイルの行を残す
     res.replaced = int(dup.sum())
     df = df[~dup]
+    # 前走の列が空の行（TARGET で前走データ読込をせずに出した行）を、統合した全期間の 血統登録番号 の履歴から補う
+    # （10年より古い行を消す前に。窓の最初の年の馬も、その前の走りから補える）
+    df = fill_previous_runs(df, log=log)
+    res.prev_filled = int(df.attrs.get("prev_filled", {}).get("filled", 0))
+    cols += [c for c in df.columns if c not in cols]
     y = _year(df)
     res.no_year = int(y.isna().sum())
     if y.notna().any():

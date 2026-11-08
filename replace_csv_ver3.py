@@ -10,6 +10,8 @@
       各馬に外部指数を レースID(新)・レースID(旧) で結び付け、「{地域}_{指数名}」の入力があるものとして処理する
       （csv_files に同じ地域・指数のファイルがあれば、そちらを使う）
   廃止した指数（カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F）は読まない
+  前走の列（前走場所〜前走レースID(新)・間隔・休み明け～戦目）が全部空の行（TARGET で前走データ読込をせずに出した行）は、
+  同じCSVの 血統登録番号 ごとの履歴から補う（shisu.conditions.fill_previous_runs。障害・頭数で絞る前に）
   raw_csv/ に未統合の基本CSV（追加抽出したタイムM・対戦M）があれば、先に csv_files/全場_タイムM.csv・全場_対戦M.csv に
   統合する（レースID(新) で重複を除き後のファイルを優先・最大10年分。shisu/raw_merge.py。--no-raw-merge で飛ばす）
 
@@ -31,7 +33,8 @@ from pathlib import Path
 import pandas as pd
 
 from shisu import config
-from shisu.conditions import INNER_FILE, CONDITION_COLUMNS, derive, inner_lookup_from, standardize_history
+from shisu.conditions import (INNER_FILE, CONDITION_COLUMNS, derive, fill_previous_runs, inner_lookup_from,
+                              standardize_history)
 from shisu.csvio import norm_series, read_csv_any, write_csv
 from shisu.families import build_keys, get as get_family
 from shisu.finish import parse_finish
@@ -121,8 +124,14 @@ def process_frame(raw: pd.DataFrame, stem: str, region: str, indicator: str, mas
     spec = spec_for(indicator)
     if "指数" not in raw.columns:
         return f"[SKIP] {label}: 指数 列がありません"
+    if "prev_filled" not in raw.attrs:   # 前走の列が空の行（前走データ読込なし）を同じCSVの履歴から補う（障害を除く前に）
+        raw = fill_previous_runs(raw)
     df = normalize_history(raw)
     notes = []
+    pf = raw.attrs.get("prev_filled") or {}
+    if pf.get("blank"):
+        notes.append(f"前走の列が空の {pf['blank']} 行のうち {pf['filled']} 行を血統登録番号の履歴から補いました"
+                     f"（前の走りがCSVに無い・デビュー {pf['no_history']} 行・キャリアが続かない {pf['gap']} 行は空のまま）")
     if df.attrs.get("race_level_ids"):
         notes.append(f"レース単位のレースID {df.attrs['race_level_ids']}行に馬番を付けて18桁にしました")
     if df.attrs.get("race_level_unfixed"):
@@ -167,7 +176,7 @@ def process_frame(raw: pd.DataFrame, stem: str, region: str, indicator: str, mas
         print(f"[WARN] {label}: 頭数 列が無いため頭数{MIN_HEADS}以上の絞り込みをしません", file=sys.stderr)
         heads_ok = pd.Series(True, index=df.index)
 
-    cond = derive(standardize_history(raw, df), inner_lookup)
+    cond = derive(standardize_history(raw, df, fill_previous=False), inner_lookup)   # 補うのは上で済んでいる
     for c in CONDITION_COLUMNS:
         df[c] = cond[c]
     m = df[heads_ok].copy()
@@ -198,7 +207,8 @@ def process_file(path: str, master_dir: str, processed_dir: str | None, inner_lo
 
 @functools.lru_cache(maxsize=2)
 def _read_base(path: str) -> pd.DataFrame:
-    return read_csv_any(path)
+    """基本CSV（指数ごとに何度も使う）。前走の列の補いもここで1回だけする。"""
+    return fill_previous_runs(read_csv_any(path))
 
 
 def process_ext(base_path: str, indicator: str, master_dir: str, processed_dir: str | None,
