@@ -2,7 +2,7 @@
 
 開発再開時の「思い出し用」要約。詳細な仕様は **CLAUDE.md** を参照（コードが正、CLAUDE.md はコードに合わせて更新）。
 
-更新日: 2026-11-08
+更新日: 2026-11-07
 
 ## 流れ
 
@@ -48,6 +48,5 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - WEDGE = WIN（決定力）+ EDGE（オッズから見た期待着順を上回った割合）。adjusted_WEDGE は年10件以上の年すべて（最大10年）を新しい年ほど重い指数減衰（0.65）で加重
 - 外部指数の取得は `shisu/ingest/` と `shisu/yasui_extractor.py`（安井 8指数。指数ごとのフォルダ。ベースCSV未指定でも ingest_in/base/・entries_in/ から該当日を探す。出馬表用の entries_in/yasui_*.csv は廃止）
 - 出馬表の外部指数: 出馬表に値のある指数は出馬表の値（ファイル・レースごとに判定）、無い・0 だけのレースは ext_indices から過去側と同じ関数（`ext_indices.attach_filled`）で付ける → 同じ馬なら master と順位・偏差値が一致
-- ★6 の過去CSVは TARGET の「前走データ読込」なしでよい: 前走の列・間隔・休み明け～戦目 が全部空の行は、同じCSVの 血統登録番号 の履歴から補う（`shisu.conditions.fill_previous_runs`。間隔 = 木曜始まりの週の差、休み明け = 間隔8以上で1。TARGET の出力に合わせた規則。取消・除外は前走にしない。キャリアが続かない行は補わない）
 - レース単位（16桁）の レースID(新) は replace が馬番を付けて18桁にする（旧版の band 系の件数膨張の再発防止。tests/test_band_regression.py）
 - family・集計条件だけ変えたときは aggregate → build_db だけでよい（master はそのまま）
