@@ -2,12 +2,13 @@
 
 開発再開時の「思い出し用」要約。詳細な仕様は **CLAUDE.md** を参照（コードが正、CLAUDE.md はコードに合わせて更新）。
 
-更新日: 2026-11-07
+更新日: 2026-11-08
 
 ## 流れ
 
 ```
 raw_csv/（追加分の基本CSV）─ replace の最初に統合 ─> csv_files/全場_タイムM.csv・全場_対戦M.csv（重複は後優先・最大10年）
+raw_csv/（列パッチ: レースID(新) と前走の列だけ・指数 列なし）─ 統合のあとに 全場_タイムM・全場_対戦M の両方へ横結合（空でない値で上書き）
 csv_files/（★6タブの基本CSV {地域}_タイムM / {地域}_対戦M。従来の {地域}_{指数名} も可）＋ ext_indices/（外部指数CSV群）
            ─ replace_csv_ver3.py ─> master_csv/（1頭1行。キーの部品・22条件・偏差値・順位）
            ─ screen_families.py（推奨）─> screening_report.csv / selected_families.json（使う family）

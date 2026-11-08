@@ -10,6 +10,11 @@
   - 最大10年分を残す: 基準年（既定はデータの中の最新年。ref_year で指定もできる）の9年前以降。
     例: 2026年が基準なら 2017〜2026年を残し、2016年以前は消す。年は レースID(新) の先頭4桁（無ければ 日付S）
   - 統合したファイルは raw_csv/merged_done/ に移す（同じ名前があれば _2 などを付ける。次回また統合しない）
+  - **列パッチ**: `レースID(新)` があって `指数` 列の無いCSV（前走の列だけを出した軽いCSVなど。名前は問わない）は、
+    基本CSVではなく列パッチとして扱う。全部のパッチを読み、レースID(新)（18桁。16桁なら馬番を付ける）ごとに、
+    パッチにある列（レースID(新) 以外）の空でない値で csv_files/全場_タイムM.csv・全場_対戦M.csv の両方の同じ馬の行を
+    上書き・補完する（無い列は足す。複数のパッチで同じ馬・同じ列なら後のファイルの値）。基本CSVの統合のあとに当てる。
+    当てたパッチは merged_done/ に移す。全場_*.csv が無い・1行も当たらないパッチは raw_csv に残す
 replace_csv_ver3.py は raw_csv/ に未統合のCSVがあれば、master を作る前にこれを実行する。
 """
 from __future__ import annotations
@@ -73,6 +78,136 @@ class MergeResult:
         return (f"{self.kind}: 既存 {self.before} 行 ＋ 追加 {len(self.files)} 本 {self.added_rows} 行 → "
                 f"{self.after} 行（{span}。重複の置き換え {self.replaced} 行・10年より古い行の削除 {self.dropped_old} 行）"
                 f" → {self.out_path.name}")
+
+
+PATCH_KIND = "列パッチ"
+
+
+def _columns(path: Path) -> list[str] | None:
+    """CSV の見出し（読めなければ None）。cp932 → utf-8-sig → utf-8 の順。レースID(新) が見えなければ UTF-8 でも読み直す。"""
+    found = None
+    for enc in ("cp932", "utf-8-sig", "utf-8"):
+        try:
+            cols = [str(c).strip() for c in pd.read_csv(path, encoding=enc, dtype=str, nrows=0).columns]
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            return None
+        if RID in cols:
+            return cols
+        found = found or cols
+    return found
+
+
+def file_role(path: Path | str) -> str | None:
+    """raw_csv のファイルの扱い: 'タイムM' / '対戦M'（基本CSV）・PATCH_KIND（列パッチ）・None（分からない）。
+    レースID(新) があって 指数 列の無いCSVは、名前に関係なく列パッチ。それ以外は名前で種類を決める。"""
+    cols = _columns(Path(path))
+    if cols is not None and RID in cols and "指数" not in cols:
+        return PATCH_KIND
+    return kind_of(Path(path).name)
+
+
+@dataclass
+class PatchResult:
+    """列パッチ（§3.9）の結果。"""
+    kind: str = PATCH_KIND
+    files: list[Path] = field(default_factory=list)            # 当てたパッチ
+    rows: int = 0                                               # パッチの行（18桁の レースID(新) がある行）
+    bad_ids: int = 0                                            # レースID(新) が18桁にならない行（当てない）
+    unmatched: int = 0                                          # どの 全場_*.csv にも無い馬（当てない）
+    updated: dict[str, int] = field(default_factory=dict)      # 全場_*.csv → 値が変わった行
+    columns: dict[str, dict[str, int]] = field(default_factory=dict)   # 全場_*.csv → 列 → 値が変わったセル
+    moved: list[Path] = field(default_factory=list)
+
+    def summary(self) -> str:
+        targets = "・".join(f"{name} 更新 {n} 行" for name, n in self.updated.items()) or "当てる 全場_*.csv がありません"
+        cols: list[str] = []
+        for per in self.columns.values():
+            cols += [c for c in per if c not in cols]
+        extra = f"・全場_*.csv に無い {self.unmatched} 行" if self.unmatched else ""
+        extra += f"・レースID(新) が18桁でない {self.bad_ids} 行" if self.bad_ids else ""
+        return (f"前走・追加列パッチを反映しました: {targets}（パッチ {len(self.files)} 本 {self.rows} 行{extra}。"
+                f"対象列: {'・'.join(cols) if cols else 'なし（値の変わる列なし）'}）")
+
+
+def _blank(s: pd.Series) -> pd.Series:
+    return s.astype(object).where(s.notna(), "").astype(str).str.strip() == ""
+
+
+def apply_patches(files: list[Path], csv_dir: Path | str, log: Logger = print) -> PatchResult:
+    """列パッチ（files。古い順）を csv_files/全場_タイムM.csv・全場_対戦M.csv に当てる（パッチのファイルは動かさない）。"""
+    res = PatchResult()
+    frames = []
+    for p in files:
+        try:
+            df = read_csv_any(p)
+        except Exception as e:
+            log(f"[WARN] raw_csv/{p.name} を読めないのでパッチを当てません（{type(e).__name__}: {e}）")
+            continue
+        if RID not in df.columns:
+            log(f"[WARN] raw_csv/{p.name} に {RID} 列が無いのでパッチを当てません")
+            continue
+        frames.append(df)
+        res.files.append(p)
+    if not frames:
+        return res
+    cols: list[str] = []
+    for f in frames:
+        cols += [c for c in f.columns if c not in cols]
+    patch = pd.concat([f.reindex(columns=cols) for f in frames], ignore_index=True)
+    patch = patch.astype(object).where(patch.notna(), "")
+    uma = patch["馬番"] if "馬番" in patch.columns else pd.Series("", index=patch.index)
+    key = horse_race_id(patch[RID], uma)
+    ok = key.str.fullmatch(r"\d{18}").fillna(False).astype(bool)
+    res.bad_ids = int((~ok).sum())
+    res.rows = int(ok.sum())
+    patch, key = patch[ok], key[ok]
+    targets_cols = [c for c in cols if c != RID and not str(c).startswith("Unnamed:")]
+    values: dict[str, pd.Series] = {}                 # 列 → (馬 → 値)。空の値は当てない。同じ馬は後のファイルの値
+    for c in targets_cols:
+        has = ~_blank(patch[c])
+        if has.any():
+            v = pd.Series(patch.loc[has, c].to_numpy(), index=key[has].to_numpy())
+            values[c] = v[~v.index.duplicated(keep="last")]
+    found: set[str] = set()
+    for kind in KINDS:
+        out = Path(csv_dir) / MERGED_NAME.format(kind=kind)
+        if not out.exists():
+            continue
+        df = read_csv_any(out)
+        tuma = df["馬番"] if "馬番" in df.columns else pd.Series("", index=df.index)
+        tkey = horse_race_id(df[RID], tuma) if RID in df.columns else pd.Series("", index=df.index)
+        found |= set(tkey[tkey.isin(set(key))])
+        changed_rows = pd.Series(False, index=df.index)
+        per: dict[str, int] = {}
+        for c, v in values.items():
+            new = tkey.map(v)
+            hit = new.notna()
+            if not hit.any():
+                continue
+            if c not in df.columns:
+                df[c] = ""
+            cur = df[c].astype(object).where(df[c].notna(), "")
+            diff = hit & (cur.astype(str) != new.astype(str))
+            if diff.any():
+                df[c] = cur.where(~diff, new)
+                per[c] = int(diff.sum())
+                changed_rows |= diff
+        res.updated[out.name] = int(changed_rows.sum())
+        res.columns[out.name] = per
+        if per:
+            tmp = out.with_name(f".{out.name}.tmp")          # 一時ファイルに書いてから置き換える
+            write_csv(df, tmp)
+            os.replace(tmp, out)
+    res.unmatched = int((~key.isin(found)).sum()) if res.updated else res.rows
+    if not res.updated:
+        log(f"[WARN] {MERGED_NAME.format(kind='タイムM')}・{MERGED_NAME.format(kind='対戦M')} が無いので、列パッチ "
+            f"{len(res.files)} 本を当てられません（基本CSVを先に統合してください。パッチは raw_csv に残します）")
+    elif res.unmatched:
+        log(f"[WARN] 列パッチの {res.unmatched} 行は 全場_*.csv に無いレース（馬）なので当てていません"
+            "（そのレースの基本CSVを統合してから、パッチを raw_csv に置き直してください）")
+    return res
 
 
 def _year(df: pd.DataFrame) -> pd.Series:
@@ -153,34 +288,55 @@ def _unique(dest: Path) -> Path:
 
 def merge_raw(raw_dir: Path | str, csv_dir: Path | str, files: Iterable[Path | str] | None = None,
               years: int = DEFAULT_YEARS, ref_year: int | None = None, move: bool = True,
-              log: Logger = print) -> list[MergeResult]:
-    """raw_csv/ の基本CSV（files を渡せばそれだけ）を種類ごとに統合する。統合したファイルは merged_done/ に移す。"""
+              log: Logger = print) -> list:
+    """raw_csv/ の基本CSV（files を渡せばそれだけ）を種類ごとに統合し、そのあと列パッチを当てる。
+    統合・当てたファイルは merged_done/ に移す。戻り値は MergeResult（種類ごと）と PatchResult（パッチがあれば）。"""
     raw_dir = Path(raw_dir)
     files = [Path(f) for f in files] if files is not None else pending_files(raw_dir)
     by_kind: dict[str, list[Path]] = {k: [] for k in KINDS}
+    patches: list[Path] = []
     for p in files:
-        k = kind_of(p.name)
+        k = file_role(p)
+        if k == PATCH_KIND:
+            patches.append(p)
+            continue
         if k is None:
             log(f"[WARN] raw_csv/{p.name}: 名前から タイムM か 対戦M か分からないので統合しません"
-                "（名前に「タイム」「マイニング」または「対戦」を入れてください）")
+                "（基本CSVなら名前に「タイム」「マイニング」または「対戦」を入れてください。"
+                "列パッチなら レースID(新) と補う列だけにしてください（指数 列を入れない））")
             continue
         by_kind[k].append(p)
-    results = []
+
+    def move_done(res) -> None:
+        if not (res.files and move):
+            return
+        done = raw_dir / DONE_DIR
+        done.mkdir(parents=True, exist_ok=True)
+        for p in res.files:
+            if Path(p).parent.resolve() != raw_dir.resolve():
+                continue                    # raw_csv の外のファイル（直接渡したもの）は動かさない
+            dst = _unique(done / p.name)
+            shutil.move(str(p), str(dst))
+            res.moved.append(dst)
+
+    results: list = []
     for kind, fs in by_kind.items():
         if not fs:
             continue
         res = merge_kind(kind, fs, csv_dir, years, ref_year, log)
-        if res.files and move:
-            done = raw_dir / DONE_DIR
-            done.mkdir(parents=True, exist_ok=True)
-            for p in res.files:
-                if Path(p).parent.resolve() != raw_dir.resolve():
-                    continue                    # raw_csv の外のファイル（直接渡したもの）は動かさない
-                dst = _unique(done / p.name)
-                shutil.move(str(p), str(dst))
-                res.moved.append(dst)
+        move_done(res)
         if res.files:
             log(f"[INFO] 過去基本CSVを統合しました: {res.summary()}")
+        results.append(res)
+    if patches:                             # 基本CSVを統合したあとに当てる（今回統合した行にも当たる）
+        res = apply_patches(patches, csv_dir, log)
+        if res.updated and res.unmatched < res.rows:
+            move_done(res)
+            log(f"[INFO] {res.summary()}")
+        else:                               # 当たらなかったパッチは raw_csv に残す
+            if res.updated and res.files:
+                log(f"[WARN] 列パッチ {len(res.files)} 本は 全場_*.csv の行に1行も当たらないので、raw_csv に残します")
+            res.files = []
         results.append(res)
     return results
 
@@ -192,5 +348,5 @@ def safe_upload_name(name: str) -> str:
     return s or "upload.csv"
 
 
-__all__ = ["KINDS", "DEFAULT_YEARS", "DONE_DIR", "MergeResult", "kind_of", "pending_files", "merge_kind", "merge_raw",
-           "safe_upload_name"]
+__all__ = ["KINDS", "DEFAULT_YEARS", "DONE_DIR", "PATCH_KIND", "MergeResult", "PatchResult", "kind_of", "file_role",
+           "pending_files", "merge_kind", "apply_patches", "merge_raw", "safe_upload_name"]

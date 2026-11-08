@@ -279,11 +279,13 @@ FORM_BODY = """
 {% endfor %}
 <div style="margin-top:12px"><button type="submit" {{ 'disabled' if busy else '' }}>実行</button></div>
 </div></form>
-<div class="card" id="raw"><h1>過去基本CSV（タイムM・対戦M）の統合</h1>
+<div class="card" id="raw"><h1>過去基本CSV（タイムM・対戦M）の統合・列パッチ</h1>
 <div class="muted">TARGET ★6タブで追加抽出した基本CSVを <code>csv_files/全場_タイムM.csv</code>・<code>全場_対戦M.csv</code> に統合します。
 レースID(新) が重なる行は新しいファイルを優先し、最大10年分（データの最新年の9年前以降）を残します。
-ファイル名に「タイム」「マイニング」または「対戦」を入れてください。統合したファイルは <code>raw_csv/merged_done/</code> に移ります。
-（replace_csv_ver3.py も、raw_csv/ に未統合のファイルがあれば先に統合します）</div>
+基本CSVはファイル名に「タイム」「マイニング」または「対戦」を入れてください。<br>
+<b>列パッチ</b>: <code>レースID(新)</code> と補いたい列（前走の列など）だけのCSV（<code>指数</code> 列なし・名前は自由）は、
+<code>全場_タイムM.csv</code>・<code>全場_対戦M.csv</code> の両方の同じ馬の行に、空でない値を上書き・補完します。<br>
+済んだファイルは <code>raw_csv/merged_done/</code> に移ります。（replace_csv_ver3.py も、raw_csv/ に未統合のファイルがあれば先に統合します）</div>
 {% for e in raw_errors %}<div class="warn" style="margin-top:6px">{{ e }}</div>{% endfor %}
 <form method="post" action="{{ url_for('ingest.raw_merge') }}" enctype="multipart/form-data" style="margin-top:8px">
 <input type="file" name="raw_files" multiple accept=".csv">
@@ -297,7 +299,7 @@ FORM_BODY = """
 """
 
 RAW_BODY = """
-<div class="card"><h1>過去基本CSVの統合：{{ '完了' if results else '統合したファイルはありません' }}</h1>
+<div class="card"><h1>過去基本CSVの統合・列パッチ：{{ '完了' if results else '統合・反映したファイルはありません' }}</h1>
 {% for r in results %}<div style="margin-top:4px">{{ r.summary() }}</div>{% endfor %}
 {% for r in results if r.moved %}<div class="muted" style="margin-top:4px">{{ r.kind }}: {{ r.moved|length }} 本を raw_csv/merged_done/ に移しました</div>{% endfor %}
 <div style="margin-top:8px"><a href="{{ url_for('ingest.index') }}#raw">戻る</a></div></div>
@@ -363,7 +365,7 @@ def make_blueprint(render) -> Blueprint:
 
     @bp.route("/raw_merge", methods=["POST"])
     def raw_merge():
-        """追加の過去基本CSVをアップロード（または raw_csv/ から選び）、csv_files/全場_*.csv に統合する（最大10年分）。"""
+        """追加の過去基本CSV・列パッチをアップロード（または raw_csv/ から選び）、csv_files/全場_*.csv に統合する・当てる。"""
         from .. import raw_merge as rm
         if not same_origin():
             abort(403)
@@ -374,17 +376,25 @@ def make_blueprint(render) -> Blueprint:
             listed = set(raw_listed())
             picked = [raw / n for n in request.form.getlist("raw_pick") if n in listed]   # 一覧にある名前だけ
             uploads = [f for f in request.files.getlist("raw_files") if f and f.filename]
-            bad = [f.filename for f in uploads if not f.filename.lower().endswith(".csv")
-                   or rm.kind_of(rm.safe_upload_name(f.filename)) is None]
+            bad = [f.filename for f in uploads if not f.filename.lower().endswith(".csv")]
             if bad:
-                return form(raw_errors=[f"CSV で、名前に「タイム」「マイニング」または「対戦」を含むファイルにしてください: {n}"
-                                        for n in bad], status=400)
+                return form(raw_errors=[f"CSV ファイルにしてください: {n}" for n in bad], status=400)
             raw.mkdir(parents=True, exist_ok=True)
             taken: set[Path] = set()
+            saved: list[Path] = []
             for f in uploads:
                 dest = unique_path(raw / rm.safe_upload_name(f.filename), taken)
                 f.save(dest)
-                picked.append(dest)
+                saved.append(dest)
+            # 中身で決める: 指数 列の無いCSVは列パッチ、それ以外は名前で タイムM / 対戦M。どちらでもなければ受け付けない
+            unknown = [p for p in saved if rm.file_role(p) is None]
+            if unknown:
+                for p in saved:
+                    p.unlink(missing_ok=True)
+                return form(raw_errors=[f"基本CSVなら名前に「タイム」「マイニング」または「対戦」を入れてください。"
+                                        f"列パッチなら レースID(新) と補う列だけにしてください（指数 列を入れない）: {p.name}"
+                                        for p in unknown], status=400)
+            picked += saved
             if not picked:
                 return form(raw_errors=["統合するファイルを選ぶかアップロードしてください"], status=400)
             lines: list[str] = []
