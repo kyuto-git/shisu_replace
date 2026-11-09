@@ -53,4 +53,4 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - レース単位（16桁）の レースID(新) は replace が馬番を付けて18桁にする（旧版の band 系の件数膨張の再発防止。tests/test_band_regression.py）
 - family・集計条件だけ変えたときは aggregate → build_db だけでよい（master はそのまま）
 - 馬体重発表後のマイニング確定値: entries_in の出馬表を上書きして calc_entry_hensachi.py --merge-only --clean → build_db.py --entries-only
-- replace の --workers は子プロセスを4件ごとに作り直す（OOM・BrokenProcessPool 対策）
+- replace の --workers は子プロセスを4件ほどで作り直す（workers × 4 件のまとまりごとに新しいプール。OOM・BrokenProcessPool 対策。止められたファイルは [ERROR] にして残りを続ける）

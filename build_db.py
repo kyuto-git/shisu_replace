@@ -389,6 +389,10 @@ def parse_cli(argv=None):
     p.add_argument("--db-path", default=str(config.db_path()), help="既定は環境変数 DB_PATH か racing.db")
     args = p.parse_args(argv)
     if args.entries_only:
+        if args.mode not in ("both", "entries"):
+            p.error("--entries-only と --mode foragg は一緒に使えません")
+        if args.fresh:
+            p.error("--entries-only と --fresh は一緒に使えません（--fresh は成績表も含めて DB を消します）")
         args.mode = "entries"
     return args
 

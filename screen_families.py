@@ -330,8 +330,13 @@ def select(report: pd.DataFrame, min_axis: int = 25, min_groups: int = 10, min_c
     r["select_B"] = b_axis | b_abs
     ok_a = ((_num(r, "groups_ge10") >= min_groups) & (_num(r, "coverage") >= min_coverage)
             & (_num(r, "fuku_spread") >= min_fuku_spread) & (_num(r, "wedge_spread") >= min_spread))
-    by_w = _num(r, "wedge_spread")[ok_a].sort_values(ascending=False, kind="stable").head(top_a).index
-    by_adj = _num(r, "adj_wedge_spread")[ok_a].dropna().sort_values(ascending=False, kind="stable").head(top_a).index
+    def top(col: str) -> pd.Index:               # 同じ値は name・scheme の順（行の並びで選抜が変わらないように）
+        t = pd.DataFrame({"v": _num(r, col), "name": r.get("name", pd.Series("", index=r.index)).astype(str),
+                          "scheme": r.get("scheme", pd.Series("", index=r.index)).fillna("").astype(str)})[ok_a]
+        t = t.dropna(subset=["v"])
+        return t.sort_values(["v", "name", "scheme"], ascending=[False, True, True], kind="stable").head(top_a).index
+
+    by_w, by_adj = top("wedge_spread"), top("adj_wedge_spread")
     a_w, a_adj = r.index.isin(by_w), r.index.isin(by_adj)
     r["select_A"] = a_w | a_adj
     r["selected"] = r["select_A"] | r["select_B"]
@@ -385,12 +390,13 @@ def main(argv=None) -> int:
     ap.add_argument("--regions", default="", help="使う地域（カンマ区切りの部分一致。既定は全部）")
     ap.add_argument("--odds", default=",".join(ODDS_MODES), help="判定するオッズ帯（既定は4区分すべて）")
     ap.add_argument("--max-candidates", type=int, default=0, help="候補の数の上限（0=上限なし。試しに動かすとき用）")
-    ap.add_argument("--report", default=str(config.base_dir() / "screening_report.csv"))
+    ap.add_argument("--report", default=None,
+                    help="レポートの書き先（既定 screening_report.csv。--from-report にファイルを渡したときは、そのファイルに書き戻す）")
     ap.add_argument("--export-selected", nargs="?", const=str(config.selected_families_path()), default=None,
                     help="選抜した family を JSON に書く（既定の書き先 selected_families.json）")
     ap.add_argument("--from-report", nargs="?", const="", default=None, metavar="REPORT_CSV",
-                    help="採点し直さずに、採点済みの screening_report.csv（既定は --report の値）から選抜だけやり直す"
-                         "（数秒。選抜の基準を変えて試すとき用）")
+                    help="採点し直さずに、採点済みのレポート（省略時は --report の値か screening_report.csv）から選抜だけやり直す"
+                         "（数秒。選抜の基準を変えて試すとき用）。結果は --report を指定しなければ読んだレポートに書き戻す")
     ap.add_argument("--min-axis", type=int, default=25, help="選抜①: 絶対軸＋軸候補のキー数の下限（既定25）")
     ap.add_argument("--always-select-abs", action=argparse.BooleanOptionalAction, default=True,
                     help="選抜①: 絶対軸が1つでも出る候補は --min-axis に関係なく選ぶ（既定 ON。--no-always-select-abs で切る）")
@@ -404,8 +410,13 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--wedge-min-year-count", type=int, default=None)
     args = ap.parse_args(argv)
+    default_report = str(config.base_dir() / "screening_report.csv")
     if args.from_report is not None:
+        src = args.from_report or args.report or default_report
+        args.from_report = src
+        args.report = args.report or src        # 読んだレポートに書き戻す（別の採点結果を上書きしない）
         return _reselect(args)
+    args.report = args.report or default_report
 
     import aggregate_stats_ver2 as agg
     masters = [p for p in sorted(Path(args.master_dir).glob("master_*.csv.gz")) if file_stem(p) not in agg.SKIP_MASTERS]
@@ -496,7 +507,7 @@ def _export(report: pd.DataFrame, fams: list[F.Family], args, meta: dict) -> int
 
 def _reselect(args) -> int:
     """--from-report: 採点し直さず、採点済みのレポートに select() をかけ直す。"""
-    src = Path(args.from_report or args.report)
+    src = Path(args.from_report)
     if not src.exists():
         print(f"[ERROR] 採点済みのレポートがありません: {src}（先に --from-report なしで採点してください）", file=sys.stderr)
         return 2

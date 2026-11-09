@@ -58,7 +58,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python replace_csv_ver3.py --clean --workers 4
   ・raw_csv/ に未統合のファイルがあれば、最初に csv_files/全場_*.csv へ統合・前走の列パッチを反映します（ログに件数）
   ・ログで「外部指数が付いた馬 x/y」と「使わないファイル」の WARN を確認（x が極端に少ない指数はファイルの置き方を疑う）
-  ・--workers は並列数。子プロセスは4件ごとに作り直すのでメモリはたまりませんが、Docker のメモリが少ないときは 2 に下げる
+  ・--workers は並列数。子プロセスは4件ほどで作り直すのでメモリはたまりにくいですが、Docker のメモリが少ないときは 2 に下げる
 
 # Step 1.5（推奨）: 全掛け合わせ候補を採点して、使う family を選ぶ（→ 5章）
 #   (a) 採点（重い。master を作り直したときだけ。代表の指数で、all なら約5時間/master）
@@ -488,8 +488,9 @@ DB を作らずにメモリ上で、family の候補を「本番と同じ集計�
   3) screening_report.csv を開き、selected=True の行（reason 列）と件数・スプレッドを確認。
      選ばれる数を変えたいときは、採点し直さずに --from-report で選抜だけやり直す（数秒。master は読みません）：
        docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --from-report --export-selected --min-axis 40 --top-a 80
-     ・--from-report の後にファイル名を書けば別のレポートから（例 --from-report old_report.csv）。書かなければ --report の値
-       （既定 screening_report.csv）を読み、選抜の列（select_A・select_B・selected・reason）を書き直して同じ名前で保存します
+     ・--from-report だけなら screening_report.csv を読み、選抜の列（select_A・select_B・selected・reason）を書き直して同じ名前で
+       保存します。後にファイル名を書けば別のレポートから選び直し、そのファイルに書き戻します（例 --from-report old_report.csv。
+       screening_report.csv は変わりません）。別の名前で残したいときは --report new_report.csv を付ける
      ・ログの「選抜: N 通り・M family」を見ながら、本集計にかけられる量（目安は全指数で現実的な時間に収まる数）まで絞る
      ・selected_families.json を手で編集してもよい
   4) 集計と DB の作り直し（selected_families.json が自動で使われます）
@@ -581,8 +582,9 @@ DB を作らずにメモリ上で、family の候補を「本番と同じ集計�
 
   Q. replace_csv_ver3.py --workers 4 が途中で BrokenProcessPool で落ちる
   A. Docker のメモリが足りず、子プロセスが OOM Killer に止められています。今の版は統合のあとにメモリを手放し、子プロセスを
-     4件ごとに作り直すので起きにくくなっていますが、それでも落ちるなら --workers 2（または 1）にするか、Docker Desktop の
-     メモリの割り当てを増やしてください。
+     4件ほどで作り直すので起きにくくなっています。それでも止められたら、そのまとまり（最大 --workers × 4 ファイル）の
+     終わっていなかったファイルが「[ERROR] … 子プロセスが止められました」になり、次のまとまりから続きます。--workers 2（または 1）にするか、Docker Desktop の
+     メモリの割り当てを増やして、もう一度 replace を実行してください。
 
   Q. GitHub の Dependabot に lxml の脆弱性アラートが出た
   A. 2026-11-09 に lxml を 6.1.3 に上げました（CVE-2026-41066 は 6.1.0 で修正）。lxml は Ω・吉馬・かよちんの HTML 解析で

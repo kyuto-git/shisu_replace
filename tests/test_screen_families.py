@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -395,6 +396,32 @@ def test_from_report_reselects_without_scoring(screened, base, tmp_path):
     assert tight["selected"].sum() < first["selected"].sum() and tight["select_A"].sum() <= 2
     crit = json.loads(out_sel.read_text(encoding="utf-8"))["criteria"]
     assert crit["min_axis"] == 1000 and crit["always_select_abs"] is False and crit["top_a"] == 1
+
+
+def test_from_report_writes_back_to_the_file_it_read(screened, base, tmp_path, monkeypatch):
+    """--from-report に別のレポートを渡して --report を書かなければ、そのファイルに書き戻す
+    （既定の screening_report.csv を別の採点結果で上書きしない）。"""
+    import screen_families as S
+    default = base / "screening_report.csv"
+    other = tmp_path / "old_report.csv"
+    shutil.copy(default, other)
+    before = default.read_bytes()
+    assert S.main(["--from-report", str(other), "--min-axis", "1000", "--no-always-select-abs", "--top-a", "1",
+                   "--min-groups", "3", "--min-coverage", "0", "--min-spread", "-9"]) == 0
+    assert default.read_bytes() == before
+    rewritten = pd.read_csv(other, encoding="cp932")
+    assert rewritten["selected"].sum() < pd.read_csv(default, encoding="cp932")["selected"].sum()
+
+
+def test_select_ties_do_not_depend_on_row_order():
+    """wedge_spread が同じ値の候補が top_a の境目にあっても、行の並びで選抜が変わらない。"""
+    import screen_families as S
+    rows = [{"name": n, "scheme": "s1", "groups_ge10": 50, "coverage": 0.9, "fuku_spread": 30.0,
+             "wedge_spread": 0.5, "adj_wedge_spread": float("nan"), "abs_total": 0, "axis_total": 0}
+            for n in ["X_c", "X_a", "X_b", "X_d"]]
+    df = pd.DataFrame(rows)
+    pick = lambda d: sorted(S.select(d, top_a=2).query("selected")["name"])  # noqa: E731
+    assert pick(df) == pick(df.iloc[::-1].reset_index(drop=True)) == ["X_a", "X_b"]
 
 
 def test_from_report_errors(tmp_path):

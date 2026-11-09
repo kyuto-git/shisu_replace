@@ -26,7 +26,8 @@ import functools
 import gc
 import shutil
 import sys
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 import pandas as pd
@@ -342,11 +343,7 @@ def main(argv=None) -> int:
     jobs = [("file", str(p), args.master_dir, processed_dir, inner) for p in direct]
     jobs += [("ext", str(b), ind, args.master_dir, processed_dir, inner, str(ext_root)) for b, ind in pairs]
     if args.workers > 1:
-        # 子プロセスは MAX_TASKS_PER_CHILD 件ごとに作り直す（基本CSVのキャッシュなどがたまって Docker の OOM Killer に
-        # 落とされ BrokenProcessPool になるのを防ぐ。Python 3.11 以上）
-        kw = {"max_tasks_per_child": MAX_TASKS_PER_CHILD} if sys.version_info >= (3, 11) else {}
-        with ProcessPoolExecutor(max_workers=args.workers, **kw) as ex:
-            results = list(ex.map(_run, jobs))
+        results = run_parallel(jobs, args.workers)
     else:
         results = [_run(j) for j in jobs]
     for r in results:
@@ -355,6 +352,39 @@ def main(argv=None) -> int:
 
 
 MAX_TASKS_PER_CHILD = 4
+
+
+def _job_label(job) -> str:
+    return Path(job[1]).name + ("" if job[0] == "file" else " + " + str(job[2]))
+
+
+def run_parallel(jobs: list, workers: int) -> list[str]:
+    """jobs を workers 並列で処理する。子プロセスは1つあたり MAX_TASKS_PER_CHILD 件ほどで作り直す: jobs を
+    workers × MAX_TASKS_PER_CHILD 件ずつに分け、まとまりごとに新しい ProcessPoolExecutor を作って終わったら閉じる
+    （基本CSVのキャッシュなどがたまって Docker の OOM Killer に止められるのを防ぐ）。
+    ProcessPoolExecutor(max_tasks_per_child=…) は使わない（Python 3.11・3.12 では、子プロセスが規定の件数で終わったあとに
+    代わりが起動されず、親が止まったままになる。Docker の Python 3.11.18 で再現）。
+    子プロセスが止められた（BrokenProcessPool）ときは、そのまとまりの終わっていないジョブを [ERROR] にして次へ進む。"""
+    results: list[str | None] = [None] * len(jobs)
+    step = max(1, workers * MAX_TASKS_PER_CHILD)
+    for start in range(0, len(jobs), step):
+        idx = list(range(start, min(start + step, len(jobs))))
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_run, jobs[i]): i for i in idx}
+                for f in as_completed(futs):
+                    try:
+                        results[futs[f]] = f.result()
+                    except BrokenProcessPool:
+                        pass                        # 下でまとめて [ERROR] にする
+        except BrokenProcessPool:
+            pass
+        for i in idx:
+            if results[i] is None:
+                results[i] = (f"[ERROR] {_job_label(jobs[i])}: 子プロセスが止められました（メモリ不足の可能性。"
+                              "--workers を減らすか、Docker のメモリの割り当てを増やしてやり直してください）")
+        gc.collect()
+    return [r if r is not None else "" for r in results]
 
 
 def _run(job) -> str:

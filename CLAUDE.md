@@ -183,7 +183,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 5. 頭数10以上（頭数列が無ければ警告して絞らない）の馬を `master_{地域}_{指数名}.csv.gz` に書く。除外レース（欠損2頭以上・全頭同値・有効2頭未満）・新馬除外（ZI・吉馬6種）の馬は `指数有効=0` で残す（集計では使わない）
 - **family ごとの素材ファイルは作らない**（旧版は 20本×入力。今は aggregate が master からその場でキーを作る）
 - オプション: `--clean`（master と processed を空に）, `--workers N`, `--processed`, `--csv-dir`, `--ext-dir`, `--no-ext`, `--master-dir`, `--raw-dir`, `--no-raw-merge`
-- メモリ（2026-11-09〜）: raw_csv の統合と前走の内外の表を作ったあとに `gc.collect()` で手放す。`--workers` が2以上のとき、子プロセスは `MAX_TASKS_PER_CHILD`（4）件ごとに作り直す（`ProcessPoolExecutor(max_tasks_per_child=4)`。Python 3.11 以上。基本CSVのキャッシュなどがたまって Docker の OOM Killer に止められ `BrokenProcessPool` になるのを防ぐ。開始方式が spawn になるので、子プロセスの起動ごとに pandas などを読み込む分だけ少し遅い）
+- メモリ（2026-11-09〜）: raw_csv の統合と前走の内外の表を作ったあとに `gc.collect()` で手放す。`--workers` が2以上のとき、子プロセスは1つあたり `MAX_TASKS_PER_CHILD`（4）件ほどで作り直す（`run_parallel`: ジョブを workers × 4 件ずつのまとまりに分け、まとまりごとに新しい `ProcessPoolExecutor` を作って閉じる。基本CSVのキャッシュなどがたまって Docker の OOM Killer に止められ `BrokenProcessPool` になるのを防ぐ）。`ProcessPoolExecutor(max_tasks_per_child=…)` は使わない（Python 3.11・3.12 では、子プロセスが規定の件数で終わったあとに代わりが起動されず親が止まったままになる。Docker の Python 3.11.18 で再現）。それでも子プロセスが止められたら、そのまとまりの終わっていないジョブを `[ERROR] … 子プロセスが止められました` にして次のまとまりへ進む（終了コード1）
 - 目安: 実サンプル `202610.csv`（3,447行）で 0.6秒
 
 ### 3.2 aggregate_stats_ver2.py（master → 成績表）
@@ -220,7 +220,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 ### 3.4 build_db.py（CSV → racing.db）
 
 - family の定義ファイル（`SHISU_FAMILIES_FILE` など）が無い・読めないときは、DB に触る前に終了コード2
-- `--mode both|foragg|entries`, `--entries-only`（＝ `--mode entries`。出馬表だけ取り込み直す。馬体重発表後のマイニング確定値の差し替えなど）, `--fresh`, `--prune`, `--no-xjoin`, `--agg-dir`, `--allow-empty`, `--entries-dir`, `--db-path`
+- `--mode both|foragg|entries`, `--entries-only`（＝ `--mode entries`。出馬表だけ取り込み直す。馬体重発表後のマイニング確定値の差し替えなど。`--mode foragg`・`--fresh` とは一緒に使えない）, `--fresh`, `--prune`, `--no-xjoin`, `--agg-dir`, `--allow-empty`, `--entries-dir`, `--db-path`
 - foragg: `agg_csv/families.json` の family を台帳に入れ（無ければ selected_families.json か初期セット）、成績表を読み、5つの率の `*_val` を文字列の括弧内（推定値）で作り直す → テーブル → unified_all（索引: 照合用 (結合データ, family, indicator)、テーブル名、WEDGE、adjusted_WEDGE）→ __facets__ → **`__families__`**（family の定義）
   - 読める成績表が0本なら DB に触らず終了コード2（空にしたいときだけ `--allow-empty`）。WEDGE 列の無い旧形式の成績表は取り込まず終了コード1
   - families.json に無い family・スキームの成績表（前の実行の残り）は取り込まず、本数を警告する
@@ -322,11 +322,11 @@ DB を作らずにメモリ上で、family の候補を master ごとに**本番
   - `select_A`・`select_B`・`selected`・`reason`
 - 選抜（`--export-selected [FILE]`。既定の書き先 `selected_families.json`。2026-11-09 に既定を変更）:
   - ① 基準B: 絶対軸＋軸候補のキーが `--min-axis`（既定25）個以上。`--always-select-abs`（既定 ON。`--no-always-select-abs` で切る）なら、絶対軸のキーが1つでもある候補は `--min-axis` に関係なく選ぶ
-  - ② 基準A: `groups_ge10 >= --min-groups`（10）かつ `coverage >= --min-coverage`（0.2）かつ `fuku_spread >= --min-fuku-spread`（20.0 ＝ 複勝率の差20%ポイント）かつ `wedge_spread >= --min-spread`（0.10）を満たすもののうち、wedge_spread の大きい順に `--top-a`（既定100）個、または adj_wedge_spread の大きい順に `--top-a` 個（どちらかに入れば選ぶ）
+  - ② 基準A: `groups_ge10 >= --min-groups`（10）かつ `coverage >= --min-coverage`（0.2）かつ `fuku_spread >= --min-fuku-spread`（20.0 ＝ 複勝率の差20%ポイント）かつ `wedge_spread >= --min-spread`（0.10）を満たすもののうち、wedge_spread の大きい順に `--top-a`（既定100）個、または adj_wedge_spread の大きい順に `--top-a` 個（どちらかに入れば選ぶ。同じ値は name・scheme の順で、レポートの行の並びで選抜が変わらない）
   - `reason` 列: `B:軸が出る`（①の下限）・`B:絶対軸`（絶対軸だけで選ばれた）・`A:識別力`（wedge_spread 上位）・`A:識別力(adj)`（adj_wedge_spread 上位だけ）
   - 値の無い（NaN の）指標は満たさないとみなす。指数順位帯の family は選ばれたスキームだけを持つ（`"schemes": ["s2"]` など）。使った基準は selected_families.json の `criteria` に残す
   - 変更の理由: 旧既定（`--min-axis 1`・`--top-a 30`）では `--space all` の 7,557通りのうち 4,868通り（3,531 family）が選ばれ、全33指数の本集計が50時間を超えた（ユーザーの実データ）。約3分の1（約1,600通り・約1,200 family）に絞る目安で既定を決めた。選ばれる数はデータで変わるので `--from-report` で確かめて調整する
-- **`--from-report [REPORT_CSV]`**（2026-11-09〜）: master を採点し直さず（`--space all` で約5時間かかる処理をしない）、採点済みの screening_report.csv（省略時は `--report` の値。既定 `screening_report.csv`）を読んで `select()` だけをかけ直し、`--report` に書き直す（選抜の列 `select_A`・`select_B`・`selected`・`reason` を作り直す）。`--export-selected` なら selected_families.json も書く（family はレポートの `name`・`parts`・`tail`・`layer` から作り直す）。数秒。master_csv は読まない。レポートが無い・形が違えば終了コード2
+- **`--from-report [REPORT_CSV]`**（2026-11-09〜）: master を採点し直さず（`--space all` で約5時間かかる処理をしない）、採点済みのレポート（省略時は `--report` の値。既定 `screening_report.csv`）を読んで `select()` だけをかけ直し、`--report` に書き直す（`--report` を指定しなければ読んだファイルに書き戻す。`--from-report old_report.csv` で既定の screening_report.csv を上書きしない）（選抜の列 `select_A`・`select_B`・`selected`・`reason` を作り直す）。`--export-selected` なら selected_families.json も書く（family はレポートの `name`・`parts`・`tail`・`layer` から作り直す）。数秒。master_csv は読まない。レポートが無い・形が違えば終了コード2
 - `--indicators`・`--regions` で master を絞る（全角・別名でもファイル名と同じ形にそろえて比べる）。`--workers N` で master を並列に。`--max-candidates` は試し用
 - 採点できない master が1本でもあれば、レポートは書くが選抜（selected_families.json）は書かず終了コード1
 - 目安（検証環境・1プロセス、30万行の master 1本、オッズ帯4区分）: 1通りあたり約2.4秒 → `initial`（129通り）約5分、`default`（2,098通り）約1.4時間、`all`（7,557通り）約5時間。master が多い（2地域 × 約34指数 = 約68本）と `default` は1プロセスで4日近くかかるので、`--indicators タイムM,対戦M` など代表の指数で選ぶか `--workers` を使う。メモリは1プロセス 0.5GB 前後（30万行）
@@ -640,8 +640,8 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - `tests/test_entries_ext.py`: 出馬表1本（マイニング値だけ）に ext_indices の指数（オメガ・ST指数・Gold・BC・ZI）が付き、**master と順位・偏差値・偏差値帯・順位帯が一致する**こと、出馬表に値のある指数は出馬表の値を使うこと、0 だけの列（と右の 指数順位1）を ext で上書きすること、**優先がファイル・レースごと**（別のファイルに値があっても・0 だけのレースは ext から付き、過去側と同じ順位）、台帳に無い指数の 指数順位N を足した列に回さないこと、`--no-ext`・レースID の無い出馬表
 - `tests/test_raw_merge.py`: ファイル名からの種類、**列パッチ**（中身での見分け・2本のパッチを 全場_タイムM・全場_対戦M の両方に当てる・後のファイル優先・空欄で上書きしない・無い列を足す・16桁の ID＋馬番・18桁でない行・当てる先が無い／当たらない行のあるパッチは残す・基本CSVと同じ回・あとから基本CSVを統合すると当たって移る・片方の 全場_*.csv がまだ無いときは残す・ファイルごとに移すかを決める・見出しのゆれ・指数順位を書き換えない・replace の master の22条件に入る・画面からのアップロード）、重複の置き換え（後のファイル優先）・10年の窓・merged_done への移動（同じ名前は `_2`）・種類の分からないファイルと読めないファイルを残すこと、16桁の ID でも馬ごとに比べること、書き込みの途中失敗で既存の 全場_*.csv を壊さないこと、`--raw-dir` の既定が `--csv-dir` の隣になること、replace が master の前に統合すること（`--no-raw-merge`）、/ingest のアップロードと選択・パスの除去・不正な名前・別サイトからの POST
 - `tests/test_screen_families.py` には候補の数（骨格・因果トリオ）・冗長の除外・単独の 場所/距離/芝(内・外) を含む family の過去側と出馬表側のキーの一致（単独の 芝(内・外) はダート・内外の区別の無い芝で両側ともキーを作らない）・成績表のコース列・select の複勝スプレッド・adj_wedge_* も
-- `tests/test_screen_families.py` に選抜の新しい規則（基準B の絶対軸・基準A の adj 上位）と `--from-report`（採点し直さず同じ選抜になる・基準を変えると減る・基準が JSON に残る・レポートが無い/形が違うと終了コード2）、`tests/test_pipeline.py` に `build_db --entries-only` と replace の `--workers 2`（子プロセスを作り直しても1プロセスと同じ master）
-- 件数: 443（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
+- `tests/test_screen_families.py` に選抜の新しい規則（基準B の絶対軸・基準A の adj 上位）と `--from-report`（採点し直さず同じ選抜になる・基準を変えると減る・基準が JSON に残る・読んだファイルに書き戻す・レポートが無い/形が違うと終了コード2）・同じ値の並びに依らない選抜、`tests/test_pipeline.py` に `build_db --entries-only`（`--fresh`・`--mode foragg` と一緒なら弾く）と replace の `--workers 2`（まとまりごとに子プロセスを作り直しても1プロセスと同じ master・子プロセスが止められてもそのまとまりを [ERROR] にして残りを続ける）
+- 件数: 446（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
 
 ---
 
@@ -688,11 +688,12 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 
 ### 2026-11-09 選抜のやり直し・メモリ・lxml・Readme.txt
 - screen_families: `--from-report [CSV]`（採点済みの screening_report.csv から選抜だけやり直す。数秒）。選抜の既定を `--min-axis 25`・`--top-a 100` に。基準B は絶対軸が1つでも出る候補を必ず選ぶ（`--always-select-abs`）、基準A は wedge_spread 上位か adj_wedge_spread 上位
-- replace_csv_ver3: raw_csv の統合・内外の表のあとに `gc.collect()`、`ProcessPoolExecutor(max_tasks_per_child=4)`（BrokenProcessPool 対策）
+- replace_csv_ver3: raw_csv の統合・内外の表のあとに `gc.collect()`、子プロセスを workers × 4 件のまとまりごとに作り直す（BrokenProcessPool 対策。`max_tasks_per_child` は Python 3.11・3.12 で止まるので使わない）
 - build_db: `--entries-only`（＝ `--mode entries`）
 - lxml 6.0.2 → 6.1.3（Dependabot の脆弱性アラート。lxml は BeautifulSoup の解析で使うので削除せず更新）
 - Readme.txt を最新の運用（ext_indices への自動コピー・安井出馬表用CSVの廃止・出馬表1本への外部指数の自動結合・raw_csv の基本CSVと列パッチ・`--from-report`・馬体重発表後の差し替え）に更新
-- テスト 443件
+- 検証（反証役が再現）の指摘を反映: `ProcessPoolExecutor(max_tasks_per_child=4)` が Docker の Python 3.11.18 で workers × 4 件を超えると止まる（テストはジョブ3件で気づけなかった）→ まとまりごとの作り直しに変更、`--from-report old.csv` が既定の screening_report.csv を上書きしていた → 読んだファイルに書き戻す。あわせて、選抜の同じ値の並びを決める・`--entries-only` と `--fresh`／`--mode foragg` を弾く
+- テスト 446件
 
 ### 2026-11-08 列パッチ（前走の列の横結合）・前走の自動補完の取り消し
 - 前走の列を 血統登録番号 の履歴から作る機能（b3bf845・5615360）を取り消した（地方・海外帰りなどで前走がずれるため。TARGET の前走の列をそのまま使う 63b7461 の動きに戻した）
