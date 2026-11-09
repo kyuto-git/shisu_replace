@@ -615,7 +615,7 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 ## 7. Docker・実行環境
 
 - `Dockerfile`: `python:3.11.18-slim-bookworm`（`--build-arg PYTHON_IMAGE=...` で差し替え可）、ja_JP.UTF-8、sqlite3 CLI、`requirements-dev.txt`（実行用＋pytest）を固定版でインストール
-- `requirements.txt`: pandas 2.3.3 / numpy 2.3.5 / scipy 1.16.3 / Flask 3.1.2 / requests 2.32.5 / beautifulsoup4 4.14.2 / lxml 6.1.3 / openpyxl 3.1.5（依存も固定）。lxml は Ω・吉馬・かよちんの HTML 解析（`BeautifulSoup(html, "lxml")`）で使う。2026-11-09 に 6.0.2 → 6.1.3（Dependabot の High アラート: CVE-2026-41066 / GHSA-vfmq-68hx-4jfw。XML の外部実体で手元のファイルを読まれる。6.1.0 で修正）。テストは pandas 2.3.3 と 3.0.5 の両方、Docker（Python 3.11.18）で通ることを確認済み
+- `requirements.txt`: pandas 2.3.3 / numpy 2.3.5 / scipy 1.16.3 / Flask 3.1.3 / requests 2.33.1 / beautifulsoup4 4.14.2 / lxml 6.1.3 / openpyxl 3.1.5（依存も固定）。lxml は Ω・吉馬・かよちんの HTML 解析（`BeautifulSoup(html, "lxml")`）で使う。2026-11-09 に Dependabot のアラート3件を解消: lxml 6.0.2 → 6.1.3（High。CVE-2026-41066 / GHSA-vfmq-68hx-4jfw。XML の外部実体で手元のファイルを読まれる。6.1.0 で修正）、Flask 3.1.2 → 3.1.3（CVE-2026-27205 / GHSA-68rp-wp8r-4726。session のキーだけを見たとき `Vary: Cookie` が付かない。キャッシュするプロキシの裏で問題になる）、requests 2.32.5 → 2.33.1（CVE-2026-25645 / GHSA-gc5v-m9x4-r6x2。`extract_zipped_paths()` の一時ファイル名が予測できる。このコードは呼んでいない）。固定版は pip-audit で既知の脆弱性なしを確認した。テストは pandas 2.3.3 と 3.0.5 の両方、Docker（Python 3.11.18）で通ることを確認済み
 - Dockerfile は `ingest_in/{base,lap,yasui}`・`ingest_out` も作る。`/ingest` は `docker run -p 8000:8000 …  python app.py` の画面から使う（スクレイピングはコンテナからインターネットに出られることが前提）
 - パス: 全スクリプトが `shisu/config.py` を使う（既定はリポジトリ直下。Docker では /app）。`SHISU_BASE_DIR`・`DB_PATH` で変更可。Docker 外でもそのまま動く
 - 運用は `-v "$(pwd)":/app` でホストを丸ごとマウント。コード変更は再ビルド不要、`requirements*.txt` を変えたら再ビルド
@@ -690,7 +690,7 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - screen_families: `--from-report [CSV]`（採点済みの screening_report.csv から選抜だけやり直す。数秒）。選抜の既定を `--min-axis 25`・`--top-a 100` に。基準B は絶対軸が1つでも出る候補を必ず選ぶ（`--always-select-abs`）、基準A は wedge_spread 上位か adj_wedge_spread 上位
 - replace_csv_ver3: raw_csv の統合・内外の表のあとに `gc.collect()`、子プロセスを workers × 4 件のまとまりごとに作り直す（BrokenProcessPool 対策。`max_tasks_per_child` は Python 3.11・3.12 で止まるので使わない）
 - build_db: `--entries-only`（＝ `--mode entries`）
-- lxml 6.0.2 → 6.1.3（Dependabot の脆弱性アラート。lxml は BeautifulSoup の解析で使うので削除せず更新）
+- lxml 6.0.2 → 6.1.3（Dependabot の脆弱性アラート。lxml は BeautifulSoup の解析で使うので削除せず更新）。同じく Dependabot に出ていた Flask 3.1.2 → 3.1.3・requests 2.32.5 → 2.33.1（§7）
 - Readme.txt を最新の運用（ext_indices への自動コピー・安井出馬表用CSVの廃止・出馬表1本への外部指数の自動結合・raw_csv の基本CSVと列パッチ・`--from-report`・馬体重発表後の差し替え）に更新
 - 検証（反証役が再現）の指摘を反映: `ProcessPoolExecutor(max_tasks_per_child=4)` が Docker の Python 3.11.18 で workers × 4 件を超えると止まる（テストはジョブ3件で気づけなかった）→ まとまりごとの作り直しに変更、`--from-report old.csv` が既定の screening_report.csv を上書きしていた → 読んだファイルに書き戻す。あわせて、選抜の同じ値の並びを決める・`--entries-only` と `--fresh`／`--mode foragg` を弾く
 - テスト 446件

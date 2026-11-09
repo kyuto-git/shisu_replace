@@ -586,9 +586,11 @@ DB を作らずにメモリ上で、family の候補を「本番と同じ集計�
      終わっていなかったファイルが「[ERROR] … 子プロセスが止められました」になり、次のまとまりから続きます。--workers 2（または 1）にするか、Docker Desktop の
      メモリの割り当てを増やして、もう一度 replace を実行してください。
 
-  Q. GitHub の Dependabot に lxml の脆弱性アラートが出た
-  A. 2026-11-09 に lxml を 6.1.3 に上げました（CVE-2026-41066 は 6.1.0 で修正）。lxml は Ω・吉馬・かよちんの HTML 解析で
-     使っています。requirements.txt を変えたら docker build -t csv_processor_shisu . でイメージを作り直してください。
+  Q. GitHub の Dependabot に lxml・Flask・requests の脆弱性アラートが出た
+  A. 2026-11-09 に lxml を 6.1.3（CVE-2026-41066。6.1.0 で修正）、Flask を 3.1.3（CVE-2026-27205）、requests を 2.33.1
+     （CVE-2026-25645）に上げました。lxml は Ω・吉馬・かよちんの HTML 解析で使っているので削除はしていません。
+     requirements.txt を変えたら docker build -t csv_processor_shisu . でイメージを作り直してください
+     （作り直すまでは古い版のまま動きます）。アラートはこのブランチを main に取り込むと消えます。
 
   Q. raw_csv/ に置いた前走のパッチが merged_done/ に移らない
   A. パッチの行のうち、全場_タイムM.csv か 全場_対戦M.csv に無い馬がある間は raw_csv に残します（ログの WARN にファイル名と
