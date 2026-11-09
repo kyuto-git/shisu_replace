@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import gc
 import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -309,6 +310,7 @@ def main(argv=None) -> int:
         if raw_merge.pending_files(args.raw_dir):
             print(f"[INFO] {args.raw_dir} に未統合の基本CSVがあるので、csv_files/全場_*.csv に統合します（最大10年分）")
             raw_merge.merge_raw(args.raw_dir, args.csv_dir)
+            gc.collect()                # 統合で読んだ 全場_*.csv の DataFrame を、並列の子プロセスを作る前に手放す
     files = sorted(p for p in Path(args.csv_dir).glob("*.csv"))
     if not files:
         print(f"[INFO] 入力CSVがありません: {args.csv_dir}")
@@ -333,19 +335,26 @@ def main(argv=None) -> int:
         if region not in by_region or indicator in BASE_INDICATORS:
             by_region[region] = p
     inner = collect_inner_lookup(list(by_region.values()))
+    gc.collect()                        # 内外の表を作るために読んだ基本CSVを手放す
     write_csv(pd.DataFrame({"レースID16": list(inner), "芝(内・外)": list(inner.values())}),
               Path(args.master_dir) / INNER_FILE)
 
     jobs = [("file", str(p), args.master_dir, processed_dir, inner) for p in direct]
     jobs += [("ext", str(b), ind, args.master_dir, processed_dir, inner, str(ext_root)) for b, ind in pairs]
     if args.workers > 1:
-        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        # 子プロセスは MAX_TASKS_PER_CHILD 件ごとに作り直す（基本CSVのキャッシュなどがたまって Docker の OOM Killer に
+        # 落とされ BrokenProcessPool になるのを防ぐ。Python 3.11 以上）
+        kw = {"max_tasks_per_child": MAX_TASKS_PER_CHILD} if sys.version_info >= (3, 11) else {}
+        with ProcessPoolExecutor(max_workers=args.workers, **kw) as ex:
             results = list(ex.map(_run, jobs))
     else:
         results = [_run(j) for j in jobs]
     for r in results:
         print(r)
     return 1 if any(r.startswith("[ERROR]") for r in results) else 0
+
+
+MAX_TASKS_PER_CHILD = 4
 
 
 def _run(job) -> str:

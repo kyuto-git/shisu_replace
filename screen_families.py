@@ -23,10 +23,11 @@ shisu.classify.classify）でオッズ帯4区分を集計し、master を通し�
   基準B（本番の判定で絶対軸・軸候補などが生まれるか）
     abs_*, axis_*, opp_*, keshi_*   オッズ帯ごと（normal/odds10u/odds10_50/odds50p）の該当キー数と合計（*_total）
 選抜（--export-selected）: 次のどちらかを満たす候補（family 単位。指数順位帯はスキーム s1/s2 ごとに）
-  ① 絶対軸＋軸候補のキーが --min-axis 個以上
+  ① 絶対軸＋軸候補のキーが --min-axis 個以上（既定25）。--always-select-abs（既定 ON）なら絶対軸が1つでも出る候補も
   ② 基準A: groups_ge10 >= --min-groups（10）かつ coverage >= --min-coverage（0.2）かつ
      fuku_spread >= --min-fuku-spread（20.0 ＝ 複勝率の差20%ポイント）かつ wedge_spread >= --min-spread（0.10）、
-     そのうち wedge_spread の大きい順に上位 --top-a 個
+     そのうち wedge_spread の大きい順に上位 --top-a 個（既定100）か、adj_wedge_spread の大きい順に上位 --top-a 個
+  --from-report [CSV]: master を採点し直さず、採点済みの screening_report.csv から選抜だけやり直す（基準を変えて試す）
 候補の空間（--space）: 骨格（舞台）× 条件。条件は 重量種別・クラス名・枠番グループ・騎手 と 22条件（28種）
   骨格0（コース不問）: 単一条件・2条件ペア・因果トリオ（騎手×ローテ×前走、物理属性×前走R印3/脚質×前走着順/上り、
                        前走人気×前走着順×今走条件、枠番グループ×初角帯/F係数帯×前走脚質）
@@ -308,17 +309,59 @@ def summarize(rows: list[dict], fams: list[F.Family], modes: tuple[str, ...]) ->
     return out
 
 
-def select(report: pd.DataFrame, min_axis: int, min_groups: int, min_coverage: float, min_spread: float,
-           top_a: int, min_fuku_spread: float = 20.0) -> pd.DataFrame:
+REPORT_TEXT_COLUMNS = ("name", "scheme", "layer", "tail", "parts", "label", "reason")
+
+
+def _num(r: pd.DataFrame, col: str) -> pd.Series:
+    return pd.to_numeric(r[col], errors="coerce") if col in r.columns else pd.Series(np.nan, index=r.index)
+
+
+def select(report: pd.DataFrame, min_axis: int = 25, min_groups: int = 10, min_coverage: float = 0.2,
+           min_spread: float = 0.10, top_a: int = 100, min_fuku_spread: float = 20.0,
+           always_abs: bool = True) -> pd.DataFrame:
+    """選抜（1行 = 候補 × スキーム）。
+    基準B: 絶対軸＋軸候補のキーが min_axis 個以上。always_abs なら、絶対軸が1つでも出る候補は min_axis に関係なく選ぶ。
+    基準A: groups_ge10・coverage・fuku_spread・wedge_spread の下限を満たすもののうち、wedge_spread 上位 top_a 個
+           または adj_wedge_spread 上位 top_a 個のどちらかに入るもの。値の無い（NaN の）指標は満たさないとみなす。"""
     r = report.copy()
-    r["select_B"] = (r["abs_total"] + r["axis_total"]) >= min_axis
-    ok_a = ((r["groups_ge10"] >= min_groups) & (r["coverage"] >= min_coverage)
-            & (r["fuku_spread"] >= min_fuku_spread) & (r["wedge_spread"] >= min_spread))
-    rank_a = r[ok_a].sort_values("wedge_spread", ascending=False).head(top_a).index
-    r["select_A"] = r.index.isin(rank_a)
+    abs_t, axis_t = _num(r, "abs_total").fillna(0), _num(r, "axis_total").fillna(0)
+    b_axis = (abs_t + axis_t) >= min_axis
+    b_abs = (abs_t >= 1) if always_abs else pd.Series(False, index=r.index)
+    r["select_B"] = b_axis | b_abs
+    ok_a = ((_num(r, "groups_ge10") >= min_groups) & (_num(r, "coverage") >= min_coverage)
+            & (_num(r, "fuku_spread") >= min_fuku_spread) & (_num(r, "wedge_spread") >= min_spread))
+    by_w = _num(r, "wedge_spread")[ok_a].sort_values(ascending=False, kind="stable").head(top_a).index
+    by_adj = _num(r, "adj_wedge_spread")[ok_a].dropna().sort_values(ascending=False, kind="stable").head(top_a).index
+    a_w, a_adj = r.index.isin(by_w), r.index.isin(by_adj)
+    r["select_A"] = a_w | a_adj
     r["selected"] = r["select_A"] | r["select_B"]
-    r["reason"] = ["・".join(x for x, f in (("B:軸が出る", b), ("A:識別力", a)) if f) for a, b in zip(r["select_A"], r["select_B"])]
+    labels = (("B:軸が出る", b_axis.to_numpy()), ("B:絶対軸", (b_abs & ~b_axis).to_numpy()),
+              ("A:識別力", a_w), ("A:識別力(adj)", a_adj & ~a_w))
+    r["reason"] = ["・".join(name for name, flags in labels if flags[i]) for i in range(len(r))]
     return r
+
+
+def report_families(report: pd.DataFrame) -> list[F.Family]:
+    """screening_report.csv の行（name・parts・tail・layer）から family を作り直す（--from-report 用）。"""
+    out: dict[str, F.Family] = {}
+    for _, row in report.drop_duplicates("name").iterrows():
+        parts = tuple(p for p in str(row["parts"]).split(F.SEP) if p)
+        f = F.Family(str(row["name"]), parts, str(row["tail"]), layer=str(row.get("layer", "") or ""))
+        F.validate(f)
+        out[f.name] = f
+    return list(out.values())
+
+
+def read_report(path: Path) -> pd.DataFrame:
+    """screening_report.csv を読む（数の列は数に。選抜の列は select() が作り直す）。"""
+    df = read_csv_any(path)
+    missing = [c for c in ("name", "scheme", "parts", "tail", "abs_total", "axis_total") if c not in df.columns]
+    if missing:
+        raise ValueError(f"{path} は screening_report.csv の形ではありません（無い列: {', '.join(missing)}）")
+    for c in df.columns:
+        if c not in REPORT_TEXT_COLUMNS and c not in ("select_A", "select_B", "selected"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.drop(columns=[c for c in ("select_A", "select_B", "selected", "reason") if c in df.columns])
 
 
 def selected_families(report: pd.DataFrame, fams: list[F.Family]) -> list[F.Family]:
@@ -345,16 +388,24 @@ def main(argv=None) -> int:
     ap.add_argument("--report", default=str(config.base_dir() / "screening_report.csv"))
     ap.add_argument("--export-selected", nargs="?", const=str(config.selected_families_path()), default=None,
                     help="選抜した family を JSON に書く（既定の書き先 selected_families.json）")
-    ap.add_argument("--min-axis", type=int, default=1, help="選抜①: 絶対軸＋軸候補のキー数の下限（既定1）")
+    ap.add_argument("--from-report", nargs="?", const="", default=None, metavar="REPORT_CSV",
+                    help="採点し直さずに、採点済みの screening_report.csv（既定は --report の値）から選抜だけやり直す"
+                         "（数秒。選抜の基準を変えて試すとき用）")
+    ap.add_argument("--min-axis", type=int, default=25, help="選抜①: 絶対軸＋軸候補のキー数の下限（既定25）")
+    ap.add_argument("--always-select-abs", action=argparse.BooleanOptionalAction, default=True,
+                    help="選抜①: 絶対軸が1つでも出る候補は --min-axis に関係なく選ぶ（既定 ON。--no-always-select-abs で切る）")
     ap.add_argument("--min-groups", type=int, default=10, help="選抜②: 件数10以上のグループ数の下限（既定10）")
     ap.add_argument("--min-coverage", type=float, default=0.2, help="選抜②: カバー率の下限（既定0.2）")
     ap.add_argument("--min-spread", type=float, default=0.10, help="選抜②: wedge_spread の下限（既定0.10）")
     ap.add_argument("--min-fuku-spread", type=float, default=20.0,
                     help="選抜②: fuku_spread（上位帯と下位帯の複勝率の差。%ポイント）の下限（既定20.0）")
-    ap.add_argument("--top-a", type=int, default=30, help="選抜②で採る数の上限（既定30）")
+    ap.add_argument("--top-a", type=int, default=100,
+                    help="選抜②: wedge_spread 上位・adj_wedge_spread 上位のそれぞれで採る数（既定100）")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--wedge-min-year-count", type=int, default=None)
     args = ap.parse_args(argv)
+    if args.from_report is not None:
+        return _reselect(args)
 
     import aggregate_stats_ver2 as agg
     masters = [p for p in sorted(Path(args.master_dir).glob("master_*.csv.gz")) if file_stem(p) not in agg.SKIP_MASTERS]
@@ -404,31 +455,62 @@ def main(argv=None) -> int:
     if not rows:
         print("[ERROR] 採点できた master がありません", file=sys.stderr)
         return 2
-    report = select(summarize(rows, fams, modes), args.min_axis, args.min_groups, args.min_coverage,
-                    args.min_spread, args.top_a, args.min_fuku_spread)
-    report = report.sort_values(["selected", "abs_total", "axis_total", "wedge_spread"], ascending=False)
-    write_csv(report, Path(args.report))
-    n_sel = int(report["selected"].sum())
+    report = _select_and_write(summarize(rows, fams, modes), args)
     print(f"[INFO] 採点 {len(report)} 通り（{time.time() - t0:.0f}秒）→ {args.report}")
-    print(f"[INFO] 選抜: {n_sel} 通り（①軸が出る {int(report['select_B'].sum())} / ②識別力 {int(report['select_A'].sum())}）")
     if failed:
         print(f"[ERROR] 採点できなかった master が {len(failed)} 本あります。レポートは書きましたが、"
               "選抜（selected_families.json）は書きません（原因を直してやり直してください）", file=sys.stderr)
         return 1
-    if args.export_selected:
-        sel = selected_families(report, fams)
-        if not sel:
-            print("[WARN] 選抜された family がありません。selected_families.json は書きません", file=sys.stderr)
-            return 1
-        F.save_families(args.export_selected, sel, {"source": "screen_families.py", "space": args.space,
-                                                    "criteria": {"min_axis": args.min_axis, "min_groups": args.min_groups,
-                                                                 "min_coverage": args.min_coverage,
-                                                                 "min_spread": args.min_spread,
-                                                                 "min_fuku_spread": args.min_fuku_spread,
-                                                                 "top_a": args.top_a}})
-        print(f"[INFO] {len(sel)} family を {args.export_selected} に書きました。"
-              "以後の aggregate_stats_ver2.py・build_db.py・照合はこの family を使います")
+    return _export(report, fams, args, {"space": args.space})
+
+
+def _criteria(args) -> dict:
+    return {"min_axis": args.min_axis, "always_select_abs": args.always_select_abs, "min_groups": args.min_groups,
+            "min_coverage": args.min_coverage, "min_spread": args.min_spread,
+            "min_fuku_spread": args.min_fuku_spread, "top_a": args.top_a}
+
+
+def _select_and_write(report: pd.DataFrame, args) -> pd.DataFrame:
+    report = select(report, args.min_axis, args.min_groups, args.min_coverage, args.min_spread, args.top_a,
+                    args.min_fuku_spread, args.always_select_abs)
+    report = report.sort_values(["selected", "abs_total", "axis_total", "wedge_spread"], ascending=False, kind="stable")
+    write_csv(report, Path(args.report))
+    sel = report[report["selected"]]
+    print(f"[INFO] 選抜: {len(sel)} 通り・{sel['name'].nunique()} family（①軸が出る {int(report['select_B'].sum())}"
+          f" / ②識別力 {int(report['select_A'].sum())}。基準: {_criteria(args)}）")
+    return report
+
+
+def _export(report: pd.DataFrame, fams: list[F.Family], args, meta: dict) -> int:
+    if not args.export_selected:
+        return 0
+    sel = selected_families(report, fams)
+    if not sel:
+        print("[WARN] 選抜された family がありません。selected_families.json は書きません", file=sys.stderr)
+        return 1
+    F.save_families(args.export_selected, sel, {"source": "screen_families.py", **meta, "criteria": _criteria(args)})
+    print(f"[INFO] {len(sel)} family を {args.export_selected} に書きました。"
+          "以後の aggregate_stats_ver2.py・build_db.py・照合はこの family を使います")
     return 0
+
+
+def _reselect(args) -> int:
+    """--from-report: 採点し直さず、採点済みのレポートに select() をかけ直す。"""
+    src = Path(args.from_report or args.report)
+    if not src.exists():
+        print(f"[ERROR] 採点済みのレポートがありません: {src}（先に --from-report なしで採点してください）", file=sys.stderr)
+        return 2
+    t0 = time.time()
+    try:
+        report = read_report(src)
+        fams = report_families(report)
+    except (ValueError, KeyError) as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return 2
+    print(f"[INFO] 採点済みのレポートから選抜し直します: {src}（{len(report)} 通り・{len(fams)} family）")
+    report = _select_and_write(report, args)
+    print(f"[INFO] {time.time() - t0:.1f}秒 → {args.report}")
+    return _export(report, fams, args, {"from_report": str(src)})
 
 
 if __name__ == "__main__":

@@ -122,7 +122,11 @@ def test_export_selected(screened):
     picked = rep[rep["selected"]]
     assert {f.name for f in fams} == set(picked["name"])
     assert all(((r["abs_total"] + r["axis_total"]) >= 1) or r["select_A"] for r in picked.to_dict("records"))
-    assert picked["select_A"].sum() <= 5
+    # 基準A は wedge_spread 上位5 と adj_wedge_spread 上位5 の和（どちらかに入る行だけ）
+    a = rep[rep["select_A"]]
+    assert len(a) <= 10 and set(a["reason"]).issubset({"A:識別力", "A:識別力(adj)", "B:軸が出る・A:識別力",
+                                                       "B:軸が出る・A:識別力(adj)", "B:絶対軸・A:識別力",
+                                                       "B:絶対軸・A:識別力(adj)"})
     for f in fams:
         schemes = set(picked.loc[picked["name"] == f.name, "scheme"].fillna(""))
         if f.uses_schemes:
@@ -340,3 +344,62 @@ def test_standalone_inner_part_matches_past_side_only():
                          "順位": [2, 2, 2]})
     keys = F.build_keys(hist, fam)
     assert keys.tolist() == ["外×51~60"] and keys.index.tolist() == [1]
+
+
+def test_select_new_rules_abs_always_and_adj_top():
+    """基準B: 絶対軸＋軸候補 ≥ min_axis、または絶対軸が1つでも出る（always_abs）。
+    基準A: 下限を満たすもののうち wedge_spread 上位 top_a か adj_wedge_spread 上位 top_a。"""
+    import screen_families as S
+    base = {"groups_ge10": 50, "coverage": 0.5, "fuku_spread": 30.0}
+    rep = pd.DataFrame([
+        {"name": "abs1", **base, "wedge_spread": 0.0, "adj_wedge_spread": 0.0, "abs_total": 1, "axis_total": 0},
+        {"name": "axis30", **base, "wedge_spread": 0.0, "adj_wedge_spread": 0.0, "abs_total": 0, "axis_total": 30},
+        {"name": "axis10", **base, "wedge_spread": 0.0, "adj_wedge_spread": 0.0, "abs_total": 0, "axis_total": 10},
+        {"name": "w_top", **base, "wedge_spread": 0.9, "adj_wedge_spread": 0.11, "abs_total": 0, "axis_total": 0},
+        {"name": "adj_top", **base, "wedge_spread": 0.12, "adj_wedge_spread": 0.8, "abs_total": 0, "axis_total": 0},
+        {"name": "neither", **base, "wedge_spread": 0.11, "adj_wedge_spread": 0.1, "abs_total": 0, "axis_total": 0},
+        {"name": "no_adj", **base, "wedge_spread": 0.5, "adj_wedge_spread": None, "abs_total": 0, "axis_total": 0},
+    ])
+    r = S.select(rep, top_a=1).set_index("name")                # 既定: min_axis=25・always_abs
+    assert r["select_B"].to_dict() == {"abs1": True, "axis30": True, "axis10": False, "w_top": False,
+                                      "adj_top": False, "neither": False, "no_adj": False}
+    assert r.loc[["w_top", "adj_top"], "select_A"].all() and not r.loc[["neither", "no_adj"], "select_A"].any()
+    assert r.loc["abs1", "reason"] == "B:絶対軸" and r.loc["adj_top", "reason"] == "A:識別力(adj)"
+    r = S.select(rep, top_a=1, always_abs=False).set_index("name")
+    assert not r.loc["abs1", "select_B"]
+    r = S.select(rep, top_a=2).set_index("name")                # wedge 上位2 = w_top・no_adj
+    assert r.loc["no_adj", "select_A"] and not r.loc["neither", "select_A"]
+
+
+def test_from_report_reselects_without_scoring(screened, base, tmp_path):
+    """--from-report: master を読まずに、採点済みのレポートから選抜だけやり直して JSON を書く。"""
+    import screen_families as S
+    report = base / "screening_report.csv"
+    out_rep, out_sel = tmp_path / "rep2.csv", tmp_path / "sel2.json"
+    assert S.main(["--from-report", str(report), "--report", str(out_rep), "--export-selected", str(out_sel),
+                   "--master-dir", str(tmp_path / "no_masters"), "--min-axis", "1", "--min-groups", "3",
+                   "--min-coverage", "0", "--min-spread", "-9", "--top-a", "5"]) == 0
+    first = pd.read_csv(report, encoding="cp932")
+    again = pd.read_csv(out_rep, encoding="cp932")
+    key = ["name", "scheme"]
+    a = first.set_index(key).sort_index()
+    b = again.set_index(key).sort_index()
+    assert a["selected"].tolist() == b["selected"].tolist() and a["reason"].fillna("").tolist() == b["reason"].fillna("").tolist()
+    assert json.loads(out_sel.read_text(encoding="utf-8"))["families"] == \
+        json.loads((base / "sel_initial.json").read_text(encoding="utf-8"))["families"]
+    # 基準を厳しくすると減る。基準は JSON に残る
+    assert S.main(["--from-report", str(report), "--report", str(out_rep), "--export-selected", str(out_sel),
+                   "--min-axis", "1000", "--no-always-select-abs", "--min-groups", "3", "--min-coverage", "0",
+                   "--min-spread", "-9", "--top-a", "1"]) == 0
+    tight = pd.read_csv(out_rep, encoding="cp932")
+    assert tight["selected"].sum() < first["selected"].sum() and tight["select_A"].sum() <= 2
+    crit = json.loads(out_sel.read_text(encoding="utf-8"))["criteria"]
+    assert crit["min_axis"] == 1000 and crit["always_select_abs"] is False and crit["top_a"] == 1
+
+
+def test_from_report_errors(tmp_path):
+    import screen_families as S
+    assert S.main(["--from-report", str(tmp_path / "none.csv")]) == 2
+    bad = tmp_path / "bad.csv"
+    bad.write_text("a,b\n1,2\n", encoding="cp932")
+    assert S.main(["--from-report", str(bad), "--report", str(tmp_path / "r.csv")]) == 2
