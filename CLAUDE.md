@@ -640,8 +640,8 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - `tests/test_entries_ext.py`: 出馬表1本（マイニング値だけ）に ext_indices の指数（オメガ・ST指数・Gold・BC・ZI）が付き、**master と順位・偏差値・偏差値帯・順位帯が一致する**こと、出馬表に値のある指数は出馬表の値を使うこと、0 だけの列（と右の 指数順位1）を ext で上書きすること、**優先がファイル・レースごと**（別のファイルに値があっても・0 だけのレースは ext から付き、過去側と同じ順位）、台帳に無い指数の 指数順位N を足した列に回さないこと、`--no-ext`・レースID の無い出馬表
 - `tests/test_raw_merge.py`: ファイル名からの種類、**列パッチ**（中身での見分け・2本のパッチを 全場_タイムM・全場_対戦M の両方に当てる・後のファイル優先・空欄で上書きしない・無い列を足す・16桁の ID＋馬番・18桁でない行・当てる先が無い／当たらない行のあるパッチは残す・基本CSVと同じ回・あとから基本CSVを統合すると当たって移る・片方の 全場_*.csv がまだ無いときは残す・ファイルごとに移すかを決める・見出しのゆれ・指数順位を書き換えない・replace の master の22条件に入る・画面からのアップロード）、重複の置き換え（後のファイル優先）・10年の窓・merged_done への移動（同じ名前は `_2`）・種類の分からないファイルと読めないファイルを残すこと、16桁の ID でも馬ごとに比べること、書き込みの途中失敗で既存の 全場_*.csv を壊さないこと、`--raw-dir` の既定が `--csv-dir` の隣になること、replace が master の前に統合すること（`--no-raw-merge`）、/ingest のアップロードと選択・パスの除去・不正な名前・別サイトからの POST
 - `tests/test_screen_families.py` には候補の数（骨格・因果トリオ）・冗長の除外・単独の 場所/距離/芝(内・外) を含む family の過去側と出馬表側のキーの一致（単独の 芝(内・外) はダート・内外の区別の無い芝で両側ともキーを作らない）・成績表のコース列・select の複勝スプレッド・adj_wedge_* も
-- `tests/test_screen_families.py` に選抜の新しい規則（基準B の絶対軸・基準A の adj 上位）と `--from-report`（採点し直さず同じ選抜になる・基準を変えると減る・基準が JSON に残る・読んだファイルに書き戻す・レポートが無い/形が違うと終了コード2）・同じ値の並びに依らない選抜、`tests/test_pipeline.py` に `build_db --entries-only`（`--fresh`・`--mode foragg` と一緒なら弾く）と replace の `--workers 2`（まとまりごとに子プロセスを作り直しても1プロセスと同じ master・子プロセスが止められてもそのまとまりを [ERROR] にして残りを続ける）
-- 件数: 446（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
+- `tests/test_screen_families.py` に選抜の新しい規則（基準B の絶対軸・基準A の adj 上位）と `--from-report`（採点し直さず同じ選抜になる・基準を変えると減る・基準が JSON に残る・読んだファイルに書き戻す・ファイル名なしの --from-report に --report を付けると --report を読む・レポートが無い/形が違うと終了コード2）・同じ値の並びに依らない選抜、`tests/test_pipeline.py` に `build_db --entries-only`（`--fresh`・`--mode foragg` と一緒なら弾く）と replace の `--workers 2`（まとまりごとに子プロセスを作り直しても1プロセスと同じ master・子プロセスが止められてもそのまとまりを [ERROR] にして残りを続ける）
+- 件数: 447（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
 
 ---
 
@@ -693,7 +693,8 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - lxml 6.0.2 → 6.1.3（Dependabot の脆弱性アラート。lxml は BeautifulSoup の解析で使うので削除せず更新）。同じく Dependabot に出ていた Flask 3.1.2 → 3.1.3・requests 2.32.5 → 2.33.1（§7）
 - Readme.txt を最新の運用（ext_indices への自動コピー・安井出馬表用CSVの廃止・出馬表1本への外部指数の自動結合・raw_csv の基本CSVと列パッチ・`--from-report`・馬体重発表後の差し替え）に更新
 - 検証（反証役が再現）の指摘を反映: `ProcessPoolExecutor(max_tasks_per_child=4)` が Docker の Python 3.11.18 で workers × 4 件を超えると止まる（テストはジョブ3件で気づけなかった）→ まとまりごとの作り直しに変更、`--from-report old.csv` が既定の screening_report.csv を上書きしていた → 読んだファイルに書き戻す。あわせて、選抜の同じ値の並びを決める・`--entries-only` と `--fresh`／`--mode foragg` を弾く
-- テスト 446件
+- 2回目の検証（コミット済みの範囲。build_db・文書と Flask・requests の影響）の指摘: Readme.txt 5章の「別の名前で残したいときは --report new_report.csv を付ける」が、ファイル名なしの `--from-report` では --report のファイルを読むコードと逆だった → `--from-report screening_report.csv --report new_report.csv` と書き、注意を足した。Flask 3.1.3・requests 2.33.1 は、変更点の突き合わせ・画面の応答ヘッダの比較・文字コード14通りの取得の比較で動きの違いなし
+- テスト 447件
 
 ### 2026-11-08 列パッチ（前走の列の横結合）・前走の自動補完の取り消し
 - 前走の列を 血統登録番号 の履歴から作る機能（b3bf845・5615360）を取り消した（地方・海外帰りなどで前走がずれるため。TARGET の前走の列をそのまま使う 63b7461 の動きに戻した）

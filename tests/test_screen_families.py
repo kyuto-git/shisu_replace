@@ -413,6 +413,19 @@ def test_from_report_writes_back_to_the_file_it_read(screened, base, tmp_path, m
     assert rewritten["selected"].sum() < pd.read_csv(default, encoding="cp932")["selected"].sum()
 
 
+def test_from_report_bare_with_report_reads_that_report(screened, base, tmp_path):
+    """--from-report（ファイル名なし）に --report を付けると、--report のファイルを読んで書き戻す（Readme 5章の注意書き）。
+    別の名前で残すには --from-report screening_report.csv --report new.csv。"""
+    import screen_families as S
+    default = base / "screening_report.csv"
+    before = default.read_bytes()
+    new = tmp_path / "new_report.csv"
+    assert S.main(["--from-report", "--report", str(new)]) == 2           # new_report.csv が無ければ読めずに止まる
+    assert S.main(["--from-report", str(default), "--report", str(new)]) == 0
+    assert default.read_bytes() == before
+    assert len(pd.read_csv(new, encoding="cp932")) == len(pd.read_csv(default, encoding="cp932"))
+
+
 def test_select_ties_do_not_depend_on_row_order():
     """wedge_spread が同じ値の候補が top_a の境目にあっても、行の並びで選抜が変わらない。"""
     import screen_families as S

@@ -488,9 +488,12 @@ DB を作らずにメモリ上で、family の候補を「本番と同じ集計�
   3) screening_report.csv を開き、selected=True の行（reason 列）と件数・スプレッドを確認。
      選ばれる数を変えたいときは、採点し直さずに --from-report で選抜だけやり直す（数秒。master は読みません）：
        docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --from-report --export-selected --min-axis 40 --top-a 80
-     ・--from-report だけなら screening_report.csv を読み、選抜の列（select_A・select_B・selected・reason）を書き直して同じ名前で
-       保存します。後にファイル名を書けば別のレポートから選び直し、そのファイルに書き戻します（例 --from-report old_report.csv。
-       screening_report.csv は変わりません）。別の名前で残したいときは --report new_report.csv を付ける
+     ・--from-report だけ（--report も無し）なら screening_report.csv を読み、選抜の列（select_A・select_B・selected・reason）を
+       書き直して同じ名前で保存します。後にファイル名を書けば別のレポートから選び直し、そのファイルに書き戻します
+       （例 --from-report old_report.csv。screening_report.csv は変わりません）
+     ・結果を別の名前で残したいときは、読むファイルも書いて --from-report screening_report.csv --report new_report.csv とする。
+       --from-report の後にファイル名を書かずに --report を付けると、--report のファイルを「読む」ので注意（無ければエラーで
+       止まり、古いファイルが残っていればそれで選び直して selected_families.json を上書きします）
      ・ログの「選抜: N 通り・M family」を見ながら、本集計にかけられる量（目安は全指数で現実的な時間に収まる数）まで絞る
      ・selected_families.json を手で編集してもよい
   4) 集計と DB の作り直し（selected_families.json が自動で使われます）
