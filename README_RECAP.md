@@ -2,7 +2,7 @@
 
 開発再開時の「思い出し用」要約。詳細な仕様は **CLAUDE.md** を参照（コードが正、CLAUDE.md はコードに合わせて更新）。
 
-更新日: 2026-11-08
+更新日: 2026-11-09
 
 ## 流れ
 
@@ -29,6 +29,7 @@ ingest_in/ ─ ingest.py（または /ingest）─> ingest_out/実行日時/（�
 docker build -t csv_processor_shisu .
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python replace_csv_ver3.py --clean
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --indicators タイムM,対戦M --workers 4 --export-selected
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --from-report --export-selected   # 採点し直さず選抜だけ
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --merge-only --clean
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
@@ -45,9 +46,11 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - family（`shisu/families.py`）: 部品は COURSE・重量種別・クラス名・枠番グループ・騎手・芝・ダ・場所・距離・芝(内・外)・22条件。初期セット49の型（A 15・B 9・C 10・D 15 → 83 family・129通り）。`selected_families.json` があれば置き換え（集計・DB・照合・画面）。初期セットのままだと成績表・DB は旧版の約8〜9倍
 - オッズ帯: 通常 / 10倍未満（odds10u）/ 10〜50倍（odds10_50）/ 50倍以上（odds50p）
 - 推定値: Jeffreys 事前の事後分布の下側10%点（複勝率は頻度20%以下なら上側90%点）。DB の 勝率_val〜3着率_val は推定値、掲示板率_val は頻度。率はすべて 0–100
-- 条件ヒット馬: 消し → 絶対軸 → 軸候補 → 相手 の順で最初に当てはまった区分（閾値は `shisu/classify.py`）。screen_families の基準B はこの判定のキー数。基準A は groups_ge10・coverage・wedge_spread・fuku_spread（既定20%ポイント）。候補は 骨格（コース不問〜COURSE）× 条件28種 × 因果トリオ（default 2,098通り・all 7,557通り。master 1本30万行で 1.4時間・5時間）
+- 条件ヒット馬: 消し → 絶対軸 → 軸候補 → 相手 の順で最初に当てはまった区分（閾値は `shisu/classify.py`）。screen_families の基準B はこの判定のキー数（既定: 絶対軸＋軸候補 25 以上、または絶対軸が1つでも）。基準A は groups_ge10・coverage・wedge_spread・fuku_spread（既定20%ポイント）を満たす wedge_spread 上位100 か adj_wedge_spread 上位100。`--from-report` で採点し直さずに選抜だけやり直せる。候補は 骨格（コース不問〜COURSE）× 条件28種 × 因果トリオ（default 2,098通り・all 7,557通り。master 1本30万行で 1.4時間・5時間）
 - WEDGE = WIN（決定力）+ EDGE（オッズから見た期待着順を上回った割合）。adjusted_WEDGE は年10件以上の年すべて（最大10年）を新しい年ほど重い指数減衰（0.65）で加重
 - 外部指数の取得は `shisu/ingest/` と `shisu/yasui_extractor.py`（安井 8指数。指数ごとのフォルダ。ベースCSV未指定でも ingest_in/base/・entries_in/ から該当日を探す。出馬表用の entries_in/yasui_*.csv は廃止）
 - 出馬表の外部指数: 出馬表に値のある指数は出馬表の値（ファイル・レースごとに判定）、無い・0 だけのレースは ext_indices から過去側と同じ関数（`ext_indices.attach_filled`）で付ける → 同じ馬なら master と順位・偏差値が一致
 - レース単位（16桁）の レースID(新) は replace が馬番を付けて18桁にする（旧版の band 系の件数膨張の再発防止。tests/test_band_regression.py）
 - family・集計条件だけ変えたときは aggregate → build_db だけでよい（master はそのまま）
+- 馬体重発表後のマイニング確定値: entries_in の出馬表を上書きして calc_entry_hensachi.py --merge-only --clean → build_db.py --entries-only
+- replace の --workers は子プロセスを4件ほどで作り直す（workers × 4 件のまとまりごとに新しいプール。OOM・BrokenProcessPool 対策。止められたファイルは [ERROR] にして残りを続ける）

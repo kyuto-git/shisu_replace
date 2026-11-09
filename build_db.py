@@ -377,6 +377,8 @@ def families_from_db(con: sqlite3.Connection) -> list:
 def parse_cli(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mode", choices=["both", "foragg", "entries"], default="both")
+    p.add_argument("--entries-only", action="store_true",
+                   help="--mode entries と同じ（出馬表だけ取り込み直す。馬体重発表後のマイニング確定値の更新など）")
     p.add_argument("--fresh", action="store_true", help="DBファイルを削除して作り直す")
     p.add_argument("--prune", action="store_true", help="今回作り直した種類の古いテーブルを削除する")
     p.add_argument("--no-xjoin", action="store_true", help="entries_xjoin_* を作らない（画面はその場で照合する）")
@@ -385,7 +387,14 @@ def parse_cli(argv=None):
     p.add_argument("--allow-empty", action="store_true", help="成績表が0本でも unified_all を空で作り直す")
     p.add_argument("--entries-dir", default=str(config.entries_out_dir()))
     p.add_argument("--db-path", default=str(config.db_path()), help="既定は環境変数 DB_PATH か racing.db")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.entries_only:
+        if args.mode not in ("both", "entries"):
+            p.error("--entries-only と --mode foragg は一緒に使えません")
+        if args.fresh:
+            p.error("--entries-only と --fresh は一緒に使えません（--fresh は成績表も含めて DB を消します）")
+        args.mode = "entries"
+    return args
 
 
 def main(argv=None) -> int:

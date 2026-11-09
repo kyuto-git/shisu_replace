@@ -572,3 +572,69 @@ def test_entries_wedge_on_the_fly_matches_xjoin(base, monkeypatch, tmp_path):
     monkeypatch.setattr(am, "DB_PATH", str(no_x))
     b = c.get("/entries/wedge.csv", query_string=q).data
     assert a == b and len(a.splitlines()) > 1
+
+
+def test_entries_only_is_mode_entries(base, tmp_path):
+    """build_db --entries-only は --mode entries と同じ（出馬表だけ取り込み直す。成績表のテーブルは残す）。"""
+    import build_db
+    assert build_db.parse_cli(["--entries-only"]).mode == "entries"
+    assert build_db.parse_cli(["--entries-only", "--mode", "entries"]).mode == "entries"
+    for bad in (["--entries-only", "--mode", "foragg"], ["--entries-only", "--fresh"]):
+        with pytest.raises(SystemExit):              # 成績表を消す・作り直す指定とは一緒に使えない
+            build_db.parse_cli(bad)
+    p = tmp_path / "eo.db"
+    shutil.copy(base / "racing.db", p)
+    with sqlite3.connect(p) as con:
+        before = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'foragg_%'")}
+    assert build_db.main(["--entries-only", "--db-path", str(p)]) == 0
+    with sqlite3.connect(p) as con:
+        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert before and before <= names and any(n.startswith("entries_xjoin_") for n in names)
+
+
+def test_replace_parallel_restarts_workers_and_matches_sequential(base, tmp_path, monkeypatch):
+    """--workers 2 でも1プロセスと同じ master。子プロセスは workers × MAX_TASKS_PER_CHILD 件ごとに
+    ProcessPoolExecutor を作り直して入れ替える（max_tasks_per_child は Python 3.11・3.12 で止まるので使わない）。"""
+    import concurrent.futures
+    import replace_csv_ver3
+    created = []
+
+    class Recorder(concurrent.futures.ProcessPoolExecutor):
+        def __init__(self, *a, **k):
+            created.append(k)
+            super().__init__(*a, **k)
+    monkeypatch.setattr(replace_csv_ver3, "ProcessPoolExecutor", Recorder)
+    monkeypatch.setattr(replace_csv_ver3, "MAX_TASKS_PER_CHILD", 1)    # 2件ごとに作り直す（ジョブは3件以上）
+    out = tmp_path / "m2"
+    assert replace_csv_ver3.main(["--workers", "2", "--no-raw-merge", "--master-dir", str(out)]) == 0
+    assert len(created) >= 2 and all("max_tasks_per_child" not in k for k in created)
+    names = sorted(p.name for p in (base / "master_csv").glob("master_*.csv.gz"))
+    assert names and names == sorted(p.name for p in out.glob("master_*.csv.gz"))
+    for n in names:
+        a = pd.read_csv(base / "master_csv" / n, encoding="cp932", dtype=str, keep_default_na=False)
+        b = pd.read_csv(out / n, encoding="cp932", dtype=str, keep_default_na=False)
+        assert a.equals(b), n
+
+
+def _run_or_crash(job):
+    """run_parallel の試験用（子プロセスで pickle から戻せるようにモジュールの直下に置く）。"""
+    import os
+    if job[1] == "crash.csv":
+        os._exit(1)                                 # OOM Killer に止められたのと同じ（例外を出さずに子プロセスが消える）
+    return f"ok {job[1]}"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fork が前提")
+def test_replace_run_parallel_survives_killed_worker(monkeypatch):
+    """子プロセスが止められても（BrokenProcessPool）、そのまとまりのジョブを [ERROR] にして残りを続ける。"""
+    import multiprocessing
+    import replace_csv_ver3
+    if multiprocessing.get_start_method() != "fork":
+        pytest.skip("試験用の関数を子プロセスに渡すのに fork が要る")
+    monkeypatch.setattr(replace_csv_ver3, "_run", _run_or_crash)
+    monkeypatch.setattr(replace_csv_ver3, "MAX_TASKS_PER_CHILD", 1)    # まとまり = [0,1] [2,3] [4]
+    jobs = [("file", n) for n in ["j0.csv", "j1.csv", "crash.csv", "j3.csv", "j4.csv"]]
+    res = replace_csv_ver3.run_parallel(jobs, 2)
+    assert res[0] == "ok j0.csv" and res[1] == "ok j1.csv" and res[4] == "ok j4.csv"
+    assert res[2].startswith("[ERROR] crash.csv: 子プロセスが止められました")
+    assert res[3] == "ok j3.csv" or res[3].startswith("[ERROR] j3.csv: 子プロセスが止められました")
