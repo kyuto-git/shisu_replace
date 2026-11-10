@@ -215,9 +215,12 @@ def test_master_aggregates_without_payouts(run, tmp_path):
     out = tmp_path / "agg"
     assert aggregate_stats_ver2.main(["--in-dir", str(b / "master_csv"), "--out-dir", str(out), "--clean",
                                       "--wedge-min-year-count", "0"]) == 0
-    files = sorted(out.glob(f"foragg_*_{REGION}_オメガ指数.csv"))
+    from shisu.aggstore import read_agg_tables
+    files = [t for n, t in sorted(read_agg_tables(out).items()) if n.endswith(f"_{REGION}_オメガ指数.csv")]
     assert files
-    t = pd.concat([pd.read_csv(f, encoding="cp932") for f in files])
+    t = pd.concat(files)
+    for c in ("単勝回収値", "複勝回収値", "件数"):
+        t[c] = pd.to_numeric(t[c])
     assert (t["単勝回収値"] == 0).all() and (t["複勝回収値"] == 0).all() and (t["件数"] >= 5).all()
 
 

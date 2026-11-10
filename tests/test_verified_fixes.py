@@ -208,10 +208,13 @@ def mini(tmp_path_factory):
 
 
 def _agg(b: Path, out: str, *extra) -> list[str]:
+    """集計して、旧来の1表1ファイルの名前の一覧を返す（ここでは表の有無・列を見るので全部の行を残す）。"""
     import aggregate_stats_ver2
+    from shisu.aggstore import read_agg_tables
     assert aggregate_stats_ver2.main(["--in-dir", str(b / "master_csv"), "--out-dir", str(b / out),
-                                      "--families", str(b / "fams.json"), "--wedge-min-year-count", "0", *extra]) == 0
-    return sorted(p.name for p in (b / out).glob("foragg_*.csv"))
+                                      "--families", str(b / "fams.json"), "--wedge-min-year-count", "0",
+                                      "--no-compact", *extra]) == 0
+    return sorted(read_agg_tables(b / out))
 
 
 def test_rankband_schemes_env_removes_old_files_and_limits_families_json(mini, monkeypatch):
@@ -226,31 +229,45 @@ def test_rankband_schemes_env_removes_old_files_and_limits_families_json(mini, m
 
 
 def test_ref_columns_only_for_families_that_fix_them(mini):
+    from shisu.aggstore import read_agg_tables
     _agg(mini, "agg2", "--clean")
-    a = mini / "agg2"
-    course = pd.read_csv(a / "foragg_normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv", encoding="cp932", dtype=str,
-                         keep_default_na=False)
+    t = read_agg_tables(mini / "agg2")
+    course = t["foragg_normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv"]
     assert (course["場所"] != "").all() and (course["距離"] != "").all()
-    jk = pd.read_csv(next(a.glob("foragg_rankband_s1_X_jk_band_*.csv")), encoding="cp932", dtype=str, keep_default_na=False)
+    jk = next(v for n, v in t.items() if n.startswith("foragg_rankband_s1_X_jk_band_"))
     assert (jk[["場所", "芝・ダ", "距離", "芝(内・外)"]] == "").all().all()       # 騎手だけの family はコースを持たない
-    sd = pd.read_csv(next(a.glob("foragg_rankband_s1_X_sd_pfin_hen_*.csv")), encoding="cp932", dtype=str,
-                     keep_default_na=False)
+    sd = next(v for n, v in t.items() if n.startswith("foragg_rankband_s1_X_sd_pfin_hen_"))
     assert (sd["芝・ダ"] != "").all() and (sd["場所"] == "").all()
 
 
 def test_build_db_skips_tables_of_other_family_sets(mini, tmp_path):
     """agg_csv に前の実行の別の family の成績表が残っていても、families.json に無いものは取り込まない。"""
     import build_db
+    from shisu.aggstore import ROW_META, read_agg_master, read_agg_tables
+    from shisu.csvio import write_csv
     a = mini / "agg3"
     _agg(mini, "agg3", "--clean")
-    stale = a / "foragg_rankJ_主５場（中山、東京、中京、京都、阪神）_SAV.csv"
-    stale.write_bytes((a / "foragg_normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv").read_bytes())
-    db = tmp_path / "x.db"
-    F.reset()
-    assert build_db.main(["--mode", "foragg", "--agg-dir", str(a), "--db-path", str(db), "--fresh"]) == 0
-    with sqlite3.connect(db) as con:
-        fams = {r[0] for r in con.execute("SELECT DISTINCT family FROM unified_all")}
-    assert fams <= {"normal", "X_jk_band", "X_sd_pfin_hen"} and "rankJ" not in fams
+    src = "主５場（中山、東京、中京、京都、阪神）_SAV"
+    # ① master ごとの成績表に、前の実行の別の family の行（rankJ）が混ざっていても取り込まない
+    m = read_agg_master(a / f"agg_master_{src}.csv.gz")
+    stale = m[m["family"] == "normal"].assign(family="rankJ", テーブル名=f"foragg_rankJ_{src}")
+    write_csv(pd.concat([m, stale], ignore_index=True), a / f"agg_master_{src}.csv.gz")
+    # ② 旧来の1表1ファイル（agg_master の無い master の分）でも同じ
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    for name, t in read_agg_tables(a).items():
+        write_csv(t, legacy / name)
+    (legacy / f"foragg_rankJ_{src}.csv").write_bytes((legacy / f"foragg_normal_{src}.csv").read_bytes())
+    (legacy / "families.json").write_bytes((a / "families.json").read_bytes())
+    for d in (a, legacy):
+        db = tmp_path / f"{d.name}.db"
+        F.reset()
+        assert build_db.main(["--mode", "foragg", "--agg-dir", str(d), "--db-path", str(db), "--fresh"]) == 0
+        with sqlite3.connect(db) as con:
+            fams = {r[0] for r in con.execute("SELECT DISTINCT family FROM unified_all")}
+            metas = {r[0] for r in con.execute("SELECT DISTINCT family FROM __tables_meta__ WHERE kind='foragg'")}
+        assert fams <= {"normal", "X_jk_band", "X_sd_pfin_hen"} and "rankJ" not in fams and "rankJ" not in metas
+    assert set(ROW_META) <= set(m.columns)
     F.reset()
 
 
