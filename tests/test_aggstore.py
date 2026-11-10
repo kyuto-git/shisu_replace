@@ -182,6 +182,10 @@ def test_compact_thresholds_are_options(mb, tmp_path):
     assert len(_rows(tight)) <= len(_rows(mb / "agg_csv"))
     s = json.loads((tight / "agg_settings.json").read_text(encoding="utf-8"))
     assert s["compact"] == {"enabled": True, "min_count": 100000, "min_wedge": 99.0}
+    # 0 はその条件を使わない（区分と layer A だけで残す）。件数・WEDGE の下限を極端にしたときと同じ行
+    off = tmp_path / "off"
+    assert agg.main(["--out-dir", str(off), "--compact-min-count", "0", "--compact-min-wedge", "0", *YEAR]) == 0
+    assert [p.read_bytes() for p in sorted(off.glob("agg_master_*"))] == [p.read_bytes() for p in sorted(tight.glob("agg_master_*"))]
 
 
 # ---------------------------------------------------------------- --resume

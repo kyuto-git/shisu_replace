@@ -10,8 +10,8 @@
 コンパクト化（aggregate の --compact。既定 ON）: compact_mask の条件のどれかを満たす行だけを残す
   a) classify（shisu/classify.py）で 絶対軸・軸候補・相手候補・消し候補 のどれかになる行
      （判定の値は build_db が DB に入れる値と同じ: 5つの率の *_val は文字列の括弧内の推定値）
-  b) WEDGE >= min_wedge または adjusted_WEDGE >= min_wedge（既定 0.70）
-  c) layer が FULL_LAYERS（初期セットのコース固定 A）の family の行、または 件数 >= min_count（既定30）
+  b) WEDGE >= min_wedge または adjusted_WEDGE >= min_wedge（既定 0.70。0 以下ならこの条件を使わない）
+  c) layer が FULL_LAYERS（初期セットのコース固定 A）の family の行、または 件数 >= min_count（既定30。0 以下なら件数の条件を使わない）
 """
 from __future__ import annotations
 
@@ -69,15 +69,19 @@ def prepare_agg_frame(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def compact_mask(out: pd.DataFrame, mode: str, layer: str = "", min_count: int = COMPACT_MIN_COUNT,
                  min_wedge: float = COMPACT_MIN_WEDGE) -> np.ndarray:
-    """成績表 out（aggregate_frame の出力。1つの family・スキーム・オッズ帯 mode）のうち残す行。"""
+    """成績表 out（aggregate_frame の出力。1つの family・スキーム・オッズ帯 mode）のうち残す行。
+    min_count・min_wedge が 0 以下ならその条件は使わない（区分と layer A だけで残す行を決められるように）。"""
     n = len(out)
     if n == 0 or layer in FULL_LAYERS:
         return np.ones(n, dtype=bool)
     num = lambda c: (pd.to_numeric(out[c], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
                      if c in out.columns else np.full(n, np.nan))
+    keep = np.zeros(n, dtype=bool)
     with np.errstate(invalid="ignore"):
-        keep = num("件数") >= min_count
-        keep |= (num("WEDGE") >= min_wedge) | (num("adjusted_WEDGE") >= min_wedge)
+        if min_count > 0:
+            keep |= num("件数") >= min_count
+        if min_wedge > 0:
+            keep |= (num("WEDGE") >= min_wedge) | (num("adjusted_WEDGE") >= min_wedge)
     rest = ~keep
     if rest.any():                                      # 判定は残りの行だけ（DB と同じ推定値で）
         sub = out.loc[rest, [c for c in ("件数", "複勝率", "連対率", "掲示板率_val", "複勝回収値", "単勝適正回収値")

@@ -83,7 +83,15 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2
   ・コンパクト化（既定 ON）：条件ヒット馬の4区分（絶対軸・軸候補・相手候補・消し候補）に入る行、WEDGE か adjusted_WEDGE が
     0.70 以上の行、初期セットのコース固定（A の15種）の行、件数30以上の行だけを書きます。区分にも上位にも入らない件数の
     少ない平凡な行は書かないので、ファイルと DB が小さくなります。全部の行を残すときだけ --no-compact
-    （残す件数の下限は --compact-min-count、WEDGE の下限は --compact-min-wedge で変えられます）
+    （残す件数の下限は --compact-min-count、WEDGE の下限は --compact-min-wedge で変えられます。0 にするとその条件を使いません）
+  ・どれくらい小さくなるか（30万行＝10年分相当の合成データ、X_ の family で測った残る行の割合）：
+        既定（件数30以上・WEDGE 0.70以上）              … 約56%
+        --compact-min-count 100                         … 約39%
+        --compact-min-count 0                           … 約21%
+        --compact-min-count 0 --compact-min-wedge 1.0   … 約7%（区分と A の15種の行は必ず残る）
+    既定のままだと半分ほどにしかなりません。数千通りの family を全指数で集計して DB が大きすぎるときは、下の2つで絞ります
+    （DB は1行あたり約740バイト。4,868通り×33指数なら既定で約180GB、件数0・WEDGE 1.0 で約21GB の見積もり）：
+      docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4 --compact-min-count 0 --compact-min-wedge 1.0
   ・--workers N のとき、master を1本ずつ子プロセスに渡し、N×2本ごとに子プロセスを作り直します（メモリがたまらないように）
 
 # Step 3: 出馬表の偏差値計算・1ファイル統合（entries_in/ → entries_out/entries_merged_hensachi.csv）

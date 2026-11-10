@@ -399,9 +399,10 @@ def main(argv=None) -> int:
                     help="区分（絶対軸・軸候補・相手候補・消し候補）にも WEDGE の上位にも入らない平凡な行を書かない"
                          "（既定 ON。全部の行を残すときは --no-compact）")
     ap.add_argument("--compact-min-count", type=int, default=COMPACT_MIN_COUNT,
-                    help=f"コンパクト化しても残す件数の下限（既定 {COMPACT_MIN_COUNT}。これ以上の行は区分に関係なく残す）")
+                    help=f"コンパクト化しても残す件数の下限（既定 {COMPACT_MIN_COUNT}。これ以上の行は区分に関係なく残す。"
+                         "0 なら件数では残さない）")
     ap.add_argument("--compact-min-wedge", type=float, default=COMPACT_MIN_WEDGE,
-                    help=f"コンパクト化しても残す WEDGE・adjusted_WEDGE の下限（既定 {COMPACT_MIN_WEDGE}）")
+                    help=f"コンパクト化しても残す WEDGE・adjusted_WEDGE の下限（既定 {COMPACT_MIN_WEDGE}。0 なら WEDGE では残さない）")
     ap.add_argument("--wedge-min-year-count", type=int, default=None,
                     help=f"adjusted_WEDGE で使う年の最低件数（既定 {WEDGE_MIN_YEAR_COUNT}。環境変数 AGG_WEDGE_MIN_YEAR_COUNT）")
     ap.add_argument("--wedge-max-years", type=int, default=None,
@@ -472,8 +473,9 @@ def main(argv=None) -> int:
     print(f"[INFO] {len(files)} files / 推定={PROP_MODE} (q={LOWER_Q}/{UPPER_Q}) / scipy={'あり' if has_scipy() else 'なし(正規近似)'}"
           f" / WEDGE: 年の最低件数={opts['min_year_count']} 遡る年数≦{opts['max_years']}"
           f" 減衰率={opts['decay']} 窓={opts['window']}")
-    print("[INFO] コンパクト化: " + (f"ON（区分・WEDGE≧{copts['min_wedge']}・layer A・件数≧{copts['min_count']} の行だけ書く）"
-                                if copts["enabled"] else "OFF（全部の行を書く）"))
+    rule = ["区分"] + ([f"WEDGE≧{copts['min_wedge']}"] if copts["min_wedge"] > 0 else []) + ["layer A"] + (
+        [f"件数≧{copts['min_count']}"] if copts["min_count"] > 0 else [])
+    print("[INFO] コンパクト化: " + (f"ON（{'・'.join(rule)} の行だけ書く）" if copts["enabled"] else "OFF（全部の行を書く）"))
     legacy = legacy_files(out_dir)
     if legacy:
         print(f"[WARN] 旧来の成績表 foragg_*.csv が {len(legacy)} 本あります（例: {legacy[0].name}）。build_db は "
