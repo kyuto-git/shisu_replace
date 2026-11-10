@@ -56,6 +56,6 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - family・集計条件だけ変えたときは aggregate → build_db だけでよい（master はそのまま）
 - 馬体重発表後のマイニング確定値: entries_in の出馬表を上書きして calc_entry_hensachi.py --merge-only --clean → build_db.py --entries-only
 - 成績表のコンパクト化（aggregate の既定）: 4区分（絶対軸・軸候補・相手候補・消し候補）・WEDGE か adjusted_WEDGE ≧0.70・layer A・件数≧30 のどれかの行だけを書く（区分と高 WEDGE は1行も落とさない）。全部の行は `--no-compact`
-- aggregate の --workers は master を1本ずつ渡し、workers × 2 本ごとに子プロセスを作り直す。--resume は agg_settings.json と設定が同じときだけ、済んだ master を飛ばす
+- aggregate の --workers は master を1本ずつ渡し、workers × 2 本ごとに子プロセスを作り直す。--resume は書き終わりの印（.done: 設定のハッシュ・master の大きさと更新時刻・ファイルの大きさ）が今と合う master だけを飛ばす（違えば作り直す）。コンパクト化の下限を外すのは none
 - 画面の「集計表ごと」は unified_all のテーブル名が同じ行（前の版の DB の foragg_* テーブルがあればそこから。同じ結果）
 - replace の --workers は子プロセスを4件ほどで作り直す（workers × 4 件のまとまりごとに新しいプール。OOM・BrokenProcessPool 対策。止められたファイルは [ERROR] にして残りを続ける）

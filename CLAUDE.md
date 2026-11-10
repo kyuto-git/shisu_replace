@@ -200,18 +200,20 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
   - agg_csv に旧来の `foragg_*.csv` が残っていれば WARN（build_db は同じ master の agg_master があれば使わない。消すには `--clean`）
 - **コンパクト化（`--compact`。既定 ON。全部の行を書くのは `--no-compact`）**: 成績表の行のうち、次のどれかを満たすものだけを書く（`shisu.aggstore.compact_mask`）
   - a) `classify` で 絶対軸・軸候補・相手候補・消し候補 のどれかになる（判定の値は build_db が DB に入れる値と同じ: 5つの率の `*_val` は文字列の括弧内の推定値。`classify_frame` で全行を一度に判定）
-  - b) `WEDGE >= 0.70` または `adjusted_WEDGE >= 0.70`（`--compact-min-wedge`。0 ならこの条件を使わない）
-  - c) family の layer が A（初期セットのコース固定15種）、または `件数 >= 30`（`--compact-min-count`。0 なら件数の条件を使わない）
+  - b) `WEDGE >= 0.70` または `adjusted_WEDGE >= 0.70`（`--compact-min-wedge`。`none` ならこの条件を使わない）
+  - c) family の layer が A（初期セットのコース固定15種）、または `件数 >= 30`（`--compact-min-count`。`none` なら件数の条件を使わない）
+  - 下限は正の数か `none`。0 以下は受け付けない（0 を「使わない」にすると、下げたのに残る行が減る逆向きの動きになるため）
   - 条件ヒット馬（4区分すべて）と WEDGE の上位の行は1行も落とさない（`tests/test_aggstore.py` で、全部の行から独立に計算した行と完全に一致すること、DB の4区分・WEDGE≧0.70 の行が全部の行の DB と同じことを確認）。落ちるのは、どの区分にも入らず WEDGE も低く件数30未満の行（レース別 WEDGE 一覧・条件ヒット馬の画面にはもともと出ても使わない行）
   - 実測（2026-11-10。残る行の割合）:
     - 実サンプル `202610.csv`（1か月分）・初期セット: 35,998行 → 13,587行（37.7%）
     - 合成の master 1本（30万行＝10年分相当）・初期セット: 91.2%（行の63%が layer A で全部残る。区分 3.7%・WEDGE≧0.70 が 18.6%）
-    - 同じ master・`--space all` の X_ 候補から無作為に150 family（251通り。layer A なし）: 既定（件数≧30・WEDGE≧0.70）で 55.9%。区分は 4.8%・WEDGE≧0.70 は 16.5%（件数の少ないグループは WEDGE がたまたま高く出やすい）。下限の組み合わせ: 件数≧100・WEDGE≧0.70 で 38.5%、件数≧100・WEDGE≧1.0 で 25.9%、件数なし（`--compact-min-count 0`）・WEDGE≧0.70 で 21.3%、件数なし・WEDGE≧1.0 で 6.7%、件数なし・WEDGE なし（区分だけ）で 4.8%
-    - つまり既定の規則では半分ほどにしかならない（「9割が平凡」でも、平凡な行の多くが件数30以上か WEDGE≧0.70 に入る）。10分の1にするには `--compact-min-count 0 --compact-min-wedge 1.0` くらいまで絞る（区分と layer A の行は常に残る）
+    - 同じ master・`--space all` の X_ 候補から無作為に150 family（251通り。layer A なし）: 既定（件数≧30・WEDGE≧0.70）で 55.9%。区分は 4.8%・WEDGE≧0.70 は 16.5%（件数の少ないグループは WEDGE がたまたま高く出やすい）。下限の組み合わせ: 件数≧100・WEDGE≧0.70 で 38.5%、件数≧100・WEDGE≧1.0 で 25.9%、件数なし（`--compact-min-count none`）・WEDGE≧0.70 で 21.3%、件数なし・WEDGE≧1.0 で 6.7%、件数なし・WEDGE なし（区分だけ）で 4.8%
+    - つまり既定の規則では半分ほどにしかならない（「9割が平凡」でも、平凡な行の多くが件数30以上か WEDGE≧0.70 に入る）。10分の1にするには `--compact-min-count none --compact-min-wedge 1.0` くらいまで絞る（区分と layer A の行は常に残る）
     - 大きさの目安: unified_all は1行あたり約740バイト（索引込み）、agg_master_*.csv.gz は約51バイト。4,868通り × 33指数（全部の行で約4.3億行と見積もり）なら、既定で DB 約180GB、件数なし・WEDGE≧1.0 で約21GB（合成データからの見積もり。実データでは違う）
   - 時間はほとんど変わらない（判定は書く前の成績表に1回かけるだけ）
 - **並列（`--workers N`）**: master を1本ずつ子プロセスに渡し（`chunksize=1` と同じ）、N × `MASTERS_PER_CHILD`（2）本ごとに `ProcessPoolExecutor` を作り直して `gc.collect()` する（`shisu.parallel.run_batched`。replace と同じ。子プロセスが止められたらそのまとまりの残りを `[ERROR]` にして次へ）。進み具合は `[済んだ本数/全体] [OK] …` で1本ずつ出す
-- **`--resume`**: `agg_master_*.csv.gz` がすでにある master を飛ばす（途中で止まったあとの続きから）。集計の設定（family の定義・スキーム・WEDGE・推定・コンパクト化）を `agg_csv/agg_settings.json` に書いておき、今の設定と違えば止める（終了コード2。違う設定の成績表が混ざらないように）。settings が無いのに済んだファイルがあるときも止める。`--clean` と一緒には使えない。前の実行の書きかけ `.part` は消してからやり直す
+- **書き終わりの印と `--resume`**: master を書き始めるときに前の `agg_master_*.csv.gz` と印を消し、書き終えたら fsync して本来の名前に置き換え、印 `agg_master_*.csv.gz.done`（集計の設定のハッシュ・元の master の名前・大きさ・更新時刻・行数・成績表のファイルの大きさ）を書く。`--resume` は、印が**今の設定・今の master と合い、成績表が印のとおりの大きさで残っている** master だけを飛ばし、ほかは作り直す（違う設定で作った成績表・replace で作り直した master・途中で切れたファイルを混ぜない。設定を変えた実行が途中で止まっても、`--resume` で今の設定にそろう）。設定（family の定義・スキーム・WEDGE・推定・コンパクト化）は `agg_csv/agg_settings.json` にも書き、前回と違えばどの項目かをログに出す。`--clean` と一緒には使えない。前の実行の書きかけ `.part` は消してからやり直す
+- 失敗: 子プロセスが止められた・例外の master は `[ERROR]`（終了コード1）。全部の master が失敗したときもそう出す（「replace を先に」とは出さない）。直してから `--resume` で失敗した分だけ集計できる
 - 行ごとに決まる値（着順の解析・オッズ・配当・年）は master 1本につき1回だけ求め、family・オッズ帯ごとには aggregate_frame の入力に要る列だけを渡す（`with_precomputed`。結果は1行ずつ求めたときと同じ）
 - 重複排除: レースID × 結合データ × 馬番（s2 の重なりで1頭が2つのキーに入るのは別のキーなので数える）
 - 着順: 取消・除外（★6 の「消」「外」も）は分母外、失格・中止（「止」も）は分母に入れて着順=頭数（不明なら18）
@@ -221,7 +223,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
   - `--wedge-min-year-count N`（既定10）、`--wedge-max-years N`（既定10）、`--wedge-decay D`（既定0.65）、`--wedge-window data|key`（既定 data）。環境変数 `AGG_WEDGE_*` でも指定できる
 - 件数 < 5 のグループは計算前に除く（出力しない）
 - 集計できた master が0本なら終了コード2（replace を先に実行）
-- 環境変数: `AGG_PROP_MODE`(lower|mean), `AGG_LOWER_Q`, `AGG_UPPER_Q`, `AGG_PRIOR_ALPHA/BETA`, `PLC_SWITCH_THRESHOLD_PCT`, `AGG_MIN_SAMPLE`, `AGG_RANKBAND_SCHEMES`（例 `s1` で s2 を作らない）, `AGG_WEDGE_*`。オプション `--in-dir`（既定 master_csv）, `--out-dir`, `--families`, `--clean`, `--resume`, `--workers N`, `--compact`/`--no-compact`, `--compact-min-count N`, `--compact-min-wedge X`, `--wedge-*`
+- 環境変数: `AGG_PROP_MODE`(lower|mean), `AGG_LOWER_Q`, `AGG_UPPER_Q`, `AGG_PRIOR_ALPHA/BETA`, `PLC_SWITCH_THRESHOLD_PCT`, `AGG_MIN_SAMPLE`, `AGG_RANKBAND_SCHEMES`（例 `s1` で s2 を作らない）, `AGG_WEDGE_*`。オプション `--in-dir`（既定 master_csv）, `--out-dir`, `--families`, `--clean`, `--resume`, `--workers N`, `--compact`/`--no-compact`, `--compact-min-count N|none`, `--compact-min-wedge X|none`, `--wedge-*`
 - 目安（検証環境・1プロセス）: 30万行の master 1本 × 初期セット（122通りの時点で計測）= 3分19秒（合成データ。71万グループ・成績表488本・CSV 168MB。行ごとの値の前計算の前は約2.5倍かかった）。実サンプル（3,188頭）では 18秒・成績表 476本・unified_all 33,210行（うちレイヤーA（旧版の15種に当たる）は 3,847行）
 
 ### 3.3 calc_entry_hensachi.py（出馬表 → 偏差値付き出馬表）
@@ -243,7 +245,10 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - family の定義ファイル（`SHISU_FAMILIES_FILE` など）が無い・読めないときは、DB に触る前に終了コード2
 - `--mode both|foragg|entries`, `--entries-only`（＝ `--mode entries`。出馬表だけ取り込み直す。馬体重発表後のマイニング確定値の差し替えなど。`--mode foragg`・`--fresh` とは一緒に使えない）, `--fresh`, `--prune`, `--no-xjoin`, `--agg-dir`, `--allow-empty`, `--entries-dir`, `--db-path`
 - foragg（2026-11-10〜）: `agg_csv/families.json` の family を台帳に入れ（無ければ selected_families.json か初期セット）、`agg_master_*.csv.gz` を20万行ずつ読み、5つの率の `*_val` を文字列の括弧内（推定値）で作り直して **unified_all に直接入れる**（1表ずつのテーブル `foragg_*` は作らない。旧版は同じ行を foragg_* と unified_all の2回持っていた）。__tables_meta__ は「テーブル名」ごとに1行（kind=foragg・n_rows は unified_all の行数・source_file は読んだファイル。その名前の実テーブルは無い）。__facets__ は読みながら集めた値。→ 索引（照合用 (結合データ, family, indicator)、テーブル名、WEDGE、adjusted_WEDGE）→ **`__families__`**（family の定義）
-  - 作り直しは `unified_all__build` に入れてから、最後に1つのトランザクションで前の unified_all と入れ替える（途中で止まっても前の unified_all が残る。画面は入れ替えまで前の DB を見る）。ファイルごとにコミットするので、WAL が DB 全体の大きさまで膨らまない。前の版の DB に残っている1表ずつのテーブル `foragg_*` は入れ替えのときに消す（ファイルを小さくするには `--fresh`）
+  - 作り直しは `unified_all__build` に入れてから、最後に1つのトランザクションで前の unified_all と入れ替える（途中で止まっても前の unified_all が残る。画面は入れ替えまで前の DB を見る）。行はファイルごとにコミットする。入れ替えのトランザクションで索引を作るので、WAL はその間だけ索引の大きさほどに膨らむ（100万行で約180MB）。最後に `wal_checkpoint(TRUNCATE)` で切り詰める
+  - 前の版の DB に残っている1表ずつのテーブル `foragg_*` は入れ替えのときに消す。`DROP_TABLE_LIMIT`（5,000）本を超えるときは消さずに WARN（DROP は1本ごとにスキーマを書き直すので本数の2乗で遅い。1.6万本で約13秒、数十万本だと何時間も）。画面は使わないので表示には影響しない。消してファイルを小さくするには `--fresh`
+  - 読めない成績表（途中で切れた gzip・壊れた CSV）は、そのファイルの分だけ戻して飛ばし `[ERROR]`（終了コード1。ほかのファイルは入れる。`aggregate --resume` で作り直せる）
+  - 書き終わりの印（`.done`）の設定のハッシュが成績表によって違う・印が無いものがあれば WARN（違う設定の成績表の混ざり。`aggregate --resume` でそろえる）
   - 旧来の1表1ファイル（`foragg_*.csv`）も読める（互換）。同じ master の `agg_master_*.csv.gz` があれば、その master の旧来のファイルは使わない（二重に入れない）
   - 読める成績表が0本なら DB に触らず終了コード2（空にしたいときだけ `--allow-empty`）。WEDGE 列の無い旧形式の成績表は取り込まず終了コード1
   - families.json に無い family・スキームの行・ファイル（前の実行の残り）は取り込まず、行数・本数を警告する
@@ -256,7 +261,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - 接続のたびに DB の `__families__` を family の台帳に反映する（DB が変わったときだけ読み、台帳を作り直す。同じ名前で部品が変わっても置き換わる。無ければ初期セット）。family の選択肢・ラベル・その場照合・`/entries/wedge` の family 絞り込みはこの family
 - `/`: 条件（場所・芝・ダ・距離・芝(内・外)・地域）、family、指数、オッズ帯、プリセット（絶対軸・軸候補・相手候補・消し候補。判定は `classify` と同じ SQL）、下限（件数・WEDGE・adjusted_WEDGE）で絞り込む
   - 表示は2通り: 「集計表ごと」（最大100表・各200行）と「まとめて」（unified_all の横断ランキング、上位500行。既定の並びは adjusted_WEDGE の大きい順）
-  - 「集計表ごと」の中身（2026-11-10〜）: unified_all の「テーブル名」が同じ行（`WHERE "テーブル名" = ?`。並べ替えの列の索引を使わせず `+列` で並べ、同点は rowid＝成績表の行の順）。前の版の DB で1表ずつのテーブル `foragg_*` があれば、そのテーブルから同じ規則で読む（どちらでも同じ表示になることをテストで確認）
+  - 「集計表ごと」の中身（2026-11-10〜）: 常に unified_all の「テーブル名」が同じ行（`WHERE "テーブル名" = ?`。並べ替えの列の索引を使わせず `+列` で並べ、同点は rowid＝成績表の行の順）。前の版の DB に1表ずつのテーブル `foragg_*` が残っていても使わない（前の版の unified_all はそのテーブルを同じ順で詰め直したものなので表示は同じ。古い中身のテーブルが残っていても影響しないことをテストで確認）
   - 並べ替えは件数・各率の *_val・平均着順・回収値・WIN・EDGE・WEDGE・adjusted_WEDGE・adjusted_WEDGE_件数。空欄は常に最後。並べ替え欄の「既定」は表示に合わせる（集計表ごと=複勝率_val、まとめて=adjusted_WEDGE）。表示列に無い列で並べたらその列も表示する
   - 横断ランキングの速さ: 絞り込みが無ければ WEDGE/adjusted_WEDGE の索引で即座に返る。他の条件で絞るときは索引を使わず全件を読んで並べる（索引を最後までたどると遅くなるため）。合成550万行で最大約1.4秒
   - 下限の入力は全角・カンマ区切りも受ける。読めない値は入力欄に残して警告
@@ -413,7 +418,8 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 
 - `agg_master_{地域}_{指数名}.csv.gz`（2026-11-10〜。master 1本につき1ファイル・cp932・gzip）: 下の表の列 ＋ `family, odds_mode, rank_scheme, indicator, region, テーブル名`。1つの成績表（family × スキーム × オッズ帯）の行は続けて並び、中の並びは結合データの昇順。テーブル名 = 旧来のファイル名（拡張子なし）を SQLite 用に安全化したもの
 - 旧来の `foragg_{オッズ接頭辞}{rankband_スキーム_}{family}_{地域}_{指数名}.csv`（2026-11-09 まで。1表1ファイル）も build_db が読める。`shisu.aggstore.read_agg_tables` は両方を旧来の1表1ファイルの形（{ファイル名: 成績表}）に分けて返す（確認・テスト用）
-- `agg_settings.json`: 集計の設定（family の定義・スキーム・WEDGE・推定・コンパクト化）。`--resume` で前回と比べる
+- `agg_master_{地域}_{指数名}.csv.gz.done`: 書き終わりの印（JSON: settings（設定のハッシュ）, master, master_size, master_mtime_ns, rows, bytes）。`--resume` と build_db の混ざりの確認が見る
+- `agg_settings.json`: 集計の設定（family の定義・スキーム・WEDGE・推定・コンパクト化）。前回と違えばログに出す
 
 | 列 | 内容 |
 |---|---|
@@ -668,15 +674,15 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - `tests/test_entries_ext.py`: 出馬表1本（マイニング値だけ）に ext_indices の指数（オメガ・ST指数・Gold・BC・ZI）が付き、**master と順位・偏差値・偏差値帯・順位帯が一致する**こと、出馬表に値のある指数は出馬表の値を使うこと、0 だけの列（と右の 指数順位1）を ext で上書きすること、**優先がファイル・レースごと**（別のファイルに値があっても・0 だけのレースは ext から付き、過去側と同じ順位）、台帳に無い指数の 指数順位N を足した列に回さないこと、`--no-ext`・レースID の無い出馬表
 - `tests/test_raw_merge.py`: ファイル名からの種類、**列パッチ**（中身での見分け・2本のパッチを 全場_タイムM・全場_対戦M の両方に当てる・後のファイル優先・空欄で上書きしない・無い列を足す・16桁の ID＋馬番・18桁でない行・当てる先が無い／当たらない行のあるパッチは残す・基本CSVと同じ回・あとから基本CSVを統合すると当たって移る・片方の 全場_*.csv がまだ無いときは残す・ファイルごとに移すかを決める・見出しのゆれ・指数順位を書き換えない・replace の master の22条件に入る・画面からのアップロード）、重複の置き換え（後のファイル優先）・10年の窓・merged_done への移動（同じ名前は `_2`）・種類の分からないファイルと読めないファイルを残すこと、16桁の ID でも馬ごとに比べること、書き込みの途中失敗で既存の 全場_*.csv を壊さないこと、`--raw-dir` の既定が `--csv-dir` の隣になること、replace が master の前に統合すること（`--no-raw-merge`）、/ingest のアップロードと選択・パスの除去・不正な名前・別サイトからの POST
 - `tests/test_screen_families.py` には候補の数（骨格・因果トリオ）・冗長の除外・単独の 場所/距離/芝(内・外) を含む family の過去側と出馬表側のキーの一致（単独の 芝(内・外) はダート・内外の区別の無い芝で両側ともキーを作らない）・成績表のコース列・select の複勝スプレッド・adj_wedge_* も
-- `tests/test_aggstore.py`（2026-11-10）: master ごとの1ファイルとメタ列・テーブル名、`classify_frame` と1行版の一致（境界値・欠損・4オッズ帯）、旧来のファイル名の速い解析が前の当て方と同じこと、**コンパクト化で残る行が仕様の条件から独立に計算した行と完全に一致**すること・DB の4区分と WEDGE≧0.70 の行が全部の行の DB と同じこと・layer A は全部残ること・下限のオプション、`--resume`（済んだ master を触らない・書きかけを消す・設定が違う／settings が無い／--clean と一緒なら止める）、並列のまとまり（子プロセスを作り直しても1プロセスと同じバイト列）、build_db が旧来の1表1ファイルからでも同じ unified_all・__tables_meta__ を作ること・agg_master と重なる旧来のファイルを使わないこと・前の版の1表ずつのテーブルを消すこと・読める成績表が無ければ DB を変えないこと、__facets__、**「集計表ごと」の画面が1表ずつのテーブルからでも unified_all からでも同じ HTML**になること
+- `tests/test_aggstore.py`（2026-11-10）: master ごとの1ファイルとメタ列・テーブル名、`classify_frame` と1行版の一致（境界値・欠損・4オッズ帯）、旧来のファイル名の速い解析が前の当て方と同じこと、**コンパクト化で残る行が仕様の条件から独立に計算した行と完全に一致**すること・DB の4区分と WEDGE≧0.70 の行が全部の行の DB と同じこと・layer A は全部残ること・下限のオプション、`--resume`（済んだ master を触らない・書きかけを消す・設定を変えた実行が途中で止まっても今の設定にそろう・途中で切れたファイルと作り直した master は作り直す・--clean と一緒なら止める）、全部の master が失敗したときの終了コードとメッセージ、下限の `none` と 0 以下を弾くこと、並列のまとまり（子プロセスを作り直しても1プロセスと同じバイト列）、build_db が旧来の1表1ファイルからでも同じ unified_all・__tables_meta__ を作ること・agg_master と重なる旧来のファイルを使わないこと・前の版の1表ずつのテーブルを消すこと（多すぎれば残して WARN）・読める成績表が無ければ DB を変えないこと・途中で切れたファイルを飛ばして [ERROR]・違う設定の混ざりの WARN、__facets__、**「集計表ごと」の画面が、前の版の DB（1表ずつのテーブルあり・古い中身のテーブルあり）でも新しい DB でも同じ HTML**になること
 - `tests/test_screen_families.py` に選抜の新しい規則（基準B の絶対軸・基準A の adj 上位）と `--from-report`（採点し直さず同じ選抜になる・基準を変えると減る・基準が JSON に残る・読んだファイルに書き戻す・ファイル名なしの --from-report に --report を付けると --report を読む・レポートが無い/形が違うと終了コード2）・同じ値の並びに依らない選抜、`tests/test_pipeline.py` に `build_db --entries-only`（`--fresh`・`--mode foragg` と一緒なら弾く）と replace の `--workers 2`（まとまりごとに子プロセスを作り直しても1プロセスと同じ master・子プロセスが止められてもそのまとまりを [ERROR] にして残りを続ける）
-- 件数: 460（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
+- 件数: 464（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
 
 ---
 
 ## 9. 既知の制約・要確認事項
 
-1. **集計量と DB の大きさ**: 成績表の行数は family の数にほぼ比例する。実サンプル `202610.csv`（1か月・3,188頭）・初期セットで、全部の行は 35,998行・コンパクト化（既定）で 13,587行。2026-11-10 から DB は unified_all だけに持つ（前は1表ずつのテーブルにも同じ行を持っていた）。数千 family を全指数で集計するときは、コンパクト化のまま回す。**既定の規則（件数≧30・WEDGE≧0.70）では行は半分ほどにしかならない**（§3.2 の実測。4,868通り × 33指数で DB 約180GB の見積もり）。ディスクが足りなければ `--compact-min-count 0 --compact-min-wedge 1.0`（同 約21GB）などで絞る。**集計の時間は family の数に比例し、コンパクト化では減らない**（30万行の master 1本 × 129通りで約3分 → 4,868通りなら1本あたり約2時間・33指数で1プロセス約3日。`--workers` と `--resume` で分けて回す）。時間が足りなければ screen_families.py で family を絞る
+1. **集計量と DB の大きさ**: 成績表の行数は family の数にほぼ比例する。実サンプル `202610.csv`（1か月・3,188頭）・初期セットで、全部の行は 35,998行・コンパクト化（既定）で 13,587行。2026-11-10 から DB は unified_all だけに持つ（前は1表ずつのテーブルにも同じ行を持っていた）。数千 family を全指数で集計するときは、コンパクト化のまま回す。**既定の規則（件数≧30・WEDGE≧0.70）では行は半分ほどにしかならない**（§3.2 の実測。4,868通り × 33指数で DB 約180GB の見積もり）。ディスクが足りなければ `--compact-min-count none --compact-min-wedge 1.0`（同 約21GB）などで絞る。**集計の時間は family の数に比例し、コンパクト化では減らない**（30万行の master 1本 × 129通りで約3分 → 4,868通りなら1本あたり約2時間・33指数で1プロセス約3日。`--workers` と `--resume` で分けて回す）。時間が足りなければ screen_families.py で family を絞る
 2. **screen_families の時間**: 30万行の master 1本で1通り約2.4秒（`default` 2,098通りで約1.4時間、`all` 7,557通りで約5時間）。全 master で `default` は1プロセスで4日近く。代表の指数（`--indicators タイムM,対戦M`）で選ぶか `--workers` で並列にする
 3. **外部指数CSV（ext_indices/）は実ファイルで未確認**: 形式A〜D とフォルダ名・ファイル名の規則は依頼文の仕様と実データ例から組んだ。最初の実行では replace のログ（`外部指数が付いた馬 x/y`・使わないファイルの WARN）を確認する。形式Aは `/ingest` の TARGET 取込用CSVと同じ形
 4. **間隔帯**: TARGET の「間隔」を両側とも週数（1=連闘、2=中1週）とみなし、値 2〜3 を `中2-3` のように分けている（「中N週」の N ではなく TARGET の値そのもの）。出馬表サンプル（`test.csv`）の「2」が前走から14〜15日だったことからの判断。中N週の N で区切りたい場合は `conditions.interval_band` を1つずらす
@@ -723,7 +729,8 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - build_db: 1表ずつのテーブル `foragg_*` を作らず、agg_master（と旧来の foragg_*.csv）を少しずつ読んで unified_all に直接入れる。`unified_all__build` に作ってから入れ替える。__tables_meta__ はテーブル名ごと、__facets__ は読みながら集める。前の版の1表ずつのテーブルは消す
 - app: 「集計表ごと」を unified_all の同じテーブル名の行から（1表ずつのテーブルがあればそこから。同じ結果）
 - shisu: `aggstore.py`（保存形式・コンパクト化・読み込み。`prepare_agg_frame`・`estimate_percent` を build_db から移した）、`parallel.py`、`classify.classify_frame`（ベクトル版）、`naming` に agg_master の名前と速い旧来名の解析
-- テスト: `tests/test_aggstore.py` を追加。個別の成績表ファイルを読んでいたテストは `read_agg_tables` で同じ形に分けて読む（件数を厳密に比べるテストは `--no-compact`）。pipeline の fixture は既定のコンパクト化で全段を通す。テスト 460件
+- 独立レビュー（再現つき）の指摘を反映: `--resume` が設定を変えた実行の途中で止まったあとに前の設定の成績表を飛ばして混ぜた（agg_settings.json を毎回書き直していたため）→ 成績表ごとの書き終わりの印（設定のハッシュ・master の大きさと更新時刻・ファイルの大きさ）で判定し、合わないものは作り直す。書き終わりに fsync。途中で切れた成績表で build_db が例外で止まった → そのファイルを飛ばして [ERROR]。全部の master が失敗したときに「replace を先に」と出た。`--compact-min-count 0` で下げたのに残る行が減った → `none` で外し、0 以下は弾く。前の版の DB の1表ずつのテーブルが数十万本あると消すのに何時間もかかる → 画面は常に unified_all から読み、5,000本を超えたら消さずに WARN。WAL の記述の訂正と切り詰め
+- テスト: `tests/test_aggstore.py` を追加。個別の成績表ファイルを読んでいたテストは `read_agg_tables` で同じ形に分けて読む（件数を厳密に比べるテストは `--no-compact`）。pipeline の fixture は既定のコンパクト化で全段を通す。テスト 464件
 
 ### 2026-11-09 選抜のやり直し・メモリ・lxml・Readme.txt
 - screen_families: `--from-report [CSV]`（採点済みの screening_report.csv から選抜だけやり直す。数秒）。選抜の既定を `--min-axis 25`・`--top-a 100` に。基準B は絶対軸が1つでも出る候補を必ず選ぶ（`--always-select-abs`）、基準A は wedge_spread 上位か adj_wedge_spread 上位

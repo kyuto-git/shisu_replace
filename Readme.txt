@@ -78,20 +78,21 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py -
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4
   ・ログに [済んだ本数/全体] と master ごとの結果が1行ずつ出ます。最後の「書いた行: k/n」がコンパクト化の効き目です
   ・途中で止まった（Docker が落ちた・Ctrl+C）ときは、--clean を外して --resume を付ければ、済んだ master を飛ばして
-    続きから集計します（設定を変えていると止まります）：
+    続きから集計します（今の設定で最後まで書けた master だけを飛ばし、設定を変える前の成績表・途中で切れたファイル・
+    replace で作り直した master の分は作り直します）：
       docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --resume --workers 4
   ・コンパクト化（既定 ON）：条件ヒット馬の4区分（絶対軸・軸候補・相手候補・消し候補）に入る行、WEDGE か adjusted_WEDGE が
     0.70 以上の行、初期セットのコース固定（A の15種）の行、件数30以上の行だけを書きます。区分にも上位にも入らない件数の
     少ない平凡な行は書かないので、ファイルと DB が小さくなります。全部の行を残すときだけ --no-compact
-    （残す件数の下限は --compact-min-count、WEDGE の下限は --compact-min-wedge で変えられます。0 にするとその条件を使いません）
+    （残す件数の下限は --compact-min-count、WEDGE の下限は --compact-min-wedge で変えられます。none にするとその条件を使いません）
   ・どれくらい小さくなるか（30万行＝10年分相当の合成データ、X_ の family で測った残る行の割合）：
         既定（件数30以上・WEDGE 0.70以上）              … 約56%
         --compact-min-count 100                         … 約39%
-        --compact-min-count 0                           … 約21%
-        --compact-min-count 0 --compact-min-wedge 1.0   … 約7%（区分と A の15種の行は必ず残る）
+        --compact-min-count none                        … 約21%
+        --compact-min-count none --compact-min-wedge 1.0  … 約7%（区分と A の15種の行は必ず残る）
     既定のままだと半分ほどにしかなりません。数千通りの family を全指数で集計して DB が大きすぎるときは、下の2つで絞ります
-    （DB は1行あたり約740バイト。4,868通り×33指数なら既定で約180GB、件数0・WEDGE 1.0 で約21GB の見積もり）：
-      docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4 --compact-min-count 0 --compact-min-wedge 1.0
+    （DB は1行あたり約740バイト。4,868通り×33指数なら既定で約180GB、件数 none・WEDGE 1.0 で約21GB の見積もり）：
+      docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4 --compact-min-count none --compact-min-wedge 1.0
   ・--workers N のとき、master を1本ずつ子プロセスに渡し、N×2本ごとに子プロセスを作り直します（メモリがたまらないように）
 
 # Step 3: 出馬表の偏差値計算・1ファイル統合（entries_in/ → entries_out/entries_merged_hensachi.csv）
@@ -303,7 +304,8 @@ docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu pyth
     ・コンパクト化（既定 ON）：4区分に入る行・WEDGE か adjusted_WEDGE が0.70以上の行・コース固定（A）の family の行・
       件数30以上の行だけを書く。条件ヒット馬（4区分すべて）と WEDGE の高い行は1行も落としません。
     ・使った family の定義を agg_csv/families.json、集計の設定を agg_csv/agg_settings.json に書く。
-    ・--resume：agg_master_*.csv.gz がすでにある master を飛ばす（agg_settings.json と今の設定が違えば止める）。
+    ・--resume：今の設定で最後まで書けた master を飛ばす（書き終わりの印 agg_master_*.csv.gz.done で判定。設定を変える前の
+      成績表・途中で切れたファイル・作り直した master は作り直す）。
 
   [Step 3] calc_entry_hensachi.py（出馬表への外部指数の結合・偏差値・帯付与＆横結合）
     ・ext_indices/ の外部指数を、過去側と同じ関数で出馬表の各馬に付ける（出馬表に値のある指数はそのレースだけ出馬表の値）。
@@ -315,7 +317,9 @@ docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu pyth
       直接入れる（1表ずつのテーブルは作らない。同じ行を2回持たないので DB が半分になる）。集計表の一覧は __tables_meta__、
       family の定義は __families__ テーブルに入る（画面・照合はこれを使う）。
     ・作り直しは別名のテーブルに作ってから最後に置き換えるので、途中で止まっても前の unified_all が残ります。
-      前の版で作った DB に1表ずつのテーブル foragg_* が残っていれば消します（ファイルを小さくするには --fresh）。
+      前の版で作った DB に1表ずつのテーブル foragg_* が残っていれば消します（5,000個を超えるときは時間がかかるので残して
+      警告。画面は使いません）。ファイルを小さくするには --fresh。
+    ・読めない成績表（途中で切れたファイル）は飛ばして [ERROR] を出します（aggregate --resume で作り直してから再実行）。
     ・出馬表の全出走馬×全指数×全 family の検索キー候補（s2 の重なり・内外の候補も含む）を事前展開し、
       unified_all と突合した結果テーブル「entries_xjoin_merged_hensachi」を構築。
 
@@ -628,9 +632,10 @@ DB を作らずにメモリ上で、family の候補を「本番と同じ集計�
      採点済みなら --from-report で基準だけ変えて選び直せます（数秒）。
 
   Q. 集計（Step 2）が途中で止まった（Docker が落ちた・Mac がスリープした・Ctrl+C）
-  A. --clean を外して --resume を付けて同じコマンドを実行してください。agg_master_*.csv.gz ができている master は飛ばして、
-     残りだけを集計します（書きかけの .part は消してからやり直す）。family や --compact などの設定を変えていると、違う設定の
-     成績表が混ざるので止まります。そのときは --clean で最初からやり直してください。
+  A. --clean を外して --resume を付けて同じコマンドを実行してください。今の設定で最後まで書けた master（書き終わりの印
+     agg_master_*.csv.gz.done が今の設定・今の master と合うもの）は飛ばして、残りだけを集計します（書きかけの .part は
+     消してからやり直す）。family や --compact などの設定を途中で変えたときも、--resume で今の設定にそろいます
+     （前の設定の成績表は作り直します）。
 
   Q. 条件ヒット馬・WEDGE一覧に出る行が前より少ない
   A. コンパクト化（既定 ON）で、4区分にも WEDGE 0.70以上にも入らず件数も30未満の行は DB に入れていないためです。

@@ -134,14 +134,18 @@ class AggMasterWriter:
         self.rows += len(df)
 
     def close(self) -> bool:
-        """書いた行が1行以上なら本来の名前に置き換えて True。0行なら一時ファイルも本来のファイルも消して False。"""
+        """書いた行が1行以上なら本来の名前に置き換えて True。0行なら一時ファイルも本来のファイルも消して False。
+        置き換える前に fsync する（Docker の VM ごと落ちても、本来の名前のファイルが途中で切れていないように）。"""
         self._f.close()
+        self._raw.flush()
+        os.fsync(self._raw.fileno())
         self._raw.close()
         if self.rows == 0:
             self.tmp.unlink(missing_ok=True)
             self.path.unlink(missing_ok=True)
             return False
         os.replace(self.tmp, self.path)
+        _fsync_dir(self.path.parent)
         return True
 
     def abort(self) -> None:
@@ -160,6 +164,82 @@ class AggMasterWriter:
         else:
             self.abort()
         return False
+
+
+def _fsync_dir(d: Path) -> None:
+    try:
+        fd = os.open(str(d), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# 書き終わりの印（--resume 用）
+# ---------------------------------------------------------------------------
+STAMP_SUFFIX = ".done"
+
+
+def settings_hash(settings: dict) -> str:
+    """集計の設定（agg_settings.json の中身）の短いハッシュ。"""
+    import hashlib
+    import json
+    text = json.dumps(settings, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def stamp_path(agg_path) -> Path:
+    p = Path(agg_path)
+    return p.with_name(p.name + STAMP_SUFFIX)
+
+
+def master_identity(master) -> dict:
+    st = Path(master).stat()
+    return {"master": Path(master).name, "master_size": st.st_size, "master_mtime_ns": st.st_mtime_ns}
+
+
+def write_stamp(agg_path, settings_id: str, master, rows: int) -> None:
+    """agg_master_*.csv.gz を書き終えた印（設定のハッシュ・元の master・行数・ファイルの大きさ）。
+    成績表を本来の名前に置き換えて fsync したあとに書く（印があれば、成績表は最後まで書けている）。"""
+    import json
+    agg_path = Path(agg_path)
+    data = {"settings": settings_id, **master_identity(master), "rows": int(rows),
+            "bytes": agg_path.stat().st_size if agg_path.exists() else 0}
+    sp = stamp_path(agg_path)
+    tmp = sp.with_name(sp.name + PART_SUFFIX)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, sp)
+    _fsync_dir(sp.parent)
+
+
+def read_stamp(agg_path) -> dict | None:
+    import json
+    try:
+        return json.loads(stamp_path(agg_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def stamp_matches(agg_path, settings_id: str, master) -> bool:
+    """--resume で飛ばしてよいか: 印があり、同じ設定・同じ master（大きさと更新時刻）から作られ、
+    成績表のファイルが印のとおりの大きさで残っている（0行の master はファイルが無いのが正しい）。"""
+    st = read_stamp(agg_path)
+    if not st or st.get("settings") != settings_id:
+        return False
+    if {k: st.get(k) for k in ("master", "master_size", "master_mtime_ns")} != master_identity(master):
+        return False
+    agg_path = Path(agg_path)
+    if int(st.get("rows", -1)) == 0:
+        return not agg_path.exists()
+    return agg_path.exists() and agg_path.stat().st_size == int(st.get("bytes", -1))
 
 
 # ---------------------------------------------------------------------------

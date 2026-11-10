@@ -53,8 +53,8 @@ import numpy as np
 import pandas as pd
 
 from shisu import config
-from shisu.aggstore import (COMPACT_MIN_COUNT, COMPACT_MIN_WEDGE, PART_SUFFIX, AggMasterWriter, agg_master_files,
-                            compact_mask, legacy_files)
+from shisu.aggstore import (COMPACT_MIN_COUNT, COMPACT_MIN_WEDGE, PART_SUFFIX, AggMasterWriter, compact_mask,
+                            legacy_files, settings_hash, stamp_matches, stamp_path, write_stamp)
 from shisu.csvio import read_csv_any
 from shisu.estimates import beta_quantile, has_scipy, posterior_mean
 from shisu.finish import parse_finish
@@ -325,10 +325,12 @@ def compact_options(enabled: bool = True, min_count: int | None = None, min_wedg
 
 
 def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, schemes: set[str] | None = None,
-                     families: list[dict] | None = None, compact: dict | None = None) -> str:
+                     families: list[dict] | None = None, compact: dict | None = None,
+                     settings_id: str | None = None) -> str:
     """master 1本 → 成績表 agg_csv/agg_master_{地域}_{指数名}.csv.gz（family・スキーム・オッズ帯を縦に並べる）。
     families は使う family の定義（to_dict の list。並列の子プロセスにも同じ定義を渡す）。
-    compact は compact_options() の dict（省略時はコンパクト化する）。"""
+    compact は compact_options() の dict（省略時はコンパクト化する）。
+    settings_id（集計の設定のハッシュ）を渡すと、書き終えたあとに印（.done）を書く（--resume が見る）。"""
     src = Path(src)
     stem = file_stem(src)
     if not stem.startswith(MASTER_PREFIX) or stem in SKIP_MASTERS:
@@ -345,7 +347,11 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
     ref_year = ref_year_of(df)
     total = adj = kept = n_tables = 0
     fams = restrict_schemes(fam_registry.active(), schemes)
-    writer = AggMasterWriter(Path(out_dir) / agg_master_filename(source))
+    path = Path(out_dir) / agg_master_filename(source)
+    # 書き直す間は前の成績表も印も消す（途中で止まった・失敗したときに、前の設定の成績表が黙って残らないように）
+    stamp_path(path).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+    writer = AggMasterWriter(path)
     try:
         for fam, scheme, sub in family_frames(df, fams):
             for mode in ODDS_MODES:
@@ -367,8 +373,26 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
         writer.abort()
         raise
     writer.close()
+    if settings_id is not None:
+        write_stamp(path, settings_id, src, kept)
     return (f"[OK] {src.name}: {n_tables} tables groups={total}(adj {adj}) kept={kept}/{total}"
             f" / 年度窓の終わり={ref_year}")
+
+
+def _threshold(kind):
+    """--compact-min-count / --compact-min-wedge の値。正の数か none（その条件を使わない。内部では 0）。"""
+    def parse(text: str):
+        t = str(text).strip().lower()
+        if t in ("none", "off", "なし"):
+            return kind(0)
+        try:
+            v = kind(t)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"正の数か none: {text}")
+        if not v > 0:
+            raise argparse.ArgumentTypeError(f"正の数か none（条件を使わないときは none）: {text}")
+        return v
+    return parse
 
 
 def settings_of(fam_dicts: list[dict], schemes: set[str], wedge_opts: dict, compact: dict) -> dict:
@@ -398,11 +422,11 @@ def main(argv=None) -> int:
     ap.add_argument("--compact", action=argparse.BooleanOptionalAction, default=True,
                     help="区分（絶対軸・軸候補・相手候補・消し候補）にも WEDGE の上位にも入らない平凡な行を書かない"
                          "（既定 ON。全部の行を残すときは --no-compact）")
-    ap.add_argument("--compact-min-count", type=int, default=COMPACT_MIN_COUNT,
+    ap.add_argument("--compact-min-count", type=_threshold(int), default=COMPACT_MIN_COUNT,
                     help=f"コンパクト化しても残す件数の下限（既定 {COMPACT_MIN_COUNT}。これ以上の行は区分に関係なく残す。"
-                         "0 なら件数では残さない）")
-    ap.add_argument("--compact-min-wedge", type=float, default=COMPACT_MIN_WEDGE,
-                    help=f"コンパクト化しても残す WEDGE・adjusted_WEDGE の下限（既定 {COMPACT_MIN_WEDGE}。0 なら WEDGE では残さない）")
+                         "none なら件数では残さない）")
+    ap.add_argument("--compact-min-wedge", type=_threshold(float), default=COMPACT_MIN_WEDGE,
+                    help=f"コンパクト化しても残す WEDGE・adjusted_WEDGE の下限（既定 {COMPACT_MIN_WEDGE}。none なら WEDGE では残さない）")
     ap.add_argument("--wedge-min-year-count", type=int, default=None,
                     help=f"adjusted_WEDGE で使う年の最低件数（既定 {WEDGE_MIN_YEAR_COUNT}。環境変数 AGG_WEDGE_MIN_YEAR_COUNT）")
     ap.add_argument("--wedge-max-years", type=int, default=None,
@@ -446,20 +470,21 @@ def main(argv=None) -> int:
     fam_dicts = [f.to_dict() for f in fams]
     out_dir = Path(args.out_dir)
     settings = settings_of(fam_dicts, schemes, opts, copts)
+    sid = settings_hash(settings)
     done: set[str] = set()
     if args.resume:
-        done = {p.name for p in agg_master_files(out_dir)}
+        # 済み = 印（.done）が今の設定・今の master（大きさと更新時刻）と合い、成績表が印のとおりの大きさで残っているもの。
+        # 違う設定・作り直した master・途中で切れたファイルは作り直す（違う設定の成績表を混ぜない）
+        done = {p.name for p in files if stamp_matches(out_dir / agg_master_filename(file_stem(p)[len(MASTER_PREFIX):]),
+                                                       sid, p)}
         prev_path = out_dir / SETTINGS_FILE
-        if done:
-            if not prev_path.exists():
-                print(f"[ERROR] --resume: 前回の設定（{SETTINGS_FILE}）がありません。済んだ成績表が同じ設定か分からないので、"
-                      "--resume を外して（必要なら --clean で）実行してください", file=sys.stderr)
-                return 2
-            diff = _settings_diff(json.loads(prev_path.read_text(encoding="utf-8")), settings)
+        if prev_path.exists():
+            try:
+                diff = _settings_diff(json.loads(prev_path.read_text(encoding="utf-8")), settings)
+            except ValueError:
+                diff = ["（読めません）"]
             if diff:
-                print(f"[ERROR] --resume: 前回と設定が違います（{', '.join(diff)}）。違う設定の成績表が混ざるので、"
-                      "--resume を外して（必要なら --clean で）実行してください", file=sys.stderr)
-                return 2
+                print(f"[INFO] --resume: 前回の実行と設定が違います（{', '.join(diff)}）。今の設定で作っていない成績表は作り直します")
     if args.clean and out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -481,10 +506,10 @@ def main(argv=None) -> int:
         print(f"[WARN] 旧来の成績表 foragg_*.csv が {len(legacy)} 本あります（例: {legacy[0].name}）。build_db は "
               "agg_master_*.csv.gz のある master では使いません。容量を空けるには --clean を付けて実行し直すか、"
               "手で消してください", file=sys.stderr)
-    todo = [p for p in files if agg_master_filename(file_stem(p)[len(MASTER_PREFIX):]) not in done]
-    if args.resume and len(todo) < len(files):
-        print(f"[INFO] --resume: {len(files) - len(todo)} 本は済んでいるので飛ばします（残り {len(todo)} 本）")
-    jobs = [(str(p), str(out_dir), opts, None, fam_dicts, copts) for p in todo]
+    todo = [p for p in files if p.name not in done]
+    if args.resume:
+        print(f"[INFO] --resume: {len(done)} 本は今の設定で済んでいるので飛ばします（残り {len(todo)} 本）")
+    jobs = [(str(p), str(out_dir), opts, None, fam_dicts, copts, sid) for p in todo]
     n_done = [0]
 
     def progress(_i, r):
@@ -508,8 +533,15 @@ def main(argv=None) -> int:
     for r in errors:
         print(r, file=sys.stderr)
     if n_ok == 0 and n_skip_done == 0:
+        if errors:
+            print(f"[ERROR] すべての master（{len(errors)} 本）が失敗しました（上の [ERROR] を見てください）。"
+                  "直してから --resume を付けて実行すれば、失敗した分だけ集計します", file=sys.stderr)
+            return 1
         print("[ERROR] 集計できた master がありません。replace_csv_ver3.py を先に実行してください", file=sys.stderr)
         return 2
+    if errors:
+        print(f"[WARN] 失敗した master が {len(errors)} 本あります。直してから --resume を付けて実行すれば、その分だけ集計します",
+              file=sys.stderr)
     return 1 if errors else 0
 
 

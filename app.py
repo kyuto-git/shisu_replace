@@ -4,7 +4,8 @@
   /              横断検索（集計表を family・指数・オッズ帯・地域・コース条件で絞り込み。
                  表ごとの表示と、全表をまとめて WEDGE などで並べる横断ランキングの2通り。
                  集計表は __tables_meta__ の kind=foragg の行。中身は unified_all の「テーブル名」が同じ行
-                 （前の版の DB で1表ずつのテーブル foragg_* があれば、そのテーブルから読む。結果は同じ）
+                 （前の版の DB に1表ずつのテーブル foragg_* が残っていても使わない。前の版の unified_all は
+                 そのテーブルを同じ順で詰め直したものなので、表示は同じ）
   /entries       出馬表のレース一覧（日付・場所で絞り込み）
   /entries/race  出馬表（各馬の指数順位・偏差値）
   /entries/key   結合データの前方一致で unified_all を表示
@@ -391,14 +392,12 @@ def index():
             mw, mp, mcols = _min_filters(mins)
             for m in metas[:MAX_TABLES]:
                 t = m["table_name"]
-                # 集計表の中身: 前の版の DB の1表ずつのテーブルがあればそれ、無ければ unified_all の同じテーブル名の行
-                # （並びは同じ列で並べ、同点は元の成績表の行の順＝rowid。どちらから読んでも同じ行が同じ順で出る）
-                physical = table_exists(con, t)
-                cols_in = set(table_columns(con, t)) if physical else unified_cols
+                # 集計表の中身は unified_all の同じテーブル名の行（並びは同じ列で並べ、同点は成績表の行の順＝rowid）
+                cols_in = unified_cols
                 if not set(mcols) <= cols_in:      # 下限を指定した列が無い表（古い集計）は出さない
                     continue
                 show = [c for c in DISPLAY_ORDER if c in cols_in]
-                w, p = ([], []) if physical else (['"テーブル名" = ?'], [t])
+                w, p = ['"テーブル名" = ?'], [t]
                 cw, cp = _course_filters(place, sd, dist, inout)
                 w += cw
                 p += cp
@@ -406,11 +405,10 @@ def index():
                     w.append(sql_condition(q_preset, m["odds_mode"]))
                 w += mw
                 p += mp
-                # unified_all では並べ替えに WEDGE などの索引を使わせない（テーブル名の索引で絞ってから並べる）
-                order = (f"ORDER BY {'' if physical else '+'}{q(q_sort)} {q_dir} NULLS LAST, rowid "
-                         if q_sort in cols_in else "ORDER BY rowid ")
-                sql = (f"SELECT {', '.join(q(c) for c in show)} FROM {q(t) if physical else UNIFIED} "
-                       f"{'WHERE ' + ' AND '.join(w) if w else ''} {order}LIMIT {ROWS_PER_TABLE}")
+                # 並べ替えに WEDGE などの索引を使わせない（テーブル名の索引で絞ってから並べる）
+                order = f"ORDER BY +{q(q_sort)} {q_dir} NULLS LAST, rowid " if q_sort in cols_in else "ORDER BY rowid "
+                sql = (f"SELECT {', '.join(q(c) for c in show)} FROM {UNIFIED} "
+                       f"WHERE {' AND '.join(w)} {order}LIMIT {ROWS_PER_TABLE}")
                 rows = [dict(r) for r in con.execute(sql, p)]
                 if not rows:
                     continue

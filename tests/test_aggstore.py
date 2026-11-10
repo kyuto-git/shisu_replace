@@ -182,17 +182,26 @@ def test_compact_thresholds_are_options(mb, tmp_path):
     assert len(_rows(tight)) <= len(_rows(mb / "agg_csv"))
     s = json.loads((tight / "agg_settings.json").read_text(encoding="utf-8"))
     assert s["compact"] == {"enabled": True, "min_count": 100000, "min_wedge": 99.0}
-    # 0 はその条件を使わない（区分と layer A だけで残す）。件数・WEDGE の下限を極端にしたときと同じ行
+    # none はその条件を使わない（区分と layer A だけで残す）。件数・WEDGE の下限を極端にしたときと同じ行
     off = tmp_path / "off"
-    assert agg.main(["--out-dir", str(off), "--compact-min-count", "0", "--compact-min-wedge", "0", *YEAR]) == 0
-    assert [p.read_bytes() for p in sorted(off.glob("agg_master_*"))] == [p.read_bytes() for p in sorted(tight.glob("agg_master_*"))]
+    assert agg.main(["--out-dir", str(off), "--compact-min-count", "none", "--compact-min-wedge", "none", *YEAR]) == 0
+    assert _bytes(off) == _bytes(tight)
+    # 0 以下は受け付けない（下げたのに残る行が減る、という逆向きの動きにしない）
+    for bad in (["--compact-min-count", "0"], ["--compact-min-wedge", "0"], ["--compact-min-count", "-1"], ["--compact-min-wedge", "x"]):
+        with pytest.raises(SystemExit):
+            agg.main(["--out-dir", str(tmp_path / "bad"), *bad, *YEAR])
 
 
 # ---------------------------------------------------------------- --resume
-def test_resume_skips_finished_masters_and_checks_settings(mb, tmp_path, capsys):
+def _bytes(d: Path) -> list[bytes]:
+    return [p.read_bytes() for p in sorted(d.glob("agg_master_*.csv.gz"))]
+
+
+def test_resume_skips_only_masters_done_with_current_settings(mb, tmp_path, capsys):
     import aggregate_stats_ver2 as agg
+    ref = mb / "agg_csv"                                # 既定（コンパクト化）の正解
     out = tmp_path / "agg"
-    shutil.copytree(mb / "agg_csv", out)
+    shutil.copytree(ref, out)
     files = sorted(out.glob("agg_master_*.csv.gz"))
     kept = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in files[1:]}
     files[0].unlink()
@@ -200,21 +209,60 @@ def test_resume_skips_finished_masters_and_checks_settings(mb, tmp_path, capsys)
     capsys.readouterr()
     assert agg.main(["--out-dir", str(out), "--resume", *YEAR]) == 0
     log = capsys.readouterr().out
-    assert "2 本は済んでいる" in log and "[1/1]" in log
-    assert files[0].read_bytes() == (mb / "agg_csv" / files[0].name).read_bytes()     # 止まる前と同じ結果
+    assert "2 本は今の設定で済んでいる" in log and "[1/1]" in log
+    assert _bytes(out) == _bytes(ref)                                 # 止まる前と同じ結果
     assert {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in files[1:]} == kept   # 済んだ分は触らない
     assert not list(out.glob("*.part"))
-    # 設定が違えば続きから作らない（違う設定の成績表が混ざるので）
-    assert agg.main(["--out-dir", str(out), "--resume", "--no-compact", *YEAR]) == 2
-    assert "compact" in capsys.readouterr().err
     assert agg.main(["--out-dir", str(out), "--resume", "--clean", *YEAR]) == 2
-    (out / "agg_settings.json").unlink()
-    assert agg.main(["--out-dir", str(out), "--resume", *YEAR]) == 2
-    # 済んだ成績表が無ければ、--resume はふつうの実行と同じ
-    empty = tmp_path / "empty"
-    assert agg.main(["--out-dir", str(empty), "--resume", *YEAR]) == 0
-    assert [p.read_bytes() for p in sorted(empty.glob("agg_master_*"))] == \
-        [p.read_bytes() for p in sorted((mb / "agg_csv").glob("agg_master_*"))]
+
+
+def test_resume_after_interrupted_run_with_other_settings(mb, tmp_path, capsys):
+    """設定を変えた実行（--no-compact → 既定）が master 1本目で止まった。前の設定の成績表は、--resume で
+    今の設定で作り直す（飛ばして混ぜない。レビューで再現した不具合）。"""
+    import aggregate_stats_ver2 as agg
+    from shisu.aggstore import stamp_path
+    ref, full = mb / "agg_csv", mb / "agg_full"
+    mixed = tmp_path / "mixed"
+    shutil.copytree(full, mixed)
+    first = sorted(ref.glob("agg_master_*.csv.gz"))[0]
+    shutil.copy2(first, mixed / first.name)
+    shutil.copy2(stamp_path(first), stamp_path(mixed / first.name))
+    capsys.readouterr()
+    assert agg.main(["--out-dir", str(mixed), "--resume", *YEAR]) == 0
+    log = capsys.readouterr().out
+    assert "1 本は今の設定で済んでいる" in log and "[2/2]" in log and "compact" in log
+    assert _bytes(mixed) == _bytes(ref)
+
+
+def test_resume_redoes_truncated_files_and_rebuilt_masters(mb, tmp_path, capsys):
+    import os
+    import aggregate_stats_ver2 as agg
+    ref = mb / "agg_csv"
+    mdir = tmp_path / "m"
+    shutil.copytree(mb / "master_csv", mdir)                          # copy2: 大きさ・更新時刻はそのまま
+    out = tmp_path / "agg"
+    shutil.copytree(ref, out)
+    files = sorted(out.glob("agg_master_*.csv.gz"))
+    files[1].write_bytes(files[1].read_bytes()[: files[1].stat().st_size // 2])     # VM ごと落ちて途中で切れた
+    masters = sorted(mdir.glob("master_*.csv.gz"))
+    st = masters[2].stat()
+    os.utime(masters[2], ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))         # replace で master を作り直した
+    capsys.readouterr()
+    assert agg.main(["--in-dir", str(mdir), "--out-dir", str(out), "--resume", *YEAR]) == 0
+    assert "1 本は今の設定で済んでいる" in capsys.readouterr().out
+    assert _bytes(out) == _bytes(ref)
+
+
+def test_all_masters_failing_is_reported_as_failure(mb, tmp_path, monkeypatch, capsys):
+    import aggregate_stats_ver2 as agg
+
+    def boom(*a, **k):
+        raise MemoryError("simulated")
+    monkeypatch.setattr(agg, "aggregate_master", boom)
+    capsys.readouterr()
+    assert agg.main(["--out-dir", str(tmp_path / "x"), *YEAR]) == 1
+    err = capsys.readouterr().err
+    assert "すべての master" in err and "--resume" in err and "replace_csv_ver3.py を先に" not in err
 
 
 # ---------------------------------------------------------------- 並列のまとまり
@@ -233,8 +281,8 @@ def test_parallel_batches_recreate_pool_and_match_serial(mb, tmp_path, monkeypat
     out = tmp_path / "par"
     assert agg.main(["--out-dir", str(out), "--workers", "2", *YEAR]) == 0
     assert len(created) == 2 and all("max_tasks_per_child" not in k for k in created)
-    assert [p.read_bytes() for p in sorted(out.glob("agg_master_*"))] == \
-        [p.read_bytes() for p in sorted((mb / "agg_csv").glob("agg_master_*"))]
+    assert _bytes(out) == _bytes(mb / "agg_csv")
+    assert [p.read_bytes() for p in sorted(out.glob("*.done"))] == [p.read_bytes() for p in sorted((mb / "agg_csv").glob("*.done"))]
 
 
 # ---------------------------------------------------------------- build_db
@@ -272,7 +320,37 @@ def test_build_db_reads_legacy_one_file_per_table_the_same(mb, tmp_path):
     pd.testing.assert_frame_equal(u3, u2)
 
 
-def test_build_db_drops_old_table_level_foragg_and_keeps_db_on_failure(mb, tmp_path):
+def test_build_db_skips_truncated_file_and_warns_on_mixed_settings(mb, tmp_path, capsys):
+    import build_db
+    from shisu.aggstore import stamp_path
+    d = tmp_path / "agg"
+    shutil.copytree(mb / "agg_csv", d)
+    files = sorted(d.glob("agg_master_*.csv.gz"))
+    files[0].write_bytes(files[0].read_bytes()[: files[0].stat().st_size // 2])
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(d), "--db-path", str(tmp_path / "t.db")]) == 1
+    err = capsys.readouterr().err
+    assert "読めません" in err and files[0].name in err
+    with sqlite3.connect(tmp_path / "t.db") as con:
+        inds = {r[0] for r in con.execute("SELECT DISTINCT indicator FROM unified_all")}
+        srcs = {r[0] for r in con.execute("SELECT DISTINCT source_file FROM __tables_meta__ WHERE kind='foragg'")}
+    assert len(inds) == 2 and files[0].name not in srcs and srcs == {p.name for p in files[1:]}
+    # 違う設定（--no-compact）の成績表が混ざっていれば警告する
+    m = tmp_path / "mixed"
+    shutil.copytree(mb / "agg_csv", m)
+    other = sorted((mb / "agg_full").glob("agg_master_*.csv.gz"))[0]
+    shutil.copy2(other, m / other.name)
+    shutil.copy2(stamp_path(other), stamp_path(m / other.name))
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(m), "--db-path", str(tmp_path / "m.db")]) == 0
+    assert "違う設定" in capsys.readouterr().err
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(mb / "agg_csv"),
+                          "--db-path", str(tmp_path / "ok.db")]) == 0
+    assert "違う設定" not in capsys.readouterr().err
+
+
+def test_build_db_drops_old_table_level_foragg_and_keeps_db_on_failure(mb, tmp_path, monkeypatch, capsys):
     import build_db
     p = tmp_path / "old.db"
     shutil.copy(mb / "racing.db", p)
@@ -297,6 +375,15 @@ def test_build_db_drops_old_table_level_foragg_and_keeps_db_on_failure(mb, tmp_p
     u2, m2 = _unified(mb / "racing.db")
     pd.testing.assert_frame_equal(u1, u2)
     pd.testing.assert_frame_equal(m1, m2)
+    # 多すぎるときは消さずに残して --fresh を勧める（DROP は本数の2乗で遅い。画面は使わない）
+    with sqlite3.connect(p) as con:
+        con.execute(f'CREATE TABLE "{t}" AS SELECT * FROM unified_all WHERE "テーブル名" = ?', (t,))
+    monkeypatch.setattr(build_db, "DROP_TABLE_LIMIT", 0)
+    capsys.readouterr()
+    assert build_db.main(["--mode", "foragg", "--agg-dir", str(mb / "agg_csv"), "--db-path", str(p)]) == 0
+    assert "--fresh" in capsys.readouterr().err
+    with sqlite3.connect(p) as con:
+        assert con.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (t,)).fetchone()
 
 
 def test_facets_from_stream_match_distinct(mb):
@@ -311,8 +398,9 @@ def test_facets_from_stream_match_distinct(mb):
 
 # ---------------------------------------------------------------- 画面（集計表ごと）
 def test_tables_view_same_from_unified_all_and_old_tables(mb, tmp_path, monkeypatch):
-    """1表ずつのテーブルが無くても、「集計表ごと」の表示は前の版の DB（1表ずつのテーブルあり）と同じ。"""
-    old = tmp_path / "old.db"
+    """1表ずつのテーブルが無くても、「集計表ごと」の表示は前の版の DB（1表ずつのテーブルあり）と同じ。
+    古い中身の1表ずつのテーブルが残っていても（多すぎて消さなかったとき）、表示は unified_all のとおり。"""
+    old, stale = tmp_path / "old.db", tmp_path / "stale.db"
     shutil.copy(mb / "racing.db", old)
     with sqlite3.connect(old) as con:
         show = [r[1] for r in con.execute('PRAGMA table_info("unified_all")')
@@ -320,6 +408,13 @@ def test_tables_view_same_from_unified_all_and_old_tables(mb, tmp_path, monkeypa
         cols = ", ".join(f'"{c}"' for c in show)
         for (t,) in con.execute("SELECT table_name FROM __tables_meta__ WHERE kind='foragg'").fetchall():
             con.execute(f'CREATE TABLE "{t}" AS SELECT {cols} FROM unified_all WHERE "テーブル名" = ? ORDER BY rowid', (t,))
+        con.commit()
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")          # WAL の中身を本体に（ファイルをコピーするので）
+    shutil.copy(old, stale)
+    with sqlite3.connect(stale) as con:
+        for (t,) in con.execute("SELECT table_name FROM __tables_meta__ WHERE kind='foragg'").fetchall():
+            con.execute(f'UPDATE "{t}" SET "件数" = 99999, "複勝率" = \'stale\'')
+        con.commit()
     bodies = {}
     import app as app_module
     queries = [
@@ -331,12 +426,12 @@ def test_tables_view_same_from_unified_all_and_old_tables(mb, tmp_path, monkeypa
         {"place": "東京", "sd": "ダ", "min_cnt": "10"},
         {"ind": "SAV", "sort": "adjusted_WEDGE", "min_adj": "0.5"},
     ]
-    for name, db in (("old", old), ("new", mb / "racing.db")):
+    for name, db in (("old", old), ("stale", stale), ("new", mb / "racing.db")):
         monkeypatch.setenv("DB_PATH", str(db))
         am = importlib.reload(app_module)
         c = am.app.test_client()
         bodies[name] = [c.get("/", query_string={"submitted": "1", "view": "tables", **qs}).get_data(as_text=True)
                         for qs in queries]
-    for qs, a, b in zip(queries, bodies["old"], bodies["new"]):
-        assert a == b, qs
-    assert any("<td>" in b for b in bodies["new"])
+    for qs, a, b, c in zip(queries, bodies["old"], bodies["stale"], bodies["new"]):
+        assert a == b == c, qs
+    assert any("<td>" in b for b in bodies["new"]) and not any("99999" in b for b in bodies["new"])

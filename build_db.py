@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+import zlib
 from pathlib import Path
 
 import pandas as pd
@@ -38,7 +39,7 @@ from shisu.conditions import CONDITION_COLUMNS, derive, load_inner_lookup, stand
 from shisu.csvio import norm_series, read_csv_any
 from shisu.matching import HIT_COLUMNS, STAT_COLUMNS, UNIFIED, indicator_bases, match_entry_row, unified_status
 from shisu.aggstore import (FLOAT_COLUMNS, INT_COLUMNS, RATE_NAMES, ROW_META, agg_master_files,  # noqa: F401
-                            estimate_percent, iter_agg_chunks, legacy_files, prepare_agg_frame)
+                            estimate_percent, iter_agg_chunks, legacy_files, prepare_agg_frame, read_stamp)
 from shisu.csvio import READ_ENCODINGS
 from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, FORAGG_PREFIX, file_stem, parse_agg_master_name,
                           parse_foragg_stem, table_name_for_entries, table_name_for_foragg, xjoin_table_for)
@@ -52,6 +53,11 @@ FACETS = "__facets__"
 FAMILIES_TABLE = fam_registry.DB_TABLE
 UNIFIED_BUILD = UNIFIED + "__build"
 AGG_CHUNK_ROWS = 200_000
+# 前の版の1表ずつのテーブル foragg_* を作り直しのときに消す上限。DROP TABLE は1本ごとにスキーマを書き直すので
+# 本数の2乗で遅くなる（1.6万本で約13秒、数十万本だと何時間も）。超えたら消さずに残して --fresh を勧める
+# （画面は unified_all から読むので、残っていても表示は変わらない）
+DROP_TABLE_LIMIT = 5000
+READ_ERRORS = (EOFError, OSError, zlib.error, pd.errors.ParserError, pd.errors.EmptyDataError)
 META_COLUMNS = ("table_name", "source_file", "kind", "family", "odds_mode", "rank_scheme", "indicator",
                 "region", "n_rows")
 UNIFIED_TEXT = ("場所", "芝・ダ", "距離", "芝(内・外)", "結合データ")
@@ -133,6 +139,7 @@ class _AggLoad:
         self.rows = 0
         self.inactive_rows = 0
         self.inactive_files: list[str] = []
+        self.failed: list[str] = []
         self._ins = (f"INSERT INTO {q(UNIFIED_BUILD)} ({', '.join(q(c) for c in UNIFIED_COLUMNS)}) "
                      f"VALUES ({', '.join('?' * len(UNIFIED_COLUMNS))})")
 
@@ -180,6 +187,14 @@ class _AggLoad:
                 self.con.execute("RELEASE agg_file")
                 self.inactive_rows = inactive0
                 continue
+            except READ_ERRORS as e:            # 途中で切れた gzip・壊れた CSV: そのファイルだけ戻して飛ばす
+                self.con.execute("ROLLBACK TO agg_file")
+                self.con.execute("RELEASE agg_file")
+                self.inactive_rows = inactive0
+                print(f"[ERROR] {source_file}: 読めません（{type(e).__name__}: {e}）。このファイルは取り込みません"
+                      "（途中で切れている可能性。aggregate_stats_ver2.py --resume で作り直せます）", file=sys.stderr)
+                self.failed.append(source_file)
+                return -1
             except BaseException:
                 self.con.execute("ROLLBACK TO agg_file")
                 self.con.execute("RELEASE agg_file")
@@ -196,6 +211,7 @@ class _AggLoad:
             self.rows += n
             return n
         print(f"[foragg] SKIP（{READ_ENCODINGS} で読めません）: {source_file} ({last})", file=sys.stderr)
+        self.failed.append(source_file)
         return -1
 
 
@@ -214,7 +230,7 @@ def _header(read) -> list[str] | None:
 
 def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict], int, dict[str, set]]:
     """成績表（agg_master_*.csv.gz と旧来の foragg_*.csv）を unified_all__build に入れる。
-    戻り値は (__tables_meta__ の行, WEDGE 列が無く取り込まなかった旧形式の本数, __facets__ の値)。
+    戻り値は (__tables_meta__ の行, WEDGE 列が無い旧形式の本数＋読めなかった本数, __facets__ の値)。
     unified_all はまだ置き換えない（swap_unified で置き換える）。"""
     masters = agg_master_files(agg_dir)
     legacy = legacy_files(agg_dir)
@@ -227,6 +243,7 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
     load = _AggLoad(con, active)
     skipped, old_format, shadowed = 0, [], 0
     sources = set()
+    stamps: dict[str, str] = {}
     for p in masters:
         source = parse_agg_master_name(p.name)
         read = lambda enc, nrows=None, _p=p: (                         # noqa: E731
@@ -246,6 +263,8 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
             skipped += 1
             sources.discard(source)
             continue
+        st = read_stamp(p)
+        stamps[p.name] = (st or {}).get("settings", "")
         print(f"[foragg] {p.name}: {n} rows", flush=True)
     for p in legacy:
         info = parse_foragg_stem(file_stem(p.name))
@@ -286,30 +305,43 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
     if old_format:
         print(f"[ERROR] WEDGE 列の無い旧形式の成績表が {len(old_format)} 本あり、取り込みませんでした"
               f"（例: {old_format[0]}）。aggregate_stats_ver2.py --clean を実行し直してください", file=sys.stderr)
+    ids = set(stamps.values())
+    if len(ids) > 1 or "" in ids:
+        no_stamp = sum(1 for v in stamps.values() if not v)
+        print(f"[WARN] master ごとの成績表が、違う設定（family・コンパクト化・WEDGE など）で作られたものの混ざりです"
+              f"（設定 {len(ids - {''})} 通り・書き終わりの印が無いもの {no_stamp} 本）。aggregate_stats_ver2.py --resume で"
+              "今の設定にそろえてから作り直してください", file=sys.stderr)
     con.commit()
-    return rows, len(old_format), load.facets
+    return rows, len(old_format) + len(load.failed), load.facets
 
 
-def drop_table_level_foragg(con: sqlite3.Connection) -> int:
-    """前の版の build_db が作った1表ずつのテーブル foragg_*（今は作らない。unified_all と同じ行）を消す。"""
+def drop_table_level_foragg(con: sqlite3.Connection, limit: int | None = None) -> tuple[int, int]:
+    """前の版の build_db が作った1表ずつのテーブル foragg_*（今は作らない。unified_all と同じ行）を消す。
+    limit（既定 DROP_TABLE_LIMIT）本を超えるときは消さない（遅いので）。戻り値は (消した本数, 残した本数)。"""
     names = [r[0] for r in con.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'foragg\\_%' ESCAPE '\\'")]
+    if len(names) > (DROP_TABLE_LIMIT if limit is None else limit):
+        return 0, len(names)
     for t in names:
         con.execute(f"DROP TABLE IF EXISTS {q(t)}")
-    return len(names)
+    return len(names), 0
 
 
 def swap_unified(con: sqlite3.Connection, facets: dict[str, set] | None = None) -> None:
     """unified_all__build を unified_all にする（索引・__facets__ も作る）。前の unified_all・1表ずつの foragg_* は消す。"""
     con.commit()
     con.execute("BEGIN")
-    n_old = drop_table_level_foragg(con)
+    n_old, n_left = drop_table_level_foragg(con)
     con.execute(f"DROP TABLE IF EXISTS {UNIFIED}")
     con.execute(f"ALTER TABLE {q(UNIFIED_BUILD)} RENAME TO {UNIFIED}")
     _create_unified_indexes(con)
     rebuild_facets(con, facets)
     n = con.execute(f"SELECT COUNT(*) FROM {UNIFIED}").fetchone()[0]
     print(f"[foragg] unified_all: {n} rows" + (f"（前の版の1表ずつのテーブル foragg_* {n_old} 個を消しました）" if n_old else ""))
+    if n_left:
+        print(f"[WARN] 前の版の1表ずつのテーブル foragg_* が {n_left} 個残っています（多すぎて消すと時間がかかるので残しました。"
+              "画面は unified_all から読むので表示には使いません）。DB を小さくするには build_db.py --fresh で作り直してください",
+              file=sys.stderr)
 
 
 def rebuild_facets(con: sqlite3.Connection, facets: dict[str, set] | None = None) -> None:
@@ -605,6 +637,10 @@ def main(argv=None) -> int:
     if args.prune:
         prune(con, kinds, keep)
     con.commit()
+    try:                                     # 作り直しで大きくなった WAL を切り詰める（ディスクを返す）
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.DatabaseError:
+        pass
     con.close()
     print(f"{'OK' if rc == 0 else 'DONE(警告あり)'}: {db} (mode={args.mode}, prune={args.prune}, xjoin={not args.no_xjoin})")
     return rc
