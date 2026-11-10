@@ -134,13 +134,13 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 |---|---|
 | csv_files・raw_csv・ext_indices（過去データ）・キーの部品の規則（`shisu/` の normalize・conditions・course・data/） | replace → （screen）→ aggregate → build_db --mode both |
 | 使う family（selected_families.json を作り直した・消した） | aggregate --clean → build_db --fresh（master はそのまま使える） |
-| 集計の条件（推定方法・MIN_SAMPLE・オッズ帯の定義・WEDGE の年の最低件数・遡る年数・減衰率・窓・コンパクト化の設定など） | aggregate --clean → build_db --fresh（`--resume` で回すと、今の設定で作っていない成績表だけ作り直す） |
+| 集計の条件（推定方法・MIN_SAMPLE・オッズ帯の定義・WEDGE の年の最低件数・遡る年数・減衰率・窓・コンパクト化の設定など） | aggregate --clean → build_db --fresh（`--resume` で回すと、今の設定で作っていない成績表だけ作り直す。設定のハッシュに入るのは、aggregate の引数・環境変数（AGG_*）・family の定義・区分の閾値・オッズ帯の境目（`shisu/odds.py` の `ODDS_BREAKS`）・EDGE の表（`shisu/wedge.py`）。それ以外のコード（`shisu/*.py`）を変えたときは `--resume` では気づかないので `--clean`） |
 | 出馬表・ext_indices（出馬表の日の外部指数）・馬体重発表後のマイニング確定値（entries_in の出馬表を上書き） | calc_entry_hensachi --merge-only --clean → build_db --entries-only（＝ `--mode entries`。古い出馬表を消すなら `--prune`） |
 | 画面（app.py） | app の再起動だけ |
-| 区分の閾値（`shisu/classify.py`） | コンパクト化（既定）しているなら aggregate（`--resume` で、閾値が変わった成績表を作り直す。閾値は設定のハッシュに入る）→ build_db --fresh。`--no-compact` なら app の再起動だけ |
+| 区分の閾値（`shisu/classify.py`） | コンパクト化（既定）しているなら aggregate（`--resume` で、閾値が変わった成績表を作り直す。閾値は設定のハッシュに入る）→ build_db --fresh → app の再起動。`--no-compact` なら app の再起動だけ |
 
 - `build_db --mode foragg` だけ回すと xjoin（照合結果）が古いまま残るので、警告が出る。続けて `--mode entries` を回す。
-- `--prune` は「今回作り直した種類」の古いテーブルだけを消す（`--mode entries --prune` で foragg_* は消えない）。
+- `--prune` は今回作り直した出馬表の古いテーブル（entries_*・entries_xjoin_*）だけを消す。成績表（unified_all・__tables_meta__ の集計表の行）は触らない（前の版の1表ずつのテーブル foragg_* は `--mode foragg` の入れ替えで消える。多すぎて残ったときは `--fresh`）。
 - family を入れ替えたら `aggregate --clean`（古い family の成績表を agg_csv に残さない）と `build_db --fresh`。
 - 画面は `__tables_meta__` に載っている集計表だけを使う。family の名前・ラベル・照合に使う family は DB の `__families__` から読む。
 
@@ -213,7 +213,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
     - 大きさの目安: unified_all は1行あたり約740バイト（索引込み）、agg_master_*.csv.gz は約51バイト。4,868通り × 33指数（全部の行で約4.3億行と見積もり）なら、既定で DB 約180GB、件数なし・WEDGE≧1.0 で約21GB（合成データからの見積もり。実データでは違う）
   - 時間はほとんど変わらない（判定は書く前の成績表に1回かけるだけ）
 - **並列（`--workers N`）**: master を1本ずつ子プロセスに渡し（`chunksize=1` と同じ）、N × `MASTERS_PER_CHILD`（2）本ごとに `ProcessPoolExecutor` を作り直して `gc.collect()` する（`shisu.parallel.run_batched`。replace と同じ。子プロセスが止められたらそのまとまりの残りを `[ERROR]` にして次へ）。進み具合は `[済んだ本数/全体] [OK] …` で1本ずつ出す
-- **書き終わりの印と `--resume`**: master を読む前に前の `agg_master_*.csv.gz` と印を消し（読めない・止められた・[SKIP] でも前の成績表を残さない）、master の大きさ・更新時刻を読む前に取り（集計の間に replace が master を作り直したら印を書かない）、書き終えたら fsync して本来の名前に置き換え、印 `agg_master_*.csv.gz.done`（集計の設定のハッシュ・元の master の名前・大きさ・更新時刻・行数・成績表のファイルの大きさ）を書く。`--resume` は、印が**今の設定・今の master と合い、成績表が印のとおりの大きさで残っている** master だけを飛ばし、ほかは作り直す（違う設定で作った成績表・replace で作り直した master・途中で切れたファイルを混ぜない。設定を変えた実行が途中で止まっても、`--resume` で今の設定にそろう）。設定のハッシュには、family の定義・スキーム・WEDGE・推定（scipy の有無も）・コンパクト化と、コンパクト化しているときは区分の閾値（`shisu/classify.py` の定数）も入る。設定は `agg_csv/agg_settings.json` にも書き、`--resume` のとき前回と違えばどの項目かをログに出す。`--clean` と一緒には使えない。前の実行の書きかけ `.part` は消してからやり直す
+- **書き終わりの印と `--resume`**: master を読む前に前の `agg_master_*.csv.gz` と印を消し（読めない・止められた・[SKIP] でも前の成績表を残さない）、master の識別（名前・大きさ・中身の指紋＝gzip の末尾8バイトの CRC32 と長さ。更新時刻はコピー・Docker のマウントで変わるので比べない）を読む前に取り（集計の間に replace が master を作り直したら印を書かない）、書き終えたら fsync して本来の名前に置き換え、印 `agg_master_*.csv.gz.done`（集計の設定のハッシュ・元の master の識別と読んだ場所・行数・成績表のファイルの大きさ）を書く。`--resume` は、印が**今の設定・今の master（名前・大きさ・中身の指紋）と合い、成績表が印のとおりの大きさで残っている** master だけを飛ばし、ほかは作り直す（違う設定で作った成績表・replace で中身を作り直した master・途中で切れたファイルを混ぜない。更新時刻だけ変わった master は作り直さない。設定を変えた実行が途中で止まっても、`--resume` で今の設定にそろう）。設定のハッシュには、family の定義・スキーム・WEDGE・推定（scipy の有無も）・コンパクト化と、コンパクト化しているときは区分の閾値（`shisu/classify.py` の定数）も入る。設定は `agg_csv/agg_settings.json` にも書き、`--resume` のとき前回と違えばどの項目かをログに出す。`--clean` と一緒には使えない。前の実行の書きかけ `.part` は消してからやり直す
 - 失敗: 子プロセスが止められた・例外の master は `[ERROR]`（終了コード1）。全部の master が失敗したときもそう出す（「replace を先に」とは出さない）。直してから `--resume` で失敗した分だけ集計できる
 - 行ごとに決まる値（着順の解析・オッズ・配当・年）は master 1本につき1回だけ求め、family・オッズ帯ごとには aggregate_frame の入力に要る列だけを渡す（`with_precomputed`。結果は1行ずつ求めたときと同じ）
 - 重複排除: レースID × 結合データ × 馬番（s2 の重なりで1頭が2つのキーに入るのは別のキーなので数える）
@@ -249,7 +249,9 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
   - 作り直しは `unified_all__build` に入れてから、最後に1つのトランザクションで前の unified_all と入れ替える（途中で止まっても前の unified_all が残る。画面は入れ替えまで前の DB を見る）。行はファイルごとにコミットする。入れ替えのトランザクションで索引を作るので、WAL はその間だけ索引の大きさほどに膨らむ（100万行で約180MB）。最後に `wal_checkpoint(TRUNCATE)` で切り詰める
   - 前の版の DB に残っている1表ずつのテーブル `foragg_*` は入れ替えのときに消す。`DROP_TABLE_LIMIT`（5,000）本を超えるときは消さずに WARN（DROP は1本ごとにスキーマを書き直すので本数の2乗で遅い。1.6万本で約13秒、数十万本だと何時間も）。画面は使わないので表示には影響しない。消してファイルを小さくするには `--fresh`
   - 読めない成績表（途中で切れた gzip・gzip でないファイル・壊れた CSV。見出しから読めないものも）は、そのファイルの分だけ戻して飛ばし `[ERROR]`（終了コード1。ほかのファイルは入れる。`aggregate --resume` で作り直せる）。読めなかった master でも、同じ master の旧来の foragg_*.csv は代わりに使わない
-  - 書き終わりの印（`.done`）の設定のハッシュが成績表によって違う・印のある成績表と無い成績表（旧来の foragg_*.csv を含む）が混ざっていれば WARN（`aggregate --resume` でそろえる）。印の master の大きさ・更新時刻が master_csv の今の master と違えば WARN（成績表を作ったあとに replace で作り直した）
+  - 書き終わりの印（`.done`）の設定のハッシュが成績表によって違う、または印の無い agg_master がある（集計の間に master が作り直された・前の版の aggregate で作った）なら WARN（`aggregate --resume` でそろえる）。旧来の foragg_*.csv を使ったときは別に WARN（agg_master と一緒なら。旧来のファイルだけなら INFO。設定が分からないので `aggregate --clean` を勧める）
+  - 印の master の大きさ・中身の指紋が、集計が読んだ場所（印の master_path。無ければ master_csv の同じ名前）の今の master と違えば WARN（成績表を作ったあとに replace で作り直した）
+  - 旧来の foragg_*.csv を使わない master = agg_master のファイルがある master と、今の版で集計して0行だった master（印だけがある）
   - `--prune` は成績表を触らない（前の版の1表ずつのテーブルは入れ替えのときに扱い、__tables_meta__ の集計表の行は入れ替えで作り直す）
   - 旧来の1表1ファイル（`foragg_*.csv`）も読める（互換）。同じ master の `agg_master_*.csv.gz` があれば、その master の旧来のファイルは使わない（二重に入れない）
   - 読める成績表が0本なら DB に触らず終了コード2（空にしたいときだけ `--allow-empty`）。WEDGE 列の無い旧形式の成績表は取り込まず終了コード1
@@ -420,7 +422,7 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 
 - `agg_master_{地域}_{指数名}.csv.gz`（2026-11-10〜。master 1本につき1ファイル・cp932・gzip）: 下の表の列 ＋ `family, odds_mode, rank_scheme, indicator, region, テーブル名`。1つの成績表（family × スキーム × オッズ帯）の行は続けて並び、中の並びは結合データの昇順。テーブル名 = 旧来のファイル名（拡張子なし）を SQLite 用に安全化したもの
 - 旧来の `foragg_{オッズ接頭辞}{rankband_スキーム_}{family}_{地域}_{指数名}.csv`（2026-11-09 まで。1表1ファイル）も build_db が読める。`shisu.aggstore.read_agg_tables` は両方を旧来の1表1ファイルの形（{ファイル名: 成績表}）に分けて返す（確認・テスト用）
-- `agg_master_{地域}_{指数名}.csv.gz.done`: 書き終わりの印（JSON: settings（設定のハッシュ）, master, master_size, master_mtime_ns, rows, bytes）。`--resume` と build_db の混ざりの確認が見る
+- `agg_master_{地域}_{指数名}.csv.gz.done`: 書き終わりの印（JSON: settings（設定のハッシュ）, master, master_size, master_fingerprint（gzip の末尾8バイト。gz でなければ sha256）, master_path, master_mtime_ns（確認用。比べない）, rows, bytes）。`--resume` と build_db の確認が見る
 - `agg_settings.json`: 集計の設定（family の定義・スキーム・WEDGE・推定・コンパクト化・区分の閾値）。`--resume` のとき、前回と違えば項目をログに出す
 
 | 列 | 内容 |
@@ -676,9 +678,9 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - `tests/test_entries_ext.py`: 出馬表1本（マイニング値だけ）に ext_indices の指数（オメガ・ST指数・Gold・BC・ZI）が付き、**master と順位・偏差値・偏差値帯・順位帯が一致する**こと、出馬表に値のある指数は出馬表の値を使うこと、0 だけの列（と右の 指数順位1）を ext で上書きすること、**優先がファイル・レースごと**（別のファイルに値があっても・0 だけのレースは ext から付き、過去側と同じ順位）、台帳に無い指数の 指数順位N を足した列に回さないこと、`--no-ext`・レースID の無い出馬表
 - `tests/test_raw_merge.py`: ファイル名からの種類、**列パッチ**（中身での見分け・2本のパッチを 全場_タイムM・全場_対戦M の両方に当てる・後のファイル優先・空欄で上書きしない・無い列を足す・16桁の ID＋馬番・18桁でない行・当てる先が無い／当たらない行のあるパッチは残す・基本CSVと同じ回・あとから基本CSVを統合すると当たって移る・片方の 全場_*.csv がまだ無いときは残す・ファイルごとに移すかを決める・見出しのゆれ・指数順位を書き換えない・replace の master の22条件に入る・画面からのアップロード）、重複の置き換え（後のファイル優先）・10年の窓・merged_done への移動（同じ名前は `_2`）・種類の分からないファイルと読めないファイルを残すこと、16桁の ID でも馬ごとに比べること、書き込みの途中失敗で既存の 全場_*.csv を壊さないこと、`--raw-dir` の既定が `--csv-dir` の隣になること、replace が master の前に統合すること（`--no-raw-merge`）、/ingest のアップロードと選択・パスの除去・不正な名前・別サイトからの POST
 - `tests/test_screen_families.py` には候補の数（骨格・因果トリオ）・冗長の除外・単独の 場所/距離/芝(内・外) を含む family の過去側と出馬表側のキーの一致（単独の 芝(内・外) はダート・内外の区別の無い芝で両側ともキーを作らない）・成績表のコース列・select の複勝スプレッド・adj_wedge_* も
-- `tests/test_aggstore.py`（2026-11-10）: master ごとの1ファイルとメタ列・テーブル名、`classify_frame` と1行版の一致（境界値・欠損・4オッズ帯）、旧来のファイル名の速い解析が前の当て方と同じこと、**コンパクト化で残る行が仕様の条件から独立に計算した行と完全に一致**すること・DB の4区分と WEDGE≧0.70 の行が全部の行の DB と同じこと・layer A は全部残ること・下限のオプション、`--resume`（済んだ master を触らない・書きかけを消す・設定を変えた実行が途中で止まっても今の設定にそろう・途中で切れたファイルと作り直した master は作り直す・--clean と一緒なら止める）、全部の master が失敗したときの終了コードとメッセージ、下限の `none` と 0 以下を弾くこと、並列のまとまり（子プロセスを作り直しても1プロセスと同じバイト列）、build_db が旧来の1表1ファイルからでも同じ unified_all・__tables_meta__ を作ること・agg_master と重なる旧来のファイルを使わないこと・前の版の1表ずつのテーブルを消すこと（多すぎれば残して WARN）・読める成績表が無ければ DB を変えないこと・途中で切れたファイルを飛ばして [ERROR]・違う設定の混ざりの WARN、__facets__、**「集計表ごと」の画面が、前の版の DB（1表ずつのテーブルあり・古い中身のテーブルあり）でも新しい DB でも同じ HTML**になること。2回目の検証で再現した不具合の再発防止（master が読めないときに前の成績表を残さない・集計の間に master が作り直されたら印を書かない・区分の閾値が設定のハッシュに入る・先頭から壊れたファイルと gzip でないファイルを [ERROR] にし旧来のファイルで代用しない・旧来のファイルとの混ざりと master の作り直しの WARN・`--prune` が集計表の一覧を消さない）
+- `tests/test_aggstore.py`（2026-11-10）: master ごとの1ファイルとメタ列・テーブル名、`classify_frame` と1行版の一致（境界値・欠損・4オッズ帯）、旧来のファイル名の速い解析が前の当て方と同じこと、**コンパクト化で残る行が仕様の条件から独立に計算した行と完全に一致**すること・DB の4区分と WEDGE≧0.70 の行が全部の行の DB と同じこと・layer A は全部残ること・下限のオプション、`--resume`（済んだ master を触らない・書きかけを消す・設定を変えた実行が途中で止まっても今の設定にそろう・途中で切れたファイルと作り直した master は作り直す・--clean と一緒なら止める）、全部の master が失敗したときの終了コードとメッセージ、下限の `none` と 0 以下を弾くこと、並列のまとまり（子プロセスを作り直しても1プロセスと同じバイト列）、build_db が旧来の1表1ファイルからでも同じ unified_all・__tables_meta__ を作ること・agg_master と重なる旧来のファイルを使わないこと・前の版の1表ずつのテーブルを消すこと（多すぎれば残して WARN）・読める成績表が無ければ DB を変えないこと・途中で切れたファイルを飛ばして [ERROR]・違う設定の混ざりの WARN、__facets__、**「集計表ごと」の画面が、前の版の DB（1表ずつのテーブルあり・古い中身のテーブルあり）でも新しい DB でも同じ HTML**になること。2回目の検証で再現した不具合の再発防止（master が読めないときに前の成績表を残さない・集計の間に master が作り直されたら印を書かない・区分の閾値が設定のハッシュに入る・先頭から壊れたファイルと gzip でないファイルを [ERROR] にし旧来のファイルで代用しない・旧来のファイルとの混ざりと master の作り直しの WARN・`--prune` が集計表の一覧を消さない）、3回目の検証の分（印の無い成績表だけでも WARN・0行で終わった master の旧来のファイルを使わない・更新時刻だけ変わった master は作り直さず、中身が変わったものは作り直す・オッズ帯の境目と EDGE の表が設定のハッシュに入る・印を書かなかった master も年度の窓のまとめに入る）
 - `tests/test_screen_families.py` に選抜の新しい規則（基準B の絶対軸・基準A の adj 上位）と `--from-report`（採点し直さず同じ選抜になる・基準を変えると減る・基準が JSON に残る・読んだファイルに書き戻す・ファイル名なしの --from-report に --report を付けると --report を読む・レポートが無い/形が違うと終了コード2）・同じ値の並びに依らない選抜、`tests/test_pipeline.py` に `build_db --entries-only`（`--fresh`・`--mode foragg` と一緒なら弾く）と replace の `--workers 2`（まとまりごとに子プロセスを作り直しても1プロセスと同じ master・子プロセスが止められてもそのまとまりを [ERROR] にして残りを続ける）
-- 件数: 470（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
+- 件数: 472（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
 
 ---
 
@@ -733,7 +735,8 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - shisu: `aggstore.py`（保存形式・コンパクト化・読み込み。`prepare_agg_frame`・`estimate_percent` を build_db から移した）、`parallel.py`、`classify.classify_frame`（ベクトル版）、`naming` に agg_master の名前と速い旧来名の解析
 - 独立レビュー（再現つき）の指摘を反映: `--resume` が設定を変えた実行の途中で止まったあとに前の設定の成績表を飛ばして混ぜた（agg_settings.json を毎回書き直していたため）→ 成績表ごとの書き終わりの印（設定のハッシュ・master の大きさと更新時刻・ファイルの大きさ）で判定し、合わないものは作り直す。書き終わりに fsync。途中で切れた成績表で build_db が例外で止まった → そのファイルを飛ばして [ERROR]。全部の master が失敗したときに「replace を先に」と出た。`--compact-min-count 0` で下げたのに残る行が減った → `none` で外し、0 以下は弾く。前の版の DB の1表ずつのテーブルが数十万本あると消すのに何時間もかかる → 画面は常に unified_all から読み、5,000本を超えたら消さずに WARN。WAL の記述の訂正と切り詰め
 - 2回目の検証（修正分。3つの観点で探して反証役が再現。確定12件）の指摘を反映: master の読み込みで失敗すると前の成績表と印が残り build_db が黙って使った → 読む前に消す。印の master の大きさ・更新時刻を集計のあとに取っていた（集計中に replace が作り直すと古い結果が「済み」になる）→ 読む前に取り、変わっていたら印を書かない。設定のハッシュに区分の閾値（classify.py）と scipy の有無が無かった。build_db が先頭から壊れたファイル・gzip でないファイルを黙って飛ばしていた → [ERROR]。壊れた agg_master の代わりに同じ master の旧来のファイルを使っていた → 使わない。`--prune` で前の版のテーブルを残したとき集計表の一覧（__tables_meta__）を全部消していた → `--prune` は成績表を触らない。旧来のファイルとの混ざり・master の作り直しを WARN。`--resume` の説明（ヘルプ・ドキュメント）と画面の説明・終了コードの記述の食い違い
-- テスト: `tests/test_aggstore.py` を追加。個別の成績表ファイルを読んでいたテストは `read_agg_tables` で同じ形に分けて読む（件数を厳密に比べるテストは `--no-compact`）。pipeline の fixture は既定のコンパクト化で全段を通す。テスト 470件
+- 3回目の検証（2回目の修正分。確定7件）の指摘を反映: 印の無い agg_master しか無いと build_db が警告しなかった（旧来のファイルを印の無いものに数えないよう条件を狭めたため）→ 旧来のファイルは別に数えて別の WARN。0行で終わった master（印だけ）の旧来のファイルを使っていた → 使わない。「master を作り直した」の WARN が `--in-dir` で集計したとき・master をコピーしたとき（更新時刻が変わる）に誤って出た → 印に読んだ場所と中身の指紋を残して比べ、更新時刻は比べない（`--resume` も同じ）。オッズ帯の境目・EDGE の表が設定のハッシュに無かった。印を書かなかった master の [OK] 行の追記が年度の窓のまとめを壊した。`--prune` と区分の閾値の手順の記述
+- テスト: `tests/test_aggstore.py` を追加。個別の成績表ファイルを読んでいたテストは `read_agg_tables` で同じ形に分けて読む（件数を厳密に比べるテストは `--no-compact`）。pipeline の fixture は既定のコンパクト化で全段を通す。テスト 472件
 
 ### 2026-11-09 選抜のやり直し・メモリ・lxml・Readme.txt
 - screen_families: `--from-report [CSV]`（採点済みの screening_report.csv から選抜だけやり直す。数秒）。選抜の既定を `--min-axis 25`・`--top-a 100` に。基準B は絶対軸が1つでも出る候補を必ず選ぶ（`--always-select-abs`）、基準A は wedge_spread 上位か adj_wedge_spread 上位

@@ -56,7 +56,8 @@ import pandas as pd
 from shisu import config
 from shisu import classify as classify_rules
 from shisu.aggstore import (COMPACT_MIN_COUNT, COMPACT_MIN_WEDGE, PART_SUFFIX, AggMasterWriter, compact_mask,
-                            legacy_files, master_identity, settings_hash, stamp_matches, stamp_path, write_stamp)
+                            IDENTITY_KEYS, legacy_files, master_identity, settings_hash, stamp_matches, stamp_path,
+                            write_stamp)
 from shisu.csvio import read_csv_any
 from shisu.estimates import beta_quantile, has_scipy, posterior_mean
 from shisu.finish import parse_finish
@@ -379,7 +380,8 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
     writer.close()
     note = ""
     if settings_id is not None:
-        if master_identity(src) == ident:
+        now = master_identity(src)
+        if all(now[k] == ident[k] for k in IDENTITY_KEYS):
             write_stamp(path, settings_id, ident, kept)
         else:                                       # 集計の間に replace が master を作り直した
             note = " / [WARN] 集計の間に master が作り直されたので書き終わりの印を書きません（--resume で作り直します）"
@@ -406,10 +408,14 @@ def _threshold(kind):
 def settings_of(fam_dicts: list[dict], schemes: set[str], wedge_opts: dict, compact: dict) -> dict:
     """成績表の中身を変える集計の設定（agg_settings.json と、書き終わりの印のハッシュ）。--resume はこのハッシュが
     違う成績表を作り直す。コンパクト化で残す行は shisu/classify.py の閾値でも変わるので、その値も入れる。"""
+    from shisu import odds as odds_rules
+    from shisu import wedge as wedge_rules
     rules = {k: v for k, v in sorted(vars(classify_rules).items())
              if k.isupper() and isinstance(v, (int, float)) and not isinstance(v, bool)}
     return {"version": 1, "families": fam_dicts, "schemes": sorted(schemes), "wedge": wedge_opts,
             "compact": compact, "classify": rules if compact.get("enabled") else {}, "min_sample": MIN_SAMPLE,
+            "odds": {"modes": list(odds_rules.ODDS_MODES), "breaks": list(odds_rules.ODDS_BREAKS)},
+            "edge": {"clip": wedge_rules.ODDS_CLIP, "table": [list(t) for t in wedge_rules.EDGE_TABLE]},
             "estimate": {"mode": PROP_MODE, "lower_q": LOWER_Q, "upper_q": UPPER_Q, "prior_alpha": PRIOR_A,
                          "prior_beta": PRIOR_B, "plc_switch_pct": PLC_SWITCH_PCT, "scipy": has_scipy()}}
 
@@ -570,7 +576,7 @@ def _print_wedge_coverage(results: list[str], max_years: int = DEFAULT_MAX_YEARS
         for g, a in re.findall(r"=(\d+)\(adj (\d+)\)", r):
             total += int(g)
             adj += int(a)
-        m = re.search(r"^\[OK\] (.+?): .*年度窓の終わり=(\S+)$", r)
+        m = re.search(r"^\[OK\] (.+?): .*年度窓の終わり=(\S+)", r)
         if m:
             ends.setdefault(m.group(2), []).append(m.group(1))
     if total:

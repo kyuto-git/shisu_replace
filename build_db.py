@@ -21,7 +21,9 @@
 作り直す。掲示板率_val は頻度のまま。率はすべて 0–100。
 WIN / EDGE / WEDGE / adjusted_WEDGE（と adjusted_WEDGE_年数・件数・最終年）は集計CSVの値をそのまま入れる。
 
---prune は「今回作り直した種類」の古いテーブルだけを消す（--mode entries --prune で foragg_* は消えない）。
+--prune は今回作り直した出馬表の古いテーブル（entries_*・entries_xjoin_*）だけを消す。成績表（unified_all・
+__tables_meta__ の kind=foragg・前の版の foragg_*）は触らない（前の版の foragg_* は --mode foragg の入れ替えで消える。
+多すぎて残ったときは --fresh）。
 """
 from __future__ import annotations
 
@@ -39,7 +41,8 @@ from shisu.conditions import CONDITION_COLUMNS, derive, load_inner_lookup, stand
 from shisu.csvio import norm_series, read_csv_any
 from shisu.matching import HIT_COLUMNS, STAT_COLUMNS, UNIFIED, indicator_bases, match_entry_row, unified_status
 from shisu.aggstore import (FLOAT_COLUMNS, INT_COLUMNS, RATE_NAMES, ROW_META, agg_master_files,  # noqa: F401
-                            estimate_percent, iter_agg_chunks, legacy_files, prepare_agg_frame, read_stamp)
+                            IDENTITY_KEYS, STAMP_SUFFIX, estimate_percent, iter_agg_chunks, legacy_files,
+                            master_identity, prepare_agg_frame, read_stamp)
 from shisu.csvio import READ_ENCODINGS
 from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, file_stem, parse_agg_master_name,
                           parse_foragg_stem, table_name_for_entries, table_name_for_foragg, xjoin_table_for)
@@ -247,7 +250,11 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
     # 旧来の foragg_*.csv を使わない master = agg_master のファイルがある master（読めなかったものも。
     # 壊れた agg_master の代わりに前の版の古い成績表を黙って使わないように）
     sources = {parse_agg_master_name(p.name) for p in masters}
+    # 今の版で集計して0行だった master（印だけがあり成績表のファイルは無い）も、旧来のファイルを使わない
+    sources |= {parse_agg_master_name(p.name[:-len(STAMP_SUFFIX)])
+                for p in Path(agg_dir).glob(f"agg_master_*{STAMP_SUFFIX}")} - {None}
     loaded_sources = set()
+    legacy_sources: set[str] = set()
     for p in masters:
         source = parse_agg_master_name(p.name)
         read = lambda enc, nrows=None, _p=p: (                         # noqa: E731
@@ -277,10 +284,14 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
         loaded_sources.add(source)
         st = read_stamp(p) or {}
         stamps[p.name] = st.get("settings", "")
-        m = master_dir / str(st.get("master", ""))
-        if st.get("master") and m.exists():          # 成績表を作ったあとに replace が master を作り直した
-            cur = m.stat()
-            if (cur.st_size, cur.st_mtime_ns) != (st.get("master_size"), st.get("master_mtime_ns")):
+        # 成績表を作ったあとに replace が master を作り直したか（読んだ場所に無ければ master_csv の同じ名前で。
+        # 比べるのは大きさと中身の指紋。更新時刻はコピー・Docker のマウントで変わるので使わない）
+        m = Path(st.get("master_path") or "")
+        if not (st.get("master_path") and m.exists()):
+            m = master_dir / str(st.get("master", ""))
+        if st.get("master") and st.get("master_fingerprint") and m.is_file():
+            cur = master_identity(m)
+            if any(cur[k] != st.get(k) for k in IDENTITY_KEYS):
                 rebuilt.append(p.name)
         print(f"[foragg] {p.name}: {n} rows", flush=True)
     for p in legacy:
@@ -308,7 +319,7 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
         df = df.assign(family=info["family"], odds_mode=info["mode"], rank_scheme=info["scheme"],
                        indicator=info["indicator"], region=info["region"], テーブル名=table_name_for_foragg(p.name))
         if load.load_file(lambda enc, _df=df: iter([_df]), p.name) >= 0:
-            stamps.setdefault("legacy:" + info["source"], "")         # 旧来の成績表には書き終わりの印が無い
+            legacy_sources.add(info["source"])
     rows = sorted(load.meta.values(), key=lambda m: m["table_name"])
     print(f"[foragg] loaded {len(rows)} tables / {load.rows} rows（master ごとの成績表 {len(loaded_sources)} 本・"
           f"旧来の成績表 {len(legacy) - shadowed} 本 / skip {skipped}）")
@@ -323,12 +334,18 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
     if old_format:
         print(f"[ERROR] WEDGE 列の無い旧形式の成績表が {len(old_format)} 本あり、取り込みませんでした"
               f"（例: {old_format[0]}）。aggregate_stats_ver2.py --clean を実行し直してください", file=sys.stderr)
-    ids = set(stamps.values())
-    if len(ids) > 1:                         # 設定が2通り以上、または印のある成績表と印の無い成績表（旧来のものを含む）の混ざり
-        no_stamp = sum(1 for v in stamps.values() if not v)
-        print(f"[WARN] 成績表が、違う設定（family・コンパクト化・WEDGE など）で作られたものの混ざりです"
-              f"（設定 {len(ids - {''})} 通り・書き終わりの印が無いもの {no_stamp} 本。旧来の foragg_*.csv も印の無いものに"
-              "数えます）。aggregate_stats_ver2.py --resume で今の設定にそろえてから作り直してください", file=sys.stderr)
+    ids = set(stamps.values()) - {""}
+    no_stamp = [n for n, v in stamps.items() if not v]
+    if len(ids) > 1 or no_stamp:
+        print(f"[WARN] master ごとの成績表に、違う設定（family・コンパクト化・WEDGE など）で作られたもの、または書き終わりの印"
+              f"（.done）が無いものがあります（設定 {len(ids)} 通り・印が無いもの {len(no_stamp)} 本"
+              + (f"。例: {no_stamp[0]}" if no_stamp else "") + "）。印が無いのは、集計の間に master が作り直された・前の版の"
+              "aggregate で作ったものです。aggregate_stats_ver2.py --resume で今の設定にそろえてから作り直してください",
+              file=sys.stderr)
+    if legacy_sources:
+        msg = (f"旧来の成績表 foragg_*.csv を使いました（{len(legacy_sources)} master。例: {sorted(legacy_sources)[0]}）。"
+               "作ったときの設定が分からないので、aggregate_stats_ver2.py --clean で作り直すのがおすすめです")
+        print(("[WARN] " if loaded_sources else "[INFO] ") + msg, file=sys.stderr if loaded_sources else sys.stdout)
     if rebuilt:
         print(f"[WARN] 成績表を作ったあとに master が作り直されています（{len(rebuilt)} 本。例: {rebuilt[0]}）。"
               "aggregate_stats_ver2.py --resume で作り直してください", file=sys.stderr)
@@ -562,7 +579,8 @@ def parse_cli(argv=None):
     p.add_argument("--entries-only", action="store_true",
                    help="--mode entries と同じ（出馬表だけ取り込み直す。馬体重発表後のマイニング確定値の更新など）")
     p.add_argument("--fresh", action="store_true", help="DBファイルを削除して作り直す")
-    p.add_argument("--prune", action="store_true", help="今回作り直した種類の古いテーブルを削除する")
+    p.add_argument("--prune", action="store_true",
+                   help="今回作り直した出馬表の古いテーブル（entries_*・entries_xjoin_*）を削除する（成績表は触らない）")
     p.add_argument("--no-xjoin", action="store_true", help="entries_xjoin_* を作らない（画面はその場で照合する）")
     p.add_argument("--agg-dir", dest="agg_dir", default=str(config.agg_dir()),
                    help="成績表（aggregate_stats_ver2.py の出力）のディレクトリ（既定 agg_csv/）")

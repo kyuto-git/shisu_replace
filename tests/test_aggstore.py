@@ -48,6 +48,14 @@ def mb(tmp_path_factory, monkeypatch_module):
     F.reset()
 
 
+def _shrink_master(path: Path) -> None:
+    """master の中身を変える（replace で作り直したのと同じ。最初のレースを除く）。"""
+    from shisu.csvio import read_csv_any, write_csv
+    m = read_csv_any(path)
+    first = m["レースID(新/馬番無)"].iloc[0]
+    write_csv(m[m["レースID(新/馬番無)"] != first], path)
+
+
 def _rows(agg_dir: Path) -> pd.DataFrame:
     from shisu.aggstore import agg_master_files, read_agg_master
     return pd.concat([read_agg_master(p) for p in agg_master_files(agg_dir)], ignore_index=True)
@@ -239,18 +247,22 @@ def test_resume_redoes_truncated_files_and_rebuilt_masters(mb, tmp_path, capsys)
     import aggregate_stats_ver2 as agg
     ref = mb / "agg_csv"
     mdir = tmp_path / "m"
-    shutil.copytree(mb / "master_csv", mdir)                          # copy2: 大きさ・更新時刻はそのまま
+    shutil.copytree(mb / "master_csv", mdir)
     out = tmp_path / "agg"
     shutil.copytree(ref, out)
     files = sorted(out.glob("agg_master_*.csv.gz"))
     files[1].write_bytes(files[1].read_bytes()[: files[1].stat().st_size // 2])     # VM ごと落ちて途中で切れた
     masters = sorted(mdir.glob("master_*.csv.gz"))
-    st = masters[2].stat()
-    os.utime(masters[2], ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))         # replace で master を作り直した
+    _shrink_master(masters[2])                                                     # replace で master を作り直した
+    st = masters[0].stat()
+    os.utime(masters[0], ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))           # 更新時刻だけ変わった（コピー・マウント）
     capsys.readouterr()
     assert agg.main(["--in-dir", str(mdir), "--out-dir", str(out), "--resume", *YEAR]) == 0
-    assert "1 本は今の設定で済んでいる" in capsys.readouterr().out
-    assert _bytes(out) == _bytes(ref)
+    assert "1 本は今の設定で済んでいる" in capsys.readouterr().out                 # 中身の同じ masters[0] は飛ばす
+    fresh = tmp_path / "fresh"
+    assert agg.main(["--in-dir", str(mdir), "--out-dir", str(fresh), *YEAR]) == 0
+    assert _bytes(out) == _bytes(fresh)
+    assert _bytes(out)[0] == _bytes(ref)[0] and _bytes(out)[2] != _bytes(ref)[2]
 
 
 def test_all_masters_failing_is_reported_as_failure(mb, tmp_path, monkeypatch, capsys):
@@ -459,8 +471,8 @@ def test_failed_master_read_leaves_no_old_agg_file(mb, tmp_path, capsys):
 
 
 def test_master_rebuilt_during_aggregation_gets_no_stamp(mb, tmp_path, monkeypatch, capsys):
-    import os
     import aggregate_stats_ver2 as agg
+    import build_db
     from shisu.aggstore import stamp_path
     mdir, out = tmp_path / "m", tmp_path / "agg"
     shutil.copytree(mb / "master_csv", mdir)
@@ -470,19 +482,39 @@ def test_master_rebuilt_during_aggregation_gets_no_stamp(mb, tmp_path, monkeypat
     def read_then_rebuild(path, *a, **k):              # 読んだあとに replace が master を作り直した
         df = real(path, *a, **k)
         if Path(path).name == target.name:
-            st = target.stat()
-            os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+            _shrink_master(target)
         return df
     monkeypatch.setattr(agg, "read_csv_any", read_then_rebuild)
     capsys.readouterr()
     assert agg.main(["--in-dir", str(mdir), "--out-dir", str(out), *YEAR]) == 0
-    assert "作り直されたので書き終わりの印を書きません" in capsys.readouterr().out
+    log = capsys.readouterr().out
+    assert "作り直されたので書き終わりの印を書きません" in log
+    assert "年度窓の終わり: " in log or "年度窓の終わり（master の最終年）" in log    # 年度の窓のまとめから落ちない
     done = out / ("agg_master_" + target.name[len("master_"):])
     assert done.exists() and not stamp_path(done).exists()
+    # 印の無い成績表があれば build_db が警告する（全部の成績表に印が無くても）
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(out), "--db-path", str(tmp_path / "x.db")]) == 0
+    assert "印" in capsys.readouterr().err
+    only = tmp_path / "only"
+    only.mkdir()
+    shutil.copy(done, only / done.name)
+    shutil.copy(out / "families.json", only / "families.json")
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(only), "--db-path", str(tmp_path / "y.db")]) == 0
+    assert "印" in capsys.readouterr().err
     monkeypatch.setattr(agg, "read_csv_any", real)
     capsys.readouterr()
     assert agg.main(["--in-dir", str(mdir), "--out-dir", str(out), "--resume", *YEAR]) == 0
     assert "2 本は今の設定で済んでいる" in capsys.readouterr().out and stamp_path(done).exists()
+
+
+def test_wedge_window_summary_keeps_masters_with_a_note(capsys):
+    import aggregate_stats_ver2 as agg
+    agg._print_wedge_coverage(["[OK] a.csv.gz: 1 tables groups=1(adj 1) kept=1/1 / 年度窓の終わり=2025 / [WARN] 印を書きません",
+                               "[OK] b.csv.gz: 1 tables groups=1(adj 1) kept=1/1 / 年度窓の終わり=2024"])
+    err = capsys.readouterr().err
+    assert "2024: 1本" in err and "2025: 1本" in err
 
 
 def test_classify_thresholds_are_part_of_settings(monkeypatch):
@@ -494,6 +526,12 @@ def test_classify_thresholds_are_part_of_settings(monkeypatch):
     monkeypatch.setattr(classify, "ABS_REN", 79.0)
     assert settings_hash(agg.settings_of([], set(), {}, on)) != h_on        # コンパクト化で残す行が変わる
     assert settings_hash(agg.settings_of([], set(), {}, off)) == h_off      # 全部の行を書くなら関係ない
+    from shisu import odds, wedge
+    monkeypatch.setattr(odds, "ODDS_BREAKS", (8.0, 50.0))                 # オッズ帯の境目
+    h2 = settings_hash(agg.settings_of([], set(), {}, off))
+    assert h2 != h_off
+    monkeypatch.setattr(wedge, "EDGE_TABLE", wedge.EDGE_TABLE[:-1])       # EDGE の表
+    assert settings_hash(agg.settings_of([], set(), {}, off)) != h2
 
 
 def test_build_db_reports_unreadable_files_and_does_not_substitute_legacy(mb, tmp_path, capsys):
@@ -519,10 +557,10 @@ def test_build_db_reports_unreadable_files_and_does_not_substitute_legacy(mb, tm
     assert srcs == {files[2].name}                               # 旧来のファイルで代わりに埋めない
 
 
-def test_build_db_warns_on_legacy_mix_and_rebuilt_master(mb, tmp_path, monkeypatch, capsys):
+def test_build_db_warns_on_legacy_mix_and_rebuilt_master(mb, tmp_path, capsys):
     import os
+    import aggregate_stats_ver2 as agg
     import build_db
-    from shisu import config
     from shisu.aggstore import read_agg_tables
     from shisu.csvio import write_csv
     d = tmp_path / "agg"
@@ -536,16 +574,41 @@ def test_build_db_warns_on_legacy_mix_and_rebuilt_master(mb, tmp_path, monkeypat
     (d / (first.name + ".done")).unlink()
     capsys.readouterr()
     assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(d), "--db-path", str(tmp_path / "a.db")]) == 0
-    assert "違う設定" in capsys.readouterr().err
-    mdir = tmp_path / "m"
+    assert "旧来の成績表" in capsys.readouterr().err
+    # master を作り直したら警告する（集計が読んだ場所の master と中身で比べる。更新時刻だけの違いは警告しない）
+    mdir, out = tmp_path / "m", tmp_path / "out"
     shutil.copytree(mb / "master_csv", mdir)
-    m = sorted(mdir.glob("master_*.csv.gz"))[1]
-    st = m.stat()
-    os.utime(m, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
-    monkeypatch.setattr(config, "master_dir", lambda: mdir)
+    assert agg.main(["--in-dir", str(mdir), "--out-dir", str(out), *YEAR]) == 0
+    masters = sorted(mdir.glob("master_*.csv.gz"))
+    st = masters[0].stat()
+    os.utime(masters[0], ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
     capsys.readouterr()
-    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(mb / "agg_csv"), "--db-path", str(tmp_path / "b.db")]) == 0
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(out), "--db-path", str(tmp_path / "b.db")]) == 0
+    assert "作り直されています" not in capsys.readouterr().err
+    _shrink_master(masters[1])
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(out), "--db-path", str(tmp_path / "c.db")]) == 0
     assert "master が作り直されています" in capsys.readouterr().err
+
+
+def test_zero_row_master_does_not_bring_back_legacy_files(mb, tmp_path):
+    import json as _json
+    import build_db
+    from shisu.aggstore import read_agg_tables, stamp_path
+    from shisu.csvio import write_csv
+    d = tmp_path / "agg"
+    shutil.copytree(mb / "agg_csv", d)
+    first = sorted(d.glob("agg_master_*.csv.gz"))[0]
+    src0 = first.name[len("agg_master_"):-len(".csv.gz")]
+    for name, t in read_agg_tables(mb / "agg_full").items():       # 前の版の古い成績表
+        if name.endswith(f"_{src0}.csv"):
+            write_csv(t, d / name)
+    st = _json.loads(stamp_path(first).read_text(encoding="utf-8"))
+    first.unlink()                                                  # 今の版で集計したら0行だった
+    stamp_path(first).write_text(_json.dumps({**st, "rows": 0, "bytes": 0}), encoding="utf-8")
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(d), "--db-path", str(tmp_path / "z.db")]) == 0
+    with sqlite3.connect(tmp_path / "z.db") as con:
+        assert con.execute("SELECT COUNT(DISTINCT indicator) FROM unified_all").fetchone()[0] == 2
 
 
 def test_prune_keeps_table_list_when_old_tables_are_left(mb, tmp_path, monkeypatch):

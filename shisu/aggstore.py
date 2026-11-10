@@ -198,9 +198,30 @@ def stamp_path(agg_path) -> Path:
     return p.with_name(p.name + STAMP_SUFFIX)
 
 
+def master_fingerprint(master) -> str:
+    """master の中身の指紋。.gz は末尾8バイト（展開した中身の CRC32 と長さ。読むのは8バイトだけ）、
+    それ以外はファイル全体の sha256。更新時刻は使わない（コピー・Docker のマウントで変わるため）。"""
+    import hashlib
+    p = Path(master)
+    with open(p, "rb") as f:
+        if p.name.endswith(".gz"):
+            f.seek(0, os.SEEK_END)
+            if f.tell() >= 18:
+                f.seek(-8, os.SEEK_END)
+                return "gz:" + f.read(8).hex()
+            f.seek(0)
+        return "sha256:" + hashlib.sha256(f.read()).hexdigest()
+
+
 def master_identity(master) -> dict:
-    st = Path(master).stat()
-    return {"master": Path(master).name, "master_size": st.st_size, "master_mtime_ns": st.st_mtime_ns}
+    """印に書く master の識別: 名前・大きさ・中身の指紋（と、確認用に読んだ場所・更新時刻。比べるときは使わない）。"""
+    p = Path(master)
+    st = p.stat()
+    return {"master": p.name, "master_size": st.st_size, "master_fingerprint": master_fingerprint(p),
+            "master_path": str(p.resolve()), "master_mtime_ns": st.st_mtime_ns}
+
+
+IDENTITY_KEYS = ("master", "master_size", "master_fingerprint")      # 同じ master かを比べる項目
 
 
 def write_stamp(agg_path, settings_id: str, master, rows: int) -> None:
@@ -231,12 +252,13 @@ def read_stamp(agg_path) -> dict | None:
 
 
 def stamp_matches(agg_path, settings_id: str, master) -> bool:
-    """--resume で飛ばしてよいか: 印があり、同じ設定・同じ master（大きさと更新時刻）から作られ、
+    """--resume で飛ばしてよいか: 印があり、同じ設定・同じ master（名前・大きさ・中身の指紋）から作られ、
     成績表のファイルが印のとおりの大きさで残っている（0行の master はファイルが無いのが正しい）。"""
     st = read_stamp(agg_path)
     if not st or st.get("settings") != settings_id:
         return False
-    if {k: st.get(k) for k in ("master", "master_size", "master_mtime_ns")} != master_identity(master):
+    cur = master_identity(master)
+    if any(st.get(k) != cur[k] for k in IDENTITY_KEYS):
         return False
     agg_path = Path(agg_path)
     if int(st.get("rows", -1)) == 0:

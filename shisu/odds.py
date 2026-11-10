@@ -14,6 +14,7 @@ ODDS_MODES: tuple[str, ...] = ("normal", "odds10u", "odds10_50", "odds50p")
 ODDS_LABELS = {"normal": "通常", "odds10u": "10倍未満", "odds10_50": "10〜50倍", "odds50p": "50倍以上"}
 ODDS_RANK = {m: i for i, m in enumerate(ODDS_MODES)}   # 画面の表示順
 LEGACY_MODES = ("odds5p",)                               # 旧仕様。build_db は取り込まない
+ODDS_BREAKS = (10.0, 50.0)                               # odds10u / odds10_50 / odds50p の境目（集計の設定のハッシュにも入る）
 
 
 def odds_mask(odds: pd.Series, mode: str) -> pd.Series:
@@ -25,22 +26,24 @@ def odds_mask_numeric(o: pd.Series, mode: str) -> pd.Series:
     """odds_mask の数値版（オッズを数にしたもの。欠損は NaN）。"""
     if mode == "normal":
         return pd.Series(True, index=o.index)
+    lo, hi = ODDS_BREAKS
     if mode == "odds10u":
-        return (o < 10.0).fillna(False)
+        return (o < lo).fillna(False)
     if mode == "odds10_50":
-        return ((o >= 10.0) & (o < 50.0)).fillna(False)
+        return ((o >= lo) & (o < hi)).fillna(False)
     if mode == "odds50p":
-        return (o >= 50.0).fillna(False)
+        return (o >= hi).fillna(False)
     raise ValueError(f"unknown odds mode: {mode}")
 
 
 def odds_bucket(odds: pd.Series) -> pd.Series:
     """1頭ごとのオッズ帯（master 用）。欠損は ''。"""
     o = pd.to_numeric(odds, errors="coerce")
+    lo, hi = ODDS_BREAKS
     out = pd.Series("", index=o.index, dtype=object)
-    out[o < 10.0] = "odds10u"
-    out[(o >= 10.0) & (o < 50.0)] = "odds10_50"
-    out[o >= 50.0] = "odds50p"
+    out[o < lo] = "odds10u"
+    out[(o >= lo) & (o < hi)] = "odds10_50"
+    out[o >= hi] = "odds50p"
     return out
 
 
