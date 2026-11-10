@@ -8,7 +8,7 @@ master 1本（1地域×1指数）について、family（とスキーム s1/s2�
         family・オッズ帯・スキームの成績表を縦に並べ、family, odds_mode, rank_scheme, indicator, region, テーブル名
         の列で区別する（テーブル名は旧来の1表1ファイル foragg_*.csv のテーブル名と同じ）
   agg_csv/families.json に使った family の定義を書く（build_db・画面が family の名前と部品を知るため）
-  agg_csv/agg_settings.json に集計の設定を書く（--resume で前回と同じ設定かを確かめるため）
+  agg_csv/agg_settings.json に集計の設定を書く（--resume のとき、前回と違う項目をログに出す）
 集計に使うのは master の 指数有効=1 の馬（除外レース・新馬除外・欠損の馬を除く）。
 family ごとの素材ファイルは作らない（49 family × 3 の素材は容量・時間ともに大きすぎるため。キーはメモリ上で作る）。
 
@@ -19,7 +19,8 @@ family ごとの素材ファイルは作らない（49 family × 3 の素材は�
   （条件ヒット馬の4区分と WEDGE の高い行は1行も落とさない。落ちるのは件数が少なく区分にも入らない平凡な行）
 並列（--workers N）: master を1本ずつ子プロセスに渡し（chunksize=1）、N × MASTERS_PER_CHILD（2）本ごとに
   子プロセスを作り直して gc.collect() する（shisu/parallel.py。子プロセスにメモリがたまらないように）
---resume: agg_master_*.csv.gz がすでにある master は飛ばす（途中で止まったあとの続きから。設定が前回と違えば止める）
+--resume: 書き終わりの印（agg_master_*.csv.gz.done）が今の設定・今の master と合う master は飛ばし、ほかは作り直す
+  （途中で止まったあとの続きから。設定が違う・途中で切れた成績表・作り直した master は混ぜない）
 
 出力列（旧来の成績表の列。agg_master_*.csv.gz はこれに family, odds_mode, rank_scheme, indicator, region, テーブル名 が付く）:
   結合データ, 件数, 勝率_val, 勝率, 連対率_val, 連対率, 複勝率_val, 複勝率, 2着率_val, 2着率,
@@ -53,8 +54,9 @@ import numpy as np
 import pandas as pd
 
 from shisu import config
+from shisu import classify as classify_rules
 from shisu.aggstore import (COMPACT_MIN_COUNT, COMPACT_MIN_WEDGE, PART_SUFFIX, AggMasterWriter, compact_mask,
-                            legacy_files, settings_hash, stamp_matches, stamp_path, write_stamp)
+                            legacy_files, master_identity, settings_hash, stamp_matches, stamp_path, write_stamp)
 from shisu.csvio import read_csv_any
 from shisu.estimates import beta_quantile, has_scipy, posterior_mean
 from shisu.finish import parse_finish
@@ -339,6 +341,12 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
         fam_registry.set_active([fam_registry.Family.from_dict(d) for d in families])
     source = stem[len(MASTER_PREFIX):]
     region, indicator = parse_source_name(source)
+    path = Path(out_dir) / agg_master_filename(source)
+    # 前の成績表と印は、master を読む前に消す（読めない・メモリ不足・止められた・[SKIP] のどれでも、
+    # 前の master や前の設定から作った成績表が黙って残らないように）
+    stamp_path(path).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+    ident = master_identity(src)                   # 印に書く master の大きさ・更新時刻は、読む前に取る
     df = master_frame(read_csv_any(src))
     for c in (RID, "着順"):
         if c not in df.columns:
@@ -347,10 +355,6 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
     ref_year = ref_year_of(df)
     total = adj = kept = n_tables = 0
     fams = restrict_schemes(fam_registry.active(), schemes)
-    path = Path(out_dir) / agg_master_filename(source)
-    # 書き直す間は前の成績表も印も消す（途中で止まった・失敗したときに、前の設定の成績表が黙って残らないように）
-    stamp_path(path).unlink(missing_ok=True)
-    path.unlink(missing_ok=True)
     writer = AggMasterWriter(path)
     try:
         for fam, scheme, sub in family_frames(df, fams):
@@ -373,10 +377,14 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
         writer.abort()
         raise
     writer.close()
+    note = ""
     if settings_id is not None:
-        write_stamp(path, settings_id, src, kept)
+        if master_identity(src) == ident:
+            write_stamp(path, settings_id, ident, kept)
+        else:                                       # 集計の間に replace が master を作り直した
+            note = " / [WARN] 集計の間に master が作り直されたので書き終わりの印を書きません（--resume で作り直します）"
     return (f"[OK] {src.name}: {n_tables} tables groups={total}(adj {adj}) kept={kept}/{total}"
-            f" / 年度窓の終わり={ref_year}")
+            f" / 年度窓の終わり={ref_year}{note}")
 
 
 def _threshold(kind):
@@ -396,11 +404,14 @@ def _threshold(kind):
 
 
 def settings_of(fam_dicts: list[dict], schemes: set[str], wedge_opts: dict, compact: dict) -> dict:
-    """agg_settings.json に書く集計の設定（--resume で前回と比べる）。"""
+    """成績表の中身を変える集計の設定（agg_settings.json と、書き終わりの印のハッシュ）。--resume はこのハッシュが
+    違う成績表を作り直す。コンパクト化で残す行は shisu/classify.py の閾値でも変わるので、その値も入れる。"""
+    rules = {k: v for k, v in sorted(vars(classify_rules).items())
+             if k.isupper() and isinstance(v, (int, float)) and not isinstance(v, bool)}
     return {"version": 1, "families": fam_dicts, "schemes": sorted(schemes), "wedge": wedge_opts,
-            "compact": compact, "min_sample": MIN_SAMPLE,
+            "compact": compact, "classify": rules if compact.get("enabled") else {}, "min_sample": MIN_SAMPLE,
             "estimate": {"mode": PROP_MODE, "lower_q": LOWER_Q, "upper_q": UPPER_Q, "prior_alpha": PRIOR_A,
-                         "prior_beta": PRIOR_B, "plc_switch_pct": PLC_SWITCH_PCT}}
+                         "prior_beta": PRIOR_B, "plc_switch_pct": PLC_SWITCH_PCT, "scipy": has_scipy()}}
 
 
 def _settings_diff(old: dict, new: dict) -> list[str]:
@@ -417,7 +428,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out-dir", default=str(config.agg_dir()))
     ap.add_argument("--clean", action="store_true", help="出力先 agg_csv を空にしてから実行")
     ap.add_argument("--resume", action="store_true",
-                    help="agg_master_*.csv.gz がすでにある master は飛ばして続きから（設定が前回と違えば止める）")
+                    help="今の設定で最後まで書けた master（書き終わりの印 agg_master_*.csv.gz.done が今の設定・今の master と"
+                         "合うもの）は飛ばして続きから。設定が違う・印の無い・途中で切れた成績表、作り直した master は作り直す")
     ap.add_argument("--workers", type=int, default=1, help="並列数（既定1）")
     ap.add_argument("--compact", action=argparse.BooleanOptionalAction, default=True,
                     help="区分（絶対軸・軸候補・相手候補・消し候補）にも WEDGE の上位にも入らない平凡な行を書かない"

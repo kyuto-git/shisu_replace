@@ -41,7 +41,7 @@ from shisu.matching import HIT_COLUMNS, STAT_COLUMNS, UNIFIED, indicator_bases, 
 from shisu.aggstore import (FLOAT_COLUMNS, INT_COLUMNS, RATE_NAMES, ROW_META, agg_master_files,  # noqa: F401
                             estimate_percent, iter_agg_chunks, legacy_files, prepare_agg_frame, read_stamp)
 from shisu.csvio import READ_ENCODINGS
-from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, FORAGG_PREFIX, file_stem, parse_agg_master_name,
+from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, file_stem, parse_agg_master_name,
                           parse_foragg_stem, table_name_for_entries, table_name_for_foragg, xjoin_table_for)
 from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_series, distance_series,
                              entry_inner_outer, frame_group_series, infer_entry_weight, race_date,
@@ -216,6 +216,7 @@ class _AggLoad:
 
 
 def _header(read) -> list[str] | None:
+    """見出しの列（符号化を順に試す）。読めない（壊れた・空・途中で切れた）ときは READ_ERRORS を投げる。"""
     for enc in READ_ENCODINGS:
         try:
             for df in read(enc, nrows=0):
@@ -223,8 +224,6 @@ def _header(read) -> list[str] | None:
             return []
         except UnicodeDecodeError:
             continue
-        except (pd.errors.ParserError, pd.errors.EmptyDataError, OSError, EOFError):
-            return None
     return None
 
 
@@ -242,29 +241,47 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
     active = {f.name: set(f.schemes) for f in fam_registry.active()}
     load = _AggLoad(con, active)
     skipped, old_format, shadowed = 0, [], 0
-    sources = set()
     stamps: dict[str, str] = {}
+    rebuilt: list[str] = []
+    master_dir = config.master_dir()
+    # 旧来の foragg_*.csv を使わない master = agg_master のファイルがある master（読めなかったものも。
+    # 壊れた agg_master の代わりに前の版の古い成績表を黙って使わないように）
+    sources = {parse_agg_master_name(p.name) for p in masters}
+    loaded_sources = set()
     for p in masters:
         source = parse_agg_master_name(p.name)
         read = lambda enc, nrows=None, _p=p: (                         # noqa: E731
             iter_agg_chunks(_p, AGG_CHUNK_ROWS, enc) if nrows is None else
             iter([pd.read_csv(_p, compression="gzip", encoding=enc, dtype=str, keep_default_na=False, nrows=nrows)]))
-        cols = _header(read)
-        if cols is None or not {"結合データ", "件数", *ROW_META} <= set(cols):
+        try:
+            cols = _header(read)
+        except READ_ERRORS as e:
+            print(f"[ERROR] {p.name}: 読めません（{type(e).__name__}: {e}）。このファイルは取り込みません"
+                  "（壊れている・途中で切れている可能性。aggregate_stats_ver2.py --resume で作り直せます）", file=sys.stderr)
+            load.failed.append(p.name)
+            continue
+        if cols is None:
+            print(f"[foragg] SKIP（{READ_ENCODINGS} で読めません）: {p.name}", file=sys.stderr)
+            load.failed.append(p.name)
+            continue
+        if not {"結合データ", "件数", *ROW_META} <= set(cols):
             print(f"[foragg] SKIP（master ごとの成績表の形ではありません）: {p.name}", file=sys.stderr)
             skipped += 1
             continue
         if [c for c in WEDGE_COLUMNS if c not in cols]:
             old_format.append(p.name)
             continue
-        sources.add(source)
         n = load.load_file(read, p.name)
         if n < 0:
-            skipped += 1
-            sources.discard(source)
             continue
-        st = read_stamp(p)
-        stamps[p.name] = (st or {}).get("settings", "")
+        loaded_sources.add(source)
+        st = read_stamp(p) or {}
+        stamps[p.name] = st.get("settings", "")
+        m = master_dir / str(st.get("master", ""))
+        if st.get("master") and m.exists():          # 成績表を作ったあとに replace が master を作り直した
+            cur = m.stat()
+            if (cur.st_size, cur.st_mtime_ns) != (st.get("master_size"), st.get("master_mtime_ns")):
+                rebuilt.append(p.name)
         print(f"[foragg] {p.name}: {n} rows", flush=True)
     for p in legacy:
         info = parse_foragg_stem(file_stem(p.name))
@@ -290,9 +307,10 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
             continue
         df = df.assign(family=info["family"], odds_mode=info["mode"], rank_scheme=info["scheme"],
                        indicator=info["indicator"], region=info["region"], テーブル名=table_name_for_foragg(p.name))
-        load.load_file(lambda enc, _df=df: iter([_df]), p.name)
+        if load.load_file(lambda enc, _df=df: iter([_df]), p.name) >= 0:
+            stamps.setdefault("legacy:" + info["source"], "")         # 旧来の成績表には書き終わりの印が無い
     rows = sorted(load.meta.values(), key=lambda m: m["table_name"])
-    print(f"[foragg] loaded {len(rows)} tables / {load.rows} rows（master ごとの成績表 {len(sources)} 本・"
+    print(f"[foragg] loaded {len(rows)} tables / {load.rows} rows（master ごとの成績表 {len(loaded_sources)} 本・"
           f"旧来の成績表 {len(legacy) - shadowed} 本 / skip {skipped}）")
     if shadowed:
         print(f"[INFO] 旧来の成績表 foragg_*.csv {shadowed} 本は、同じ master の agg_master_*.csv.gz があるので使いませんでした"
@@ -306,11 +324,14 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
         print(f"[ERROR] WEDGE 列の無い旧形式の成績表が {len(old_format)} 本あり、取り込みませんでした"
               f"（例: {old_format[0]}）。aggregate_stats_ver2.py --clean を実行し直してください", file=sys.stderr)
     ids = set(stamps.values())
-    if len(ids) > 1 or "" in ids:
+    if len(ids) > 1:                         # 設定が2通り以上、または印のある成績表と印の無い成績表（旧来のものを含む）の混ざり
         no_stamp = sum(1 for v in stamps.values() if not v)
-        print(f"[WARN] master ごとの成績表が、違う設定（family・コンパクト化・WEDGE など）で作られたものの混ざりです"
-              f"（設定 {len(ids - {''})} 通り・書き終わりの印が無いもの {no_stamp} 本）。aggregate_stats_ver2.py --resume で"
-              "今の設定にそろえてから作り直してください", file=sys.stderr)
+        print(f"[WARN] 成績表が、違う設定（family・コンパクト化・WEDGE など）で作られたものの混ざりです"
+              f"（設定 {len(ids - {''})} 通り・書き終わりの印が無いもの {no_stamp} 本。旧来の foragg_*.csv も印の無いものに"
+              "数えます）。aggregate_stats_ver2.py --resume で今の設定にそろえてから作り直してください", file=sys.stderr)
+    if rebuilt:
+        print(f"[WARN] 成績表を作ったあとに master が作り直されています（{len(rebuilt)} 本。例: {rebuilt[0]}）。"
+              "aggregate_stats_ver2.py --resume で作り直してください", file=sys.stderr)
     con.commit()
     return rows, len(old_format) + len(load.failed), load.facets
 
@@ -503,16 +524,17 @@ def build_xjoin(con: sqlite3.Connection, entries_table: str, families=None) -> d
 # 掃除
 # ---------------------------------------------------------------------------
 def prune(con: sqlite3.Connection, kinds: set[str], keep: set[str]) -> None:
+    """今回作り直した種類の古いテーブルを消す（出馬表 entries_*・entries_xjoin_*）。
+    成績表は対象にしない: 前の版の1表ずつのテーブル foragg_* は swap_unified が（DROP_TABLE_LIMIT つきで）消し、
+    __tables_meta__ の kind=foragg の行は replace_meta が入れ替える（ここで消すと unified_all の集計表の一覧まで消える）。"""
     existing = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     prefixes = []
-    if "foragg" in kinds:
-        prefixes.append(FORAGG_PREFIX)
     if "entries" in kinds:
         prefixes.append(ENTRIES_PREFIX)   # entries_xjoin_* も含む
     stale = sorted(t for t in existing if any(t.startswith(p) for p in prefixes) and t not in keep)
     for t in stale:
         con.execute(f"DROP TABLE IF EXISTS {q(t)}")
-        con.execute(f"DELETE FROM {META} WHERE table_name = ?", (t,))
+        con.execute(f"DELETE FROM {META} WHERE table_name = ? AND kind IS NOT 'foragg'", (t,))
     print(f"[prune] dropped {len(stale)} tables" + (f" (例: {stale[0]})" if stale else ""))
 
 

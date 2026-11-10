@@ -205,10 +205,12 @@ def master_identity(master) -> dict:
 
 def write_stamp(agg_path, settings_id: str, master, rows: int) -> None:
     """agg_master_*.csv.gz を書き終えた印（設定のハッシュ・元の master・行数・ファイルの大きさ）。
-    成績表を本来の名前に置き換えて fsync したあとに書く（印があれば、成績表は最後まで書けている）。"""
+    成績表を本来の名前に置き換えて fsync したあとに書く（印があれば、成績表は最後まで書けている）。
+    master は master のパスか、読む前に取った master_identity() の dict（集計の間に変わっても読んだときの値を残す）。"""
     import json
     agg_path = Path(agg_path)
-    data = {"settings": settings_id, **master_identity(master), "rows": int(rows),
+    ident = master if isinstance(master, dict) else master_identity(master)
+    data = {"settings": settings_id, **ident, "rows": int(rows),
             "bytes": agg_path.stat().st_size if agg_path.exists() else 0}
     sp = stamp_path(agg_path)
     tmp = sp.with_name(sp.name + PART_SUFFIX)

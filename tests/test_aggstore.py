@@ -435,3 +435,129 @@ def test_tables_view_same_from_unified_all_and_old_tables(mb, tmp_path, monkeypa
     for qs, a, b, c in zip(queries, bodies["old"], bodies["stale"], bodies["new"]):
         assert a == b == c, qs
     assert any("<td>" in b for b in bodies["new"]) and not any("99999" in b for b in bodies["new"])
+
+
+# ---------------------------------------------------------------- 検証で再現した不具合の再発防止（2026-11-10）
+def test_failed_master_read_leaves_no_old_agg_file(mb, tmp_path, capsys):
+    """master が読めない（途中で切れた等）とき、その master の前の成績表と印を残さない（build_db が黙って使わない）。"""
+    import aggregate_stats_ver2 as agg
+    import build_db
+    from shisu.aggstore import stamp_path
+    mdir, out = tmp_path / "m", tmp_path / "agg"
+    shutil.copytree(mb / "master_csv", mdir)
+    shutil.copytree(mb / "agg_csv", out)
+    bad = sorted(mdir.glob("master_*.csv.gz"))[0]
+    bad.write_bytes(bad.read_bytes()[: bad.stat().st_size // 3])
+    old = out / ("agg_master_" + bad.name[len("master_"):])
+    assert old.exists() and stamp_path(old).exists()
+    assert agg.main(["--in-dir", str(mdir), "--out-dir", str(out), *YEAR]) == 1
+    assert not old.exists() and not stamp_path(old).exists()
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(out), "--db-path", str(tmp_path / "x.db")]) == 0
+    with sqlite3.connect(tmp_path / "x.db") as con:
+        assert con.execute("SELECT COUNT(DISTINCT indicator) FROM unified_all").fetchone()[0] == 2
+
+
+def test_master_rebuilt_during_aggregation_gets_no_stamp(mb, tmp_path, monkeypatch, capsys):
+    import os
+    import aggregate_stats_ver2 as agg
+    from shisu.aggstore import stamp_path
+    mdir, out = tmp_path / "m", tmp_path / "agg"
+    shutil.copytree(mb / "master_csv", mdir)
+    target = sorted(mdir.glob("master_*.csv.gz"))[1]
+    real = agg.read_csv_any
+
+    def read_then_rebuild(path, *a, **k):              # 読んだあとに replace が master を作り直した
+        df = real(path, *a, **k)
+        if Path(path).name == target.name:
+            st = target.stat()
+            os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+        return df
+    monkeypatch.setattr(agg, "read_csv_any", read_then_rebuild)
+    capsys.readouterr()
+    assert agg.main(["--in-dir", str(mdir), "--out-dir", str(out), *YEAR]) == 0
+    assert "作り直されたので書き終わりの印を書きません" in capsys.readouterr().out
+    done = out / ("agg_master_" + target.name[len("master_"):])
+    assert done.exists() and not stamp_path(done).exists()
+    monkeypatch.setattr(agg, "read_csv_any", real)
+    capsys.readouterr()
+    assert agg.main(["--in-dir", str(mdir), "--out-dir", str(out), "--resume", *YEAR]) == 0
+    assert "2 本は今の設定で済んでいる" in capsys.readouterr().out and stamp_path(done).exists()
+
+
+def test_classify_thresholds_are_part_of_settings(monkeypatch):
+    import aggregate_stats_ver2 as agg
+    from shisu import classify
+    from shisu.aggstore import settings_hash
+    on, off = agg.compact_options(True), agg.compact_options(False)
+    h_on, h_off = (settings_hash(agg.settings_of([], set(), {}, c)) for c in (on, off))
+    monkeypatch.setattr(classify, "ABS_REN", 79.0)
+    assert settings_hash(agg.settings_of([], set(), {}, on)) != h_on        # コンパクト化で残す行が変わる
+    assert settings_hash(agg.settings_of([], set(), {}, off)) == h_off      # 全部の行を書くなら関係ない
+
+
+def test_build_db_reports_unreadable_files_and_does_not_substitute_legacy(mb, tmp_path, capsys):
+    import build_db
+    from shisu.aggstore import read_agg_tables
+    from shisu.csvio import write_csv
+    d = tmp_path / "agg"
+    shutil.copytree(mb / "agg_csv", d)
+    files = sorted(d.glob("agg_master_*.csv.gz"))
+    # 同じ master の旧来の成績表（前の版の残り）
+    src0 = files[0].name[len("agg_master_"):-len(".csv.gz")]
+    for name, t in read_agg_tables(mb / "agg_full").items():
+        if name.endswith(f"_{src0}.csv"):
+            write_csv(t, d / name)
+    files[0].write_bytes(files[0].read_bytes()[:100])             # 先頭から切れた
+    files[1].write_bytes(b"this is not gzip\n")                   # gzip でない
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(d), "--db-path", str(tmp_path / "x.db")]) == 1
+    err = capsys.readouterr().err
+    assert err.count("読めません") >= 2 and files[0].name in err and files[1].name in err
+    with sqlite3.connect(tmp_path / "x.db") as con:
+        srcs = {r[0] for r in con.execute("SELECT DISTINCT source_file FROM __tables_meta__ WHERE kind='foragg'")}
+    assert srcs == {files[2].name}                               # 旧来のファイルで代わりに埋めない
+
+
+def test_build_db_warns_on_legacy_mix_and_rebuilt_master(mb, tmp_path, monkeypatch, capsys):
+    import os
+    import build_db
+    from shisu import config
+    from shisu.aggstore import read_agg_tables
+    from shisu.csvio import write_csv
+    d = tmp_path / "agg"
+    shutil.copytree(mb / "agg_csv", d)
+    first = sorted(d.glob("agg_master_*.csv.gz"))[0]
+    src0 = first.name[len("agg_master_"):-len(".csv.gz")]
+    for name, t in read_agg_tables(mb / "agg_csv").items():        # その master は旧来の形だけにする
+        if name.endswith(f"_{src0}.csv"):
+            write_csv(t, d / name)
+    first.unlink()
+    (d / (first.name + ".done")).unlink()
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(d), "--db-path", str(tmp_path / "a.db")]) == 0
+    assert "違う設定" in capsys.readouterr().err
+    mdir = tmp_path / "m"
+    shutil.copytree(mb / "master_csv", mdir)
+    m = sorted(mdir.glob("master_*.csv.gz"))[1]
+    st = m.stat()
+    os.utime(m, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    monkeypatch.setattr(config, "master_dir", lambda: mdir)
+    capsys.readouterr()
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(mb / "agg_csv"), "--db-path", str(tmp_path / "b.db")]) == 0
+    assert "master が作り直されています" in capsys.readouterr().err
+
+
+def test_prune_keeps_table_list_when_old_tables_are_left(mb, tmp_path, monkeypatch):
+    import build_db
+    p = tmp_path / "p.db"
+    shutil.copy(mb / "racing.db", p)
+    with sqlite3.connect(p) as con:
+        t = con.execute("SELECT table_name FROM __tables_meta__ WHERE kind='foragg' LIMIT 1").fetchone()[0]
+        con.execute(f'CREATE TABLE "{t}" AS SELECT * FROM unified_all WHERE "テーブル名" = ?', (t,))
+        n = con.execute("SELECT COUNT(*) FROM __tables_meta__ WHERE kind='foragg'").fetchone()[0]
+    monkeypatch.setattr(build_db, "DROP_TABLE_LIMIT", 0)
+    assert build_db.main(["--mode", "both", "--prune", "--agg-dir", str(mb / "agg_csv"), "--db-path", str(p)]) == 0
+    with sqlite3.connect(p) as con:
+        assert con.execute("SELECT COUNT(*) FROM __tables_meta__ WHERE kind='foragg'").fetchone()[0] == n
+        assert con.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (t,)).fetchone()
