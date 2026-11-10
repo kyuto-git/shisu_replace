@@ -82,21 +82,28 @@ def test_classification_counts_equal_production(base, screened, tmp_path):
     import build_db
     rep, _ = screened
     F.reset()
-    agg = tmp_path / "agg"
     only_sav = tmp_path / "m"
     only_sav.mkdir()
     (only_sav / f"master_{SAV}.csv.gz").write_bytes((base / "master_csv" / f"master_{SAV}.csv.gz").read_bytes())
-    assert aggregate_stats_ver2.main(["--in-dir", str(only_sav), "--out-dir", str(agg), "--clean", *YEAR_ARGS]) == 0
-    db = tmp_path / "p.db"
-    assert build_db.main(["--mode", "foragg", "--agg-dir", str(agg), "--db-path", str(db), "--fresh"]) == 0
-    with sqlite3.connect(db) as con:
-        rows = con.execute('SELECT family, COALESCE(rank_scheme, \'\'), odds_mode, "件数", "複勝率_val", "連対率_val", '
-                           '"掲示板率_val", "複勝回収値", "単勝適正回収値" FROM unified_all').fetchall()
-    prod: dict[tuple, int] = {}
-    for fam, sc, mode, cnt, fv, rv, top5, frc, tra in rows:
-        c = classify({"cnt": cnt, "fv": fv, "rv": rv, "top5": top5, "frc": frc, "tra": tra}, mode)
-        if c:
-            prod[(fam, sc, mode, c)] = prod.get((fam, sc, mode, c), 0) + 1
+    def production(*extra):
+        """本番の手順（aggregate → build_db）で作った unified_all を classify した数と、DB の場所。"""
+        out, db = tmp_path / f"agg{len(extra)}", tmp_path / f"p{len(extra)}.db"
+        assert aggregate_stats_ver2.main(["--in-dir", str(only_sav), "--out-dir", str(out), "--clean", *YEAR_ARGS,
+                                          *extra]) == 0
+        assert build_db.main(["--mode", "foragg", "--agg-dir", str(out), "--db-path", str(db), "--fresh"]) == 0
+        with sqlite3.connect(db) as con:
+            rows = con.execute('SELECT family, COALESCE(rank_scheme, \'\'), odds_mode, "件数", "複勝率_val", "連対率_val", '
+                               '"掲示板率_val", "複勝回収値", "単勝適正回収値" FROM unified_all').fetchall()
+        counts: dict[tuple, int] = {}
+        for fam, sc, mode, cnt, fv, rv, top5, frc, tra in rows:
+            c = classify({"cnt": cnt, "fv": fv, "rv": rv, "top5": top5, "frc": frc, "tra": tra}, mode)
+            if c:
+                counts[(fam, sc, mode, c)] = counts.get((fam, sc, mode, c), 0) + 1
+        return counts, db, len(rows)
+
+    prod, _, n_compact = production()                    # 既定（コンパクト化）でも区分のキーは1つも落ちない
+    prod_full, db, n_full = production("--no-compact")
+    assert prod == prod_full and n_compact < n_full
     rep = rep.assign(scheme=rep["scheme"].fillna(""))
     got = {}
     for r in rep.to_dict("records"):
@@ -106,7 +113,7 @@ def test_classification_counts_equal_production(base, screened, tmp_path):
                     got[(r["name"], r["scheme"], mode, c)] = int(r[f"{c}_{mode}"])
     assert got == prod
     assert sum(prod.values()) > 0
-    # 件数10以上のグループ数も本番の成績表と一致
+    # 件数10以上のグループ数も本番の成績表（全部の行。--no-compact）と一致
     with sqlite3.connect(db) as con:
         ge10 = dict(((f, s), n) for f, s, n in con.execute(
             'SELECT family, COALESCE(rank_scheme, \'\'), SUM("件数" >= 10) FROM unified_all WHERE odds_mode=\'normal\' '
@@ -258,7 +265,8 @@ def test_selected_families_replace_initial_set(base, monkeypatch):
         names = {f["name"] for f in CUSTOM}
         fj = json.loads((base / "agg_csv" / "families.json").read_text(encoding="utf-8"))
         assert {f["name"] for f in fj["families"]} == names
-        files = [p.name for p in (base / "agg_csv").glob("foragg_*.csv")]
+        from shisu.aggstore import read_agg_tables
+        files = list(read_agg_tables(base / "agg_csv"))
         assert files and all(any(f"_{n}_" in fn for n in names) for fn in files)
         assert not any("rankband_s1_X_jk_pfin_season" in fn for fn in files)      # schemes=["s2"] のとおり
         assert any("rankband_s2_X_jk_pfin_season" in fn for fn in files)
@@ -435,6 +443,29 @@ def test_select_ties_do_not_depend_on_row_order():
     df = pd.DataFrame(rows)
     pick = lambda d: sorted(S.select(d, top_a=2).query("selected")["name"])  # noqa: E731
     assert pick(df) == pick(df.iloc[::-1].reset_index(drop=True)) == ["X_a", "X_b"]
+
+
+def test_from_report_selection_feeds_compact_aggregate_and_db(screened, base, tmp_path):
+    """--from-report で選び直した selected_families.json を、そのまま集計（既定のコンパクト化）→ DB に使える。"""
+    import aggregate_stats_ver2
+    import build_db
+    import screen_families as S
+    sel = tmp_path / "sel.json"
+    assert S.main(["--from-report", str(base / "screening_report.csv"), "--report", str(tmp_path / "r.csv"),
+                   "--export-selected", str(sel), "--min-axis", "1", "--top-a", "300", "--min-groups", "3",
+                   "--min-coverage", "0", "--min-spread", "-9"]) == 0
+    names = {f.name for f in F.load_families(sel)}
+    out = tmp_path / "agg"
+    assert aggregate_stats_ver2.main(["--in-dir", str(base / "master_csv"), "--out-dir", str(out), "--families", str(sel),
+                                      "--clean", *YEAR_ARGS]) == 0
+    assert sorted(p.name for p in out.glob("agg_master_*.csv.gz")) and not list(out.glob("foragg_*.csv"))
+    F.reset()
+    db = tmp_path / "s.db"
+    assert build_db.main(["--fresh", "--mode", "foragg", "--agg-dir", str(out), "--db-path", str(db)]) == 0
+    with sqlite3.connect(db) as con:
+        assert {r[0] for r in con.execute("SELECT name FROM __families__")} == names
+        assert {r[0] for r in con.execute("SELECT DISTINCT family FROM unified_all")} <= names
+    F.reset()
 
 
 def test_from_report_errors(tmp_path):

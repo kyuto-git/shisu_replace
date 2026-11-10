@@ -63,11 +63,11 @@ def run_pipeline(tmp: Path, df: pd.DataFrame, name: str = "中山_SAV.csv") -> d
     synth.write_cp932(df, d["csv"] / name)
     assert replace_csv_ver3.main(["--csv-dir", str(d["csv"]), "--no-ext", "--master-dir", str(d["master"]),
                                   "--processed-dir", str(d["processed"]), "--clean"]) == 0
+    # 件数を厳密に比べるので、全部の行を残す（--no-compact）
     assert aggregate_stats_ver2.main(["--in-dir", str(d["master"]), "--out-dir", str(d["agg"]), "--clean",
-                                      "--wedge-min-year-count", "0"]) == 0
-    out = {}
-    for p in sorted(d["agg"].glob("*.csv")):
-        out[p.name] = pd.read_csv(p, encoding="cp932", dtype=str, keep_default_na=False)
+                                      "--wedge-min-year-count", "0", "--no-compact"]) == 0
+    from shisu.aggstore import read_agg_tables
+    out = dict(read_agg_tables(d["agg"]))
     out["_master_dir"] = d["master"]
     return out
 

@@ -30,8 +30,11 @@ def base(tmp_path_factory, monkeypatch_module):
     (old / "foragg_normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv.gz").write_bytes(b"dummy")
     # 合成データは1キーあたり年に数件しかないので、adjusted_WEDGE の年の最低件数を下げて通す
     assert aggregate_stats_ver2.main(["--clean", *AGG_TEST_ARGS]) == 0
-    agg = next((b / "agg_csv").glob("foragg_normal_*SAV.csv"))
-    shutil.copy(agg, b / "agg_csv" / ("foragg_odds5p_" + agg.name[len("foragg_"):]))
+    from shisu.aggstore import read_agg_tables
+    from shisu.csvio import write_csv
+    name, table = next((n, t) for n, t in read_agg_tables(b / "agg_csv").items()
+                       if n.startswith("foragg_normal_") and n.endswith("SAV.csv"))
+    write_csv(table, b / "agg_csv" / ("foragg_odds5p_" + name[len("foragg_"):]))     # 旧来の形・旧仕様の名前
     assert calc_entry_hensachi.main(["--merge-one"]) == 0
     assert build_db.main(["--fresh"]) == 0
     return b
@@ -50,20 +53,28 @@ def db(base):
 
 def test_outputs_exist(base):
     from shisu import families as fam_registry
-    from shisu.naming import parse_foragg_stem
+    from shisu.aggstore import ROW_META, read_agg_master, read_agg_tables
+    from shisu.naming import file_stem, parse_foragg_stem
     # 素材（foragg_csv）はもう作らない。master が集計の入力
     assert [p.name for p in (base / "foragg_csv").iterdir()] == ["foragg_normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv.gz"]
     masters = sorted(p.name for p in (base / "master_csv").glob("master_*.csv.gz"))
     assert len(masters) == 3
-    agg = [p for p in (base / "agg_csv").glob("foragg_*.csv") if "odds5p_normal" not in p.name or
-           parse_foragg_stem(p.stem) is not None]
+    # 成績表は master 1本につき1ファイル（旧来の1表1ファイルは作らない。fixture が置いた旧仕様の odds5p だけ）
+    files = sorted(p.name for p in (base / "agg_csv").glob("agg_master_*.csv.gz"))
+    assert files == ["agg_master_" + m[len("master_"):] for m in masters]
+    assert [p.name for p in (base / "agg_csv").glob("foragg_*.csv")] == [
+        "foragg_odds5p_normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv"]
+    one = read_agg_master(base / "agg_csv" / files[0])
+    assert set(ROW_META) <= set(one.columns) and (one["テーブル名"] != "").all()
+    agg = read_agg_tables(base / "agg_csv")
+    infos = [parse_foragg_stem(file_stem(n)) for n in agg]
     variants = sum(len(f.schemes) for f in fam_registry.active())
     assert len(fam_registry.active()) == 83 and variants == 129
-    assert 3 * variants <= len(agg) <= 3 * variants * 4                   # 0件の成績表は書かない
-    normal = {parse_foragg_stem(p.stem)["family"] for p in agg if parse_foragg_stem(p.stem)["mode"] == "normal"}
+    assert all(infos) and len(agg) <= 3 * variants * 4                  # 0件の成績表は書かない
+    normal = {i["family"] for i in infos if i["mode"] == "normal"}
     assert {f.name for f in fam_registry.active() if f.layer == "A"} <= normal
-    assert not list((base / "agg_csv").glob("foragg_odds10u_odds10u_*"))
-    assert (base / "agg_csv" / "families.json").exists()
+    assert not [n for n in agg if n.startswith("foragg_odds10u_odds10u_")]
+    assert (base / "agg_csv" / "families.json").exists() and (base / "agg_csv" / "agg_settings.json").exists()
     assert len(list((base / "replace_csv").glob("processed_*.csv"))) == 3
     m = pd.read_csv(next((base / "master_csv").glob("master_*ZI.csv.gz")), encoding="cp932", dtype=str,
                     keep_default_na=False)
@@ -91,9 +102,8 @@ def test_aggregate_does_not_touch_master_and_is_rerunnable(base):
     import aggregate_stats_ver2
     src = next((base / "master_csv").glob("master_*SAV.csv.gz"))
     before = src.read_bytes()
-    outs = sorted(p for p in (base / "agg_csv").glob("foragg_*normal_主*SAV.csv") if "odds5p_normal" not in p.name
-                  or p.name.startswith("foragg_odds50p_"))
-    assert len(outs) >= 2                              # 通常 + オッズ帯（0件の帯は書かない）
+    outs = sorted((base / "agg_csv").glob("agg_master_*.csv.gz"))
+    assert len(outs) == 3
     first = [o.read_bytes() for o in outs]
     assert aggregate_stats_ver2.main(AGG_TEST_ARGS) == 0
     assert src.read_bytes() == before and [o.read_bytes() for o in outs] == first
@@ -101,10 +111,13 @@ def test_aggregate_does_not_touch_master_and_is_rerunnable(base):
 
 def test_odds_split_counts(base):
     """オッズ帯3区分の件数の合計は、オッズ欠損が無ければ通常と一致する（0件の帯はファイルが無い）。"""
-    def total(mode):
+    from shisu.aggstore import read_agg_tables
+    tables = read_agg_tables(base / "agg_csv")
+
+    def total(mode):                                   # normal は初期セットのコース固定（layer A）なので全部の行が残る
         prefix = "" if mode == "normal" else mode + "_"
-        f = base / "agg_csv" / f"foragg_{prefix}normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv"
-        return pd.read_csv(f, encoding="cp932")["件数"].sum() if f.exists() else 0
+        t = tables.get(f"foragg_{prefix}normal_主５場（中山、東京、中京、京都、阪神）_SAV.csv")
+        return pd.to_numeric(t["件数"]).sum() if t is not None else 0
     assert 0 < total("odds10u") + total("odds10_50") + total("odds50p") <= total("normal")
 
 
@@ -121,8 +134,14 @@ def test_no_broken_keys(base):
 
 def test_table_names_and_meta(base):
     with db(base) as con:
-        names = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'foragg%'")]
+        # 1表ずつのテーブルは作らない。集計表の名前は __tables_meta__ と unified_all の「テーブル名」に持つ
+        assert not con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'foragg%'").fetchall()
+        names = {r[0] for r in con.execute("SELECT table_name FROM __tables_meta__ WHERE kind='foragg'")}
         assert names and not any(n.startswith("foragg_foragg_") for n in names)
+        assert names == {r[0] for r in con.execute('SELECT DISTINCT "テーブル名" FROM unified_all')}
+        n_meta = con.execute("SELECT SUM(n_rows) FROM __tables_meta__ WHERE kind='foragg'").fetchone()[0]
+        assert n_meta == con.execute("SELECT COUNT(*) FROM unified_all").fetchone()[0]
+        assert not con.execute("SELECT 1 FROM sqlite_master WHERE name = 'unified_all__build'").fetchone()
         modes = {r[0] for r in con.execute("SELECT DISTINCT odds_mode FROM __tables_meta__ WHERE kind='foragg'")}
         assert modes == {"normal", "odds10u", "odds10_50", "odds50p"}
         inds = {r[0] for r in con.execute("SELECT DISTINCT indicator FROM unified_all")}
@@ -224,14 +243,17 @@ def test_prune_entries_keeps_foragg(base, tmp_path):
     import build_db
     p = tmp_path / "prune.db"
     shutil.copy(base / "racing.db", p)
+    count = lambda con: (con.execute("SELECT COUNT(*) FROM unified_all").fetchone()[0],          # noqa: E731
+                         con.execute("SELECT COUNT(*) FROM __tables_meta__ WHERE kind='foragg'").fetchone()[0])
     with sqlite3.connect(p) as con:
-        before = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'foragg_%'")}
+        before = count(con)
         con.execute('CREATE TABLE "entries_old_stale" (x TEXT)')
         con.execute('CREATE TABLE "entries_xjoin_old_stale" (x TEXT)')
     assert build_db.main(["--mode", "entries", "--prune", "--db-path", str(p)]) == 0
     with sqlite3.connect(p) as con:
         names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert before and before <= names                       # foragg_* は消えない
+        after = count(con)
+    assert before[0] > 0 and before[1] > 0 and after == before       # 成績表（unified_all と集計表の一覧）は消えない
     assert "entries_old_stale" not in names and "entries_xjoin_old_stale" not in names
     assert "entries_all" in names and "unified_all" in names
 
@@ -328,9 +350,11 @@ def test_wedge_columns_in_agg_csv_match_reference(base):
     fl = parse_finish(mat["着順"], mat["頭数"])
     mat = mat[fl["denom"]].assign(finish_num=fl["finish_num"][fl["denom"]])
     ref_year = int(pd.to_numeric(mat["year"]).max())
-    agg = pd.read_csv(base / "agg_csv" / ("foragg_normal_" + src.name[len("master_"):].replace(".csv.gz", ".csv")),
-                      encoding="cp932")
+    from shisu.aggstore import read_agg_tables
+    agg = read_agg_tables(base / "agg_csv")["foragg_normal_" + src.name[len("master_"):].replace(".csv.gz", ".csv")]
     assert list(agg.columns[18:25]) == list(WEDGE_COLS)
+    for c in WEDGE_COLS:
+        agg[c] = pd.to_numeric(agg[c])
     checked = 0
     for _, row in agg.iterrows():
         g = mat[mat["結合データ"] == row["結合データ"]]
@@ -440,20 +464,26 @@ def test_phase2_db_without_wedge_is_old(base, tmp_path):
 def test_build_db_rejects_agg_csv_without_wedge(base, tmp_path, capsys):
     """WEDGE 列の無い旧形式の成績表は取り込まない（WEDGE が全部空の DB を「正常」として作らない）。"""
     import build_db
+    from shisu.aggstore import read_agg_master
+    from shisu.csvio import write_csv
     agg = tmp_path / "agg"
     shutil.copytree(base / "agg_csv", agg)
-    old = next(agg.glob("foragg_normal_*SAV.csv"))
-    df = pd.read_csv(old, encoding="cp932", dtype=str, keep_default_na=False).drop(columns=list(WEDGE_COLS))
-    synth.write_cp932(df, old)
+    old = next(agg.glob("agg_master_*SAV.csv.gz"))
+    write_csv(read_agg_master(old).drop(columns=list(WEDGE_COLS)), old)
     p = tmp_path / "x.db"
     assert build_db.main(["--mode", "foragg", "--fresh", "--agg-dir", str(agg), "--db-path", str(p)]) == 1
     assert "旧形式の成績表" in capsys.readouterr().err
     with sqlite3.connect(p) as con:
         assert con.execute("SELECT COUNT(*) FROM __tables_meta__ WHERE source_file = ?", (old.name,)).fetchone()[0] == 0
         assert con.execute('SELECT COUNT(*) FROM unified_all WHERE "WEDGE" IS NULL').fetchone()[0] == 0
-    for f in agg.glob("*.csv"):
-        d = pd.read_csv(f, encoding="cp932", dtype=str, keep_default_na=False)
-        synth.write_cp932(d.drop(columns=[c for c in WEDGE_COLS if c in d.columns]), f)
+        assert con.execute("SELECT COUNT(*) FROM unified_all").fetchone()[0] > 0
+    # 旧来の1表1ファイルの形でも、WEDGE 列が無ければ取り込まない（読める成績表が無いので DB は変えずに終了コード2）
+    from shisu.aggstore import ROW_META
+    legacy = read_agg_master(old)
+    legacy = legacy[(legacy["family"] == "normal") & (legacy["odds_mode"] == "normal")].drop(columns=list(ROW_META))
+    for f in agg.glob("agg_master_*.csv.gz"):
+        f.unlink()
+    synth.write_cp932(legacy, agg / f"foragg_normal_{old.name[len('agg_master_'):-len('.csv.gz')]}.csv")
     assert build_db.main(["--mode", "foragg", "--agg-dir", str(agg), "--db-path", str(p)]) == 2
 
 
@@ -584,12 +614,14 @@ def test_entries_only_is_mode_entries(base, tmp_path):
             build_db.parse_cli(bad)
     p = tmp_path / "eo.db"
     shutil.copy(base / "racing.db", p)
+    count = lambda con: con.execute("SELECT COUNT(*) FROM unified_all").fetchone()[0]      # noqa: E731
     with sqlite3.connect(p) as con:
-        before = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'foragg_%'")}
+        before = count(con)
     assert build_db.main(["--entries-only", "--db-path", str(p)]) == 0
     with sqlite3.connect(p) as con:
         names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert before and before <= names and any(n.startswith("entries_xjoin_") for n in names)
+        after = count(con)
+    assert before > 0 and after == before and any(n.startswith("entries_xjoin_") for n in names)
 
 
 def test_replace_parallel_restarts_workers_and_matches_sequential(base, tmp_path, monkeypatch):

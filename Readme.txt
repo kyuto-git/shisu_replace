@@ -1,5 +1,5 @@
 ================================================================================
-■ docker_shisu_replace 統合システム 運用・仕様マニュアル（最新版 2026-11-09）
+■ docker_shisu_replace 統合システム 運用・仕様マニュアル（最新版 2026-11-10）
 ================================================================================
 
 --------------------------------------------------------------------------------
@@ -13,7 +13,11 @@ docker_shisu_replace/
 ├─ ext_indices/        [入力] 外部指数CSV群（Ω・かよちん・keibaAI・吉馬6・安井8・StridePlus 12・Gold・BC・ZI）
 │                             ※/ingest の TARGET 取込用CSVは自動でここにコピーされます
 ├─ master_csv/         [中間] 1頭1行の正規化済みマスター（*.csv.gz：キーの部品・22条件・偏差値・順位・成績）
-├─ agg_csv/            [成果物] ベイズ集計＋WEDGE算出済みの成績表（family × s1/s2 × オッズ4区分）＋ families.json
+├─ agg_csv/            [成果物] ベイズ集計＋WEDGE算出済みの成績表。master 1本につき1ファイル
+│                             agg_master_{地域}_{指数名}.csv.gz（family × s1/s2 × オッズ4区分を縦に並べたもの）
+│                             ＋ families.json（使った family）・agg_settings.json（集計の設定。--resume 用）
+│                             ※旧版の foragg_*.csv（1表1ファイル。数十万本になる）は今は作りません。残っていれば
+│                               aggregate_stats_ver2.py --clean で消してください（→ 7章）
 ├─ selected_families.json  [設定] screen_families.py で選抜した family（あれば初期セット49種の代わりに使われる）
 ├─ screening_report.csv    [成果物] screen_families.py の採点レポート
 ├─ replace_csv/        [任意] 結合キー確認ファイル（--processed 指定時のみ出力）
@@ -26,9 +30,10 @@ docker_shisu_replace/
 ├─ tests/              [検証] 自動テスト群（pytest）
 ├─ replace_csv_ver3.py     [Step 1] 基本CSV＋外部指数の結合・正規化・偏差値化・22条件 → master_csv/
 ├─ screen_families.py      [Step 1.5] 全掛け合わせ候補の一括採点 → screening_report.csv / selected_families.json
-├─ aggregate_stats_ver2.py [Step 2] family × オッズ4区分のグループ集計・ベイズ推定・WEDGE算出（agg_csv/）
+├─ aggregate_stats_ver2.py [Step 2] family × オッズ4区分のグループ集計・ベイズ推定・WEDGE算出（agg_csv/。既定でコンパクト化）
 ├─ calc_entry_hensachi.py  [Step 3] 出馬表CSVの偏差値・順位・帯計算＆横結合（entries_out/）
-├─ build_db.py         [Step 4] SQLite（racing.db）構築（unified_all ＋ __families__ ＋ entries_xjoin_* 事前照合）
+├─ build_db.py         [Step 4] SQLite（racing.db）構築（unified_all ＋ __families__ ＋ entries_xjoin_* 事前照合。
+│                             成績表は unified_all の1テーブルだけに入れる。1表ずつのテーブルは作らない）
 ├─ ingest.py           [CLI]  外部指数スクレイピング・ラップ計算・安井Excel抽出のCLI実行スクリプト
 ├─ app.py              [Web]  横断検索・出馬表・条件ヒット馬・WEDGE一覧・指数取得（/ingest）統合Web UI
 └─ racing.db           [DB]   SQLiteデータベース本体
@@ -69,8 +74,26 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py -
   ・screening_report.csv を見て、selected_families.json の中身（選ばれた family）を確認
   ・selected_families.json が無ければ、Step 2 は初期セット49種（83 family・129通り）で集計します
 
-# Step 2: ベイズ集計＋WEDGE算出（master_csv/ → agg_csv/）
+# Step 2: ベイズ集計＋WEDGE算出（master_csv/ → agg_csv/agg_master_{地域}_{指数名}.csv.gz）
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4
+  ・ログに [済んだ本数/全体] と master ごとの結果が1行ずつ出ます。最後の「書いた行: k/n」がコンパクト化の効き目です
+  ・途中で止まった（Docker が落ちた・Ctrl+C）ときは、--clean を外して --resume を付ければ、済んだ master を飛ばして
+    続きから集計します（今の設定で最後まで書けた master だけを飛ばし、設定を変える前の成績表・途中で切れたファイル・
+    replace で作り直した master の分は作り直します）：
+      docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --resume --workers 4
+  ・コンパクト化（既定 ON）：条件ヒット馬の4区分（絶対軸・軸候補・相手候補・消し候補）に入る行、WEDGE か adjusted_WEDGE が
+    0.70 以上の行、初期セットのコース固定（A の15種）の行、件数30以上の行だけを書きます。区分にも上位にも入らない件数の
+    少ない平凡な行は書かないので、ファイルと DB が小さくなります。全部の行を残すときだけ --no-compact
+    （残す件数の下限は --compact-min-count、WEDGE の下限は --compact-min-wedge で変えられます。none にするとその条件を使いません）
+  ・どれくらい小さくなるか（30万行＝10年分相当の合成データ、X_ の family で測った残る行の割合）：
+        既定（件数30以上・WEDGE 0.70以上）              … 約56%
+        --compact-min-count 100                         … 約39%
+        --compact-min-count none                        … 約21%
+        --compact-min-count none --compact-min-wedge 1.0  … 約7%（区分と A の15種の行は必ず残る）
+    既定のままだと半分ほどにしかなりません。数千通りの family を全指数で集計して DB が大きすぎるときは、下の2つで絞ります
+    （DB は1行あたり約740バイト。4,868通り×33指数なら既定で約180GB、件数 none・WEDGE 1.0 で約21GB の見積もり）：
+      docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4 --compact-min-count none --compact-min-wedge 1.0
+  ・--workers N のとき、master を1本ずつ子プロセスに渡し、N×2本ごとに子プロセスを作り直します（メモリがたまらないように）
 
 # Step 3: 出馬表の偏差値計算・1ファイル統合（entries_in/ → entries_out/entries_merged_hensachi.csv）
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --merge-only --clean
@@ -80,10 +103,11 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
 
 ※注意1：主5場＋ローカル5場の両方の基本CSVを csv_files/ に入れて実行してください（片方だけで --fresh すると
   unified_all はその地域だけになります）。
-※注意2：初期セットのまま全指数を集計すると、成績表・DB は旧版（20パターン）の約8〜9倍になります
-  （実サンプル1か月分で unified_all 33,210行 ／ 旧版相当の15種だけなら 3,847行）。Step 1.5 で絞るのが前提です。
-※注意3：selected_families.json を作り直した・消したときは、Step 2（--clean）と Step 4（--fresh）をやり直してください
-  （Step 1 のやり直しは不要）。
+※注意2：成績表の行数は family の数にほぼ比例します。数千通りの family を全指数で集計するときは、コンパクト化（既定 ON）の
+  まま回してください（--no-compact だと agg_csv・racing.db が何十倍にもなります）。集計の時間は family の数に比例するので、
+  時間が足りなければ Step 1.5 で絞ります。
+※注意3：selected_families.json を作り直した・消したとき、コンパクト化の設定（--no-compact・--compact-min-*）を変えたときは、
+  Step 2（--clean）と Step 4（--fresh）をやり直してください（Step 1 のやり直しは不要）。
 
 
 ■ B. 毎週末の出馬表（entries_in/）だけを更新するときの高速手順（過去集計はそのまま）
@@ -274,7 +298,14 @@ docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu pyth
       平均着順、単勝回収値、複勝回収値、単勝適正回収値（オッズ逆数重み）」を算出。
     ・Jeffreys事前分布 Beta(0.5, 0.5) に基づく片側分位（下限10% / 複勝率20%以下は上限90%）を推定値（*_val）に。
     ・各結合データの「WIN」「EDGE」「WEDGE」および時系列加重「adjusted_WEDGE」を算出。
-    ・使った family の定義を agg_csv/families.json に書く。
+    ・出力は master 1本につき1ファイル agg_csv/agg_master_{地域}_{指数名}.csv.gz。family・オッズ帯・スキームの成績表を
+      縦に並べ、family / odds_mode / rank_scheme / indicator / region / テーブル名 の列で区別します（書きかけは .part で、
+      書き終わったら本来の名前に置き換わる）。
+    ・コンパクト化（既定 ON）：4区分に入る行・WEDGE か adjusted_WEDGE が0.70以上の行・コース固定（A）の family の行・
+      件数30以上の行だけを書く。条件ヒット馬（4区分すべて）と WEDGE の高い行は1行も落としません。
+    ・使った family の定義を agg_csv/families.json、集計の設定を agg_csv/agg_settings.json に書く。
+    ・--resume：今の設定で最後まで書けた master を飛ばす（書き終わりの印 agg_master_*.csv.gz.done で判定。設定を変える前の
+      成績表・途中で切れたファイル・作り直した master は作り直す）。
 
   [Step 3] calc_entry_hensachi.py（出馬表への外部指数の結合・偏差値・帯付与＆横結合）
     ・ext_indices/ の外部指数を、過去側と同じ関数で出馬表の各馬に付ける（出馬表に値のある指数はそのレースだけ出馬表の値）。
@@ -282,8 +313,13 @@ docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu pyth
       （entries_merged_hensachi.csv）へ横結合。空文字は後続ファイルの値で埋める。
 
   [Step 4] build_db.py（SQLite化・unified_all 統合・xjoin 事前構築）
-    ・agg_csv/ の全成績表を SQLite（racing.db）に格納し、全テーブルを縦結合した「unified_all」を構築。
+    ・agg_csv/ の成績表（agg_master_*.csv.gz。旧版の foragg_*.csv も読めます）を少しずつ読み、「unified_all」1テーブルに
+      直接入れる（1表ずつのテーブルは作らない。同じ行を2回持たないので DB が半分になる）。集計表の一覧は __tables_meta__、
       family の定義は __families__ テーブルに入る（画面・照合はこれを使う）。
+    ・作り直しは別名のテーブルに作ってから最後に置き換えるので、途中で止まっても前の unified_all が残ります。
+      前の版で作った DB に1表ずつのテーブル foragg_* が残っていれば消します（5,000個を超えるときは時間がかかるので残して
+      警告。画面は使いません）。ファイルを小さくするには --fresh。
+    ・読めない成績表（途中で切れたファイル）は飛ばして [ERROR] を出します（aggregate --resume で作り直してから再実行）。
     ・出馬表の全出走馬×全指数×全 family の検索キー候補（s2 の重なり・内外の候補も含む）を事前展開し、
       unified_all と突合した結果テーブル「entries_xjoin_merged_hensachi」を構築。
 
@@ -496,9 +532,16 @@ DB を作らずにメモリ上で、family の候補を「本番と同じ集計�
        止まり、古いファイルが残っていればそれで選び直して selected_families.json を上書きします）
      ・ログの「選抜: N 通り・M family」を見ながら、本集計にかけられる量（目安は全指数で現実的な時間に収まる数）まで絞る
      ・selected_families.json を手で編集してもよい
-  4) 集計と DB の作り直し（selected_families.json が自動で使われます）
+  4) 集計と DB の作り直し（selected_families.json が自動で使われます。既定でコンパクト化）
        docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4
        docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
+     ・途中で止まったら、--clean を外して --resume で続きから（済んだ master は飛ばす）：
+       docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --resume --workers 4
+     ・成績表は master 1本につき1ファイル・既定でコンパクト化するので、family を多く選んでも（以前の基準の約4,900通りでも）
+       ファイル数とディスク・DB の大きさは抑えられます。多く持ちたいときは --from-report で基準をゆるめて選び直す
+       （例：絶対軸か軸候補のキーが1つでも出る候補を全部選ぶ）：
+       docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --from-report --export-selected --min-axis 1 --top-a 30
+       ただし集計の時間は family の数に比例します（下の (5)）。止まったら --resume で続きから回せます
   5) 初期セットに戻すときは selected_families.json を削除（または名前を変えて）から 4) を実行
 
 (5) 所要時間の目安（検証環境・1プロセス、10年分相当＝30万行の master 1本）
@@ -507,6 +550,7 @@ DB を作らずにメモリ上で、family の候補を「本番と同じ集計�
     （1プロセスのメモリは0.5GB前後）。
   ・--from-report の選抜のやり直しは数秒（採点はしません）。
   ・本番の集計（Step 2）は family の数にほぼ比例します（初期セットの129通りで master 1本あたり約3分）。
+    コンパクト化は時間をほとんど変えません（書く量が減るだけ）。長くかかるときは --workers と --resume を使ってください。
 
 (6) selected_families.json の形（手で書く・直すとき）
   {"families": [
@@ -580,14 +624,30 @@ DB を作らずにメモリ上で、family の候補を「本番と同じ集計�
      レースIDの形（18桁・旧10桁・12桁・旧8桁）が指数の形式と合っているかを確認してください。
 
   Q. 集計（Step 2）や DB が大きすぎる・時間がかかる
-  A. 初期セット（129通り）のまま全指数を集計しているか、選抜した family が多すぎます。5章の手順で family を絞ってください。
+  A. 大きさ：コンパクト化（既定 ON）で回しているか確認してください（ログの「コンパクト化: ON」と「書いた行: k/n」）。
+     --no-compact だと全部の行を書くので何倍にもなります。旧版の foragg_*.csv（1表1ファイル）が agg_csv/ に残っていれば
+     ログに WARN が出ます。--clean を付けて集計し直すと消えます。DB は build_db.py --fresh で作り直すと小さくなります
+     （--fresh を付けないと、消したテーブルの分の空きがファイルに残ります）。
+     時間：集計は family の数に比例します。5章の手順で family を絞るか、--workers で並列にしてください。
      採点済みなら --from-report で基準だけ変えて選び直せます（数秒）。
 
-  Q. replace_csv_ver3.py --workers 4 が途中で BrokenProcessPool で落ちる
-  A. Docker のメモリが足りず、子プロセスが OOM Killer に止められています。今の版は統合のあとにメモリを手放し、子プロセスを
-     4件ほどで作り直すので起きにくくなっています。それでも止められたら、そのまとまり（最大 --workers × 4 ファイル）の
-     終わっていなかったファイルが「[ERROR] … 子プロセスが止められました」になり、次のまとまりから続きます。--workers 2（または 1）にするか、Docker Desktop の
-     メモリの割り当てを増やして、もう一度 replace を実行してください。
+  Q. 集計（Step 2）が途中で止まった（Docker が落ちた・Mac がスリープした・Ctrl+C）
+  A. --clean を外して --resume を付けて同じコマンドを実行してください。今の設定で最後まで書けた master（書き終わりの印
+     agg_master_*.csv.gz.done が今の設定・今の master と合うもの）は飛ばして、残りだけを集計します（書きかけの .part は
+     消してからやり直す）。family や --compact などの設定を途中で変えたときも、--resume で今の設定にそろいます
+     （前の設定の成績表は作り直します）。
+
+  Q. 条件ヒット馬・WEDGE一覧に出る行が前より少ない
+  A. コンパクト化（既定 ON）で、4区分にも WEDGE 0.70以上にも入らず件数も30未満の行は DB に入れていないためです。
+     条件ヒット馬の4区分と WEDGE の高い行は全部残っています。レース別 WEDGE一覧で平凡な行まで見たいときは
+     aggregate_stats_ver2.py --clean --no-compact → build_db.py --fresh で全部の行を入れてください（容量は大きくなります）。
+
+  Q. replace_csv_ver3.py（または aggregate_stats_ver2.py）--workers 4 が途中で BrokenProcessPool で落ちる
+  A. Docker のメモリが足りず、子プロセスが OOM Killer に止められています。今の版は子プロセスを少しずつ作り直すので
+     （replace は4件ほど、aggregate は master 2本ほどで）起きにくくなっています。それでも止められたら、そのまとまり
+     （replace は最大 --workers × 4 ファイル、aggregate は --workers × 2 本）の終わっていなかったものが
+     「[ERROR] … 子プロセスが止められました」になり、次のまとまりから続きます。--workers 2（または 1）にするか、
+     Docker Desktop のメモリの割り当てを増やして、もう一度実行してください（aggregate は --resume で止められた分だけ）。
 
   Q. GitHub の Dependabot に lxml・Flask・requests の脆弱性アラートが出た
   A. 2026-11-09 に lxml を 6.1.3（CVE-2026-41066。6.1.0 で修正）、Flask を 3.1.3（CVE-2026-27205）、requests を 2.33.1

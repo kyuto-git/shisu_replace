@@ -2,7 +2,7 @@
 
 開発再開時の「思い出し用」要約。詳細な仕様は **CLAUDE.md** を参照（コードが正、CLAUDE.md はコードに合わせて更新）。
 
-更新日: 2026-11-09
+更新日: 2026-11-10
 
 ## 流れ
 
@@ -12,8 +12,9 @@ raw_csv/（列パッチ: レースID(新) と前走の列だけ・指数 列な�
 csv_files/（★6タブの基本CSV {地域}_タイムM / {地域}_対戦M。従来の {地域}_{指数名} も可）＋ ext_indices/（外部指数CSV群）
            ─ replace_csv_ver3.py ─> master_csv/（1頭1行。キーの部品・22条件・偏差値・順位）
            ─ screen_families.py（推奨）─> screening_report.csv / selected_families.json（使う family）
-           ─ aggregate_stats_ver2.py ─> agg_csv/（family × s1/s2 × オッズ帯の成績表）＋ families.json
-           ─ build_db.py ─> racing.db（foragg_*, unified_all, __tables_meta__, __families__）
+           ─ aggregate_stats_ver2.py ─> agg_csv/agg_master_{地域}_{指数名}.csv.gz（master 1本につき1ファイル。
+                                      family × s1/s2 × オッズ帯の成績表を縦に並べる。既定でコンパクト化）＋ families.json
+           ─ build_db.py ─> racing.db（unified_all, __tables_meta__, __families__。1表ずつのテーブル foragg_* は作らない）
 entries_in/（マイニング値だけの出馬表1本でよい）＋ ext_indices/ ─ calc_entry_hensachi.py ─> entries_out/
            ─ build_db.py --mode entries ─> racing.db（entries_*, entries_xjoin_*）
 app.py（http://localhost:8000）: 横断検索 / 出馬表 / 条件ヒット馬 / レース別 WEDGE 一覧 / 指数の取得（/ingest）
@@ -31,6 +32,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python replace_csv_ver3.py 
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --indicators タイムM,対戦M --workers 4 --export-selected
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --from-report --export-selected   # 採点し直さず選抜だけ
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --clean --workers 4
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python aggregate_stats_ver2.py --resume --workers 4   # 止まったら続きから
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --merge-only --clean
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
 docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)":/app csv_processor_shisu python app.py
@@ -53,4 +55,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - レース単位（16桁）の レースID(新) は replace が馬番を付けて18桁にする（旧版の band 系の件数膨張の再発防止。tests/test_band_regression.py）
 - family・集計条件だけ変えたときは aggregate → build_db だけでよい（master はそのまま）
 - 馬体重発表後のマイニング確定値: entries_in の出馬表を上書きして calc_entry_hensachi.py --merge-only --clean → build_db.py --entries-only
+- 成績表のコンパクト化（aggregate の既定）: 4区分（絶対軸・軸候補・相手候補・消し候補）・WEDGE か adjusted_WEDGE ≧0.70・layer A・件数≧30 のどれかの行だけを書く（区分と高 WEDGE は1行も落とさない）。全部の行は `--no-compact`
+- aggregate の --workers は master を1本ずつ渡し、workers × 2 本ごとに子プロセスを作り直す。--resume は書き終わりの印（.done: 設定のハッシュ・master の大きさと更新時刻・ファイルの大きさ）が今と合う master だけを飛ばす（違えば作り直す）。コンパクト化の下限を外すのは none
+- 画面の「集計表ごと」は常に unified_all のテーブル名が同じ行（前の版の DB に foragg_* テーブルが残っていても使わない。表示は前の版と同じ）
 - replace の --workers は子プロセスを4件ほどで作り直す（workers × 4 件のまとまりごとに新しいプール。OOM・BrokenProcessPool 対策。止められたファイルは [ERROR] にして残りを続ける）

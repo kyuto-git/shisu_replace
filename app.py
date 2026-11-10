@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """Flask UI。
 
-  /              横断検索（集計表 foragg_* を family・指数・オッズ帯・地域・コース条件で絞り込み。
-                 表ごとの表示と、全表をまとめて WEDGE などで並べる横断ランキングの2通り）
+  /              横断検索（集計表を family・指数・オッズ帯・地域・コース条件で絞り込み。
+                 表ごとの表示と、全表をまとめて WEDGE などで並べる横断ランキングの2通り。
+                 集計表は __tables_meta__ の kind=foragg の行。中身は unified_all の「テーブル名」が同じ行
+                 （前の版の DB に1表ずつのテーブル foragg_* が残っていても使わない。前の版の unified_all は
+                 そのテーブルを同じ順で詰め直したものなので、表示は同じ）
   /entries       出馬表のレース一覧（日付・場所で絞り込み）
   /entries/race  出馬表（各馬の指数順位・偏差値）
   /entries/key   結合データの前方一致で unified_all を表示
@@ -55,6 +58,7 @@ RANK_COLUMNS = ("結合データ", "件数", "複勝率_val", "連対率_val", "
                 "単勝適正回収値", *WEDGE_COLUMNS)
 PRESETS = ("none", "abs", "axis", "opp", "keshi")
 VIEWS = ("tables", "rank")
+TABLE_META_COLUMNS = ("family", "odds_mode", "rank_scheme", "indicator", "region", "テーブル名")
 # 下限フィルタ（クエリ引数名, 列）
 MIN_FILTERS = (("min_cnt", "件数"), ("min_wedge", "WEDGE"), ("min_adj", "adjusted_WEDGE"))
 
@@ -361,6 +365,7 @@ def index():
             rank_rows = _rank_query(con, q_families, q_inds, q_odds, region, (place, sd, dist, inout),
                                     q_preset, mins, q_sort, q_dir)
         elif submitted and has_db:
+            unified_cols = set(table_columns(con, UNIFIED)) - set(TABLE_META_COLUMNS)
             where, params = ["kind='foragg'"], []
             if q_families:
                 where.append(f"family IN ({','.join('?' * len(q_families))})")
@@ -374,7 +379,9 @@ def index():
             if region:
                 where.append("region = ?")
                 params.append(region)
-            metas = [dict(r) for r in con.execute(f"SELECT * FROM {META} WHERE {' AND '.join(where)}", params)]
+            metas = [dict(r) for r in con.execute(
+                f"SELECT table_name, family, rank_scheme, indicator, odds_mode, region FROM {META} "
+                f"WHERE {' AND '.join(where)}", params)]
             ind_rank = {n: i for i, n in enumerate(INDICATOR_ORDER)}
             fam_rank = {f: i for i, f in enumerate(fam_registry.active_names())}
             metas.sort(key=lambda m: (ind_rank.get(m["indicator"], 999), m["indicator"] or "",
@@ -385,20 +392,23 @@ def index():
             mw, mp, mcols = _min_filters(mins)
             for m in metas[:MAX_TABLES]:
                 t = m["table_name"]
-                if not table_exists(con, t):
-                    continue
-                cols_in = set(table_columns(con, t))
+                # 集計表の中身は unified_all の同じテーブル名の行（並びは同じ列で並べ、同点は成績表の行の順＝rowid）
+                cols_in = unified_cols
                 if not set(mcols) <= cols_in:      # 下限を指定した列が無い表（古い集計）は出さない
                     continue
                 show = [c for c in DISPLAY_ORDER if c in cols_in]
-                w, p = _course_filters(place, sd, dist, inout)
+                w, p = ['"テーブル名" = ?'], [t]
+                cw, cp = _course_filters(place, sd, dist, inout)
+                w += cw
+                p += cp
                 if q_preset != "none":
                     w.append(sql_condition(q_preset, m["odds_mode"]))
                 w += mw
                 p += mp
-                order = f"ORDER BY {q(q_sort)} {q_dir} NULLS LAST " if q_sort in cols_in else ""
-                sql = (f"SELECT {', '.join(q(c) for c in show)} FROM {q(t)} "
-                       f"{'WHERE ' + ' AND '.join(w) if w else ''} {order}LIMIT {ROWS_PER_TABLE}")
+                # 並べ替えに WEDGE などの索引を使わせない（テーブル名の索引で絞ってから並べる）
+                order = f"ORDER BY +{q(q_sort)} {q_dir} NULLS LAST, rowid " if q_sort in cols_in else "ORDER BY rowid "
+                sql = (f"SELECT {', '.join(q(c) for c in show)} FROM {UNIFIED} "
+                       f"WHERE {' AND '.join(w)} {order}LIMIT {ROWS_PER_TABLE}")
                 rows = [dict(r) for r in con.execute(sql, p)]
                 if not rows:
                     continue

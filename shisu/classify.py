@@ -102,6 +102,43 @@ def classify(rec: Mapping, mode: str) -> str | None:
     return None
 
 
+# DB の列 → classify の値（cnt, fv, rv, top5, frc, tra）
+FIELD_COLUMNS = {"cnt": "件数", "fv": "複勝率_val", "rv": "連対率_val", "top5": "掲示板率_val",
+                 "frc": "複勝回収値", "tra": "単勝適正回収値"}
+
+
+def classify_frame(df, mode: str):
+    """classify() のベクトル版。df は FIELD_COLUMNS の列を持つ DataFrame（DB と同じ値。5つの率の *_val は推定値）。
+    戻り値は区分の文字列（keshi/abs/axis/opp）か None の numpy 配列（object）。判定は classify() と同じ
+    （欠損・数にならない値はどの比較も満たさない。tests/test_core.py で1行版と照合している）。"""
+    import numpy as np
+    import pandas as pd
+
+    def col(field: str):
+        c = FIELD_COLUMNS[field]
+        if c not in df.columns:
+            return np.full(len(df), np.nan)
+        return pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+
+    cnt, fv, rv, top5, frc, tra = (col(f) for f in ("cnt", "fv", "rv", "top5", "frc", "tra"))
+    with np.errstate(invalid="ignore"):                # NaN との比較は False（= 満たさない）
+        keshi = (cnt >= KS_CNT) & (fv < KS_PLC_MAX_ANY) & (top5 < KS_TOP5_MAX_ANY)
+        if mode == "odds10u":
+            keshi |= (cnt >= KS_CNT) & (fv < KS_PLC_MAX_10U)
+        absolute = (cnt >= ABS_CNT) & (rv >= ABS_REN) & ((frc >= ABS_FRC) | (tra >= ABS_TRA))
+        axis = (cnt >= AX_CNT) & (((fv >= AX_FV_80) & (top5 >= AX_TOP5_90))
+                                  | ((rv >= AX_RV_60) & (top5 >= AX_TOP5_90))
+                                  | ((fv >= AX_FV_70) & (top5 >= AX_TOP5_80) & (frc >= AX_FRC_100))
+                                  | ((rv >= AX_RV_50) & (top5 >= AX_TOP5_80) & (frc >= AX_FRC_100)))
+        opp = (cnt >= OP_CNT) & (((fv >= OP_FV_60) & (top5 >= OP_TOP5_70))
+                                 | ((rv >= OP_RV_50) & (top5 >= OP_TOP5_70))
+                                 | ((fv >= OP_FV_33) & (frc >= OP_FRC_150) & (top5 >= OP_TOP5_50)))
+    out = np.full(len(df), None, dtype=object)
+    for name, mask in (("opp", opp), ("axis", axis), ("abs", absolute), ("keshi", keshi)):   # 判定順の逆に上書き
+        out[mask] = name
+    return out
+
+
 # ---------------------------------------------------------------------------
 # SQL 版（/ 画面のプリセット用）。classify() と同じ結果になることをテストで確認している。
 # ---------------------------------------------------------------------------

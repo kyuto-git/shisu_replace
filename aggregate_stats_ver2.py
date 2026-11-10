@@ -4,12 +4,25 @@
 使う family は shisu/families.py の台帳（selected_families.json があればその定義、無ければ初期セット49種）。
 master 1本（1地域×1指数）について、family（とスキーム s1/s2）ごとにキーを作り、オッズ帯4区分で集計する:
   通常（絞り込みなし）/ odds10u（10倍未満）/ odds10_50（10以上50未満）/ odds50p（50倍以上）
-  出力名: agg_csv/foragg_{オッズ接頭辞}{rankband_スキーム_}{family}_{地域}_{指数名}.csv（命名は shisu/naming.py）
+  出力: master 1本につき1ファイル agg_csv/agg_master_{地域}_{指数名}.csv.gz（2026-11-10〜。shisu/aggstore.py）
+        family・オッズ帯・スキームの成績表を縦に並べ、family, odds_mode, rank_scheme, indicator, region, テーブル名
+        の列で区別する（テーブル名は旧来の1表1ファイル foragg_*.csv のテーブル名と同じ）
   agg_csv/families.json に使った family の定義を書く（build_db・画面が family の名前と部品を知るため）
+  agg_csv/agg_settings.json に集計の設定を書く（--resume のとき、前回と違う項目をログに出す）
 集計に使うのは master の 指数有効=1 の馬（除外レース・新馬除外・欠損の馬を除く）。
 family ごとの素材ファイルは作らない（49 family × 3 の素材は容量・時間ともに大きすぎるため。キーはメモリ上で作る）。
 
-出力列:
+コンパクト化（--compact。既定 ON。全部の行を残すときだけ --no-compact）: 次のどれかを満たす行だけを書く
+  a) classify で 絶対軸・軸候補・相手候補・消し候補 になる行（値は build_db が DB に入れる推定値と同じ）
+  b) WEDGE >= 0.70 または adjusted_WEDGE >= 0.70（--compact-min-wedge）
+  c) 初期セットのコース固定（layer A）の family の行、または 件数 >= 30（--compact-min-count）
+  （条件ヒット馬の4区分と WEDGE の高い行は1行も落とさない。落ちるのは件数が少なく区分にも入らない平凡な行）
+並列（--workers N）: master を1本ずつ子プロセスに渡し（chunksize=1）、N × MASTERS_PER_CHILD（2）本ごとに
+  子プロセスを作り直して gc.collect() する（shisu/parallel.py。子プロセスにメモリがたまらないように）
+--resume: 書き終わりの印（agg_master_*.csv.gz.done）が今の設定・今の master と合う master は飛ばし、ほかは作り直す
+  （途中で止まったあとの続きから。設定が違う・途中で切れた成績表・作り直した master は混ぜない）
+
+出力列（旧来の成績表の列。agg_master_*.csv.gz はこれに family, odds_mode, rank_scheme, indicator, region, テーブル名 が付く）:
   結合データ, 件数, 勝率_val, 勝率, 連対率_val, 連対率, 複勝率_val, 複勝率, 2着率_val, 2着率,
   3着率_val, 3着率, 掲示板率_val, 掲示板率, 平均着順, 単勝回収値, 複勝回収値, 単勝適正回収値,
   WIN, EDGE, WEDGE, adjusted_WEDGE, adjusted_WEDGE_年数, adjusted_WEDGE_件数, adjusted_WEDGE_最終年,
@@ -30,6 +43,7 @@ family ごとの素材ファイルは作らない（49 family × 3 の素材は�
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -40,13 +54,19 @@ import numpy as np
 import pandas as pd
 
 from shisu import config
-from shisu.csvio import read_csv_any, write_csv
+from shisu import classify as classify_rules
+from shisu.aggstore import (COMPACT_MIN_COUNT, COMPACT_MIN_WEDGE, PART_SUFFIX, AggMasterWriter, compact_mask,
+                            IDENTITY_KEYS, legacy_files, master_identity, settings_hash, stamp_matches, stamp_path,
+                            write_stamp)
+from shisu.csvio import read_csv_any
 from shisu.estimates import beta_quantile, has_scipy, posterior_mean
 from shisu.finish import parse_finish
 from shisu import families as fam_registry
-from shisu.naming import agg_filename, file_stem
+from shisu.indicators import parse_source_name
+from shisu.naming import agg_filename, agg_master_filename, file_stem, table_name_for_foragg
 from shisu.normalize import race_date
 from shisu.odds import ODDS_MODES, odds_mask, odds_mask_numeric
+from shisu.parallel import run_batched
 from shisu.wedge import (DEFAULT_DECAY, DEFAULT_MAX_YEARS, DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WINDOWS,
                          check_decay, valid_years, wedge_columns)
 
@@ -296,9 +316,24 @@ def restrict_schemes(fams, schemes: set[str] | None):
     return out
 
 
+MASTERS_PER_CHILD = 2        # 並列のとき、子プロセス1つが処理する master の本数（ほど）。作り直してメモリを返す
+SETTINGS_FILE = "agg_settings.json"
+
+
+def compact_options(enabled: bool = True, min_count: int | None = None, min_wedge: float | None = None) -> dict:
+    """コンパクト化の設定（aggregate_master に渡す dict）。"""
+    return {"enabled": bool(enabled),
+            "min_count": COMPACT_MIN_COUNT if min_count is None else int(min_count),
+            "min_wedge": COMPACT_MIN_WEDGE if min_wedge is None else float(min_wedge)}
+
+
 def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, schemes: set[str] | None = None,
-                     families: list[dict] | None = None) -> str:
-    """master 1本 → 成績表。families は使う family の定義（to_dict の list。並列の子プロセスにも同じ定義を渡す）。"""
+                     families: list[dict] | None = None, compact: dict | None = None,
+                     settings_id: str | None = None) -> str:
+    """master 1本 → 成績表 agg_csv/agg_master_{地域}_{指数名}.csv.gz（family・スキーム・オッズ帯を縦に並べる）。
+    families は使う family の定義（to_dict の list。並列の子プロセスにも同じ定義を渡す）。
+    compact は compact_options() の dict（省略時はコンパクト化する）。
+    settings_id（集計の設定のハッシュ）を渡すと、書き終えたあとに印（.done）を書く（--resume が見る）。"""
     src = Path(src)
     stem = file_stem(src)
     if not stem.startswith(MASTER_PREFIX) or stem in SKIP_MASTERS:
@@ -306,30 +341,89 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
     if families is not None:
         fam_registry.set_active([fam_registry.Family.from_dict(d) for d in families])
     source = stem[len(MASTER_PREFIX):]
+    region, indicator = parse_source_name(source)
+    path = Path(out_dir) / agg_master_filename(source)
+    # 前の成績表と印は、master を読む前に消す（読めない・メモリ不足・止められた・[SKIP] のどれでも、
+    # 前の master や前の設定から作った成績表が黙って残らないように）
+    stamp_path(path).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+    ident = master_identity(src)                   # 印に書く master の大きさ・更新時刻は、読む前に取る
     df = master_frame(read_csv_any(src))
     for c in (RID, "着順"):
         if c not in df.columns:
             return f"[SKIP] {src.name}: 列 {c} がありません（master ではない可能性）"
+    copts = compact_options() if compact is None else compact
     ref_year = ref_year_of(df)
-    groups = adj = n_files = 0
+    total = adj = kept = n_tables = 0
     fams = restrict_schemes(fam_registry.active(), schemes)
-    for fam in fams:                     # 作らないスキームの、前の実行の成績表は消す（build_db が取り込まないように）
-        for sc in ("s1", "s2") if fam.uses_schemes else ():
-            if sc not in fam.schemes:
-                for mode in ODDS_MODES:
-                    (Path(out_dir) / agg_filename(fam.name, mode, sc, source)).unlink(missing_ok=True)
-    for fam, scheme, sub in family_frames(df, fams):
-        for mode in ODDS_MODES:
-            out = aggregate_frame(odds_part(sub, mode), ref_year, wedge_opts, ref_columns_for(fam))
-            path = Path(out_dir) / agg_filename(fam.name, mode, scheme, source)
-            if out.empty:                    # 0件の成績表は書かない（前の実行で書いた同じ名前のファイルは消す）
-                path.unlink(missing_ok=True)
-                continue
-            write_csv(out, path)
-            n_files += 1
-            groups += len(out)
-            adj += int(out["adjusted_WEDGE"].notna().sum()) if len(out) else 0
-    return (f"[OK] {src.name}: {n_files} files groups={groups}(adj {adj}) / 年度窓の終わり={ref_year}")
+    writer = AggMasterWriter(path)
+    try:
+        for fam, scheme, sub in family_frames(df, fams):
+            for mode in ODDS_MODES:
+                out = aggregate_frame(odds_part(sub, mode), ref_year, wedge_opts, ref_columns_for(fam))
+                if out.empty:                    # 0件の成績表は書かない
+                    continue
+                total += len(out)
+                adj += int(out["adjusted_WEDGE"].notna().sum())
+                if copts["enabled"]:
+                    out = out[compact_mask(out, mode, fam.layer, copts["min_count"], copts["min_wedge"])]
+                    if out.empty:
+                        continue
+                table = table_name_for_foragg(agg_filename(fam.name, mode, scheme, source))
+                writer.write(out.assign(family=fam.name, odds_mode=mode, rank_scheme=scheme, indicator=indicator,
+                                        region=region, テーブル名=table))
+                n_tables += 1
+                kept += len(out)
+    except BaseException:
+        writer.abort()
+        raise
+    writer.close()
+    note = ""
+    if settings_id is not None:
+        now = master_identity(src)
+        if all(now[k] == ident[k] for k in IDENTITY_KEYS):
+            write_stamp(path, settings_id, ident, kept)
+        else:                                       # 集計の間に replace が master を作り直した
+            note = " / [WARN] 集計の間に master が作り直されたので書き終わりの印を書きません（--resume で作り直します）"
+    return (f"[OK] {src.name}: {n_tables} tables groups={total}(adj {adj}) kept={kept}/{total}"
+            f" / 年度窓の終わり={ref_year}{note}")
+
+
+def _threshold(kind):
+    """--compact-min-count / --compact-min-wedge の値。正の数か none（その条件を使わない。内部では 0）。"""
+    def parse(text: str):
+        t = str(text).strip().lower()
+        if t in ("none", "off", "なし"):
+            return kind(0)
+        try:
+            v = kind(t)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"正の数か none: {text}")
+        if not v > 0:
+            raise argparse.ArgumentTypeError(f"正の数か none（条件を使わないときは none）: {text}")
+        return v
+    return parse
+
+
+def settings_of(fam_dicts: list[dict], schemes: set[str], wedge_opts: dict, compact: dict) -> dict:
+    """成績表の中身を変える集計の設定（agg_settings.json と、書き終わりの印のハッシュ）。--resume はこのハッシュが
+    違う成績表を作り直す。コンパクト化で残す行は shisu/classify.py の閾値でも変わるので、その値も入れる。"""
+    from shisu import odds as odds_rules
+    from shisu import wedge as wedge_rules
+    rules = {k: v for k, v in sorted(vars(classify_rules).items())
+             if k.isupper() and isinstance(v, (int, float)) and not isinstance(v, bool)}
+    return {"version": 1, "families": fam_dicts, "schemes": sorted(schemes), "wedge": wedge_opts,
+            "compact": compact, "classify": rules if compact.get("enabled") else {}, "min_sample": MIN_SAMPLE,
+            "odds": {"modes": list(odds_rules.ODDS_MODES), "breaks": list(odds_rules.ODDS_BREAKS)},
+            "edge": {"clip": wedge_rules.ODDS_CLIP, "table": [list(t) for t in wedge_rules.EDGE_TABLE]},
+            "estimate": {"mode": PROP_MODE, "lower_q": LOWER_Q, "upper_q": UPPER_Q, "prior_alpha": PRIOR_A,
+                         "prior_beta": PRIOR_B, "plc_switch_pct": PLC_SWITCH_PCT, "scipy": has_scipy()}}
+
+
+def _settings_diff(old: dict, new: dict) -> list[str]:
+    keys = sorted(set(old) | set(new))
+    return [k for k in keys if json.dumps(old.get(k), sort_keys=True, ensure_ascii=False)
+            != json.dumps(new.get(k), sort_keys=True, ensure_ascii=False)]
 
 
 def main(argv=None) -> int:
@@ -339,7 +433,18 @@ def main(argv=None) -> int:
                     help="使う family の定義（JSON）。既定: selected_families.json があればそれ、無ければ初期セット")
     ap.add_argument("--out-dir", default=str(config.agg_dir()))
     ap.add_argument("--clean", action="store_true", help="出力先 agg_csv を空にしてから実行")
+    ap.add_argument("--resume", action="store_true",
+                    help="今の設定で最後まで書けた master（書き終わりの印 agg_master_*.csv.gz.done が今の設定・今の master と"
+                         "合うもの）は飛ばして続きから。設定が違う・印の無い・途中で切れた成績表、作り直した master は作り直す")
     ap.add_argument("--workers", type=int, default=1, help="並列数（既定1）")
+    ap.add_argument("--compact", action=argparse.BooleanOptionalAction, default=True,
+                    help="区分（絶対軸・軸候補・相手候補・消し候補）にも WEDGE の上位にも入らない平凡な行を書かない"
+                         "（既定 ON。全部の行を残すときは --no-compact）")
+    ap.add_argument("--compact-min-count", type=_threshold(int), default=COMPACT_MIN_COUNT,
+                    help=f"コンパクト化しても残す件数の下限（既定 {COMPACT_MIN_COUNT}。これ以上の行は区分に関係なく残す。"
+                         "none なら件数では残さない）")
+    ap.add_argument("--compact-min-wedge", type=_threshold(float), default=COMPACT_MIN_WEDGE,
+                    help=f"コンパクト化しても残す WEDGE・adjusted_WEDGE の下限（既定 {COMPACT_MIN_WEDGE}。none なら WEDGE では残さない）")
     ap.add_argument("--wedge-min-year-count", type=int, default=None,
                     help=f"adjusted_WEDGE で使う年の最低件数（既定 {WEDGE_MIN_YEAR_COUNT}。環境変数 AGG_WEDGE_MIN_YEAR_COUNT）")
     ap.add_argument("--wedge-max-years", type=int, default=None,
@@ -360,6 +465,10 @@ def main(argv=None) -> int:
     except ValueError as e:
         print(f"[ERROR] WEDGE の設定: {e}", file=sys.stderr)
         return 2
+    if args.clean and args.resume:
+        print("[ERROR] --clean と --resume は一緒に使えません（--clean は済んだ成績表も消します）", file=sys.stderr)
+        return 2
+    copts = compact_options(args.compact, args.compact_min_count, args.compact_min_wedge)
 
     files = [p for p in sorted(Path(args.in_dir).glob(f"{MASTER_PREFIX}*.csv.gz")) if file_stem(p) not in SKIP_MASTERS]
     schemes = {s.strip() for s in os.getenv("AGG_RANKBAND_SCHEMES", "").split(",") if s.strip()}
@@ -377,32 +486,80 @@ def main(argv=None) -> int:
         print(f"[ERROR] AGG_RANKBAND_SCHEMES={','.join(sorted(schemes))} で作る family がありません", file=sys.stderr)
         return 2
     fam_dicts = [f.to_dict() for f in fams]
-    if args.clean and Path(args.out_dir).exists():
-        shutil.rmtree(args.out_dir)
-    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.out_dir)
+    settings = settings_of(fam_dicts, schemes, opts, copts)
+    sid = settings_hash(settings)
+    done: set[str] = set()
+    if args.resume:
+        # 済み = 印（.done）が今の設定・今の master（大きさと更新時刻）と合い、成績表が印のとおりの大きさで残っているもの。
+        # 違う設定・作り直した master・途中で切れたファイルは作り直す（違う設定の成績表を混ぜない）
+        done = {p.name for p in files if stamp_matches(out_dir / agg_master_filename(file_stem(p)[len(MASTER_PREFIX):]),
+                                                       sid, p)}
+        prev_path = out_dir / SETTINGS_FILE
+        if prev_path.exists():
+            try:
+                diff = _settings_diff(json.loads(prev_path.read_text(encoding="utf-8")), settings)
+            except ValueError:
+                diff = ["（読めません）"]
+            if diff:
+                print(f"[INFO] --resume: 前回の実行と設定が違います（{', '.join(diff)}）。今の設定で作っていない成績表は作り直します")
+    if args.clean and out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for part in out_dir.glob(f"*{PART_SUFFIX}"):          # 前に止まった実行の書きかけ
+        part.unlink(missing_ok=True)
     # build_db・照合・画面はこの定義を使う（AGG_RANKBAND_SCHEMES で絞ったスキームもここに残る）
-    fam_registry.save_families(Path(args.out_dir) / "families.json", fams, {"source": fam_registry.active_source()})
+    fam_registry.save_families(out_dir / "families.json", fams, {"source": fam_registry.active_source()})
+    (out_dir / SETTINGS_FILE).write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
     n_var = sum(len(f.schemes) for f in fams)
     print(f"[INFO] family: {fam_registry.active_source()} / {len(fams)} family・{n_var} 通り（スキーム込み）")
     print(f"[INFO] {len(files)} files / 推定={PROP_MODE} (q={LOWER_Q}/{UPPER_Q}) / scipy={'あり' if has_scipy() else 'なし(正規近似)'}"
           f" / WEDGE: 年の最低件数={opts['min_year_count']} 遡る年数≦{opts['max_years']}"
           f" 減衰率={opts['decay']} 窓={opts['window']}")
-    jobs = [(str(p), args.out_dir, opts, None, fam_dicts) for p in files]
+    rule = ["区分"] + ([f"WEDGE≧{copts['min_wedge']}"] if copts["min_wedge"] > 0 else []) + ["layer A"] + (
+        [f"件数≧{copts['min_count']}"] if copts["min_count"] > 0 else [])
+    print("[INFO] コンパクト化: " + (f"ON（{'・'.join(rule)} の行だけ書く）" if copts["enabled"] else "OFF（全部の行を書く）"))
+    legacy = legacy_files(out_dir)
+    if legacy:
+        print(f"[WARN] 旧来の成績表 foragg_*.csv が {len(legacy)} 本あります（例: {legacy[0].name}）。build_db は "
+              "agg_master_*.csv.gz のある master では使いません。容量を空けるには --clean を付けて実行し直すか、"
+              "手で消してください", file=sys.stderr)
+    todo = [p for p in files if p.name not in done]
+    if args.resume:
+        print(f"[INFO] --resume: {len(done)} 本は今の設定で済んでいるので飛ばします（残り {len(todo)} 本）")
+    jobs = [(str(p), str(out_dir), opts, None, fam_dicts, copts, sid) for p in todo]
+    n_done = [0]
+
+    def progress(_i, r):
+        n_done[0] += 1
+        print(f"[{n_done[0]}/{len(jobs)}] {r}", flush=True)
+
     if args.workers > 1:
-        with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            results = list(ex.map(_run, jobs, chunksize=8))
+        results = run_batched(_run, jobs, args.workers, MASTERS_PER_CHILD, lambda j: Path(j[0]).name,
+                              executor=ProcessPoolExecutor, on_result=progress)
     else:
-        results = [_run(j) for j in jobs]
+        results = []
+        for i, j in enumerate(jobs):
+            results.append(_run(j))
+            progress(i, results[-1])
     errors = [r for r in results if r.startswith("[ERROR]")]
-    for r in results:
-        if not r.startswith("[OK]"):
-            print(r)
     _print_wedge_coverage(results, opts["max_years"])
     n_ok = sum(r.startswith("[OK]") for r in results)
-    print(f"[DONE] OK={n_ok} SKIP={sum(r.startswith('[SKIP]') for r in results)} ERROR={len(errors)}")
-    if n_ok == 0:
+    n_skip_done = len(files) - len(todo)
+    print(f"[DONE] OK={n_ok} SKIP={sum(r.startswith('[SKIP]') for r in results)} ERROR={len(errors)}"
+          + (f" 済み（--resume で飛ばした）={n_skip_done}" if n_skip_done else ""))
+    for r in errors:
+        print(r, file=sys.stderr)
+    if n_ok == 0 and n_skip_done == 0:
+        if errors:
+            print(f"[ERROR] すべての master（{len(errors)} 本）が失敗しました（上の [ERROR] を見てください）。"
+                  "直してから --resume を付けて実行すれば、失敗した分だけ集計します", file=sys.stderr)
+            return 1
         print("[ERROR] 集計できた master がありません。replace_csv_ver3.py を先に実行してください", file=sys.stderr)
         return 2
+    if errors:
+        print(f"[WARN] 失敗した master が {len(errors)} 本あります。直してから --resume を付けて実行すれば、その分だけ集計します",
+              file=sys.stderr)
     return 1 if errors else 0
 
 
@@ -419,11 +576,15 @@ def _print_wedge_coverage(results: list[str], max_years: int = DEFAULT_MAX_YEARS
         for g, a in re.findall(r"=(\d+)\(adj (\d+)\)", r):
             total += int(g)
             adj += int(a)
-        m = re.search(r"^\[OK\] (.+?): .*年度窓の終わり=(\S+)$", r)
+        m = re.search(r"^\[OK\] (.+?): .*年度窓の終わり=(\S+)", r)
         if m:
             ends.setdefault(m.group(2), []).append(m.group(1))
     if total:
         print(f"[INFO] adjusted_WEDGE が付いたグループ: {adj}/{total} ({adj / total:.1%})")
+    kept = [(int(k), int(t)) for r in results for k, t in re.findall(r" kept=(\d+)/(\d+)", r)]
+    if kept and sum(t for _, t in kept):
+        k, t = sum(k for k, _ in kept), sum(t for _, t in kept)
+        print(f"[INFO] 書いた行: {k}/{t} ({k / t:.1%})" + ("（コンパクト化）" if k < t else ""))
     if len(ends) > 1:
         detail = ", ".join(f"{y}: {len(v)}本" for y, v in sorted(ends.items()))
         print(f"[WARN] 年度窓の終わり（master の最終年）が master によって違います: {detail}。"

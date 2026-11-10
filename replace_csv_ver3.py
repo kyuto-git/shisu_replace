@@ -26,8 +26,7 @@ import functools
 import gc
 import shutil
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -43,6 +42,7 @@ from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_s
                              frame_group_series, horse_race_id, int_series, race_date, race_id_without_horse, race_year,
                              shinba_mask, split_surface_distance, weight_series)
 from shisu.odds import odds_bucket
+from shisu.parallel import run_batched
 
 MIN_HEADS = 10   # 頭数10頭以上のレースだけ使う（TARGET 側の抽出条件と同じ）
 BASE_INDICATORS = ("タイムM", "対戦M")          # 基本CSV（ext_indices を結び付ける元）になる指数。左ほど優先
@@ -359,32 +359,12 @@ def _job_label(job) -> str:
 
 
 def run_parallel(jobs: list, workers: int) -> list[str]:
-    """jobs を workers 並列で処理する。子プロセスは1つあたり MAX_TASKS_PER_CHILD 件ほどで作り直す: jobs を
-    workers × MAX_TASKS_PER_CHILD 件ずつに分け、まとまりごとに新しい ProcessPoolExecutor を作って終わったら閉じる
-    （基本CSVのキャッシュなどがたまって Docker の OOM Killer に止められるのを防ぐ）。
-    ProcessPoolExecutor(max_tasks_per_child=…) は使わない（Python 3.11・3.12 では、子プロセスが規定の件数で終わったあとに
-    代わりが起動されず、親が止まったままになる。Docker の Python 3.11.18 で再現）。
+    """jobs を workers 並列で処理する。子プロセスは1つあたり MAX_TASKS_PER_CHILD 件ほどで作り直す
+    （shisu/parallel.py の run_batched。jobs を workers × MAX_TASKS_PER_CHILD 件ずつのまとまりに分け、まとまりごとに
+    新しい ProcessPoolExecutor を作って終わったら閉じる。基本CSVのキャッシュなどがたまって Docker の OOM Killer に
+    止められるのを防ぐ）。ProcessPoolExecutor(max_tasks_per_child=…) は使わない（Python 3.11・3.12 で止まる）。
     子プロセスが止められた（BrokenProcessPool）ときは、そのまとまりの終わっていないジョブを [ERROR] にして次へ進む。"""
-    results: list[str | None] = [None] * len(jobs)
-    step = max(1, workers * MAX_TASKS_PER_CHILD)
-    for start in range(0, len(jobs), step):
-        idx = list(range(start, min(start + step, len(jobs))))
-        try:
-            with ProcessPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_run, jobs[i]): i for i in idx}
-                for f in as_completed(futs):
-                    try:
-                        results[futs[f]] = f.result()
-                    except BrokenProcessPool:
-                        pass                        # 下でまとめて [ERROR] にする
-        except BrokenProcessPool:
-            pass
-        for i in idx:
-            if results[i] is None:
-                results[i] = (f"[ERROR] {_job_label(jobs[i])}: 子プロセスが止められました（メモリ不足の可能性。"
-                              "--workers を減らすか、Docker のメモリの割り当てを増やしてやり直してください）")
-        gc.collect()
-    return [r if r is not None else "" for r in results]
+    return run_batched(_run, jobs, workers, MAX_TASKS_PER_CHILD, _job_label, executor=ProcessPoolExecutor)
 
 
 def _run(job) -> str:
