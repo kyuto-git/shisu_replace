@@ -410,8 +410,7 @@ def settings_of(fam_dicts: list[dict], schemes: set[str], wedge_opts: dict, comp
     違う成績表を作り直す。コンパクト化で残す行は shisu/classify.py の閾値でも変わるので、その値も入れる。"""
     from shisu import odds as odds_rules
     from shisu import wedge as wedge_rules
-    rules = {k: v for k, v in sorted(vars(classify_rules).items())
-             if k.isupper() and isinstance(v, (int, float)) and not isinstance(v, bool)}
+    rules = classify_rules.rule_settings()
     return {"version": 1, "families": fam_dicts, "schemes": sorted(schemes), "wedge": wedge_opts,
             "compact": compact, "classify": rules if compact.get("enabled") else {}, "min_sample": MIN_SAMPLE,
             "odds": {"modes": list(odds_rules.ODDS_MODES), "breaks": list(odds_rules.ODDS_BREAKS)},

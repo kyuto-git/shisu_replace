@@ -46,8 +46,8 @@ class Job:
         self.status = "running"
         self.started = _dt.datetime.now()
         self.finished: _dt.datetime | None = None
-        self.current = ""
-        self.step = (0, len(req.sources))
+        self.running: list[str] = []          # いま動いている取得元（同時に動く）
+        self.step = (0, len(req.sources))     # (済んだ数, 全体)
         self.results: dict = {}
         self.stop = threading.Event()
         self.lines: collections.deque[str] = collections.deque(maxlen=5000)
@@ -70,9 +70,22 @@ class Job:
                     self._log_failed = True
                     self.lines.append(f"[WARN] ログファイルに書けません: {e}")
 
+    @property
+    def current(self) -> str:
+        with self._lock:
+            return "・".join(self.running)
+
     def on_source(self, name: str, k: int, n: int) -> None:
-        self.current = SOURCES[name].label
-        self.step = (k, n)
+        with self._lock:
+            self.running.append(SOURCES[name].label)
+            self.step = (self.step[0], n)
+
+    def on_done(self, name: str, done: int, n: int) -> None:
+        with self._lock:
+            label = SOURCES[name].label
+            if label in self.running:
+                self.running.remove(label)
+            self.step = (done, n)
 
     def run(self) -> None:
         """どんな終わり方でも status を running から外す（外さないと以後の実行がすべて 409 になる）。"""
@@ -80,7 +93,7 @@ class Job:
         try:
             session = SESSION_FACTORY() if SESSION_FACTORY else None
             self.results = run_ingest(self.req, self.out_dir, log=self.log, stop=self.stop, session=session,
-                                      sleep=SLEEP, on_source=self.on_source)
+                                      sleep=SLEEP, on_source=self.on_source, on_done=self.on_done)
             bad = [v for v in self.results.values() if isinstance(v, str)]
             status = ("cancelled" if self.stop.is_set() or "CANCELLED" in bad
                       else "error" if bad else "done")
@@ -91,7 +104,8 @@ class Job:
                 pass
         finally:
             self.finished = _dt.datetime.now()
-            self.current = ""
+            with self._lock:
+                self.running.clear()
             self.status = status
             try:
                 self.log(f"[INFO] 終了: {STATUS_LABELS.get(status, status)}")
@@ -311,7 +325,7 @@ RAW_LOCK = threading.Lock()
 JOB_BODY = """
 {% if job_running %}<meta http-equiv="refresh" content="2">{% endif %}
 <div class="card"><h1>実行 {{ run_id }}：{{ status }}</h1>
-{% if job_running %}<div>{{ step[0] }}/{{ step[1] }} {{ current }}</div>
+{% if job_running %}<div>済み {{ step[0] }}/{{ step[1] }}{% if current %} ／ 実行中（同時に取得）: {{ current }}{% endif %}</div>
 <form method="post" action="{{ url_for('ingest.cancel', run_id=run_id) }}" style="margin-top:8px"><button type="submit" style="background:#b91c1c">中止</button></form>{% endif %}
 {% if results %}<table style="margin-top:8px"><thead><tr><th>取得元</th><th>結果</th><th>取得値あり / 行</th><th>ファイル</th></tr></thead><tbody>
 {% for r in results %}<tr><td>{{ r.label }}</td><td>{{ r.state }}</td><td class="num">{{ r.ratio }}</td><td class="num">{{ r.files }}</td></tr>{% endfor %}

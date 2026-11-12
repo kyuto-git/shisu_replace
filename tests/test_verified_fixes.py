@@ -428,8 +428,11 @@ def test_hits_page_caps_rows_per_category(mini, monkeypatch):
     got = {}
     for row in rows:
         got[row["区分"]] = got.get(row["区分"], 0) + 1
+    full = {}
+    for h in am.dedupe_hits(hits):                        # CSV は全件（画面で省く冗長な「通常」の行も含む）
+        full[am.hit_category(h)] = full.get(am.hit_category(h), 0) + 1
     for k, v in buckets.items():
-        assert got.get(CATEGORY_LABELS[k], 0) == len(v)
+        assert got.get(CATEGORY_LABELS[k], 0) == full.get(k, 0) >= len(v)
     F.reset()
 
 
@@ -508,7 +511,8 @@ def test_build_db_missing_families_file_is_reported_before_fresh(tmp_path, monke
 
 # ---------------------------------------------------------------- 4回目の検証の指摘
 def test_spread_cap_fills_budget_when_groups_are_uneven():
-    """行の少ない組は全部出し、余った枠を多い組に回す（1頭に集中していても約 limit 行出る）。"""
+    """行の少ない組は全部出し、余った枠を多い組に回す（1頭に集中していても約 limit 行出る）。
+    枠はオッズ帯別の組に先に配る（2026-11-12〜。通常の行はオッズ帯別の行と重なりやすいので最後）。"""
     import app
     rows = ([{"馬番": "3", "odds_mode": "normal"}] * 800 + [{"馬番": "3", "odds_mode": "odds10u"}] * 300
             + [{"馬番": str(u), "odds_mode": "normal"} for u in range(4, 14) for _ in range(3)])
@@ -518,7 +522,7 @@ def test_spread_cap_fills_budget_when_groups_are_uneven():
     for h in out:
         n[(h["馬番"], h["odds_mode"])] = n.get((h["馬番"], h["odds_mode"]), 0) + 1
     assert all(n[("%d" % u, "normal")] == 3 for u in range(4, 14))
-    assert n[("3", "normal")] == n[("3", "odds10u")] == 235
+    assert n[("3", "odds10u")] == 300 and n[("3", "normal")] == 170
     assert len(app.spread_cap([{"馬番": str(u), "odds_mode": "n"} for u in range(600)], 500)) == 600   # 各組1行は出す
 
 

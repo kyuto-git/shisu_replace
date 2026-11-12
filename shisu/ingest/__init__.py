@@ -10,12 +10,20 @@
 
 画面（app.py の /ingest）と CLI（ingest.py）はどちらも run_ingest() を呼ぶ。
 1つの取得元で失敗しても、残りの取得元は続ける（中止ボタンのときだけ全体を止める）。
+
+並列実行（2026-11-12〜）: 選んだ取得元は、取得元ごとに1スレッドで同時に動かす（ThreadPoolExecutor）。
+  ①〜④ は別々のサイトなので、同時に動かしても1つのサイトへのアクセスは増えない。アクセス間隔は取得元ごとの
+  Fetcher が今までどおり守る（1つの取得元の中は直列。同じサイトに同時に2本のアクセスはしない）。
+  ログは1メッセージずつ排他で出し、どの取得元の行か分かるように取得元の名前を付ける（もとから名前のある行はそのまま）。
+  IngestRequest(parallel=False)（CLI は --sequential）で、前と同じ1つずつの実行になる。
 """
 from __future__ import annotations
 
 import re
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -156,6 +164,7 @@ class IngestRequest:
     keibaai_end: int | None = None
     intervals: dict[str, float] = field(default_factory=dict)
     ext_dir: Path | None = None               # TARGET 取込用CSVを ext_indices/ にも置く（None なら置かない）
+    parallel: bool = True                     # 選んだ取得元を同時に動かす（False なら1つずつ）
 
     def interval_for(self, name: str) -> float:
         v = self.intervals.get(name, SOURCES[name].default_interval)
@@ -194,10 +203,29 @@ def validate(req: IngestRequest) -> list[str]:
     return errors
 
 
+_LEVEL = re.compile(r"^(\[[A-Z]+\] )?")
+
+
+def source_logger(log: Logger, info: SourceInfo, short: str) -> Logger:
+    """取得元の名前を付けて出すログ（同時に動く取得元の行が混ざっても、どの取得元か分かるように）。
+    もとから取得元の名前（short）のある行はそのまま。無い行は「[INFO] {名前}: …」の形にする。"""
+    def tagged(msg: str) -> None:
+        msg = str(msg)
+        first = msg.split("\n", 1)[0]
+        if short in first or info.label in first:
+            log(msg)
+        else:
+            log(_LEVEL.sub(lambda m: f"{m.group(1) or ''}{short}: ", msg, count=1))
+    return tagged
+
+
 def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, stop=None, session=None,
                sleep: Callable[[float], None] = time.sleep,
-               on_source: Callable[[str, int, int], None] | None = None) -> dict[str, Outputs | str]:
-    """選んだ取得元を順に実行する。戻り値: 取得元 → Outputs（失敗は 'ERROR: …'、中止は 'CANCELLED'）。"""
+               on_source: Callable[[str, int, int], None] | None = None,
+               on_done: Callable[[str, int, int], None] | None = None) -> dict[str, Outputs | str]:
+    """選んだ取得元を実行する（既定は同時に。req.parallel=False なら1つずつ）。
+    戻り値: 取得元 → Outputs（失敗は 'ERROR: …'、中止は 'CANCELLED'）。並びは ORDER の順。
+    on_source(name, k, n) は取得元を始めたとき（k = 始めた順）、on_done(name, 済んだ数, n) は終わったときに呼ぶ。"""
     from . import kayochin, keibaai, kichiuma, lap, omega
     from .. import yasui_extractor
 
@@ -207,57 +235,99 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     selected = [s for s in ORDER if s in req.sources]
+    n = len(selected)
+    emit_lock = threading.Lock()
+
+    def emit(msg: str) -> None:              # 1メッセージずつ（別のスレッドの行が途中に入らない）
+        with emit_lock:
+            log(msg)
+
     base = None
     if req.base_paths and any(SOURCES[s].needs == "base" or s == "yasui" for s in selected):
-        base = read_base(req.base_paths, log)
-    results: dict[str, Outputs | str] = {}
-    for k, name in enumerate(selected, 1):
+        base = read_base(req.base_paths, emit)
+    shorts = {"omega": omega.LABEL, "kichiuma": kichiuma.LABEL, "kayochin": kayochin.LABEL, "keibaai": keibaai.LABEL,
+              "lap": lap.LABEL, "yasui": yasui_extractor.LABEL}
+    count_lock = threading.Lock()
+    counts = {"started": 0, "done": 0}
+
+    def run_one(name: str) -> Outputs | str:
         info = SOURCES[name]
+        slog = source_logger(emit, info, shorts[name])
+        if stop is not None and stop.is_set():
+            return "CANCELLED"
+        with count_lock:
+            counts["started"] += 1
+            k = counts["started"]
         if on_source:
-            on_source(name, k, len(selected))
-        log(f"[INFO] ===== {k}/{len(selected)} {info.label} =====")
+            on_source(name, k, n)
+        emit(f"[INFO] ===== {k}/{n} {info.label} =====")
         dest = out_dir / info.folder
+        t0 = time.monotonic()
         try:
             fetcher = None
             if info.scrape:
                 interval = req.interval_for(name)
-                log(f"[INFO] アクセス間隔 {interval:g} 秒")
-                fetcher = Fetcher(interval=interval, session=session, log=log, stop=stop, sleep=sleep)
+                slog(f"[INFO] アクセス間隔 {interval:g} 秒")
+                fetcher = Fetcher(interval=interval, session=session, log=slog, stop=stop, sleep=sleep)
             if name == "omega":
-                res = omega.run(base, fetcher, dest, log)
+                res = omega.run(base, fetcher, dest, slog)
             elif name == "kichiuma":
-                res = kichiuma.run(base, fetcher, dest, log)
+                res = kichiuma.run(base, fetcher, dest, slog)
             elif name == "kayochin":
-                res = kayochin.run(base, fetcher, dest, log)
+                res = kayochin.run(base, fetcher, dest, slog)
             elif name == "keibaai":
-                res = keibaai.run(base, fetcher, dest, req.keibaai_start, req.keibaai_end, log)
+                res = keibaai.run(base, fetcher, dest, req.keibaai_start, req.keibaai_end, slog)
             elif name == "lap":
-                res = lap.run(req.lap_paths, dest, log)
+                res = lap.run(req.lap_paths, dest, slog)
             else:
                 # ベースCSVの指定が無い開催日は ingest_in/base/ と entries_in/ の CSV から探す
-                res = yasui_extractor.run(req.yasui_paths, base, dest, log,
+                res = yasui_extractor.run(req.yasui_paths, base, dest, slog,
                                           search_dirs=(config.ingest_in_dir() / "base", config.entries_in_dir()),
                                           exclude_paths=req.base_paths)
-            results[name] = res
-            log(f"[DONE] {info.label}: {len(res.files)} ファイル")
+            emit(f"[DONE] {info.label}: {len(res.files)} ファイル（{time.monotonic() - t0:.1f} 秒）")
             if req.ext_dir is not None and name in EXT_FOLDERS:
                 ext_to = Path(req.ext_dir) / EXT_FOLDERS[name]
                 try:
-                    copied = copy_to_ext(res.files, dest, ext_to, log)
+                    copied = copy_to_ext(res.files, dest, ext_to, slog)
                 except OSError as e:     # 置けなくても取得の結果（ingest_out）は残っているので、失敗扱いにしない
-                    log(f"[WARN] {info.label}: ext_indices に置けませんでした（{type(e).__name__}: {e}）。"
-                        f"ingest_out の TARGET 取込用CSVを手で {ext_to} に置いてください")
+                    emit(f"[WARN] {info.label}: ext_indices に置けませんでした（{type(e).__name__}: {e}）。"
+                         f"ingest_out の TARGET 取込用CSVを手で {ext_to} に置いてください")
                     copied = []
                 res.ext_files = copied
                 if copied:
-                    log(f"[INFO] {info.label}: TARGET 取込用CSV {len(copied)} 本を {ext_to} に置きました"
-                        "（replace・calc_entry_hensachi が自動で結び付けます）")
+                    emit(f"[INFO] {info.label}: TARGET 取込用CSV {len(copied)} 本を {ext_to} に置きました"
+                         "（replace・calc_entry_hensachi が自動で結び付けます）")
+            return res
         except Cancelled:
-            log("[INFO] 中止しました")
-            results[name] = "CANCELLED"
-            break
+            emit(f"[INFO] {info.label}: 中止しました")
+            return "CANCELLED"
         except Exception as e:  # 1つの取得元の失敗で全体を止めない
-            log(f"[ERROR] {info.label}: {type(e).__name__}: {e}")
-            log(traceback.format_exc(limit=3).rstrip())
-            results[name] = f"ERROR: {type(e).__name__}: {e}"
+            emit(f"[ERROR] {info.label}: {type(e).__name__}: {e}")
+            emit(traceback.format_exc(limit=3).rstrip())
+            return f"ERROR: {type(e).__name__}: {e}"
+        finally:
+            with count_lock:
+                counts["done"] += 1
+                d = counts["done"]
+            if on_done:
+                on_done(name, d, n)
+
+    results: dict[str, Outputs | str] = {}
+    t_all = time.monotonic()
+    if req.parallel and n > 1:
+        emit(f"[INFO] {n} 個の取得元を同時に実行します（アクセス間隔は取得元ごとに守ります。"
+             "ログの各行に取得元の名前が付きます）")
+        with ThreadPoolExecutor(max_workers=n, thread_name_prefix="ingest") as ex:
+            futures = {name: ex.submit(run_one, name) for name in selected}
+            for name in selected:
+                try:
+                    results[name] = futures[name].result()
+                except BaseException as e:      # run_one は例外を外に出さないはず。念のため、ほかの取得元の結果は残す
+                    results[name] = f"ERROR: {type(e).__name__}: {e}"
+        emit(f"[INFO] 全体 {time.monotonic() - t_all:.1f} 秒")
+    else:
+        for name in selected:
+            results[name] = run_one(name)
+            if results[name] == "CANCELLED":
+                break
     return results

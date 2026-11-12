@@ -1119,3 +1119,135 @@ def test_copy_to_ext_reads_existing_files_like_ext_indices(tmp_path, monkeypatch
     for day in ("20251101", "20251102"):
         d = out_csv(ext / f"{day}_omega.csv").set_index("レースID(新)")["ワーク1"]
         assert d.to_dict() == {rid[0]: "55", rid[1]: "60", rid[2]: ""}, day
+
+
+# ---------------------------------------------------------------- 取得元の並列実行（2026-11-12）
+def _three_site_pages():
+    return {omega.race_url("202511010501"): omega_html([(1, 1, "a", "90"), (2, 2, "b", "80")]),
+            omega.race_url("202511010502"): omega_html([(3, 3, "c", "70")]),
+            kichiuma.race_url("202511010504010101"): kichiuma_html([(1, "a", ("1", "2", "3", "4", "5", "6"))]),
+            kayochin.page_url("251101tokyo"): kayochin_html({1: [(1, "52"), (2, "48"), (3, "47")]})}
+
+
+def _site(url: str) -> str:
+    return url.split("/")[2]
+
+
+def _tree(root: Path) -> dict[str, bytes]:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*.csv"))}
+
+
+def test_sources_run_in_parallel_and_match_sequential(tmp_path):
+    """①〜③を選ぶと同時に動く（3つのサイトへの最初のアクセスが、ほかの取得元の終わりを待たずに出る）。
+    結果のファイルは1つずつ実行したときと同じ。ログの各行にどの取得元かが付く。"""
+    base = write_base(tmp_path / "base.csv")
+    sites = {"www.keibalab.jp", "kichiuma.net", "kayochinkeiba.com"}
+    barrier = threading.Barrier(len(sites))
+    first: set[str] = set()
+    lock = threading.Lock()
+
+    class GateSession(FakeSession):
+        def get(self, url, headers=None, timeout=None):
+            site = _site(url)
+            with lock:
+                wait = site not in first
+                first.add(site)
+            if wait:                              # 3つのサイトの最初のアクセスがそろうまで待つ（直列なら時間切れで例外）
+                barrier.wait(timeout=10)
+            return super().get(url, headers, timeout)
+
+    session = GateSession(_three_site_pages())
+    logs: list[str] = []
+    started, done = [], []
+    req = IngestRequest(sources=["omega", "kichiuma", "kayochin"], base_paths=[base])
+    res = run_ingest(req, tmp_path / "par", logs.append, session=session, sleep=lambda _: None,
+                     on_source=lambda n, k, t: started.append((n, k, t)), on_done=lambda n, d, t: done.append((n, d, t)))
+    assert {_site(u) for u in session.calls} == sites and first == sites and not barrier.broken
+    assert list(res) == ["omega", "kichiuma", "kayochin"] and all(isinstance(v, common.Outputs) for v in res.values())
+    assert res["omega"].matched == 3 and res["kayochin"].matched == 3
+    assert sorted(k for _n, k, _t in started) == [1, 2, 3] and sorted(d for _n, d, _t in done) == [1, 2, 3]
+    assert {n for n, _k, _t in started} == {n for n, _d, _t in done} == set(req.sources)
+    # 1つずつの実行と同じ出力
+    seq = run_ingest(IngestRequest(sources=req.sources, base_paths=[base], parallel=False), tmp_path / "seq",
+                     lambda m: None, session=FakeSession(_three_site_pages()), sleep=lambda _: None)
+    assert _tree(tmp_path / "par") == _tree(tmp_path / "seq") and _tree(tmp_path / "par")
+    assert {k: (v.matched, v.total) for k, v in res.items()} == {k: (v.matched, v.total) for k, v in seq.items()}
+    # ログ: 同時に実行する案内・全体の時間・各行にどの取得元か（ベースCSVの読み込みの行は取得元より前）
+    assert any("同時に実行" in m for m in logs) and any(m.startswith("[INFO] 全体 ") for m in logs)
+    names = ("Ω指数", "吉馬6指数", "かよちん指数")
+    body = [m for m in logs if "ベースCSV" not in m and "同時に実行" not in m and "全体 " not in m]
+    assert body and all(any(n in m.split("\n", 1)[0] for n in names) for m in body), [m for m in body if not any(n in m for n in names)]
+    assert any(m.startswith("[INFO] Ω指数（競馬ラボ）: アクセス間隔 3 秒") for m in logs)
+    assert any(m.startswith("[INFO] 吉馬6指数: アクセス間隔 2 秒") for m in logs)
+    assert any(m.startswith("[WARN] かよちん指数: HTTP 404") for m in logs)          # Fetcher の行にも名前が付く
+    assert sum(m.startswith("[DONE] ") for m in logs) == 3
+
+
+def test_parallel_keeps_per_site_interval(tmp_path):
+    """同時に動かしても、1つのサイトへのアクセスは取得元ごとの間隔（Ω 3秒・吉馬 2秒）をあける。"""
+    base = write_base(tmp_path / "base.csv")
+    slept: dict[str, float] = {}
+    order: dict[str, list[str]] = {}
+    lock = threading.Lock()
+
+    class Recorder(FakeSession):
+        def get(self, url, headers=None, timeout=None):
+            with lock:
+                order.setdefault(threading.current_thread().name, []).append(_site(url))
+            return super().get(url, headers, timeout)
+
+    def sleep(sec):                                # 実際には待たず、スレッドごとに待つはずだった秒数を足す
+        with lock:
+            name = threading.current_thread().name
+            slept[name] = slept.get(name, 0.0) + sec
+
+    session = Recorder(_three_site_pages())
+    req = IngestRequest(sources=["omega", "kichiuma"], base_paths=[base])
+    run_ingest(req, tmp_path / "o", lambda m: None, session=session, sleep=sleep)
+    by_site = {sites[0]: (len(sites), slept.get(t, 0.0)) for t, sites in order.items()}
+    assert all(len(set(s)) == 1 for s in order.values()) and len(order) == 2      # 1スレッド = 1サイト
+    n_omega, s_omega = by_site["www.keibalab.jp"]
+    n_kichi, s_kichi = by_site["kichiuma.net"]
+    assert n_omega == 4 and n_kichi == 4                                          # ベースCSVの4レース
+    assert s_omega == pytest.approx(3.0 * (n_omega - 1), abs=0.5)                 # アクセスの間に 3秒ずつ
+    assert s_kichi == pytest.approx(2.0 * (n_kichi - 1), abs=0.5)                 # 2秒ずつ
+
+
+def test_parallel_cancel_and_failure_isolated(tmp_path):
+    """同時に動いている取得元の1つが失敗しても、ほかは続く。中止は動いている全部の取得元に効く。"""
+    base = write_base(tmp_path / "base.csv")
+    logs: list[str] = []
+    req = IngestRequest(sources=["omega", "kayochin", "lap"], base_paths=[base], lap_paths=[tmp_path / "nope.csv"])
+    res = run_ingest(req, tmp_path / "a", logs.append, session=FakeSession(_three_site_pages()), sleep=lambda _: None)
+    assert isinstance(res["lap"], str) and res["lap"].startswith("ERROR")
+    assert isinstance(res["omega"], common.Outputs) and res["omega"].matched == 3
+    assert isinstance(res["kayochin"], common.Outputs) and res["kayochin"].matched == 3
+    assert any(m.startswith("[ERROR] ⑥ ラップ6指数") for m in logs)
+    stop = threading.Event()
+    stop.set()
+    res = run_ingest(IngestRequest(sources=["omega", "kichiuma", "kayochin"], base_paths=[base]), tmp_path / "b",
+                     lambda m: None, stop=stop, session=FakeSession({}), sleep=lambda _: None)
+    assert res == {"omega": "CANCELLED", "kichiuma": "CANCELLED", "kayochin": "CANCELLED"}
+
+
+def test_job_progress_shows_running_sources_and_done_count(tmp_path, monkeypatch):
+    from shisu.ingest import web
+    job = web.Job("r", tmp_path / "r", IngestRequest(sources=["omega", "kichiuma"]))
+    job.on_source("omega", 1, 2)
+    job.on_source("kichiuma", 2, 2)
+    assert job.step == (0, 2) and "Ω指数" in job.current and "吉馬6指数" in job.current
+    job.on_done("omega", 1, 2)
+    assert job.step == (1, 2) and "Ω指数" not in job.current and "吉馬6指数" in job.current
+    job.on_done("kichiuma", 2, 2)
+    assert job.step == (2, 2) and job.current == ""
+
+
+def test_cli_sequential_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path))
+    import ingest as cli_mod
+    base = write_base(tmp_path / "b.csv")
+    seen = {}
+    monkeypatch.setattr(cli_mod, "run_ingest", lambda req, out, *a, **k: seen.setdefault("req", req) and {})
+    assert cli_mod.main(["--sources", "omega", "--base", str(base)]) == 0 and seen.pop("req").parallel is True
+    assert cli_mod.main(["--sources", "omega", "--base", str(base), "--sequential"]) == 0
+    assert seen["req"].parallel is False

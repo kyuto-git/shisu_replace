@@ -386,23 +386,88 @@ def test_sql_condition_matches_python():
     rng = random.Random(3)
     con = sqlite3.connect(":memory:")
     con.execute('CREATE TABLE t (id INTEGER, "件数" INTEGER, "複勝率_val" REAL, "連対率_val" REAL, '
-                '"掲示板率_val" REAL, "複勝回収値" REAL, "単勝適正回収値" REAL)')
+                '"掲示板率_val" REAL, "複勝回収値" REAL, "単勝適正回収値" REAL, "結合データ" TEXT, key TEXT)')
     rows = []
     pick = lambda vals: rng.choice(vals + [None])
-    for i in range(4000):
-        rows.append((i, pick([5, 9, 10, 19, 20, 29, 30, 60]), pick([0, 4.99, 5, 19.99, 33, 60, 70, 80, 95]),
-                     pick([0, 49.9, 50, 60, 80, 90]), pick([0, 9.9, 10, 50, 70, 80, 90, 99]),
-                     pick([0, 99, 100, 150, 200]), pick([0, 99, 100, 150])))
-    con.executemany("INSERT INTO t VALUES (?,?,?,?,?,?,?)", rows)
+    for i in range(12000):
+        key = pick(RARE_KEY_SAMPLES)
+        rows.append((i, pick([5, 6, 9, 10, 11, 12, 14, 15, 19, 20, 29, 30, 60]),
+                     pick([0, 4.99, 5, 19.99, 33, 34.99, 35, 49.99, 50, 60, 70, 80, 95]),
+                     pick([0, 49.9, 50, 60, 80, 90]), pick([0, 9.9, 10, 49.99, 50, 70, 80, 90, 99]),
+                     pick([0, 99, 100, 149.99, 150, 199.99, 200]), pick([0, 99, 100, 149.99, 150, 199.99, 200]),
+                     key, key))
+    con.executemany("INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    seen = set()
     for mode in odds.ODDS_MODES:
         expected = {c: set() for c in C.CATEGORIES}
         for r in rows:
-            cat = C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6]}, mode)
+            cat = C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6],
+                              "key": r[7]}, mode)
             if cat:
                 expected[cat].add(r[0])
+                seen.add((cat, C.is_rare_key(r[7])))
         for cat in C.CATEGORIES:
             got = {x[0] for x in con.execute(f"SELECT id FROM t WHERE {C.sql_condition(cat, mode)}")}
             assert got == expected[cat], (mode, cat)
+            got = {x[0] for x in con.execute(f"SELECT id FROM t WHERE {C.sql_condition(cat, mode, 'key')}")}
+            assert got == expected[cat], (mode, cat, "key")
+    assert seen == {(c, r) for c in C.CATEGORIES for r in (True, False)}       # どの区分も、希少・ふつうの両方を試している
+
+
+RARE_KEY_SAMPLES = ["東京×芝×23-24×定量×G1×3", "中山×芝×2000×内×ハンデ×重賞×1~3位", "準OP・OP×61~65",
+                    "芝×芝長×高×1位", "ダ×ダ長×前走1~3着×6位~", "G1", "重賞×1",
+                    # 希少条件ではない（部品の一部・大文字小文字・似た語）
+                    "東京×ダ×1600×定量×1・2_勝×4", "東京×芝×16-18×馬齢×1勝・OP×2", "芝×芝マイル×61~65",
+                    "騎手G1×1", "g1×1", "芝長い×1", "新馬×重賞級×2", "", "髙杉吏麒×前走上り1~3位×1~5位",
+                    # 末尾の改行・正規表現の記号（1行版・ベクトル版・SQL 版で同じ見方。部品の完全一致だけ）
+                    "東京×芝×2400×定量×G1\n", "G1\n", "(G1)×1", "準OP.OP×1", "x×G1 ×1"]
+
+
+def test_classify_rare_keys_and_high_return():
+    assert [C.is_rare_key(k) for k in RARE_KEY_SAMPLES] == [True] * 7 + [False] * 14
+    assert not C.is_rare_key(None)
+    z = {"fv": 0, "rv": 0, "top5": 0, "frc": 0, "tra": 0}
+    g1, plain = "東京×芝×23-24×定量×G1×3", "東京×芝×16-18×定量×1・2_勝×3"
+    # 希少条件は最低件数が下がる（絶対軸・軸 6、相手 15、消し 12）。ふつうの条件はそのまま
+    for key, n_abs, n_opp, n_ks in ((g1, 6, 15, 12), (plain, 10, 30, 20)):
+        assert C.classify({**z, "cnt": n_abs, "rv": 80, "frc": 100, "key": key}, "normal") == "abs"
+        assert C.classify({**z, "cnt": n_abs - 1, "rv": 80, "frc": 100, "key": key}, "normal") is None
+        assert C.classify({**z, "cnt": n_abs, "fv": 80, "top5": 90, "key": key}, "normal") == "axis"
+        assert C.classify({**z, "cnt": n_abs - 1, "fv": 80, "top5": 90, "key": key}, "normal") is None
+        assert C.classify({**z, "cnt": n_opp, "fv": 60, "top5": 70, "key": key}, "normal") == "opp"
+        assert C.classify({**z, "cnt": n_opp - 1, "fv": 60, "top5": 70, "key": key}, "normal") is None
+        assert C.classify({**z, "cnt": n_ks, "fv": 4.9, "top5": 9.9, "key": key}, "normal") == "keshi"
+        assert C.classify({**z, "cnt": n_ks - 1, "fv": 4.9, "top5": 9.9, "key": key}, "normal") is None
+        assert C.classify({**z, "cnt": n_ks, "fv": 19.9, "top5": 50, "key": key}, "odds10u") == "keshi"
+        assert C.classify({**z, "cnt": n_ks - 1, "fv": 19.9, "top5": 50, "key": key}, "odds10u") is None
+    # 結合データを渡さなければ希少条件ではない（KEY_COLUMN の名前でも渡せる）
+    assert C.classify({**z, "cnt": 6, "rv": 80, "frc": 100}, "normal") is None
+    assert C.classify({**z, "cnt": 6, "rv": 80, "frc": 100, "結合データ": g1}, "normal") == "abs"
+    # 高回収率基準（軸候補）: 10倍未満・10〜50倍のときだけ
+    # （回収値は 単勝適正回収値 で試す。複勝回収値 ≥ 150 だと、もとからある相手候補の条件にも当たるため）
+    hr1 = {**z, "cnt": 30, "fv": 35, "top5": 50, "tra": 200}
+    hr2 = {**z, "cnt": 30, "fv": 50, "tra": 150}
+    for mode, want in (("odds10u", "axis"), ("odds10_50", "axis"), ("odds50p", None), ("normal", None)):
+        assert C.classify(hr1, mode) == want and C.classify(hr2, mode) == want, mode
+        # 複勝回収値で満たしても同じ（50倍以上・通常では、もとの相手候補の条件に当たる）
+        assert C.classify({**hr1, "tra": 0, "frc": 200}, mode) == (want or "opp"), mode
+        assert C.classify({**hr2, "tra": 0, "frc": 150}, mode) == want, mode
+    for miss in ({"cnt": 29}, {"fv": 34.99}, {"top5": 49.99}, {"tra": 199.99}):
+        assert C.classify({**hr1, **miss}, "odds10_50") is None, miss
+    for miss in ({"cnt": 29}, {"fv": 49.99}, {"tra": 149.99}):
+        assert C.classify({**hr2, **miss}, "odds10_50") is None, miss
+    # 希少条件なら高回収率基準は 15件から
+    assert C.classify({**hr1, "cnt": 15, "key": g1}, "odds10_50") == "axis"
+    assert C.classify({**hr1, "cnt": 14, "key": g1}, "odds10_50") is None
+    assert C.classify({**hr1, "cnt": 15, "key": plain}, "odds10_50") is None
+    # 判定順は変わらない: 消し → 絶対軸 → 軸（高回収率でも絶対軸の条件を満たせば絶対軸）
+    assert C.classify({**hr2, "rv": 80, "frc": 150}, "odds10u") == "abs"
+    assert C.classify({**z, "cnt": 30, "fv": 19.9, "top5": 60, "frc": 300, "tra": 300}, "odds10u") == "keshi"
+    # 説明の文と規則の値（設定のハッシュに入る）
+    d = C.description_lines()
+    assert any("高回収率" in x for x in d["axis"]) and all(any("希少条件" in x for x in d[c]) for c in C.CATEGORIES)
+    s = C.rule_settings()
+    assert s["RARE_TOKENS"] == list(C.RARE_TOKENS) and s["HR_CNT"] == 30 and s["RARE_KS_CNT"] == 12
 
 
 # ---------------------------------------------------------------- WEDGE

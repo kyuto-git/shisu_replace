@@ -363,3 +363,41 @@ def test_large_pattern_b_file_is_fast(tmp_path):
     assert vals.iloc[0] == "0" and vals.iloc[12345] == str(12345 % 97) and vals.iloc[-1] == ""
     assert ranks.iloc[199_999] == str(199_999 % 18 + 1)
     assert elapsed < 10, elapsed
+
+
+# ---------------------------------------------------------------------------
+# StridePlus のボーダー（*_border*）を指数にしない
+# ---------------------------------------------------------------------------
+def test_border_files_never_become_indices(tmp_path):
+    """st_border・siagari_border（基準値との差。形は 旧ID, 値, 順位 で指数と同じ）を ST指数・仕上り に混ぜない。
+    フォルダ名で指数が決まる置き方でも、ほかの指数の border でも使わない。本物の値は上書きされない。"""
+    real = {"StridePlus/st082652.csv": "0520380101,54,2\n0520380102,56,1\n",
+            "StridePlus/siagari082652.csv": "0520380101,61,1\n0520380102,48,2\n"}
+    borders = ["StridePlus/st_border082652.csv", "StridePlus/siagari_border082652.csv",
+               "StridePlus/ST_BORDER.csv", "StridePlus/st-border_2026.csv",
+               "StridePlus/st/st_border082652.csv",            # フォルダ名（st）から ST指数 にしない
+               "StridePlus/siagari/border082652.csv", "StridePlus/border/st082652.csv",
+               "StridePlus/sav_border082652.csv", "StridePlus/gokei_border.csv"]
+    for rel, text in real.items():
+        write(tmp_path / rel, text)
+    for rel in borders:                                          # 本物より後に読まれる名前で、値はマイナスの差
+        write(tmp_path / rel, "0520380101,-12,2\n0520380102,-3,1\n")
+    log = Log()
+    sources, skipped = ex.discover(tmp_path, log=log)
+    assert set(sources) == {"ST指数", "仕上り"}
+    assert [p.name for p in sources["ST指数"].files] == ["st082652.csv"]
+    assert [p.name for p in sources["仕上り"].files] == ["siagari082652.csv"]
+    reasons = {p.relative_to(tmp_path).as_posix(): why for p, why in skipped}
+    assert set(reasons) == set(borders) and all("ボーダー" in why for why in reasons.values())
+    assert any("ボーダーのファイル 9本" in m for m in log)
+    st = ex.load_source(sources["ST指数"], log=log)
+    rids = ["202006200503080101", "202006200503080102"]
+    assert [ex.old_id_from_new(r) for r in rids] == ["0520380101", "0520380102"]
+    att = ex.attach_filled(pd.DataFrame({"レースID(新)": rids, "馬番": ["1", "2"]}), st)
+    assert list(att.values) == ["54", "56"]
+    # 接頭辞の表でも border は指数にならない（'st'・'siagari' より先に当たる）
+    assert ex._stride_prefix("st_border082652") == (True, None)
+    assert ex._stride_prefix("siagari_border082652") == (True, None)
+    assert ex._stride_prefix("st082652") == (True, "ST指数") and ex._stride_prefix("siagari082652") == (True, "仕上り")
+    # border という語でなければ外さない
+    assert not ex._is_border("borderline_x") and not ex._is_border("stborder") and ex._is_border("ST-Border_2026")

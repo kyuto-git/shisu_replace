@@ -63,26 +63,35 @@ def _rows(agg_dir: Path) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- 判定のベクトル版
 def test_classify_frame_matches_row_classify():
-    from shisu.classify import FIELD_COLUMNS, classify, classify_frame
+    from shisu.classify import FIELD_COLUMNS, classify, classify_frame, is_rare_key
     rng = np.random.default_rng(7)
-    n = 4000
     pick = lambda vals: rng.choice(np.array(vals, dtype=float), n)      # noqa: E731（境界の値を多めに混ぜる）
+    n = 12000
+    keys = ["東京×芝×23-24×定量×G1×3", "中山×芝×2000×内×ハンデ×重賞×1~3位", "準OP・OP×61~65", "芝×芝長×高×1位",
+            "ダ×ダ長×前走1~3着×6位~", "東京×ダ×1600×定量×1・2_勝×4", "東京×芝×16-18×馬齢×1勝・OP×2", "騎手G1×1",
+            "g1×1", "芝長い×1", "", None, "東京×芝×2400×定量×G1\n", "G1\n", "(G1)×1", "準OP.OP×1"]
     df = pd.DataFrame({
-        "件数": pick([5, 9, 10, 19, 20, 29, 30, 31, 100, np.nan]),
-        "複勝率_val": pick([0, 4.99, 5, 19.99, 20, 32.99, 33, 59.99, 60, 69.99, 70, 79.99, 80, 95, np.nan]),
+        "件数": pick([5, 6, 9, 10, 11, 12, 14, 15, 19, 20, 29, 30, 31, 100, np.nan]),
+        "複勝率_val": pick([0, 4.99, 5, 19.99, 20, 32.99, 33, 34.99, 35, 49.99, 50, 59.99, 60, 69.99, 70, 79.99, 80, 95,
+                         np.nan]),
         "連対率_val": pick([0, 49.99, 50, 59.99, 60, 79.99, 80, 90, np.nan]),
         "掲示板率_val": pick([0, 9.99, 10, 49.99, 50, 69.99, 70, 79.99, 80, 89.99, 90, 100, np.nan]),
-        "複勝回収値": pick([0, 99.99, 100, 149.99, 150, 300, np.nan]),
-        "単勝適正回収値": pick([0, 99.99, 100, 200, np.nan]),
+        "複勝回収値": pick([0, 99.99, 100, 149.99, 150, 199.99, 200, 300, np.nan]),
+        "単勝適正回収値": pick([0, 99.99, 100, 149.99, 150, 199.99, 200, np.nan]),
     })
+    df["結合データ"] = [keys[i] for i in rng.integers(0, len(keys), n)]
     seen = set()
     for mode in ("normal", "odds10u", "odds10_50", "odds50p"):
-        got = classify_frame(df, mode)
-        want = [classify({k: (None if pd.isna(r[c]) else r[c]) for k, c in FIELD_COLUMNS.items()}, mode)
-                for r in df.to_dict("records")]
-        assert list(got) == want, mode
-        seen |= set(want)
-    assert {"keshi", "abs", "axis", "opp", None} <= seen                  # どの区分も試している
+        want = [classify({**{k: (None if pd.isna(r[c]) else r[c]) for k, c in FIELD_COLUMNS.items()},
+                          "key": r["結合データ"]}, mode) for r in df.to_dict("records")]
+        assert list(classify_frame(df, mode)) == want, mode
+        assert list(classify_frame(df.rename(columns={"結合データ": "key"}), mode)) == want, mode
+        seen |= {(w, is_rare_key(k)) for w, k in zip(want, df["結合データ"])}
+        # 結合データの列が無ければ、希少条件ではないものとして判定する
+        plain = [classify({k: (None if pd.isna(r[c]) else r[c]) for k, c in FIELD_COLUMNS.items()}, mode)
+                 for r in df.to_dict("records")]
+        assert list(classify_frame(df.drop(columns=["結合データ"]), mode)) == plain, mode
+    assert seen == {(c, r) for c in ("keshi", "abs", "axis", "opp", None) for r in (True, False)}   # 全部の組を試している
 
 
 # ---------------------------------------------------------------- 名前の規約
@@ -148,7 +157,7 @@ def test_compact_keeps_exactly_the_specified_rows(mb):
     want = []
     for r, raw in zip(db.to_dict("records"), full.to_dict("records")):
         cat = classify({"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
-                        "frc": r["複勝回収値"], "tra": r["単勝適正回収値"]}, r["odds_mode"])
+                        "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"]}, r["odds_mode"])
         w, a = r["WEDGE"], r["adjusted_WEDGE"]
         keep = (cat is not None or (w == w and w >= 0.70) or (a == a and a >= 0.70)
                 or layer[r["family"]] == "A" or int(r["件数"]) >= 30)
@@ -161,6 +170,36 @@ def test_compact_keeps_exactly_the_specified_rows(mb):
     # layer A（初期セットのコース固定）は全部の行が残る
     a_fams = {f for f, ly in layer.items() if ly == "A"}
     assert len(comp[comp["family"].isin(a_fams)]) == len(full[full["family"].isin(a_fams)])
+
+
+def test_compact_mask_uses_rare_minimum_counts_outside_layer_a():
+    """コンパクト化は、希少条件（結合データの部品に G1・芝長 など）の行を、下がった最低件数で区分に入るなら残す
+    （layer A 以外の family。件数・WEDGE の下限では残らない行で確かめる）。ふつうの結合データの同じ成績は落とす。"""
+    from shisu.aggstore import compact_mask, estimate_percent
+    from shisu.classify import classify
+
+    def row(key, cnt, fuku, ren, top5, frc=0.0, tra=0.0):
+        return {"結合データ": key, "件数": cnt, "複勝率": f"{fuku:.2f}%（{fuku:.2f}%）", "連対率": f"{ren:.2f}%（{ren:.2f}%）",
+                "掲示板率_val": top5, "複勝回収値": frc, "単勝適正回収値": tra, "WEDGE": 0.3, "adjusted_WEDGE": None}
+
+    rare, plain = "芝×芝長×高×1位", "芝×芝マイル×高×1位"
+    cases = [("normal", 6, 90.0, 85.0, 95.0, 120.0, 0.0, "abs"),          # 絶対軸: 件数 6（ふつうは 10）
+             ("normal", 7, 82.0, 55.0, 92.0, 0.0, 0.0, "axis"),           # 軸候補: 件数 6
+             ("normal", 15, 62.0, 40.0, 72.0, 0.0, 0.0, "opp"),           # 相手候補: 件数 15（ふつうは 30）
+             ("normal", 12, 3.0, 1.0, 8.0, 0.0, 0.0, "keshi"),            # 消し候補: 件数 12（ふつうは 20）
+             ("odds10_50", 15, 36.0, 10.0, 55.0, 0.0, 210.0, "axis"),     # 高回収率: 件数 15（ふつうは 30）
+             ("odds50p", 15, 36.0, 10.0, 55.0, 0.0, 210.0, None)]         # 高回収率は 50倍以上では使わない
+    for mode, cnt, fuku, ren, top5, frc, tra, want in cases:
+        out = pd.DataFrame([row(rare, cnt, fuku, ren, top5, frc, tra), row(plain, cnt, fuku, ren, top5, frc, tra)])
+        est = {c: float(estimate_percent(out[c]).iloc[0]) for c in ("複勝率", "連対率")}
+        rec = {"cnt": cnt, "fv": est["複勝率"], "rv": est["連対率"], "top5": top5, "frc": frc, "tra": tra}
+        assert classify({**rec, "key": rare}, mode) == want and classify({**rec, "key": plain}, mode) is None, (mode, want)
+        for layer in ("B", "C", "D", "X", ""):
+            got = list(compact_mask(out, mode, layer=layer, min_count=30, min_wedge=0.70))
+            assert got == [want is not None, False], (mode, want, layer)
+        assert list(compact_mask(out, mode, layer="A")) == [True, True]
+        # 結合データの列が無い成績表は、希少条件ではないものとして見る
+        assert list(compact_mask(out.drop(columns=["結合データ"]), mode, layer="B", min_count=30, min_wedge=0.70)) == [False, False]
 
 
 def test_compact_keeps_every_category_key_in_db(mb):

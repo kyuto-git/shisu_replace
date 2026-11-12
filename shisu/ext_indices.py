@@ -65,6 +65,9 @@ STRIDE_PREFIXES: dict[str, str | None] = {
     "senko": "先行", "tsuiso": "追走", "jikyu": "持久", "jizoku": "持続", "shunpatsu": "瞬発",
     "mae_stime": "想定前半", "ato_stime": "想定後半",
     "st_se": None,  # 成績ST指数（廃止）。'st' より先に見る
+    # ボーダー（基準値との差。指数の値ではない）。'st'・'siagari' より先に見て、ST指数・仕上り に混ぜない
+    # （名前に border のあるファイル・フォルダは _helper_reason でも先に外す）
+    "st_border": None, "siagari_border": None,
 }
 _STRIDE_ORDER = sorted(STRIDE_PREFIXES.items(), key=lambda kv: -len(kv[0]))
 
@@ -330,12 +333,24 @@ def _classify(rel: Path) -> tuple[str | None, str]:
     return None, "名前から指数を決められない"
 
 
+_BORDER_RE = re.compile(r"(?:^|_)border(?![a-z])")
+
+
+def _is_border(raw: str) -> bool:
+    """名前に border の語がある（st_border082652・siagari_border_2026・border/ など）。
+    StridePlus のボーダーは「基準値との差」で、指数の値と同じ形（旧ID, 値, 順位）をしている。
+    指数として読むと、本物の st*.csv・siagari*.csv の値をマイナスの差で上書きしてしまう。"""
+    return bool(_BORDER_RE.search(_nk(raw)))
+
+
 def _helper_reason(rel: Path) -> str | None:
     """取得ツールが同じフォルダに書く補助ファイル（2列の形ではない）なら理由。"""
     name = rel.name.casefold()
     stem = _nk(Path(rel.name).stem)
     if any(p.casefold() == "entries_in" for p in rel.parts[:-1]):
         return "entries_in/ の出馬表用CSV（使わない）"
+    if _is_border(Path(rel.name).stem) or any(_is_border(p) for p in rel.parts[:-1]):
+        return "ボーダー（*_border*。基準値との差で、指数の値ではないので使わない）"
     if re.search(r"_merged(?:_\d+)?$", stem):
         return "マージ完全版（*_merged.csv。使わない）"
     if name == "yasui_extract.csv":
@@ -389,7 +404,7 @@ def discover(root: Path | str, log: Logger = print) -> tuple[dict[str, ExtSource
     """root 以下のファイルを指数に振り分ける。
 
     戻り値: (正式指数名 → ExtSource（SUPPORTED の順）, 使わないファイルと理由のリスト)。
-    使わないもの: entries_in/ の下・CSV でない・補助ファイル（*_merged・yasui_extract・*_noid）・
+    使わないもの: entries_in/ の下・CSV でない・補助ファイル（*_merged・yasui_extract・*_noid）・ボーダー（*_border*）・
     廃止された指数（INFO で種類ごとに1回だけ出す）・指数を決められない名前・形式に合わない中身。
     """
     root = Path(root)
@@ -400,6 +415,7 @@ def discover(root: Path | str, log: Logger = print) -> tuple[dict[str, ExtSource
     skipped: list[tuple[Path, str]] = []
     gone: dict[str, list[Path]] = {}
     n_helper = 0
+    borders: list[Path] = []
     unknown: list[tuple[Path, str]] = []
     for path in _walk(root):
         rel = path.relative_to(root)
@@ -408,7 +424,10 @@ def discover(root: Path | str, log: Logger = print) -> tuple[dict[str, ExtSource
             reason = "CSV でない"
         if reason is not None:
             skipped.append((path, reason))
-            n_helper += 1
+            if reason.startswith("ボーダー"):
+                borders.append(rel)
+            else:
+                n_helper += 1
             continue
         kind = next((k for k in map(_discontinued, (*rel.parts[:-1], path.stem)) if k), None)
         if kind:
@@ -437,6 +456,8 @@ def discover(root: Path | str, log: Logger = print) -> tuple[dict[str, ExtSource
             log(f"[INFO] 外部指数 {ind}（形式{PATTERN_OF[ind]}）: {len(files)}ファイル")
     if n_helper:
         log(f"[INFO] 補助ファイルなど {n_helper}本は使いません（マージ完全版・出馬表用・CSV でないもの）")
+    if borders:
+        log(f"[INFO] ボーダーのファイル {len(borders)}本は使いません（*_border*。指数の値ではない。例: {borders[0].as_posix()}）")
     if unknown:
         ex = " / ".join(f"{r.as_posix()}: {why}" for r, why in unknown[:5])
         log(f"[WARN] 使えないファイル {len(unknown)}本（{ex}{' …' if len(unknown) > 5 else ''}）")

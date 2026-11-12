@@ -429,7 +429,8 @@ def test_ranking_preset_matches_classify(base, monkeypatch):
                     '"複勝回収値", "単勝適正回収値", odds_mode FROM unified_all')]
                 want = {(r["テーブル名"], r["結合データ"]) for r in every if classify(
                     {"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
-                     "frc": r["複勝回収値"], "tra": r["単勝適正回収値"]}, r["odds_mode"]) == preset}
+                     "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"]},
+                    r["odds_mode"]) == preset}
                 assert {(r["テーブル名"], r["結合データ"]) for r in got} == want, preset
     finally:
         am.RANK_LIMIT = 500
@@ -670,3 +671,138 @@ def test_replace_run_parallel_survives_killed_worker(monkeypatch):
     assert res[0] == "ok j0.csv" and res[1] == "ok j1.csv" and res[4] == "ok j4.csv"
     assert res[2].startswith("[ERROR] crash.csv: 子プロセスが止められました")
     assert res[3] == "ok j3.csv" or res[3].startswith("[ERROR] j3.csv: 子プロセスが止められました")
+
+
+# ---------------------------------------------------------------- 画面（2026-11-12: 条件ヒット馬・WEDGE 一覧・指数クロス）
+def _fake_hit(race_row, base, mode, cnt, cat, family="normal", key="東京×ダ×1600×定量×1・2_勝×1"):
+    stats = {"abs": (85.0, 90.0, 95.0, 120.0), "axis": (55.0, 82.0, 92.0, 80.0), "keshi": (1.0, 3.0, 8.0, 10.0)}[cat]
+    h = {c: None for c in __import__("shisu.matching", fromlist=["HIT_COLUMNS"]).HIT_COLUMNS}
+    h.update({"馬番": race_row["馬番"], "枠番": race_row["枠番"], "馬名": race_row["馬名"], "騎手": race_row["騎手"],
+              "base": base, "key": key, "family": family, "odds_mode": mode, "rank_scheme": "", "region": "主5場",
+              "indicator": base, "テーブル名": f"t_{mode}_{family}_{base}", "件数": cnt, "連対率_val": stats[0],
+              "複勝率_val": stats[1], "掲示板率_val": stats[2], "複勝回収値": stats[3], "単勝適正回収値": 50.0,
+              "勝率": "", "連対率": "", "複勝率": "", "WEDGE": 0.9, "adjusted_WEDGE": 0.8})
+    return h
+
+
+def test_hits_page_drops_redundant_normal_marks_hot_rows_and_scrolls(base, monkeypatch):
+    """条件ヒット馬: 冗長な「通常」の行を表と馬ごとの該当数から除く・10〜50倍/50倍以上の軸は行を赤字・表は独立スクロールで見出し固定・
+    指数クロス好走馬（軸が複数の指数で出ている馬）の要約と絞り込み。"""
+    am = _app(base, monkeypatch)
+    rid = _race_id(base)
+    with am.connect() as con:
+        race = am._race_rows(con, "entries_merged_hensachi", rid)
+    r1, r2, r3 = race[0], race[1], race[2]
+    fake = [_fake_hit(r1, "SAV", "normal", 20, "abs"), _fake_hit(r1, "SAV", "odds10_50", 18, "abs"),     # 通常は冗長 → 省く
+            _fake_hit(r1, "ZI", "odds50p", 12, "axis"),
+            _fake_hit(r2, "SAV", "normal", 40, "axis"), _fake_hit(r2, "SAV", "odds10u", 30, "axis"),       # 件数が離れている → 残す
+            _fake_hit(r3, "ZI", "normal", 25, "keshi")]
+    monkeypatch.setattr(am, "collect_hits", lambda con, table, rows: (list(fake), "xjoin"))
+    c = am.app.test_client()
+    q = {"table": "entries_merged_hensachi", "rid": rid}
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert "「通常」の行 1 行は、重なるので省いています" in page
+    assert page.count('<tr class="hot">') == 2 and "tr.hot td{color:#b91c1c;font-weight:700;background:#fef2f2}" in page
+    assert ".scroll{max-height:520px;overflow:auto" in page and ".scroll thead th{position:sticky;top:0;z-index:2" in page
+    assert page.count('<div class="scroll"') == 6                       # 指数クロス・馬ごとの該当数・4区分の表
+    assert page.count("<thead>") == page.count('<div class="scroll"')   # どの表も見出しがスクロールの枠の中
+    body = page.split("馬ごとの該当数", 1)[1]
+    assert "絶対軸（1）" in body and "軸候補（3）" in body and "消し候補（1）" in body and "相手候補（0）" in body
+    import re as _re
+    summary = body.split("</table>", 1)[0]
+    row1 = _re.search(r"<tr><td>%s</td><td>%s</td>(.*?)</tr>" % (r1["馬番"], _re.escape(r1["馬名"])), summary, _re.S).group(1)
+    nums = _re.findall(r'<td class="num[^"]*">\s*(?:<b>)?([^<]*)', row1)
+    assert [v.strip() for v in nums] == ["1", "1", "", "", "2", "2"]      # 絶対軸1（通常は数えない）・軸1・消し・相手・穴の軸2・軸の指数数2
+    # 並び: 軸候補は 10倍未満 → 50倍以上 → 通常
+    axis_tbl = body.split('class="card cat-axis"', 1)[1].split("</table>", 1)[0]
+    order = [m for m in _re.findall(r"<td>(10倍未満|10〜50倍|10~50倍|50倍以上|通常)</td>", axis_tbl)]
+    assert order == [am.odds_label("odds10u"), am.odds_label("odds50p"), am.odds_label("normal")]
+    # 指数クロス好走馬: 馬1は SAV と ZI の2指数で軸
+    assert "指数クロス好走馬（絶対軸・軸候補が複数の指数で同時に出ている馬）：1頭" in page
+    assert "：0頭" in c.get("/entries/hits", query_string={**q, "xmin": "3"}).get_data(as_text=True)
+    assert "：2頭" in c.get("/entries/hits", query_string={**q, "xmin": "1"}).get_data(as_text=True)
+    pair = c.get("/entries/hits", query_string={**q, "xmin": "1", "xa": "SAV", "xb": "ZI"}).get_data(as_text=True)
+    assert "：1頭" in pair and "SAV と ZI の両方で軸" in pair
+    only = c.get("/entries/hits", query_string={**q, "xonly": "1"}).get_data(as_text=True).split("馬ごとの該当数", 1)[1]
+    assert "軸候補（1・指数クロスの該当馬だけ）" in only and "消し候補（0・指数クロスの該当馬だけ）" in only
+    assert c.get("/entries/hits", query_string={**q, "xmin": "abc", "xa": "nope", "_anchor": "x"}).status_code == 200
+
+
+def test_race_page_shows_indicator_cross(base, monkeypatch):
+    """出馬表: 複数の指数で同時に上位（順位3位以内・偏差値61以上）の馬の要約と絞り込み。数は DB の値から独立に数える。"""
+    am = _app(base, monkeypatch)
+    with db(base) as con:
+        con.row_factory = sqlite3.Row
+        every = [dict(r) for r in con.execute("SELECT * FROM entries_merged_hensachi")]
+    bases = sorted({c[:-len("_偏差値")] for c in every[0] if c.endswith("_偏差値")})
+    assert len(bases) >= 2
+
+    def tops(r, crit):
+        n = 0
+        for b in bases:
+            try:
+                rank = int(float(r.get(f"{b}_順位") or 0))
+            except ValueError:
+                rank = 0
+            try:
+                hen = float(r.get(f"{b}_偏差値"))
+            except (TypeError, ValueError):
+                hen = None
+            by_rank, by_hen = 1 <= rank <= 3, hen is not None and hen >= 61
+            n += {"rank": by_rank, "hen": by_hen, "both": by_rank and by_hen, "either": by_rank or by_hen}[crit]
+        return n
+
+    by_race = {}
+    for r in every:
+        by_race.setdefault(r["レースID(新/馬番無)"], []).append(r)
+    rid, rows = max(by_race.items(), key=lambda kv: sum(1 for r in kv[1] if tops(r, "either") >= 2))
+    c = am.app.test_client()
+    q = {"table": "entries_merged_hensachi", "rid": rid}
+    for crit in ("either", "rank", "hen", "both"):
+        for xmin in (1, 2, 3):
+            want = sum(1 for r in rows if tops(r, crit) >= xmin)
+            page = c.get("/entries/race", query_string={**q, "xc": crit, "xmin": str(xmin)}).get_data(as_text=True)
+            assert f"指数クロス（複数の指数で同時に上位の馬）：{want}頭" in page, (crit, xmin)
+    assert sum(1 for r in rows if tops(r, "either") >= 2) >= 1, "合成データで2指数同時に上位の馬が要る"
+    page = c.get("/entries/race", query_string=q).get_data(as_text=True)
+    assert 'class="top3' in page and "hen61" in page and '<div class="scroll tall">' in page
+    full = page.split('<div class="scroll tall">', 1)[1]
+    only = c.get("/entries/race", query_string={**q, "xonly": "1"}).get_data(as_text=True).split('<div class="scroll tall">', 1)[1]
+    want = sum(1 for r in rows if tops(r, "either") >= 2)
+    assert full.count("<tr><td>") == len(rows) and only.count("<tr><td>") == want
+    assert c.get("/entries/race", query_string={**q, "xc": "nope", "xmin": "x", "xa": "nope"}).status_code == 200
+
+
+def test_wedge_page_collapses_filters_and_keeps_matrix_on_top(base, monkeypatch):
+    """WEDGE 一覧: 指数・パターンの絞り込みは折りたたみ（選択中の数を見出しに）、馬 × 指数の表がすぐ下・見出し固定。列は今までどおり。"""
+    am = _app(base, monkeypatch)
+    rid = _race_id(base)
+    c = am.app.test_client()
+    q = {"table": "entries_merged_hensachi", "rid": rid}
+    page = c.get("/entries/wedge", query_string=q).get_data(as_text=True)
+    assert '<details class="filters" style="margin-top:6px"><summary>指数・パターンの絞り込みを開く（指数 すべて ／ パターン すべて）</summary>' in page
+    assert "<details open" not in page and "details class=\"filters\" open" not in page
+    d0, d1 = page.index("指数・パターンの絞り込みを開く"), page.index("</details></form>")
+    box = page[d0:d1]
+    assert box.count('name="ind"') >= 2 and box.count('name="family"') >= 10      # チェックボックスは折りたたみの中だけ
+    assert page.count('name="ind"') == box.count('name="ind"') and page.count('name="family"') == box.count('name="family"')
+    m0, k0 = page.index("馬 × 指数（該当キーの"), page.index("全該当キー（")
+    assert d1 < m0 < k0
+    matrix = page[m0:k0]
+    assert matrix.index('<div class="scroll tall"><table><thead>') < matrix.index("<tbody>")
+    for col in ("<th>adj 最大</th>", "<th>adj 平均</th>", "<th>WEDGE 最大</th>", "<th>WEDGE 平均</th>", "<th>該当数</th>"):
+        assert col in matrix
+    assert '<div class="scroll tall">' in page[k0:]
+    sel = c.get("/entries/wedge", query_string={**q, "ind": "SAV", "family": ["normal", "rankB"]}).get_data(as_text=True)
+    assert "指数・パターンの絞り込みを開く（指数 1 個を選択中 ／ パターン 2 個を選択中）" in sel
+    assert "指数・パターンの選択を外す" in sel and "指数・パターンの選択を外す" not in page
+    # 馬 × 指数の値は今までどおり（wedge_matrix の計算は変えていない）
+    with am.connect() as con:
+        race = am._race_rows(con, "entries_merged_hensachi", rid)
+        hits, _ = am.collect_hits(con, "entries_merged_hensachi", race)
+    rows = am.filter_wedge_hits(hits, "normal")
+    m = am.wedge_matrix(race, rows, am.order_bases({h["base"] for h in rows}))
+    best = max((x for x in m if x["adj_max"] is not None), key=lambda x: x["adj_max"], default=None)
+    if best is not None:
+        assert am.fmt(best["adj_max"], 3) in matrix and am.fmt(best["wedge_mean"], 3) in matrix
+

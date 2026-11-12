@@ -2,7 +2,7 @@
 
 開発再開時の「思い出し用」要約。詳細な仕様は **CLAUDE.md** を参照（コードが正、CLAUDE.md はコードに合わせて更新）。
 
-更新日: 2026-11-10
+更新日: 2026-11-12
 
 ## 流れ
 
@@ -54,7 +54,10 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources 
 - 出馬表の外部指数: 出馬表に値のある指数は出馬表の値（ファイル・レースごとに判定）、無い・0 だけのレースは ext_indices から過去側と同じ関数（`ext_indices.attach_filled`）で付ける → 同じ馬なら master と順位・偏差値が一致
 - レース単位（16桁）の レースID(新) は replace が馬番を付けて18桁にする（旧版の band 系の件数膨張の再発防止。tests/test_band_regression.py）
 - family・集計条件だけ変えたときは aggregate → build_db だけでよい（master はそのまま）
-- 馬体重発表後のマイニング確定値: entries_in の出馬表を上書きして calc_entry_hensachi.py --merge-only --clean → build_db.py --entries-only
+- 馬体重発表後のマイニング確定値: entries_in の出馬表を上書きして calc_entry_hensachi.py --mining-only → build_db.py --entries-only --mining-only（タイムM・対戦M の列と xjoin のその2指数の行だけの差分更新。ext_indices は読み直さない。`--indicators 指数,…` で指数を指定。乗り替わり・馬の増減などマイニング以外の照合に関わる値も変わっていたら、自動で全部の計算・全部の照合に切り替わる）
+- 区分の追加（2026-11-12）: 高回収率の軸候補（odds10u・odds10_50 だけ: 件数≧30 かつ [複勝35・掲示板50・回収200 / 複勝50・回収150]）、希少条件（結合データの部品に G1・重賞・準OP・OP・芝長・ダ長）は最低件数を緩和（軸 6・相手 15・消し 12・高回収率 15）。1行版・ベクトル版・SQL 版とも結合データを見る
+- 画面（2026-11-12）: 条件ヒット馬は オッズ帯別と同じ区分・件数差3以内の「通常」の行を省く・並びは 10倍未満 → 10〜50倍 → 50倍以上 → 通常・10〜50倍/50倍以上の軸は赤字の行・表は独立スクロールで見出し固定・指数クロス好走馬（軸が複数の指数）。出馬表に指数クロス（順位3位以内・偏差値61以上が複数の指数）。WEDGE 一覧は指数・パターンの絞り込みを折りたたみ
+- /ingest の取得元は同時に実行（取得元ごとのスレッド。サイトごとの間隔はそのまま。CLI は --sequential で順に）。StridePlus の *_border* は読まない
 - 成績表のコンパクト化（aggregate の既定）: 4区分（絶対軸・軸候補・相手候補・消し候補）・WEDGE か adjusted_WEDGE ≧0.70・layer A・件数≧30 のどれかの行だけを書く（区分と高 WEDGE は1行も落とさない）。全部の行は `--no-compact`
 - aggregate の --workers は master を1本ずつ渡し、workers × 2 本ごとに子プロセスを作り直す。--resume は書き終わりの印（.done: 設定のハッシュ・master の大きさと更新時刻・ファイルの大きさ）が今と合う master だけを飛ばす（違えば作り直す）。コンパクト化の下限を外すのは none
 - 画面の「集計表ごと」は常に unified_all のテーブル名が同じ行（前の版の DB に foragg_* テーブルが残っていても使わない。表示は前の版と同じ）
