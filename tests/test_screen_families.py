@@ -93,10 +93,10 @@ def test_classification_counts_equal_production(base, screened, tmp_path):
         assert build_db.main(["--mode", "foragg", "--agg-dir", str(out), "--db-path", str(db), "--fresh"]) == 0
         with sqlite3.connect(db) as con:
             rows = con.execute('SELECT family, COALESCE(rank_scheme, \'\'), odds_mode, "件数", "複勝率_val", "連対率_val", '
-                               '"掲示板率_val", "複勝回収値", "単勝適正回収値" FROM unified_all').fetchall()
+                               '"掲示板率_val", "複勝回収値", "単勝適正回収値", "結合データ" FROM unified_all').fetchall()
         counts: dict[tuple, int] = {}
-        for fam, sc, mode, cnt, fv, rv, top5, frc, tra in rows:
-            c = classify({"cnt": cnt, "fv": fv, "rv": rv, "top5": top5, "frc": frc, "tra": tra}, mode)
+        for fam, sc, mode, cnt, fv, rv, top5, frc, tra, key in rows:
+            c = classify({"cnt": cnt, "fv": fv, "rv": rv, "top5": top5, "frc": frc, "tra": tra, "key": key}, mode)
             if c:
                 counts[(fam, sc, mode, c)] = counts.get((fam, sc, mode, c), 0) + 1
         return counts, db, len(rows)

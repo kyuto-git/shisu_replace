@@ -7,9 +7,10 @@
                  （前の版の DB に1表ずつのテーブル foragg_* が残っていても使わない。前の版の unified_all は
                  そのテーブルを同じ順で詰め直したものなので、表示は同じ）
   /entries       出馬表のレース一覧（日付・場所で絞り込み）
-  /entries/race  出馬表（各馬の指数順位・偏差値）
+  /entries/race  出馬表（各馬の指数順位・偏差値）と指数クロス（複数の指数で同時に上位の馬）
   /entries/key   結合データの前方一致で unified_all を表示
-  /entries/hits  条件ヒット馬（絶対軸・軸候補・消し候補・相手候補）
+  /entries/hits  条件ヒット馬（絶対軸・軸候補・消し候補・相手候補）と指数クロス好走馬（軸が複数の指数で出ている馬）。
+                 オッズ帯別の行と重なる「通常」の行は省き、10〜50倍・50倍以上の軸の行は赤字で出す
   /entries/wedge レース別 WEDGE 一覧（全馬 × 該当する全キーの WEDGE / adjusted_WEDGE。閾値で足切りしない）
   /ingest        指数の取得（Ω・吉馬・かよちん・keibaAI のスクレイピング、ラップ計算、安井Excel。shisu/ingest/web.py）
   /healthz       DB 接続確認
@@ -187,6 +188,15 @@ th.num,td.num{text-align:right}
 .nav a{display:inline-block;margin-right:8px;padding:6px 10px;background:#e5e7eb;border-radius:8px;color:#111827;text-decoration:none}
 a{color:#2563eb;text-decoration:none} a:hover{text-decoration:underline}
 .cat-abs h1{color:#7c2d12} .cat-axis h1{color:#1d4ed8} .cat-keshi h1{color:#6b7280} .cat-opp h1{color:#047857}
+/* 表だけを縦にスクロールする枠（見出しの行を上に固定する。.card は横スクロール用の枠なので、ページのスクロールでは固定されない） */
+.scroll{max-height:520px;overflow:auto;border:1px solid #eef2f7;border-radius:8px}
+.scroll.tall{max-height:72vh}
+.scroll thead th{position:sticky;top:0;z-index:2;background:#f8fafc;box-shadow:0 1px 0 #e5e7eb}
+/* 10〜50倍・50倍以上で絶対軸・軸候補に当たった行（狙い目の穴馬） */
+tr.hot td{color:#b91c1c;font-weight:700;background:#fef2f2}
+.hotnum{color:#b91c1c;font-weight:700}
+td.top3{font-weight:700} td.hen61{background:#ecfdf5} td.top3.hen61{background:#d1fae5}
+details.filters>summary{cursor:pointer;font-size:13px;color:#1d4ed8;padding:4px 0}
 </style></head><body><header>{{ title }}</header><div class="container">
 <div class="nav"><a href="{{ url_for('index') }}">横断検索</a><a href="{{ url_for('entries_index') }}">出馬表</a><a href="{{ url_for('ingest.index') }}">指数の取得</a></div>
 {% if db_warning %}<div class="card warn">{{ db_warning }}</div>{% endif %}
@@ -566,15 +576,87 @@ def _race_rows(con, table: str, rid: str, legacy_ridn: str = "", date: str = "")
         f'SELECT * FROM {q(table)} WHERE {" AND ".join(cond)} ORDER BY CAST("馬番" AS INTEGER)', params)]
 
 
+CROSS_RANK_MAX = 3          # 指数クロス: 順位がこの位以内なら「上位」
+CROSS_HEN_MIN = 61.0        # 指数クロス: 偏差値がこれ以上なら「上位」
+CROSS_CRITERIA = {"either": f"順位{CROSS_RANK_MAX}位以内 または 偏差値{CROSS_HEN_MIN:g}以上", "rank": f"順位{CROSS_RANK_MAX}位以内",
+                  "hen": f"偏差値{CROSS_HEN_MIN:g}以上", "both": f"順位{CROSS_RANK_MAX}位以内 かつ 偏差値{CROSS_HEN_MIN:g}以上"}
+CROSS_MIN_CHOICES = (1, 2, 3, 4, 5, 6, 8, 10)
+
+
+def order_bases(bases) -> list[str]:
+    """指数の並び（台帳の順。台帳に無いものは名前順で後ろ）。"""
+    rank = {n: i for i, n in enumerate(INDICATOR_ORDER)}
+    return sorted(bases, key=lambda b: (rank.get(b, len(rank)), b))
+
+
+def cross_request() -> dict:
+    """指数クロスの絞り込み（出馬表・条件ヒット馬で共通の引数。xmin=何指数以上, xa/xb=この2指数の両方, xonly=該当馬だけ）。"""
+    crit = request.args.get("xc", "either").strip()
+    try:
+        xmin = int(request.args.get("xmin", "2"))
+    except ValueError:
+        xmin = 2
+    return {"crit": crit if crit in CROSS_CRITERIA else "either", "xmin": min(max(xmin, 1), 99),
+            "a": request.args.get("xa", "").strip(), "b": request.args.get("xb", "").strip(),
+            "only": request.args.get("xonly", "") == "1"}
+
+
+def cross_rows(rows: list[dict], bases: list[str], crit: str = "either", a: str = "", b: str = "",
+               xmin: int = 2) -> list[dict]:
+    """出馬表の馬ごとに、上位（crit: 順位3位以内・偏差値61以上）になっている指数を数える。
+    hit = 上位の指数が xmin 個以上で、a・b を指定したときはその両方が上位。"""
+    out = []
+    for r in rows:
+        tops = []
+        for base in bases:
+            rank = to_int(r.get(f"{base}_順位"), 0) or None
+            hen = _num(r.get(f"{base}_偏差値"))
+            by_rank = rank is not None and rank <= CROSS_RANK_MAX
+            by_hen = hen is not None and hen >= CROSS_HEN_MIN
+            ok = {"rank": by_rank, "hen": by_hen, "both": by_rank and by_hen}.get(crit, by_rank or by_hen)
+            if ok:
+                tops.append({"base": base, "rank": rank, "hen": hen})
+        names = {t["base"] for t in tops}
+        pair = (not a or a in names) and (not b or b in names)
+        out.append({"uma": str(r.get("馬番", "")), "waku": r.get("枠番", ""), "name": r.get("馬名", ""),
+                    "jockey": r.get("騎手", ""), "tops": tops, "n": len(tops), "hit": len(tops) >= xmin and pair})
+    return out
+
+
+CROSS_FORM = """
+<form method="get" style="margin-top:6px">{% for k, v in cross_hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+<div class="grid">
+  {% if cross_crit is not none %}<div><label>上位の基準</label><select name="xc">{% for k, lab in cross_criteria.items() %}
+    <option value="{{ k }}" {{ 'selected' if k == cross.crit else '' }}>{{ lab }}</option>{% endfor %}</select></div>{% endif %}
+  <div><label>何指数以上で同時に</label><select name="xmin">{% for n in cross_min_choices %}
+    <option value="{{ n }}" {{ 'selected' if n == cross.xmin else '' }}>{{ n }} 指数以上</option>{% endfor %}</select></div>
+  <div><label>指数A（A・B の両方）</label><select name="xa"><option value="">（指定なし）</option>
+    {% for b in cross_bases %}<option value="{{ b }}" {{ 'selected' if b == cross.a else '' }}>{{ b }}</option>{% endfor %}</select></div>
+  <div><label>指数B</label><select name="xb"><option value="">（指定なし）</option>
+    {% for b in cross_bases %}<option value="{{ b }}" {{ 'selected' if b == cross.b else '' }}>{{ b }}</option>{% endfor %}</select></div>
+  <div><label>&nbsp;</label><label class="cb"><input type="checkbox" name="xonly" value="1" {{ 'checked' if cross.only else '' }}>該当馬だけを下の表に出す</label></div>
+  <div><label>&nbsp;</label><button type="submit">絞り込む</button></div>
+</div></form>
+"""
+
 RACE_BODY = """
 <div class="card"><h1>{{ head }}</h1><div class="muted">{{ sub }}</div>
 <div style="margin-top:6px"><a href="{{ url_for('entries_hits', table=table, rid=rid) }}" target="_blank">条件ヒット馬を見る</a>
  ／ <a href="{{ url_for('entries_wedge', table=table, rid=rid) }}" target="_blank">WEDGE一覧を見る</a></div></div>
-<div class="card"><table><thead><tr><th>枠番</th><th>馬番</th><th>騎手</th><th>馬名</th>
+<div class="card"><h1>指数クロス（複数の指数で同時に上位の馬）：{{ cross_hits|length }}頭</h1>
+<div class="muted">上位 = {{ cross_criteria[cross.crit] }}。{{ cross.xmin }} 指数以上で同時に上位{% if cross.a or cross.b %}・{{ [cross.a, cross.b]|select|join(' と ') }} が上位{% endif %} の馬</div>
+""" + CROSS_FORM + """
+<div class="scroll" style="margin-top:8px"><table><thead><tr><th>枠番</th><th>馬番</th><th>馬名</th><th>騎手</th><th class="num">上位の指数数</th><th>上位の指数（順位 / 偏差値）</th></tr></thead><tbody>
+{% for x in cross_hits %}<tr><td>{{ x.waku }}</td><td>{{ x.uma }}</td><td>{{ x.name }}</td><td>{{ x.jockey }}</td><td class="num"><b>{{ x.n }}</b></td>
+<td style="white-space:normal">{% for t in x.tops %}<span class="tag">{{ t.base }} {{ t.rank if t.rank else '—' }}位 / {{ fmt(t.hen, 0) if t.hen is not none else '—' }}</span>{% endfor %}</td></tr>
+{% else %}<tr><td colspan="6">該当する馬はいません（基準・指数数を変えてみてください）</td></tr>{% endfor %}</tbody></table></div></div>
+<div class="card"><div class="muted">太字 = 順位{{ rank_max }}位以内、緑の背景 = 偏差値{{ hen_min }}以上{% if cross.only %}（指数クロスの該当馬だけを表示中）{% endif %}</div>
+<div class="scroll tall"><table><thead><tr><th>枠番</th><th>馬番</th><th>騎手</th><th>馬名</th><th class="num">上位数</th>
 {% for b in bases %}<th>{{ b }}<div class="muted">順位 / 偏差値 / 帯</div></th>{% endfor %}<th>結合データ（先頭部分）</th></tr></thead>
-<tbody>{% for r in rows %}<tr><td>{{ r['枠番'] }}</td><td>{{ r['馬番'] }}</td><td>{{ r['騎手'] }}</td><td>{{ r['馬名'] }}</td>
-{% for b in bases %}<td>{{ r.get(b ~ '_順位') or '' }}{% if r.get(b ~ '_順位') %}位{% endif %} / {{ r.get(b ~ '_偏差値') or '' }} / {{ r.get(b ~ '_偏差値帯') or '' }}</td>{% endfor %}
-<td>{% if head_key %}<a href="{{ url_for('entries_key', key=head_key) }}" target="_blank">{{ head_key }}</a>{% endif %}</td></tr>{% endfor %}</tbody></table></div>
+<tbody>{% for r in rows %}{% set x = cross_by[r['馬番']|string] %}<tr><td>{{ r['枠番'] }}</td><td>{{ r['馬番'] }}</td><td>{{ r['騎手'] }}</td><td>{{ r['馬名'] }}</td>
+<td class="num">{% if x.hit %}<b class="hotnum">{{ x.n }}</b>{% else %}{{ x.n or '' }}{% endif %}</td>
+{% for b in bases %}<td class="{{ cell_class(r, b) }}">{{ r.get(b ~ '_順位') or '' }}{% if r.get(b ~ '_順位') %}位{% endif %} / {{ r.get(b ~ '_偏差値') or '' }} / {{ r.get(b ~ '_偏差値帯') or '' }}</td>{% endfor %}
+<td>{% if head_key %}<a href="{{ url_for('entries_key', key=head_key) }}" target="_blank">{{ head_key }}</a>{% endif %}</td></tr>{% endfor %}</tbody></table></div></div>
 """
 
 
@@ -587,6 +669,13 @@ def _head_key(r: dict) -> str:
     return "×".join(parts)
 
 
+def cell_class(r: dict, base: str) -> str:
+    """出馬表のセルの強調（順位3位以内は太字、偏差値61以上は背景）。"""
+    rank = to_int(r.get(f"{base}_順位"), 0)
+    hen = _num(r.get(f"{base}_偏差値"))
+    return " ".join(c for c, ok in (("top3", 1 <= rank <= CROSS_RANK_MAX), ("hen61", hen is not None and hen >= CROSS_HEN_MIN)) if ok)
+
+
 @app.route("/entries/race", methods=["GET"])
 def entries_race():
     table = request.args.get("table", "").strip()
@@ -596,15 +685,25 @@ def entries_race():
         if not _valid_entries_table(con, table) or not (rid or legacy):
             return redirect(url_for("entries_index"))
         rows = _race_rows(con, table, rid, legacy, request.args.get("date", "").strip())
-        bases = indicator_bases(table_columns(con, table))
+        bases = order_bases(indicator_bases(table_columns(con, table)))
     if not rows:
         return render("出馬表", '<div class="card">該当レースがありません。</div>')
     h = rows[0]
+    rid = h.get("レースID(新/馬番無)", rid)
     head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}'
     sub = (f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")}（キー: {h.get("距離", "")}） / '
            f'内外: {h.get("芝(内・外)", "") or "—"} / 重量: {h.get("重量種別", "") or "—"} / クラス: {h.get("クラス名", "")}')
-    return render("出馬表", RACE_BODY, head=head, sub=sub, rows=rows, bases=bases, table=table,
-                  rid=h.get("レースID(新/馬番無)", rid), head_key=_head_key(h))
+    cross = cross_request()
+    cross["a"], cross["b"] = (v if v in bases else "" for v in (cross["a"], cross["b"]))
+    xs = cross_rows(rows, bases, cross["crit"], cross["a"], cross["b"], cross["xmin"])
+    hits = sorted((x for x in xs if x["hit"]), key=lambda x: (-x["n"], to_int(x["uma"])))
+    hit_umas = {x["uma"] for x in hits}
+    shown = [r for r in rows if not cross["only"] or str(r.get("馬番", "")) in hit_umas]
+    return render("出馬表", RACE_BODY, head=head, sub=sub, rows=shown, bases=bases, table=table, rid=rid,
+                  head_key=_head_key(h), cross=cross, cross_hits=hits, cross_by={x["uma"]: x for x in xs},
+                  cross_bases=bases, cross_criteria=CROSS_CRITERIA, cross_crit=cross["crit"],
+                  cross_min_choices=CROSS_MIN_CHOICES, cross_hidden=[("table", table), ("rid", rid)],
+                  cell_class=cell_class, rank_max=CROSS_RANK_MAX, hen_min=f"{CROSS_HEN_MIN:g}")
 
 
 KEY_BODY = """
@@ -665,87 +764,173 @@ def hit_category(h: dict) -> str | None:
     """ヒット行の区分（abs / axis / keshi / opp / None）。classify と同じ判定。"""
     return classify({"cnt": h.get("件数"), "fv": h.get("複勝率_val"), "rv": h.get("連対率_val"),
                      "top5": h.get("掲示板率_val"), "frc": h.get("複勝回収値"),
-                     "tra": h.get("単勝適正回収値")}, h.get("odds_mode") or "normal")
+                     "tra": h.get("単勝適正回収値"), "key": h.get("key")}, h.get("odds_mode") or "normal")
 
 
-def classify_hits(hits: list[dict]) -> dict[str, list[dict]]:
+# 条件ヒット馬の並び・表示の優先度（オッズ帯。通常は、オッズ帯を分けた行と中身が重なりやすいので最後）
+HITS_ODDS_RANK = {"odds10u": 0, "odds10_50": 1, "odds50p": 2, "normal": 3}
+REDUNDANT_NORMAL_DIFF = 3              # 通常とオッズ帯別の件数の差がこれ以内なら、通常の行は同じ馬の集まりなので省く
+HOT_MODES = ("odds10_50", "odds50p")   # このオッズ帯で絶対軸・軸候補に当たった行は、狙い目の穴馬として強調する
+HOT_CATEGORIES = ("abs", "axis")
+
+
+def is_hot(h: dict, cat: str | None) -> bool:
+    return cat in HOT_CATEGORIES and (h.get("odds_mode") or "normal") in HOT_MODES
+
+
+def drop_redundant_normal(rows: list[tuple[dict, str]]) -> tuple[list[tuple[dict, str]], int]:
+    """(ヒット行, 区分) の並びから、冗長な「通常」の行を除く。戻り値: (残した並び, 除いた行数)。
+
+    同じ馬・指数・パターン（スキーム・地域も）・結合データで、通常（normal）とオッズ帯別（10倍未満・10〜50倍・50倍以上の
+    どれか）が同じ区分に当たり、件数の差が REDUNDANT_NORMAL_DIFF 件以内なら、通常の行はオッズ帯別の行とほぼ同じ馬の
+    集まりなので除く（件数が離れていれば、通常の行はほかのオッズ帯の馬も含む別の情報なので残す）。"""
+    def ident(h: dict, cat: str) -> tuple:
+        return (h.get("馬番"), h.get("base"), h.get("family"), h.get("rank_scheme") or "", h.get("region") or "",
+                h.get("key"), cat)
+
+    subs: dict[tuple, list[float]] = {}
+    for h, cat in rows:
+        if (h.get("odds_mode") or "normal") != "normal":
+            n = _num(h.get("件数"))
+            if n is not None:
+                subs.setdefault(ident(h, cat), []).append(n)
+    out, dropped = [], 0
+    for h, cat in rows:
+        if (h.get("odds_mode") or "normal") == "normal":
+            n = _num(h.get("件数"))
+            if n is not None and any(abs(n - m) <= REDUNDANT_NORMAL_DIFF for m in subs.get(ident(h, cat), ())):
+                dropped += 1
+                continue
+        out.append((h, cat))
+    return out, dropped
+
+
+def classify_hits(hits: list[dict], info: dict | None = None) -> dict[str, list[dict]]:
+    """ヒット行を区分ごとに分ける（重複と、冗長な「通常」の行を除く）。info を渡すと、除いた行数を info["dropped"] に入れる。
+    並びは オッズ帯（10倍未満 → 10〜50倍 → 50倍以上 → 通常）→ 馬番 → 複勝率（消しは昇順）→ 指数・パターン・キー・集計表
+    （同点の並びも決めるので、表示の上限で出る行が、照合結果の行の順に左右されない）。"""
+    rows = [(h, cat) for h in dedupe_hits(hits) for cat in (hit_category(h),) if cat]
+    rows, dropped = drop_redundant_normal(rows)
+    if info is not None:
+        info["dropped"] = dropped
     buckets: dict[str, list[dict]] = {c: [] for c in CATEGORIES}
-    seen: set = set()
-    for h in hits:
-        ident = (h.get("馬番"), h.get("base"), h.get("family"), h.get("key"), h.get("テーブル名"))
-        if ident in seen:
-            continue
-        seen.add(ident)
-        cat = hit_category(h)
-        if cat:
-            buckets[cat].append(h)
+    for h, cat in rows:
+        buckets[cat].append(h)
 
     def fv(h):
         v = h.get("複勝率_val")
         return float(v) if v is not None else 0.0
 
-    for cat, rows in buckets.items():
+    ind_rank = {n: i for i, n in enumerate(INDICATOR_ORDER)}
+
+    def tie(h):      # 同点の並びを照合の経路（xjoin の行の順・その場照合）に依らず同じにする: 指数（台帳の順）→ パターン → キー → 集計表
+        b = str(h.get("base") or "")
+        return (ind_rank.get(b, len(ind_rank)), b, str(h.get("family") or ""), str(h.get("rank_scheme") or ""),
+                str(h.get("key") or ""), str(h.get("テーブル名") or ""))
+
+    for cat, items in buckets.items():
         sign = 1 if cat == "keshi" else -1
-        rows.sort(key=lambda h: (ODDS_RANK.get(h.get("odds_mode") or "normal", 9), to_int(h.get("馬番")), sign * fv(h)))
+        items.sort(key=lambda h: (HITS_ODDS_RANK.get(h.get("odds_mode") or "normal", 9), to_int(h.get("馬番")), sign * fv(h)) + tie(h))
     return buckets
 
 
 HITS_BODY = """
 <div class="card"><h1>{{ head }}</h1><div class="muted">{{ sub }}</div>
-<div class="muted">照合: {{ path }} ／ 率は DB の推定値（複勝率・連対率）と頻度（掲示板率）</div>
-<div style="margin-top:6px"><a href="{{ url_for('entries_wedge', table=table, rid=rid) }}" target="_blank">このレースの WEDGE 一覧（閾値なし・全キー）</a></div></div>
-<div class="card"><h1>馬ごとの該当数</h1><table><thead><tr><th>馬番</th><th>馬名</th>
-{% for c in order %}<th class="num">{{ CATEGORY_LABELS[c] }}</th>{% endfor %}</tr></thead><tbody>
-{% for s in summary %}<tr><td>{{ s.uma }}</td><td>{{ s.name }}</td>{% for c in order %}<td class="num">{{ s[c] or '' }}</td>{% endfor %}</tr>{% endfor %}
-</tbody></table></div>
+<div class="muted">照合: {{ path }} ／ 率は DB の推定値（複勝率・連対率）と頻度（掲示板率）
+{% if dropped %} ／ オッズ帯別の行と同じ区分・件数の差{{ diff }}件以内の「通常」の行 {{ dropped }} 行は、重なるので省いています{% endif %}</div>
+<div style="margin-top:6px"><a href="{{ url_for('entries_race', table=table, rid=rid) }}">出馬表（指数クロス）</a> ／
+<a href="{{ url_for('entries_wedge', table=table, rid=rid) }}" target="_blank">このレースの WEDGE 一覧（閾値なし・全キー）</a></div></div>
+<div class="card"><h1>指数クロス好走馬（絶対軸・軸候補が複数の指数で同時に出ている馬）：{{ cross_hits|length }}頭</h1>
+<div class="muted">絶対軸・軸候補の行がある指数を馬ごとに数えます。{{ cross.xmin }} 指数以上{% if cross.a or cross.b %}・{{ [cross.a, cross.b]|select|join(' と ') }} の両方で軸{% endif %} の馬。
+<span class="hotnum">赤字</span> = 10〜50倍・50倍以上のオッズ帯で軸に当たった指数（狙い目の穴）</div>
+""" + CROSS_FORM + """
+<div class="scroll" style="margin-top:8px"><table><thead><tr><th>馬番</th><th>馬名</th><th>騎手</th><th class="num">軸の指数数</th><th class="num">うち穴</th><th>軸に当たった指数（絶対軸 / 軸候補 の行数）</th></tr></thead><tbody>
+{% for x in cross_hits %}<tr><td>{{ x.uma }}</td><td>{{ x.name }}</td><td>{{ x.jockey }}</td><td class="num"><b>{{ x.n }}</b></td><td class="num hotnum">{{ x.n_hot or '' }}</td>
+<td style="white-space:normal">{% for t in x.inds %}<span class="tag{{ ' hotnum' if t.hot else '' }}">{{ t.base }} {{ t.abs }} / {{ t.axis }}</span>{% endfor %}</td></tr>
+{% else %}<tr><td colspan="6">該当する馬はいません（指数数を下げてみてください）</td></tr>{% endfor %}</tbody></table></div></div>
+<div class="card"><h1>馬ごとの該当数</h1><div class="scroll"><table><thead><tr><th>馬番</th><th>馬名</th>
+{% for c in order %}<th class="num">{{ CATEGORY_LABELS[c] }}</th>{% endfor %}<th class="num">穴の軸（10倍以上）</th><th class="num">軸の指数数</th></tr></thead><tbody>
+{% for s in summary %}<tr><td>{{ s.uma }}</td><td>{{ s.name }}</td>{% for c in order %}<td class="num">{{ s[c] or '' }}</td>{% endfor %}
+<td class="num hotnum">{{ s.hot or '' }}</td><td class="num">{% if s.cross %}<b>{{ s.n_ind }}</b>{% else %}{{ s.n_ind or '' }}{% endif %}</td></tr>{% endfor %}
+</tbody></table></div></div>
 {% for c in order %}
-<div class="card cat-{{ c }}"><h1>{{ CATEGORY_LABELS[c] }}（{{ buckets[c]|length }}）</h1>
+<div class="card cat-{{ c }}"><h1>{{ CATEGORY_LABELS[c] }}（{{ buckets[c]|length }}{% if cross.only %}・指数クロスの該当馬だけ{% endif %}）</h1>
 <div class="muted">{% for line in desc[c] %}• {{ line }}<br>{% endfor %}</div>
-{% if view[c]|length < buckets[c]|length %}<div class="warn">{{ view[c]|length }} 行だけ表示しています（全 {{ buckets[c]|length }} 行。馬・オッズ帯ごとに偏らないように選んでいます）。全件は <a href="{{ url_for('entries_wedge_csv', table=table, rid=rid, odds_mode='all') }}">WEDGE 一覧の CSV</a>（「区分」列で絞れます）</div>{% endif %}
-<table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
+{% if view[c]|length < buckets[c]|length %}<div class="warn">{{ view[c]|length }} 行だけ表示しています（全 {{ buckets[c]|length }} 行。馬・オッズ帯ごとに偏らないように選び、オッズ帯別の行を通常の行より先に出しています）。全件は <a href="{{ url_for('entries_wedge_csv', table=table, rid=rid, odds_mode='all') }}">WEDGE 一覧の CSV</a>（「区分」列で絞れます）</div>{% endif %}
+<div class="scroll"><table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
 <th>件数</th><th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>勝率</th><th>連対率</th><th>複勝率</th>
 <th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th></tr></thead><tbody>
-{% for h in view[c] %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
+{% for h in view[c] %}<tr{% if is_hot(h, c) %} class="hot"{% endif %}><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
 <td>{{ h['base'] }}</td><td>{{ family_label(h['family'], h['rank_scheme']) }}</td><td>{{ odds_label(h['odds_mode']) }}</td><td>{{ h['region'] }}</td><td>{{ h['key'] }}</td>
 <td class="num">{{ h['件数'] }}</td>{% for k in ['勝率_val','連対率_val','複勝率_val','掲示板率_val'] %}<td class="num">{{ fmt(h[k]) }}</td>{% endfor %}
 <td>{{ h['勝率'] }}</td><td>{{ h['連対率'] }}</td><td>{{ h['複勝率'] }}</td>
 {% for k in ['平均着順','単勝回収値','複勝回収値','単勝適正回収値','WEDGE','adjusted_WEDGE','adjusted_WEDGE_年数'] %}<td class="num">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}</tr>
-{% else %}<tr><td colspan="24">該当なし</td></tr>{% endfor %}</tbody></table></div>
+{% else %}<tr><td colspan="24">該当なし</td></tr>{% endfor %}</tbody></table></div></div>
 {% endfor %}
 """
 HITS_ORDER = ("abs", "axis", "keshi", "opp")
 HITS_VIEW_LIMIT = 500        # 区分ごとに画面に出すおよその行数（全件は /entries/wedge.csv。馬ごとの該当数は全件で数える）
 
 
+def _even_cap(sizes: list[int], limit: int) -> int:
+    """組ごとの行数 sizes を、合計が limit に収まるように同じ上限 c で切るときの最大の c（どの組も最低1行は出す）。"""
+    sizes = sorted(sizes)
+    per, used = 1, 0
+    for i, n in enumerate(sizes):
+        c = (limit - used) // (len(sizes) - i)
+        if c < n:
+            return max(per, c)
+        used += n
+        per = n
+    return sizes[-1] if sizes else 0
+
+
 def spread_cap(rows: list[dict], limit: int) -> list[dict]:
     """表示を limit 行ほどに絞る。先頭から切ると後ろの馬・オッズ帯が丸ごと消えるので、
-    (馬番, オッズ帯) ごとの行数の上限 c をそろえる（行の少ない組は全部出し、余った枠は多い組に回す。並びは元のまま）。"""
+    (馬番, オッズ帯) ごとの行数の上限をそろえる（行の少ない組は全部出し、余った枠は多い組に回す。並びは元のまま）。
+    枠はオッズ帯別（10倍未満・10〜50倍・50倍以上）の組に先に配り、通常の組は残りの枠（どの組も最低1行は出す）。"""
     if len(rows) <= limit:
         return rows
     groups: dict[tuple, int] = {}
     for h in rows:
-        g = (h.get("馬番"), h.get("odds_mode"))
+        g = (h.get("馬番"), h.get("odds_mode") or "normal")
         groups[g] = groups.get(g, 0) + 1
-    sizes = sorted(groups.values())
-    per, used_rows = 1, 0           # 合計が limit に収まる最大の c（どの組も最低1行は出す）
-    for i, n in enumerate(sizes):
-        rest = len(sizes) - i
-        c = (limit - used_rows) // rest
-        if c < n:
-            per = max(per, c)
-            break
-        used_rows += n
-        per = n
-    else:
-        per = sizes[-1]
+    sub = {g: n for g, n in groups.items() if g[1] != "normal"}
+    normal = {g: n for g, n in groups.items() if g[1] == "normal"}
+    cap_sub = _even_cap(list(sub.values()), max(limit - len(normal), len(sub))) if sub else 0
+    used_sub = sum(min(n, cap_sub) for n in sub.values())
+    cap_normal = _even_cap(list(normal.values()), max(limit - used_sub, len(normal))) if normal else 0
     used: dict[tuple, int] = {}
     out = []
     for h in rows:
-        g = (h.get("馬番"), h.get("odds_mode"))
-        if used.get(g, 0) < per:
+        g = (h.get("馬番"), h.get("odds_mode") or "normal")
+        if used.get(g, 0) < (cap_normal if g[1] == "normal" else cap_sub):
             used[g] = used.get(g, 0) + 1
             out.append(h)
     return out
+
+
+def axis_cross(race: list[dict], buckets: dict[str, list[dict]], a: str = "", b: str = "", xmin: int = 2) -> list[dict]:
+    """馬ごとに、絶対軸・軸候補の行がある指数を数える（指数クロス好走馬）。
+    hit = その指数が xmin 個以上で、a・b を指定したときはその両方で軸に当たっている。"""
+    per: dict[str, dict[str, dict]] = {}
+    for cat in HOT_CATEGORIES:
+        for h in buckets.get(cat, ()):
+            d = per.setdefault(str(h.get("馬番")), {}).setdefault(h.get("base"), {"abs": 0, "axis": 0, "hot": False})
+            d[cat] += 1
+            d["hot"] = d["hot"] or is_hot(h, cat)
+    out = []
+    for r in race:
+        uma = str(r.get("馬番", ""))
+        inds = [{"base": bname, **per.get(uma, {})[bname]} for bname in order_bases(per.get(uma, {}))]
+        names = {t["base"] for t in inds}
+        pair = (not a or a in names) and (not b or b in names)
+        out.append({"uma": uma, "name": r.get("馬名", ""), "jockey": r.get("騎手", ""), "inds": inds, "n": len(inds),
+                    "n_hot": sum(1 for t in inds if t["hot"]), "hit": len(inds) >= xmin and pair})
+    return out
+
+
+app.jinja_env.globals.update(is_hot=is_hot)
 
 
 @app.route("/entries/hits", methods=["GET"])
@@ -758,23 +943,38 @@ def entries_hits():
             return redirect(url_for("entries_index"))
         race = _race_rows(con, table, rid, legacy, request.args.get("date", "").strip())
         hits, path = collect_hits(con, table, race)
+        bases = order_bases(indicator_bases(table_columns(con, table)))
     if not race:
         return render("条件ヒット馬", '<div class="card">該当レースがありません。</div>')
-    buckets = classify_hits(hits)
+    info: dict = {}
+    buckets = classify_hits(hits, info)
     h = race[0]
+    rid = h.get("レースID(新/馬番無)", rid)
+    cross = cross_request()
+    cross["a"], cross["b"] = (v if v in bases else "" for v in (cross["a"], cross["b"]))
+    xs = axis_cross(race, buckets, cross["a"], cross["b"], cross["xmin"])
+    by_uma = {x["uma"]: x for x in xs}
+    cross_hits = sorted((x for x in xs if x["hit"]), key=lambda x: (-x["n"], -x["n_hot"], to_int(x["uma"])))
+    hit_umas = {x["uma"] for x in cross_hits}
     summary = []
     for r in race:
         uma = r.get("馬番", "")
         s = {"uma": uma, "name": r.get("馬名", "")}
         for c in HITS_ORDER:
             s[c] = sum(1 for x in buckets[c] if x.get("馬番") == uma)
+        s["hot"] = sum(1 for c in HOT_CATEGORIES for x in buckets[c] if x.get("馬番") == uma and is_hot(x, c))
+        s["n_ind"] = by_uma[str(uma)]["n"]
+        s["cross"] = str(uma) in hit_umas
         summary.append(s)
+    shown = {c: [x for x in buckets[c] if not cross["only"] or str(x.get("馬番")) in hit_umas] for c in HITS_ORDER}
     head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}'
     sub = f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")} / {h.get("クラス名_raw", "")} / {len(race)}頭'
-    return render("条件ヒット馬", HITS_BODY, head=head, sub=sub, path=path, buckets=buckets,
+    return render("条件ヒット馬", HITS_BODY, head=head, sub=sub, path=path, buckets=shown,
                   order=HITS_ORDER, desc=description_lines(), summary=summary, table=table,
-                  view={c: spread_cap(buckets[c], HITS_VIEW_LIMIT) for c in HITS_ORDER},
-                  rid=h.get("レースID(新/馬番無)", rid))
+                  view={c: spread_cap(shown[c], HITS_VIEW_LIMIT) for c in HITS_ORDER}, rid=rid,
+                  dropped=info.get("dropped", 0), diff=REDUNDANT_NORMAL_DIFF, cross=cross, cross_hits=cross_hits,
+                  cross_bases=bases, cross_criteria=CROSS_CRITERIA, cross_crit=None,
+                  cross_min_choices=CROSS_MIN_CHOICES, cross_hidden=[("table", table), ("rid", rid)])
 
 
 # ========================= レース別 WEDGE 一覧 =========================
@@ -878,8 +1078,9 @@ WEDGE_BODY = """
 <style>.w-top{background:#bbf7d0}.w-good{background:#dcfce7}.w-avg{background:#f0fdf4}.w-low{background:#f3f4f6;color:#6b7280}
 td.cell{text-align:right;min-width:64px} td.cell .sub{color:#6b7280;font-size:11px}</style>
 <div class="card"><h1>{{ head }}</h1><div class="muted">{{ sub }}</div>
-<div class="muted">照合: {{ path }} ／ 閾値による足切りなし（オッズ帯・指数・パターン・馬番の選択だけで絞る）。
-WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=下位）。adjusted_WEDGE は年度加重（空欄=条件を満たす年が無い）</div>
+<details class="filters"><summary>照合: {{ path }} ／ 閾値による足切りなし ／ WEDGE の見方を開く</summary>
+<div class="muted">オッズ帯・指数・パターン・馬番の選択だけで絞ります（WEDGE の値では足切りしません）。
+WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=下位）。adjusted_WEDGE は年度加重（空欄=条件を満たす年が無い）</div></details>
 <div style="margin-top:6px"><a href="{{ url_for('entries_race', table=table, rid=rid) }}">出馬表</a> ／
 <a href="{{ url_for('entries_hits', table=table, rid=rid) }}">条件ヒット馬</a> ／
 <a href="{{ csv_url }}">この条件の全行を CSV でダウンロード</a></div></div>
@@ -893,25 +1094,28 @@ WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=�
   <div><label>並べ替え</label><select name="sort">{% for c in sorts %}<option value="{{ c }}" {{ 'selected' if c == q_sort else '' }}>{{ c }}</option>{% endfor %}</select></div>
   <div><label>順序</label><select name="dir"><option value="DESC" {{ 'selected' if q_dir == 'DESC' else '' }}>大きい順</option>
     <option value="ASC" {{ 'selected' if q_dir == 'ASC' else '' }}>小さい順</option></select></div>
+  <div><label>&nbsp;</label><button type="submit">表示</button></div>
 </div>
-<div style="margin-top:8px"><label>指数（未選択=すべて）</label><div class="cbs">{% for b in bases %}
+<details class="filters" style="margin-top:6px"><summary>指数・パターンの絞り込みを開く（指数 {{ q_inds|length or 'すべて' }}{{ ' 個を選択中' if q_inds else '' }} ／ パターン {{ q_fams|length or 'すべて' }}{{ ' 個を選択中' if q_fams else '' }}）</summary>
+<div style="margin-top:8px"><label>指数（未選択=すべて。全 {{ bases|length }}）</label><div class="cbs">{% for b in bases %}
   <label class="cb"><input type="checkbox" name="ind" value="{{ b }}" {{ 'checked' if b in q_inds else '' }}>{{ b }}</label>{% endfor %}</div></div>
-<div style="margin-top:8px"><label>パターン（未選択=すべて）</label><div class="cbs">{% for f in families %}
+<div style="margin-top:8px"><label>パターン（未選択=すべて。全 {{ families|length }}）</label><div class="cbs">{% for f in families %}
   <label class="cb"><input type="checkbox" name="family" value="{{ f }}" {{ 'checked' if f in q_fams else '' }}>{{ family_label(f) }}</label>{% endfor %}</div></div>
-<div style="margin-top:10px"><button type="submit">表示</button></div></form></div>
+<div style="margin-top:10px"><button type="submit">この絞り込みで表示</button>
+{% if q_inds or q_fams %} <a href="{{ clear_url }}" style="margin-left:10px">指数・パターンの選択を外す</a>{% endif %}</div></details></form></div>
 
 <div class="card"><h1>馬 × 指数（該当キーの adjusted_WEDGE 最大 / WEDGE 最大・該当数）</h1>
-<table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>該当数</th><th>adj 最大</th><th>adj 平均</th><th>WEDGE 最大</th><th>WEDGE 平均</th>
+<div class="scroll tall"><table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>該当数</th><th>adj 最大</th><th>adj 平均</th><th>WEDGE 最大</th><th>WEDGE 平均</th>
 {% for b in matrix_bases %}<th>{{ b }}</th>{% endfor %}</tr></thead><tbody>
 {% for m in matrix %}<tr><td>{{ m.waku }}</td><td>{{ m.uma }}</td><td>{{ m.name }}</td><td>{{ m.jockey }}</td><td class="num">{{ m.n }}</td>
 <td class="cell {{ wedge_class(m.adj_max) }}">{{ fmt(m.adj_max, 3) }}</td><td class="cell">{{ fmt(m.adj_mean, 3) }}</td>
 <td class="cell {{ wedge_class(m.wedge_max) }}">{{ fmt(m.wedge_max, 3) }}</td><td class="cell">{{ fmt(m.wedge_mean, 3) }}</td>
 {% for b in matrix_bases %}{% set c = m.cells[b] %}<td class="cell {{ wedge_class(c.adj if c.adj is not none else c.wedge) }}">
 {% if c.n %}{{ fmt(c.adj, 3) if c.adj is not none else '—' }}<div class="sub">{{ fmt(c.wedge, 3) }}・{{ c.n }}件</div>{% endif %}</td>{% endfor %}</tr>{% endfor %}
-</tbody></table></div>
+</tbody></table></div></div>
 
 <div class="card"><h1>全該当キー（{{ total }}行{% if total > shown|length %}・画面は先頭 {{ shown|length }} 行。残りは CSV で{% endif %}）</h1>
-<table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
+<div class="scroll tall"><table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
 <th>件数</th><th>WIN</th><th>EDGE</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th><th>年の件数計</th><th>最終年</th>
 <th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>単勝回収値</th><th>複勝回収値</th></tr></thead><tbody>
 {% for h in shown %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
@@ -919,7 +1123,7 @@ WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=�
 <td><a href="{{ url_for('entries_key', key=h['key']) }}" target="_blank">{{ h['key'] }}</a></td><td class="num">{{ h['件数'] }}</td>
 {% for k in ['WIN','EDGE','WEDGE','adjusted_WEDGE'] %}<td class="num {{ wedge_class(h.get(k)) if k in ('WEDGE','adjusted_WEDGE') else '' }}">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}
 {% for k in ['adjusted_WEDGE_年数','adjusted_WEDGE_件数','adjusted_WEDGE_最終年','勝率_val','連対率_val','複勝率_val','掲示板率_val','単勝回収値','複勝回収値'] %}<td class="num">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}</tr>
-{% else %}<tr><td colspan="23">該当なし（この出馬表の馬の条件に合う集計行がありません）</td></tr>{% endfor %}</tbody></table></div>
+{% else %}<tr><td colspan="23">該当なし（この出馬表の馬の条件に合う集計行がありません）</td></tr>{% endfor %}</tbody></table></div></div>
 """
 
 
@@ -949,8 +1153,7 @@ def _wedge_data(p: dict):
         bases = indicator_bases(table_columns(con, p["table"]))
     # connect() が DB の __families__ を台帳に反映したあとで、family の絞り込みを確かめる
     p["fams"] = [v for v in p["fams"] if v in fam_registry.active_names()]
-    rank = {n: i for i, n in enumerate(INDICATOR_ORDER)}
-    bases = sorted(bases, key=lambda b: (rank.get(b, len(rank)), b))
+    bases = order_bases(bases)
     rows = sort_wedge_hits(filter_wedge_hits(hits, p["odds_mode"], p["inds"], p["fams"], p["uma"]),
                            p["sort"], p["dir"] == "DESC")
     return race, rows, path, bases
@@ -978,7 +1181,8 @@ def entries_wedge():
                   q_odds=p["odds_mode"], q_inds=p["inds"], q_fams=p["fams"], q_uma=p["uma"], q_sort=p["sort"],
                   q_dir=p["dir"], matrix=wedge_matrix(matrix_race, rows, matrix_bases), matrix_bases=matrix_bases,
                   total=len(rows), shown=rows[:WEDGE_VIEW_LIMIT],
-                  csv_url=url_for("entries_wedge_csv", **args))
+                  csv_url=url_for("entries_wedge_csv", **args),
+                  clear_url=url_for("entries_wedge", **{k: v for k, v in args.items() if k not in ("ind", "family")}))
 
 
 @app.route("/entries/wedge.csv", methods=["GET"])

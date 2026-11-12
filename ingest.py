@@ -12,6 +12,8 @@
 出力: ingest_out/{実行日時}/{取得元}/...（TARGET 取込用の日付別2列CSV と マージ完全版。詳細は shisu/ingest/）
       TARGET 取込用CSV（Ω・吉馬・かよちん・keibaAI・安井）は ext_indices/ にも置く（--no-ext-copy で置かない）
 アクセス間隔の既定: Ω・かよちん 3秒、ほかは2秒（1秒未満は1秒にする）。
+選んだ取得元は同時に実行する（取得元ごとに1スレッド。①〜④は別々のサイトなので、サイトごとのアクセス間隔はそのまま守る）。
+ログの各行に取得元の名前が付く。--sequential で前と同じ1つずつの実行。
 """
 from __future__ import annotations
 
@@ -50,6 +52,8 @@ def main(argv=None) -> int:
     ap.add_argument("--keibaai-start", type=int)
     ap.add_argument("--keibaai-end", type=int)
     ap.add_argument("--interval", type=float, help="スクレイピングのアクセス間隔（秒。全取得元に同じ値。既定は取得元ごと）")
+    ap.add_argument("--sequential", action="store_true",
+                    help="取得元を1つずつ実行する（既定は同時に実行。ログを取得元ごとにまとめて読みたいとき用）")
     ap.add_argument("--no-ext-copy", action="store_true",
                     help="TARGET 取込用CSVを ext_indices/ に置かない（既定は置く。過去レース・出馬表に自動で結び付く）")
     ap.add_argument("--out", default=str(config.ingest_out_dir()), help="出力のルート（既定 ingest_out）")
@@ -67,6 +71,7 @@ def main(argv=None) -> int:
         intervals={n: args.interval for n in names if n in SOURCES and SOURCES[n].scrape}
         if args.interval is not None else {},
         ext_dir=None if args.no_ext_copy else config.ext_dir(),
+        parallel=not args.sequential,
     )
     errors = validate(req)
     if errors:

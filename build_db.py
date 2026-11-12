@@ -21,6 +21,9 @@
 作り直す。掲示板率_val は頻度のまま。率はすべて 0–100。
 WIN / EDGE / WEDGE / adjusted_WEDGE（と adjusted_WEDGE_年数・件数・最終年）は集計CSVの値をそのまま入れる。
 
+--indicators タイムM,対戦M（--mining-only はその短い書き方）: 出馬表（entries_*）を取り込み直したあと、照合結果
+  entries_xjoin_* を全部作り直さず、base がその指数の行だけを消して、その指数だけを照合し直す（馬体重の発表後の
+  マイニング確定値の差し替え用。ほかの指数の照合結果は前のまま。--mode entries として動く）。
 --prune は今回作り直した出馬表の古いテーブル（entries_*・entries_xjoin_*）だけを消す。成績表（unified_all・
 __tables_meta__ の kind=foragg・前の版の foragg_*）は触らない（前の版の foragg_* は --mode foragg の入れ替えで消える。
 多すぎて残ったときは --fresh）。
@@ -28,8 +31,12 @@ __tables_meta__ の kind=foragg・前の版の foragg_*）は触らない（前�
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import re
 import sqlite3
 import sys
+import uuid
 import zlib
 from pathlib import Path
 
@@ -38,12 +45,14 @@ import pandas as pd
 from shisu import config
 from shisu import families as fam_registry
 from shisu.conditions import CONDITION_COLUMNS, derive, load_inner_lookup, standardize_entries
-from shisu.csvio import norm_series, read_csv_any
-from shisu.matching import HIT_COLUMNS, STAT_COLUMNS, UNIFIED, indicator_bases, match_entry_row, unified_status
+from shisu.csvio import norm_series, norm_text, read_csv_any
+from shisu.matching import (HIT_COLUMNS, HORSE_COLUMNS, PART_FIELDS, STAT_COLUMNS, UNIFIED, indicator_bases,
+                            match_entry_row, rank_text, unified_status)
 from shisu.aggstore import (FLOAT_COLUMNS, INT_COLUMNS, RATE_NAMES, ROW_META, agg_master_files,  # noqa: F401
                             IDENTITY_KEYS, STAMP_SUFFIX, estimate_percent, iter_agg_chunks, legacy_files,
                             master_identity, prepare_agg_frame, read_stamp)
 from shisu.csvio import READ_ENCODINGS
+from shisu.indicators import canonical_indicator, is_known_indicator
 from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, file_stem, parse_agg_master_name,
                           parse_foragg_stem, table_name_for_entries, table_name_for_foragg, xjoin_table_for)
 from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_series, distance_series,
@@ -55,6 +64,7 @@ META = "__tables_meta__"
 FACETS = "__facets__"
 FAMILIES_TABLE = fam_registry.DB_TABLE
 UNIFIED_BUILD = UNIFIED + "__build"
+MINING_INDICATORS = ("タイムM", "対戦M")
 AGG_CHUNK_ROWS = 200_000
 # 前の版の1表ずつのテーブル foragg_* を作り直しのときに消す上限。DROP TABLE は1本ごとにスキーマを書き直すので
 # 本数の2乗で遅くなる（1.6万本で約13秒、数十万本だと何時間も）。超えたら消さずに残して --fresh を勧める
@@ -107,6 +117,23 @@ def replace_meta(con: sqlite3.Connection, kinds: tuple[str, ...], rows: list[dic
 
 def table_exists(con: sqlite3.Connection, name: str) -> bool:
     return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+BUILD_INFO = "__build_info__"          # DB の作り直しの印（key, value）
+UNIFIED_STAMP = "unified_stamp"        # unified_all を入れ替えるたびに変わる値
+XJOIN_INFO = "xjoin_of:"               # + xjoin のテーブル名 → その照合結果が何から作られたか（JSON。xjoin_record）
+
+
+def set_info(con: sqlite3.Connection, key: str, value: str | None) -> None:
+    con.execute(f"CREATE TABLE IF NOT EXISTS {BUILD_INFO} (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute(f"INSERT OR REPLACE INTO {BUILD_INFO} (key, value) VALUES (?, ?)", (key, value))
+
+
+def get_info(con: sqlite3.Connection, key: str) -> str | None:
+    if not table_exists(con, BUILD_INFO):
+        return None
+    r = con.execute(f"SELECT value FROM {BUILD_INFO} WHERE key = ?", (key,)).fetchone()
+    return r[0] if r else None
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +401,7 @@ def swap_unified(con: sqlite3.Connection, facets: dict[str, set] | None = None) 
     con.execute(f"ALTER TABLE {q(UNIFIED_BUILD)} RENAME TO {UNIFIED}")
     _create_unified_indexes(con)
     rebuild_facets(con, facets)
+    set_info(con, UNIFIED_STAMP, uuid.uuid4().hex)    # これより前に作った照合結果（xjoin）は古い成績表のもの
     n = con.execute(f"SELECT COUNT(*) FROM {UNIFIED}").fetchone()[0]
     print(f"[foragg] unified_all: {n} rows" + (f"（前の版の1表ずつのテーブル foragg_* {n_old} 個を消しました）" if n_old else ""))
     if n_left:
@@ -537,6 +565,97 @@ def build_xjoin(con: sqlite3.Connection, entries_table: str, families=None) -> d
             "indicator": ",".join(bases)}
 
 
+def _digest(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def match_signatures(con: sqlite3.Connection, entries_table: str) -> dict:
+    """出馬表のテーブルの、照合結果を決める値のハッシュ。
+    plain = 馬の列・キーの部品・22条件（どの指数の照合にも効く）、bases[指数] = その指数の順位・偏差値帯（馬ごと）。
+    馬体重など照合に使わない列は入らない。"""
+    cur = con.execute(f"SELECT * FROM {q(entries_table)}")
+    names = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    pos = {c: i for i, c in enumerate(names)}
+    plain = [c for c in dict.fromkeys(HORSE_COLUMNS + PART_FIELDS) if c in pos]
+    ident = [c for c in ("レースID(新)", "レースID(新/馬番無)", "場 R", "馬番") if c in pos]
+    out = {"plain": _digest([plain, sorted([norm_text(r[pos[c]]) for c in plain] for r in rows)]), "bases": {}}
+    for b in indicator_bases(names):
+        rk, bd = pos[f"{b}_順位"], pos.get(f"{b}_偏差値帯")
+        out["bases"][b] = _digest(sorted([norm_text(r[pos[c]]) for c in ident]
+                                         + [rank_text(r[rk]), norm_text(r[bd]) if bd is not None else ""] for r in rows))
+    return out
+
+
+def xjoin_record(con: sqlite3.Connection, entries_table: str) -> dict:
+    """照合結果（xjoin）が何から作られたか: 成績表の印（unified_stamp）と、出馬表の照合を決める値のハッシュ。
+    照合結果と同じトランザクションで __build_info__ に残す（途中で止まった実行の照合結果には、古い記録が残るか記録が無い）。"""
+    return {"unified": get_info(con, UNIFIED_STAMP), **match_signatures(con, entries_table)}
+
+
+def load_xjoin_record(con: sqlite3.Connection, xname: str) -> dict | None:
+    try:
+        rec = json.loads(get_info(con, XJOIN_INFO + xname) or "null")
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) and isinstance(rec.get("bases"), dict) else None
+
+
+def partial_blocker(rec: dict | None, now: dict, targets) -> str | None:
+    """targets の指数の行だけの作り直しで済ませてよいか。よければ None、だめなら理由（全部の指数を照合し直す）。
+    rec = 今の照合結果を作ったときの記録、now = 今の成績表と出馬表から作った記録。"""
+    if rec is None:
+        return "この照合結果を作ったときの記録がありません（前の版で作った・前の実行が途中で止まった）"
+    if rec.get("unified") != now["unified"]:
+        return "今の成績表（unified_all）より前に作った照合結果です"
+    if rec.get("plain") != now["plain"]:
+        return "馬・騎手・枠・コースや前走の条件が、照合結果を作ったときの出馬表から変わっています"
+    skip = set(targets)
+    was = {b: h for b, h in rec["bases"].items() if b not in skip}
+    cur = {b: h for b, h in now["bases"].items() if b not in skip}
+    if was != cur:
+        diff = sorted(b for b in set(was) | set(cur) if was.get(b) != cur.get(b))
+        return f"ほかの指数（{'・'.join(diff[:5])}{' など' if len(diff) > 5 else ''}）の順位・偏差値帯が変わっています"
+    return None
+
+
+def refresh_xjoin(con: sqlite3.Connection, entries_table: str, targets: list[str], families=None) -> dict | None:
+    """entries_xjoin_* のうち、base が targets の指数の行だけを作り直す（ほかの指数の行はそのまま）。
+    照合は build_xjoin と同じ match_entry_row。xjoin が無い・列の形が今と違うときは None（呼び出し側で全部作り直す）。"""
+    families = tuple(families or fam_registry.active_names())
+    xname = xjoin_table_for(entries_table)
+    if not table_exists(con, xname):
+        return None
+    if [r[1] for r in con.execute(f"PRAGMA table_info({q(xname)})")] != list(HIT_COLUMNS):
+        return None
+    cur = con.execute(f"SELECT * FROM {q(entries_table)}")
+    names = [d[0] for d in cur.description]
+    rows = [dict(zip(names, r)) for r in cur.fetchall()]
+    all_bases = indicator_bases(names)
+    bases = [b for b in all_bases if b in set(targets)]
+    con.execute(f"DELETE FROM {q(xname)} WHERE base IN ({','.join('?' * len(targets))})", list(targets))
+    ins = (f"INSERT INTO {q(xname)} ({', '.join(q(c) for c in HIT_COLUMNS)}) "
+           f"VALUES ({', '.join('?' * len(HIT_COLUMNS))})")
+    cache: dict = {}
+    total, batch = 0, []
+    for i, row in enumerate(rows, 1):
+        if len(cache) > XJOIN_CACHE_LIMIT:
+            cache.clear()
+        if bases:
+            for h in match_entry_row(con, row, bases, entries_table, families, cache):
+                batch.append(tuple(h.get(c) for c in HIT_COLUMNS))
+        if len(batch) >= 5000 or i == len(rows):
+            con.executemany(ins, batch)
+            total += len(batch)
+            batch = []
+    n = con.execute(f"SELECT COUNT(*) FROM {q(xname)}").fetchone()[0]
+    missing = [t for t in targets if t not in all_bases]
+    print(f"[xjoin] {xname}: {'・'.join(targets)} の行だけ作り直しました（{len(rows)} 頭, その指数の hits {total}, 全体 {n} 行）"
+          + (f" ／ 出馬表に無い指数: {'・'.join(missing)}" if missing else ""), flush=True)
+    return {"table_name": xname, "source_file": entries_table, "kind": "xjoin", "n_rows": int(n),
+            "indicator": ",".join(all_bases)}
+
+
 # ---------------------------------------------------------------------------
 # 掃除
 # ---------------------------------------------------------------------------
@@ -582,17 +701,41 @@ def parse_cli(argv=None):
     p.add_argument("--prune", action="store_true",
                    help="今回作り直した出馬表の古いテーブル（entries_*・entries_xjoin_*）を削除する（成績表は触らない）")
     p.add_argument("--no-xjoin", action="store_true", help="entries_xjoin_* を作らない（画面はその場で照合する）")
+    p.add_argument("--indicators", default=None,
+                   help="この指数の照合結果だけ作り直す（カンマ区切り。例 タイムM,対戦M）。出馬表は取り込み直し、entries_xjoin_* は "
+                        "base がその指数の行だけを消して照合し直す（--mode entries として動く）")
+    p.add_argument("--mining-only", action="store_true",
+                   help=f"--indicators {','.join(MINING_INDICATORS)} と同じ（馬体重の発表後のマイニング確定値の差し替え用）")
     p.add_argument("--agg-dir", dest="agg_dir", default=str(config.agg_dir()),
                    help="成績表（aggregate_stats_ver2.py の出力）のディレクトリ（既定 agg_csv/）")
     p.add_argument("--allow-empty", action="store_true", help="成績表が0本でも unified_all を空で作り直す")
     p.add_argument("--entries-dir", default=str(config.entries_out_dir()))
     p.add_argument("--db-path", default=str(config.db_path()), help="既定は環境変数 DB_PATH か racing.db")
     args = p.parse_args(argv)
+    targets: list[str] = []
+    for raw in re.split(r"[,、，]", args.indicators or ""):
+        raw = raw.strip()
+        if not raw:
+            continue
+        if not is_known_indicator(raw):
+            p.error(f"--indicators: 台帳に無い指数です: {raw}")
+        if canonical_indicator(raw) not in targets:
+            targets.append(canonical_indicator(raw))
+    if args.indicators is not None and not targets:      # 空の指定（空のシェル変数など）で全部の作り直しにしない
+        p.error("--indicators: 指数名がありません（例 --indicators タイムM,対戦M）")
+    if args.mining_only:
+        targets += [t for t in MINING_INDICATORS if t not in targets]
+    args.targets = targets
+    if targets:
+        if args.no_xjoin:
+            p.error("--indicators / --mining-only と --no-xjoin は一緒に使えません")
+        args.entries_only = True               # 照合結果の一部だけの作り直しは、出馬表だけの取り込み
     if args.entries_only:
+        what = "--indicators / --mining-only" if targets else "--entries-only"
         if args.mode not in ("both", "entries"):
-            p.error("--entries-only と --mode foragg は一緒に使えません")
+            p.error(f"{what} と --mode foragg は一緒に使えません")
         if args.fresh:
-            p.error("--entries-only と --fresh は一緒に使えません（--fresh は成績表も含めて DB を消します）")
+            p.error(f"{what} と --fresh は一緒に使えません（--fresh は成績表も含めて DB を消します）")
         args.mode = "entries"
     return args
 
@@ -653,6 +796,7 @@ def main(argv=None) -> int:
                 fam_registry.set_active(db_fams, f"DB の {FAMILIES_TABLE}（{len(db_fams)} family）")
         entries = load_entries_tables(con, Path(args.entries_dir))
         build_entries_all(con, entries)
+        con.commit()                         # 出馬表はここまでで確定（照合結果は下で、テーブルごとに1つのトランザクション）
         keep |= {t["table_name"] for t in entries} | {ENTRIES_ALL}
         meta_rows = list(entries)
         status = unified_status(con)
@@ -660,8 +804,26 @@ def main(argv=None) -> int:
             xname = xjoin_table_for(t["table_name"])
             if args.no_xjoin or status != "ok":
                 con.execute(f"DROP TABLE IF EXISTS {q(xname)}")   # 古い照合結果を残さない
+                if table_exists(con, BUILD_INFO):
+                    con.execute(f"DELETE FROM {BUILD_INFO} WHERE key = ?", (XJOIN_INFO + xname,))
                 continue
-            meta_rows.append(build_xjoin(con, t["table_name"]))
+            # 照合結果と、それが何から作られたかの記録を1つのトランザクションで書く（途中で止まれば前の照合結果と記録に戻る）
+            if not con.in_transaction:
+                con.execute("BEGIN")
+            now = xjoin_record(con, t["table_name"])
+            meta = None
+            if args.targets:
+                # 一部の作り直しで済ませるのは、ほかの指数の照合結果が変わらないと分かるときだけ
+                why = partial_blocker(load_xjoin_record(con, xname), now, args.targets)
+                if why is None:
+                    meta = refresh_xjoin(con, t["table_name"], args.targets)
+                    why = None if meta is not None else "照合結果のテーブルが無い・列の形が今の版と違います"
+                if why is not None:
+                    print(f"[INFO] {xname}: {why}。全部の指数を照合し直します")
+            if meta is None:
+                meta = build_xjoin(con, t["table_name"])
+            set_info(con, XJOIN_INFO + xname, json.dumps(now, ensure_ascii=False))
+            meta_rows.append(meta)
             keep.add(xname)
             con.commit()
         replace_meta(con, ("entries", "xjoin"), meta_rows)
@@ -676,6 +838,9 @@ def main(argv=None) -> int:
 
     if args.prune:
         prune(con, kinds, keep)
+    if table_exists(con, BUILD_INFO):         # 消えた照合結果の記録は残さない
+        con.execute(f"DELETE FROM {BUILD_INFO} WHERE key LIKE ? AND substr(key, ?) NOT IN "
+                    "(SELECT name FROM sqlite_master WHERE type='table')", (XJOIN_INFO + "%", len(XJOIN_INFO) + 1))
     con.commit()
     try:                                     # 作り直しで大きくなった WAL を切り詰める（ディスクを返す）
         con.execute("PRAGMA wal_checkpoint(TRUNCATE)")

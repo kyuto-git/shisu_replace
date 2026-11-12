@@ -213,9 +213,9 @@ def score_master(path: str, fam_dicts: list[dict], wedge_opts: dict | None, mode
                     continue
                 db = build_db.prepare_agg_frame(out)
                 cats = [classify({"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
-                                  "frc": r["複勝回収値"], "tra": r["単勝適正回収値"]}, mode)
-                        for r in db[["件数", "複勝率_val", "連対率_val", "掲示板率_val", "複勝回収値", "単勝適正回収値"]]
-                        .to_dict("records")]
+                                  "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r[agg.KEY]}, mode)
+                        for r in db[[agg.KEY, "件数", "複勝率_val", "連対率_val", "掲示板率_val", "複勝回収値",
+                                     "単勝適正回収値"]].to_dict("records")]
                 for c in CLASSES:
                     rec[f"{c}_{mode}"] = int(sum(1 for x in cats if x == c))
                 if mode != "normal":
