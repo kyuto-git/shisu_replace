@@ -1214,7 +1214,8 @@ def test_parallel_keeps_per_site_interval(tmp_path):
 
 
 def test_parallel_cancel_and_failure_isolated(tmp_path):
-    """同時に動いている取得元の1つが失敗しても、ほかは続く。中止は動いている全部の取得元に効く。"""
+    """同時に動いている取得元の1つが失敗しても、ほかは続く。始める前に中止されていれば、どの取得元も動かない
+    （動いている最中の中止は test_cancel_reaches_sources_that_are_already_running）。"""
     base = write_base(tmp_path / "base.csv")
     logs: list[str] = []
     req = IngestRequest(sources=["omega", "kayochin", "lap"], base_paths=[base], lap_paths=[tmp_path / "nope.csv"])
@@ -1228,6 +1229,133 @@ def test_parallel_cancel_and_failure_isolated(tmp_path):
     res = run_ingest(IngestRequest(sources=["omega", "kichiuma", "kayochin"], base_paths=[base]), tmp_path / "b",
                      lambda m: None, stop=stop, session=FakeSession({}), sleep=lambda _: None)
     assert res == {"omega": "CANCELLED", "kichiuma": "CANCELLED", "kayochin": "CANCELLED"}
+
+
+def _gate_session(n_sites: int, then):
+    """各サイトの最初のアクセスが n_sites 個そろうまで待ち、そろったら then() を1回だけ呼んでから返すセッション。"""
+    barrier = threading.Barrier(n_sites)
+    first: set[str] = set()
+    lock = threading.Lock()
+    fired = []
+
+    class Gate(FakeSession):
+        def get(self, url, headers=None, timeout=None):
+            site = _site(url)
+            with lock:
+                wait = site not in first
+                first.add(site)
+            if wait:
+                barrier.wait(timeout=10)
+                with lock:
+                    go = not fired
+                    fired.append(1)
+                if go:
+                    then()
+            return super().get(url, headers, timeout)
+    return Gate(_three_site_pages())
+
+
+def test_cancel_reaches_sources_that_are_already_running(tmp_path):
+    """3つの取得元がそれぞれ最初のアクセスの中にいるときに中止すると、どの取得元も次のアクセスをしない
+    （Fetcher が中止の合図を見ている。まだ2件目のアクセスが残っている Ω・吉馬 は CANCELLED）。"""
+    base = write_base(tmp_path / "base.csv")
+    stop = threading.Event()
+    session = _gate_session(3, stop.set)
+    res = run_ingest(IngestRequest(sources=["omega", "kichiuma", "kayochin"], base_paths=[base]), tmp_path / "o",
+                     lambda m: None, stop=stop, session=session, sleep=lambda _: None)
+    assert len(session.calls) == 3 and {_site(u) for u in session.calls} == {"www.keibalab.jp", "kichiuma.net", "kayochinkeiba.com"}
+    assert res["omega"] == "CANCELLED" and res["kichiuma"] == "CANCELLED"
+    assert not list((tmp_path / "o").rglob("*omega*.csv"))
+    # 中止しなければ Ω は2ページ目も取りに行く（上の「3回だけ」が中止の効き目であること）
+    full = FakeSession(_three_site_pages())
+    run_ingest(IngestRequest(sources=["omega", "kichiuma", "kayochin"], base_paths=[base]), tmp_path / "f",
+               lambda m: None, session=full, sleep=lambda _: None)
+    assert len(full.calls) > 3 and omega.race_url("202511010502") in full.calls
+
+
+def test_keyboard_interrupt_stops_parallel_sources_and_propagates(tmp_path):
+    """同時に実行している間の Ctrl-C（KeyboardInterrupt。CLI には中止の合図 stop が無い）は、動いている取得元を止めてから
+    そのまま上に伝わる（握りつぶして最後までサイトにアクセスし続けない・「失敗した取得元」として報告しない）。"""
+    import signal
+    if not hasattr(signal, "pthread_kill"):
+        pytest.skip("pthread_kill が無い環境")
+    base = write_base(tmp_path / "base.csv")
+    interrupted = threading.Event()
+    logs: list[str] = []
+
+    def log(m):
+        logs.append(m)
+        if "中断されました" in m:
+            interrupted.set()
+
+    session = _gate_session(3, lambda: signal.pthread_kill(threading.main_thread().ident, signal.SIGINT))
+    # アクセスの間隔の待ち（次のアクセスの前）は、メインのスレッドが Ctrl-C を受け取って中止を伝えるまで待つ
+    with pytest.raises(KeyboardInterrupt):
+        run_ingest(IngestRequest(sources=["omega", "kichiuma", "kayochin"], base_paths=[base]), tmp_path / "o", log,
+                   session=session, sleep=lambda _: interrupted.wait(10))
+    assert interrupted.is_set() and len(session.calls) == 3
+    assert omega.race_url("202511010502") not in session.calls           # Ω の2ページ目は取りに行かない
+    assert not list((tmp_path / "o").rglob("*omega*.csv"))
+    assert not any("ERROR" in m and "KeyboardInterrupt" in m for m in logs)
+    assert any("Ω指数（競馬ラボ）: 中止しました" in m for m in logs)
+    # 1つずつの実行でも Ctrl-C はそのまま伝わる
+    def boom(url, headers=None, timeout=None):
+        raise KeyboardInterrupt
+    s2 = FakeSession({})
+    s2.get = boom
+    with pytest.raises(KeyboardInterrupt):
+        run_ingest(IngestRequest(sources=["omega", "kichiuma"], base_paths=[base], parallel=False), tmp_path / "s",
+                   lambda m: None, session=s2, sleep=lambda _: None)
+
+
+def test_failed_source_logs_error_and_traceback_as_one_named_message(tmp_path):
+    base = write_base(tmp_path / "base.csv")
+    logs: list[str] = []
+    run_ingest(IngestRequest(sources=["omega", "kayochin", "lap"], base_paths=[base], lap_paths=[tmp_path / "nope.csv"]),
+               tmp_path / "a", logs.append, session=FakeSession(_three_site_pages()), sleep=lambda _: None)
+    err = [m for m in logs if "Traceback" in m]
+    assert len(err) == 1 and err[0].startswith("[ERROR] ⑥ ラップ6指数") and "FileNotFoundError" in err[0].split("\n", 1)[0]
+    assert not any(m.lstrip().startswith("Traceback") for m in logs)      # 名前の無いトレースバックだけの行は出さない
+
+
+def test_web_job_page_shows_running_sources_while_they_run(tmp_path, monkeypatch):
+    """ジョブ画面は、動いている間に「済み k/n ／ 実行中（同時に取得）: …」を出す（run_ingest の on_source・on_done がジョブに
+    つながっている）。終わったら 済み n/n・実行中なし。"""
+    monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path))
+    import app as am
+    from shisu.ingest import web
+    gate, both = threading.Event(), threading.Event()
+    seen: set[str] = set()
+    lock = threading.Lock()
+
+    class SlowSession(FakeSession):
+        def get(self, url, headers=None, timeout=None):
+            with lock:
+                seen.add(_site(url))
+                if len(seen) == 2:
+                    both.set()
+            gate.wait(10)
+            return super().get(url, headers, timeout)
+
+    monkeypatch.setattr(web, "SESSION_FACTORY", lambda: SlowSession(_three_site_pages()))
+    monkeypatch.setattr(web, "SLEEP", lambda _: None)
+    monkeypatch.setattr(web, "JOBS", {})
+    c = am.app.test_client()
+    data = {"src": ["omega", "kichiuma"],
+            "base_files": [(io.BytesIO(base_frame().to_csv(index=False).encode("cp932")), "b.csv")]}
+    r = c.post("/ingest/run", data=data, content_type="multipart/form-data")
+    run_id = r.headers["Location"].rstrip("/").split("/")[-1]
+    job = web.JOBS[run_id]
+    try:
+        assert both.wait(10)
+        page = c.get(f"/ingest/job/{run_id}").get_data(as_text=True)
+        assert "済み 0/2" in page and "実行中（同時に取得）" in page and "Ω指数" in page and "吉馬6指数" in page
+        assert job.step == (0, 2) and len(job.running) == 2
+    finally:
+        gate.set()
+        job.thread.join(timeout=30)
+    assert job.status == "done" and job.step == (2, 2) and job.current == "" and job.running == []
+    assert "実行中（同時に取得）" not in c.get(f"/ingest/job/{run_id}").get_data(as_text=True)
 
 
 def test_job_progress_shows_running_sources_and_done_count(tmp_path, monkeypatch):

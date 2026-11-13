@@ -699,7 +699,7 @@ def test_hits_page_drops_redundant_normal_marks_hot_rows_and_scrolls(base, monke
             _fake_hit(r3, "ZI", "normal", 25, "keshi")]
     monkeypatch.setattr(am, "collect_hits", lambda con, table, rows: (list(fake), "xjoin"))
     c = am.app.test_client()
-    q = {"table": "entries_merged_hensachi", "rid": rid}
+    q = {"table": "entries_merged_hensachi", "rid": rid, "cut_low_10u": "0"}      # 過剰人気カットは別のテストで
     page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
     assert "「通常」の行 1 行は、重なるので省いています" in page
     assert page.count('<tr class="hot">') == 2 and "tr.hot td{color:#b91c1c;font-weight:700;background:#fef2f2}" in page
@@ -710,9 +710,10 @@ def test_hits_page_drops_redundant_normal_marks_hot_rows_and_scrolls(base, monke
     assert "絶対軸（1）" in body and "軸候補（3）" in body and "消し候補（1）" in body and "相手候補（0）" in body
     import re as _re
     summary = body.split("</table>", 1)[0]
-    row1 = _re.search(r"<tr><td>%s</td><td>%s</td>(.*?)</tr>" % (r1["馬番"], _re.escape(r1["馬名"])), summary, _re.S).group(1)
+    row1 = _re.search(r"<tr[^>]*><td>%s</td><td>%s</td>(.*?)</tr>" % (r1["馬番"], _re.escape(r1["馬名"])), summary, _re.S).group(1)
     nums = _re.findall(r'<td class="num[^"]*">\s*(?:<b>)?([^<]*)', row1)
-    assert [v.strip() for v in nums] == ["1", "1", "", "", "2", "2"]      # 絶対軸1（通常は数えない）・軸1・消し・相手・穴の軸2・軸の指数数2
+    # 絶対軸1（通常は数えない）・軸1・消し・相手・穴の軸2・軸の指数数2・消し(10倍未満)・その指数数
+    assert [v.strip() for v in nums] == ["1", "1", "", "", "2", "2", "", ""]
     # 並び: 軸候補は 10倍未満 → 50倍以上 → 通常
     axis_tbl = body.split('class="card cat-axis"', 1)[1].split("</table>", 1)[0]
     order = [m for m in _re.findall(r"<td>(10倍未満|10〜50倍|10~50倍|50倍以上|通常)</td>", axis_tbl)]
@@ -805,4 +806,102 @@ def test_wedge_page_collapses_filters_and_keeps_matrix_on_top(base, monkeypatch)
     best = max((x for x in m if x["adj_max"] is not None), key=lambda x: x["adj_max"], default=None)
     if best is not None:
         assert am.fmt(best["adj_max"], 3) in matrix and am.fmt(best["wedge_mean"], 3) in matrix
+
+
+def test_hits_page_favorite_cut_keshi_counts_and_danger_badges(base, monkeypatch):
+    """条件ヒット馬（2026-11-13）: 過剰人気カット（既定 ON・切り替え）、消し(10倍未満) の行数と指数数、
+    同じ指数で軸と消しが出ているタグ、消優勢・要注意の判定。"""
+    import re as _re
+    am = _app(base, monkeypatch)
+    rid = _race_id(base)
+    with am.connect() as con:
+        race = am._race_rows(con, "entries_merged_hensachi", rid)
+    r1, r2, r3, r4 = race[0], race[1], race[2], race[3]
+
+    def good(h):                                    # 回収値100以上の軸
+        return {**h, "複勝回収値": 130.0}
+    fake = [
+        # 馬1: 買える人気馬（10倍未満の軸が回収値100以上で2指数・消しなし）
+        good(_fake_hit(r1, "SAV", "odds10u", 30, "axis")), good(_fake_hit(r1, "ZI", "odds10u", 30, "axis")),
+        # 馬2: 軸は過剰人気（回収値80）だけ → カットで軸0・消し(10倍未満)1 → 消優勢
+        _fake_hit(r2, "SAV", "odds10u", 30, "axis"), _fake_hit(r2, "ZI", "odds10u", 30, "axis"),
+        _fake_hit(r2, "SAV", "odds10u", 25, "keshi", family="rankB"),
+        # 馬3: 同じ指数 SAV で 絶対軸1・軸1（回収値100以上）と 消し(10倍未満)1、ZI にも軸 → 軸3・消し1 → 判定なし（1 < 1.5）
+        _fake_hit(r3, "SAV", "odds10u", 12, "abs"), good(_fake_hit(r3, "SAV", "odds10u", 30, "axis", family="rankJ")),
+        good(_fake_hit(r3, "ZI", "odds10_50", 30, "axis")), _fake_hit(r3, "SAV", "odds10u", 25, "keshi", family="rankB"),
+        # 馬4: 軸2（SAV・ZI）・消し(10倍未満)1（先行）→ 要注意。通常の消しは 消し(10倍未満) に数えない
+        good(_fake_hit(r4, "SAV", "odds10u", 30, "axis")), good(_fake_hit(r4, "ZI", "odds10u", 30, "axis")),
+        _fake_hit(r4, "先行", "odds10u", 25, "keshi"), _fake_hit(r4, "先行", "normal", 60, "keshi", family="rankB"),
+    ]
+    monkeypatch.setattr(am, "collect_hits", lambda con, table, rows: (list(fake), "xjoin"))
+    c = am.app.test_client()
+    q = {"table": "entries_merged_hensachi", "rid": rid}
+
+    def rows_of(page, title):                       # 表の本体の行（馬番 → 行の HTML）
+        tbody = page.split(title, 1)[1].split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        return {m.group(1): m.group(0) for m in _re.finditer(r"<tr[^>]*><td>(\d+)</td>.*?</tr>", tbody, _re.S)}
+
+    def nums(row):
+        return [v.strip() for v in _re.findall(r'<td class="num[^"]*">\s*(?:<b>)?([^<]*)', row)]
+
+    # ---- 既定（引数なし）= 過剰人気カット ON
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert "過剰人気カット中" in page and "軸候補 2 行・相手候補 0 行" in page
+    assert 'name="cut_low_10u" value="1" checked' in page and '<input type="hidden" name="cut_low_10u" value="0">' in page
+    assert "cut_low_10u=0" in page.split("カットせずに全部表示する", 1)[0].rsplit("<a href=", 1)[1]
+    body = page.split("馬ごとの該当数", 1)[1]
+    assert "絶対軸（1）" in body and "軸候補（6）" in body and "消し候補（4）" in body
+    assert "過剰人気カットで、10倍未満・回収値100未満の 2 行を除いています" in body
+    summ = rows_of(page, "馬ごとの該当数")
+    # 列: 絶対軸・軸候補・消し候補・相手候補・穴の軸・軸の指数数・消し(10倍未満)・消し(10倍未満)の指数数
+    assert nums(summ[r1["馬番"]]) == ["", "2", "", "", "", "2", "", ""] and "kd" not in summ[r1["馬番"]].split("</td>", 3)[2]
+    assert nums(summ[r2["馬番"]]) == ["", "", "1", "", "", "", "1", "1"]
+    assert 'class="kd-dominant"' in summ[r2["馬番"]] and '<span class="kd">⚠️消優勢</span>' in summ[r2["馬番"]]
+    assert nums(summ[r3["馬番"]]) == ["1", "2", "1", "", "1", "2", "1", "1"] and "kd-" not in summ[r3["馬番"]]
+    assert nums(summ[r4["馬番"]]) == ["", "2", "2", "", "", "2", "1", "1"]
+    assert 'class="kd-caution"' in summ[r4["馬番"]] and '<span class="kd caution">要注意</span>' in summ[r4["馬番"]]
+    assert "馬ごとの該当数（⚠️消優勢 1頭・要注意 1頭）" in page
+    for th in ("<th class=\"num\">消し(10倍未満)</th>", "<th class=\"num\">消し(10倍未満)の指数数</th>"):
+        assert page.count(th) == 2                                           # 指数クロス好走馬・馬ごとの該当数の両方
+    # 指数クロス好走馬: 馬2 は軸が無くなったので出ない。馬3 の SAV のタグに (消1)（同じ指数で軸と消し）
+    assert "：3頭" in page.split("指数クロス好走馬（", 1)[1][:60]
+    cross = rows_of(page, "指数クロス好走馬（")
+    assert set(cross) == {r1["馬番"], r3["馬番"], r4["馬番"]}
+    tags3 = _re.sub(r"<[^>]+>", "", cross[r3["馬番"]].rsplit("<td", 1)[1])
+    assert "SAV 1 / 1 (消1)" in tags3 and "ZI 0 / 1" in tags3 and "ZI 0 / 1 (消" not in tags3
+    assert '<span class="tag clash">SAV 1 / 1 <span class="ks">(消1)</span></span>' in cross[r3["馬番"]]
+    assert 'class="tag hotnum">ZI 0 / 1</span>' in cross[r3["馬番"]]
+    assert "(消" not in cross[r1["馬番"]] and "(消" not in cross[r4["馬番"]]   # 馬4 の消しは別の指数（先行）
+    assert nums(cross[r3["馬番"]])[:5] == ["2", "1", "3", "1", "1"]             # 軸の指数数・うち穴・軸の行数・消し(10倍未満)・その指数数
+    assert nums(cross[r4["馬番"]])[:5] == ["2", "", "2", "1", "1"] and 'class="kd-caution"' in cross[r4["馬番"]]
+    # 4区分の表でも、判定の付いた馬の馬名にバッジ
+    keshi_tbl = body.split('class="card cat-keshi"', 1)[1].split("</table>", 1)[0]
+    assert keshi_tbl.count("⚠️消優勢") == 1 and keshi_tbl.count(">要注意<") == 2
+    # ---- カット OFF（リンク・チェックを外して送ったフォーム = hidden の 0 だけ）
+    off = c.get("/entries/hits", query_string={**q, "cut_low_10u": "0"}).get_data(as_text=True)
+    assert "過剰人気カットは切ってあります" in off and "過剰人気カット中" not in off
+    assert 'name="cut_low_10u" value="1" >' in off or 'name="cut_low_10u" value="1">' in off
+    assert "cut_low_10u=1" in off.split("回収値100以上だけにする", 1)[0].rsplit("<a href=", 1)[1]
+    assert "軸候補（8）" in off.split("馬ごとの該当数", 1)[1]
+    s_off = rows_of(off, "馬ごとの該当数")
+    assert nums(s_off[r2["馬番"]]) == ["", "2", "1", "", "", "2", "1", "1"] and 'class="kd-caution"' in s_off[r2["馬番"]]
+    c_off = rows_of(off, "指数クロス好走馬（")
+    assert set(c_off) == {r1["馬番"], r2["馬番"], r3["馬番"], r4["馬番"]}
+    assert '<span class="tag clash">SAV 0 / 1 <span class="ks">(消1)</span></span>' in c_off[r2["馬番"]]
+    # ---- フォームからの送信（チェックあり = 0 と 1 の両方が届く）は ON。ほかの絞り込みも一緒に効く
+    on = c.get("/entries/hits?table=entries_merged_hensachi&rid=%s&cut_low_10u=0&cut_low_10u=1&xmin=1&xonly=1" % rid).get_data(as_text=True)
+    assert "過剰人気カット中" in on and "xonly=1" in on.split("カットせずに全部表示する", 1)[0].rsplit("<a href=", 1)[1]
+    assert "xmin=1" in on.split("カットせずに全部表示する", 1)[0].rsplit("<a href=", 1)[1]
+    assert c.get("/entries/hits", query_string={**q, "cut_low_10u": "junk"}).status_code == 200
+    # リンクは指数A・B も保つ。選択肢に無い「何指数以上」（URL を手で書いた）も選ばれた状態で出る（送り直しても 1 に戻らない）
+    ab = c.get("/entries/hits", query_string={**q, "xmin": "7", "xa": "SAV", "xb": "ZI"}).get_data(as_text=True)
+    link = ab.split("カットせずに全部表示する", 1)[0].rsplit("<a href=", 1)[1]
+    assert "xa=SAV" in link and "xb=ZI" in link and "xmin=7" in link and "cut_low_10u=0" in link
+    assert '<option value="7" selected>7 指数以上</option>' in ab
+    race7 = c.get("/entries/race", query_string={**q, "xmin": "7"}).get_data(as_text=True)
+    assert '<option value="7" selected>7 指数以上</option>' in race7 and race7.count(" selected>") >= 1
+    assert '<option value="7"' not in c.get("/entries/race", query_string=q).get_data(as_text=True)
+    assert "過剰人気カットは切ってあります" in c.get("/entries/hits", query_string={**q, "cut_low_10u": "junk"}).get_data(as_text=True)
+    # 出馬表のページにはこのチェックは出ない
+    assert "cut_low_10u" not in c.get("/entries/race", query_string=q).get_data(as_text=True)
 

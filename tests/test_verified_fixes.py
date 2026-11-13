@@ -414,7 +414,8 @@ def test_hits_page_caps_rows_per_category(mini, monkeypatch):
     buckets = am.classify_hits(hits)
     big = [k for k, v in buckets.items() if len(v) > 2]
     assert big, "合成データで2行を超える区分が要る"
-    page = c.get("/entries/hits", query_string={"table": "entries_merged_hensachi", "rid": rid}).get_data(as_text=True)
+    page = c.get("/entries/hits", query_string={"table": "entries_merged_hensachi", "rid": rid,
+                                                "cut_low_10u": "0"}).get_data(as_text=True)    # 過剰人気カットなしの全件で比べる
     assert "行だけ表示しています" in page and "馬・オッズ帯ごとに偏らないように" in page
     body = page.split("馬ごとの該当数", 1)[1]
     for k in big:                                         # 見出しの件数は全件のまま
