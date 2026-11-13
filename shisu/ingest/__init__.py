@@ -236,6 +236,8 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
     out_dir.mkdir(parents=True, exist_ok=True)
     selected = [s for s in ORDER if s in req.sources]
     n = len(selected)
+    if stop is None:                         # 外からの中止の合図が無くても（CLI）、Ctrl-C で動いている取得元を止められるように
+        stop = threading.Event()
     emit_lock = threading.Lock()
 
     def emit(msg: str) -> None:              # 1メッセージずつ（別のスレッドの行が途中に入らない）
@@ -302,8 +304,8 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
             emit(f"[INFO] {info.label}: 中止しました")
             return "CANCELLED"
         except Exception as e:  # 1つの取得元の失敗で全体を止めない
-            emit(f"[ERROR] {info.label}: {type(e).__name__}: {e}")
-            emit(traceback.format_exc(limit=3).rstrip())
+            # 1つのメッセージで出す（別のスレッドの行が間に入らず、トレースバックがどの取得元のものか分かる）
+            emit(f"[ERROR] {info.label}: {type(e).__name__}: {e}\n{traceback.format_exc(limit=3).rstrip()}")
             return f"ERROR: {type(e).__name__}: {e}"
         finally:
             with count_lock:
@@ -318,12 +320,19 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
         emit(f"[INFO] {n} 個の取得元を同時に実行します（アクセス間隔は取得元ごとに守ります。"
              "ログの各行に取得元の名前が付きます）")
         with ThreadPoolExecutor(max_workers=n, thread_name_prefix="ingest") as ex:
-            futures = {name: ex.submit(run_one, name) for name in selected}
-            for name in selected:
-                try:
-                    results[name] = futures[name].result()
-                except BaseException as e:      # run_one は例外を外に出さないはず。念のため、ほかの取得元の結果は残す
-                    results[name] = f"ERROR: {type(e).__name__}: {e}"
+            try:                                # スレッドを起こしている最中の Ctrl-C も同じに扱う
+                futures = {name: ex.submit(run_one, name) for name in selected}
+                for name in selected:
+                    try:
+                        results[name] = futures[name].result()
+                    except Exception as e:      # run_one は例外を外に出さないはず。念のため、ほかの取得元の結果は残す
+                        results[name] = f"ERROR: {type(e).__name__}: {e}"
+            except BaseException:
+                # Ctrl-C（KeyboardInterrupt）など。待っているのはこのスレッドだけなので、動いている取得元に中止を伝えてから
+                # そのまま上に伝える（伝えないと、裏のスレッドが最後までサイトにアクセスし続ける）。with の終わりで止まるのを待つ
+                stop.set()
+                emit("[INFO] 中断されました。動いている取得元を止めています（次のアクセスの前に止まります）")
+                raise
         emit(f"[INFO] 全体 {time.monotonic() - t_all:.1f} 秒")
     else:
         for name in selected:

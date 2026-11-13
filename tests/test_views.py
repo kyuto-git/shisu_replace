@@ -190,3 +190,112 @@ def test_cross_rows_counts_top_indicators_by_rank_and_hensachi():
     assert [(t["base"], t["rank"], t["hen"]) for t in tops] == [("タイムM", 1, 70.0), ("対戦M", 3, 55.0)]
     assert app.cell_class(rows[0], "タイムM") == "top3 hen61" and app.cell_class(rows[1], "Gold") == "hen61"
     assert app.cell_class(rows[0], "対戦M") == "top3" and app.cell_class(rows[0], "Gold") == ""
+
+
+# ---------------------------------------------------------------- 人気馬（10倍未満）の見分け（2026-11-13）
+def test_low_return_cut_only_touches_favorite_axis_and_opp_rows():
+    """過剰人気カット: 10倍未満（odds10u）の軸候補・相手候補で、複勝回収値も単勝適正回収値も100未満の行だけを除く。"""
+    for cat, cnt in (("axis", 12), ("opp", 40)):
+        low = hit(1, "タイムM", "odds10u", cnt, cat)                       # 80 / 80
+        assert app.is_low_return_favorite(low, cat)
+        for more in ({"複勝回収値": 100.0}, {"単勝適正回収値": 100.0}, {"複勝回収値": 100.0, "単勝適正回収値": 250.0}):
+            assert not app.is_low_return_favorite({**low, **more}, cat), more      # どちらかが100以上なら残す（境界は残す側）
+        for more in ({"複勝回収値": 99.99, "単勝適正回収値": 99.99}, {"複勝回収値": None, "単勝適正回収値": None},
+                     {"複勝回収値": None}, {"複勝回収値": "", "単勝適正回収値": "x"}, {"複勝回収値": 0, "単勝適正回収値": 0}):
+            assert app.is_low_return_favorite({**low, **more}, cat), more          # 値が無いものは「100以上」ではない
+        for mode in ("normal", "odds10_50", "odds50p", None):                       # ほかのオッズ帯は対象外
+            assert not app.is_low_return_favorite({**low, "odds_mode": mode}, cat)
+    # 絶対軸（もともと回収値100以上が条件）・消し候補・区分なしは対象外
+    assert not app.is_low_return_favorite(hit(1, "タイムM", "odds10u", 12, "abs"), "abs")
+    assert not app.is_low_return_favorite(hit(1, "タイムM", "odds10u", 25, "keshi"), "keshi")
+    assert not app.is_low_return_favorite(hit(1, "タイムM", "odds10u", 12, "axis"), None)
+
+
+def test_classify_hits_cut_low_counts_and_keeps_everything_else():
+    rows = [hit(1, "タイムM", "odds10u", 12, "axis", family="a"),                             # 除く
+            hit(1, "タイムM", "odds10u", 12, "axis", family="b", **{"複勝回収値": 130.0}),     # 残す
+            hit(1, "タイムM", "odds10u", 40, "opp", family="c"),                              # 除く
+            hit(1, "タイムM", "odds10u", 40, "opp", family="d", **{"単勝適正回収値": 100.0}),  # 残す
+            hit(1, "タイムM", "odds10_50", 12, "axis", family="e"),                           # 10〜50倍は対象外
+            hit(1, "タイムM", "odds10u", 12, "abs", family="f"),
+            hit(1, "タイムM", "odds10u", 25, "keshi", family="g"),
+            hit(2, "対戦M", "normal", 40, "opp", family="h")]
+    off = app.classify_hits(rows, info := {})
+    assert {c: len(v) for c, v in off.items()} == {"abs": 1, "axis": 3, "opp": 3, "keshi": 1}
+    assert info["cut"] == {"axis": 0, "opp": 0}
+    on = app.classify_hits(rows, info := {}, cut_low=True)
+    assert info["cut"] == {"axis": 1, "opp": 1} and info["dropped"] == 0
+    assert sorted(h["family"] for h in on["axis"]) == ["b", "e"] and sorted(h["family"] for h in on["opp"]) == ["d", "h"]
+    assert on["abs"] == off["abs"] and on["keshi"] == off["keshi"]
+    assert app.classify_hits(rows, cut_low=False) == off
+
+
+def test_cut_row_does_not_come_back_as_its_redundant_normal_twin():
+    """カットした10倍未満の行と同じ区分・件数差3以内の「通常」の行（冗長な通常）は、カット ON でも出さない（同じ過剰人気の
+    条件が「通常」として出直さない）。その「通常」の行自身の回収値が100以上でも同じ（件数差3以内の上振れは10倍以上の馬
+    1〜3頭ぶん）。件数が離れた「通常」の行（ほかのオッズ帯の馬も含む別の情報）は、カットの対象外なので残る。行の順に依らない。"""
+    import itertools
+    fav = hit(1, "タイムM", "odds10u", 38, "axis")
+    twin = hit(1, "タイムM", "normal", 40, "axis")
+    far = hit(1, "タイムM", "normal", 90, "axis", family="rankB")
+    fav2 = hit(1, "タイムM", "odds10u", 38, "axis", family="rankB")
+    good_twin = hit(1, "タイムM", "normal", 40, "axis", family="rankJ", **{"複勝回収値": 103.0})    # 回収値100以上の「通常」
+    fav3 = hit(1, "タイムM", "odds10u", 38, "axis", family="rankJ")
+    rows = [twin, fav, far, fav2, good_twin, fav3]
+    for order in itertools.permutations(rows):
+        got = app.classify_hits(list(order), info := {}, cut_low=True)
+        assert got["axis"] == [far] and info == {"dropped": 2, "cut": {"axis": 3, "opp": 0}}
+    # カット OFF でも「通常」の2行は冗長として出ていない（カット ON の表 = OFF の表 − 依頼の条件に当たる行）
+    off = app.classify_hits(rows, info := {})
+    assert off["axis"] == [fav, fav2, fav3, far] and info["dropped"] == 2
+    assert [h for h in off["axis"] if not app.is_low_return_favorite(h, "axis")] == [far]
+    # 相手の10倍未満の行が回収値100以上で残るなら、通常は今までどおりその行の冗長
+    fav_ok = hit(1, "タイムM", "odds10u", 38, "axis", **{"複勝回収値": 120.0})
+    assert app.classify_hits([twin, fav_ok], info := {}, cut_low=True)["axis"] == [fav_ok] and info["dropped"] == 1
+
+
+@pytest.mark.parametrize("axis_rows, keshi, want", [
+    (0, 0, ""), (3, 0, ""), (0, 1, "dominant"), (1, 1, "dominant"), (2, 2, "dominant"), (2, 5, "dominant"),
+    (2, 1, "caution"), (3, 1, ""), (3, 2, "caution"), (4, 2, "caution"), (5, 2, ""), (10, 5, "caution"), (10, 4, ""),
+    (10, 9, "caution"), (10, 10, "dominant")])
+def test_danger_level_compares_axis_rows_with_favorite_keshi_rows(axis_rows, keshi, want):
+    """消優勢 = 消し(10倍未満) が1行以上で軸の行数以上。要注意 = 軸があり、消し(10倍未満) が軸の半分以上。"""
+    assert app.danger_level(axis_rows, keshi) == want
+    spec = ("dominant" if keshi > 0 and keshi >= axis_rows else
+            "caution" if axis_rows > 0 and keshi >= axis_rows * 0.5 else "")
+    assert spec == want                                                  # 依頼の式そのもの
+
+
+def test_horse_stats_and_axis_cross_count_favorite_keshi_per_indicator():
+    """消し(10倍未満) の行数と指数数は odds10u の消し候補だけを数える。指数クロスのタグには、同じ指数の 消し(10倍未満) が付く。"""
+    race = [{"馬番": str(u), "馬名": f"馬{u}", "騎手": "J"} for u in (1, 2, 3, 4)]
+    rows = [hit(1, "タイムM", "odds10u", 12, "abs"), hit(1, "タイムM", "odds10u", 12, "axis", family="rankB"),
+            hit(1, "対戦M", "odds50p", 12, "axis"),
+            hit(1, "タイムM", "odds10u", 25, "keshi", family="k1"), hit(1, "タイムM", "odds10u", 25, "keshi", family="k2"),
+            hit(1, "オメガ指数", "odds10u", 25, "keshi"), hit(1, "対戦M", "normal", 25, "keshi", family="k3"),
+            hit(1, "対戦M", "odds50p", 25, "keshi", family="k4"),
+            hit(2, "タイムM", "odds10u", 12, "axis"), hit(2, "対戦M", "odds10u", 12, "axis"),
+            hit(2, "Gold", "odds10u", 25, "keshi"),
+            hit(3, "Gold", "odds10u", 25, "keshi"), hit(3, "Gold", "normal", 40, "opp")]
+    b = app.classify_hits(rows)
+    st = app.horse_stats(race, b)
+    assert (st["1"]["abs"], st["1"]["axis"], st["1"]["keshi"], st["1"]["opp"], st["1"]["hot"]) == (1, 2, 5, 0, 1)
+    assert (st["1"]["axis_rows"], st["1"]["keshi_fav"], st["1"]["keshi_fav_inds"]) == (3, 3, 2)
+    assert st["1"]["keshi_fav_by"] == {"タイムM": 2, "オメガ指数": 1} and st["1"]["danger"] == "dominant"
+    assert (st["2"]["axis_rows"], st["2"]["keshi_fav"], st["2"]["keshi_fav_inds"], st["2"]["danger"]) == (2, 1, 1, "caution")
+    assert (st["3"]["axis_rows"], st["3"]["keshi_fav"], st["3"]["opp"], st["3"]["danger"]) == (0, 1, 1, "dominant")
+    assert (st["4"]["axis_rows"], st["4"]["keshi_fav"], st["4"]["danger"]) == (0, 0, "")
+    xs = {x["uma"]: x for x in app.axis_cross(race, b)}
+    assert [(t["base"], t["abs"], t["axis"], t["keshi_fav"], t["hot"]) for t in xs["1"]["inds"]] == [
+        ("タイムM", 1, 1, 2, False), ("対戦M", 0, 1, 0, True)]            # 対戦M の消しは 通常・50倍以上 なので数えない
+    assert (xs["1"]["n"], xs["1"]["n_clash"], xs["1"]["keshi_fav"], xs["1"]["keshi_fav_inds"], xs["1"]["danger"]) == (2, 1, 3, 2, "dominant")
+    assert [(t["base"], t["keshi_fav"]) for t in xs["2"]["inds"]] == [("タイムM", 0), ("対戦M", 0)] and xs["2"]["n_clash"] == 0
+    assert (xs["2"]["keshi_fav"], xs["2"]["danger"], xs["2"]["hit"]) == (1, "caution", True)
+    assert (xs["3"]["n"], xs["3"]["hit"], xs["3"]["danger"]) == (0, False, "dominant")
+    # 過剰人気カットで軸が減ると、判定も除いたあとの行数で変わる（馬2: 軸2 → 0・消し1 → 消優勢）
+    cut = app.classify_hits(rows, cut_low=True)
+    st2 = app.horse_stats(race, cut)
+    assert (st2["2"]["axis_rows"], st2["2"]["danger"]) == (0, "dominant")
+    assert (st2["1"]["axis_rows"], st2["1"]["keshi_fav"]) == (2, 3)       # 馬1: 10倍未満の軸候補1行が除かれ、絶対軸と50倍以上の軸が残る
+    assert [x["uma"] for x in app.axis_cross(race, cut) if x["hit"]] == ["1"]
+
