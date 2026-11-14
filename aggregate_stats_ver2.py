@@ -3,7 +3,7 @@
 
 使う family は shisu/families.py の台帳（selected_families.json があればその定義、無ければ初期セット49種）。
 master 1本（1地域×1指数）について、family（とスキーム s1/s2）ごとにキーを作り、オッズ帯4区分で集計する:
-  通常（絞り込みなし）/ odds10u（10倍未満）/ odds10_50（10以上50未満）/ odds50p（50倍以上）
+  通常（絞り込みなし）/ odds10u（2倍以上10倍未満。2026-11-14〜）/ odds10_50（10以上50未満）/ odds50p（50倍以上）
   出力: master 1本につき1ファイル agg_csv/agg_master_{地域}_{指数名}.csv.gz（2026-11-10〜。shisu/aggstore.py）
         family・オッズ帯・スキームの成績表を縦に並べ、family, odds_mode, rank_scheme, indicator, region, テーブル名
         の列で区別する（テーブル名は旧来の1表1ファイル foragg_*.csv のテーブル名と同じ）

@@ -334,12 +334,22 @@ def test_entries_table_names():
 
 
 def test_odds_modes():
-    o = pd.Series(["1.5", "9.9", "10.0", "49.9", "50.0", "", "abc"])
+    """odds10u は 2.0倍以上 10.0倍未満（2026-11-14〜。1.9倍以下は normal にだけ入る。モード名はそのまま）。"""
+    o = pd.Series(["1.5", "9.9", "10.0", "49.9", "50.0", "", "abc", "1.9", "2.0", "2", "１.９", "２．０", "1.99", "0", "-3"])
     assert odds.odds_mask(o, "normal").all()
-    assert odds.odds_mask(o, "odds10u").tolist() == [True, True, False, False, False, False, False]
-    assert odds.odds_mask(o, "odds10_50").tolist() == [False, False, True, True, False, False, False]
-    assert odds.odds_mask(o, "odds50p").tolist() == [False, False, False, False, True, False, False]
-    assert odds.odds_bucket(o).tolist() == ["odds10u", "odds10u", "odds10_50", "odds10_50", "odds50p", "", ""]
+    assert odds.odds_mask(o, "odds10u").tolist() == [False, True, False, False, False, False, False,
+                                                     False, True, True, False, False, False, False, False]
+    assert odds.odds_mask(o, "odds10_50").tolist() == [False, False, True, True] + [False] * 11
+    assert odds.odds_mask(o, "odds50p").tolist() == [False, False, False, False, True] + [False] * 10
+    assert odds.odds_bucket(o).tolist() == ["", "odds10u", "odds10_50", "odds10_50", "odds50p", "", "",
+                                            "", "odds10u", "odds10u", "", "", "", "", ""]
+    # 1頭は normal 以外では高々1つの帯に入り、帯の分け方は odds_bucket と同じ
+    for m in ("odds10u", "odds10_50", "odds50p"):
+        assert odds.odds_mask(o, m).tolist() == (odds.odds_bucket(o) == m).tolist()
+    num = pd.to_numeric(o, errors="coerce")
+    assert odds.odds_mask_numeric(num, "odds10u").tolist() == odds.odds_mask(o, "odds10u").tolist()
+    assert odds.ODDS_BREAKS == (2.0, 10.0, 50.0) and odds.ODDS_LABELS["odds10u"] == "2〜10倍未満" == odds.FAV_LABEL
+    assert odds.ODDS_MODES == ("normal", "odds10u", "odds10_50", "odds50p")      # モード名は互換のため変えない
     assert "odds5p" not in odds.ODDS_MODES
 
 
@@ -359,12 +369,23 @@ def test_classify_boundaries():
     assert C.classify({**base, "rv": 80, "frc": 100}, "normal") == "abs"
     assert C.classify({**base, "rv": 79.99, "frc": 100}, "normal") is None
     assert C.classify({**base, "rv": 80, "tra": 100}, "normal") == "abs"
-    assert C.classify({**base, "fv": 80, "top5": 90}, "normal") == "axis"
-    assert C.classify({**base, "fv": 80, "top5": 89.9}, "normal") is None
-    assert C.classify({**base, "rv": 60, "top5": 90}, "normal") == "axis"
-    assert C.classify({**base, "fv": 70, "top5": 80, "frc": 100}, "normal") == "axis"
-    assert C.classify({**base, "rv": 50, "top5": 80, "frc": 100}, "normal") == "axis"
-    assert C.classify({**base, "cnt": 9, "fv": 90, "top5": 95}, "normal") is None
+    # 軸候補は 件数 20 から（2026-11-14〜。それまで 10）。絶対軸は 10 のまま
+    ax = {**base, "cnt": 20}
+    assert C.AX_CNT == 20 == C.KS_CNT and C.ABS_CNT == 10
+    assert C.classify({**ax, "fv": 80, "top5": 90}, "normal") == "axis"
+    assert C.classify({**ax, "fv": 80, "top5": 89.9}, "normal") is None
+    assert C.classify({**ax, "rv": 60, "top5": 90}, "normal") == "axis"
+    assert C.classify({**ax, "fv": 70, "top5": 80, "frc": 100}, "normal") == "axis"
+    assert C.classify({**ax, "rv": 50, "top5": 80, "frc": 100}, "normal") == "axis"
+    for cnt in (9, 10, 15, 19, 19.9):                                        # 4つの条件とも、20件未満は軸にしない
+        for cond in ({"fv": 90, "top5": 95}, {"rv": 60, "top5": 90}, {"fv": 70, "top5": 80, "frc": 100},
+                     {"rv": 50, "top5": 80, "frc": 100}):
+            for mode in odds.ODDS_MODES:
+                assert C.classify({**base, "cnt": cnt, **cond}, mode) is None, (cnt, cond, mode)
+    # 10〜19件でも絶対軸の条件（連対率 80・回収値 100）を満たせば、今までどおり絶対軸
+    assert C.classify({**base, "cnt": 10, "rv": 80, "fv": 90, "top5": 95, "frc": 100}, "normal") == "abs"
+    assert C.classify({**base, "cnt": 19, "rv": 80, "fv": 90, "top5": 95, "tra": 100}, "odds10u") == "abs"
+    assert C.classify({**base, "cnt": 19, "rv": 79.9, "fv": 90, "top5": 95, "frc": 100}, "normal") is None
     assert C.classify({**base, "cnt": 30, "fv": 60, "top5": 70}, "normal") == "opp"
     assert C.classify({**base, "cnt": 30, "rv": 50, "top5": 70}, "normal") == "opp"
     assert C.classify({**base, "cnt": 30, "fv": 33, "frc": 150, "top5": 50}, "normal") == "opp"
@@ -429,11 +450,11 @@ def test_classify_rare_keys_and_high_return():
     z = {"fv": 0, "rv": 0, "top5": 0, "frc": 0, "tra": 0}
     g1, plain = "東京×芝×23-24×定量×G1×3", "東京×芝×16-18×定量×1・2_勝×3"
     # 希少条件は最低件数が下がる（絶対軸・軸 6、相手 15、消し 12）。ふつうの条件はそのまま
-    for key, n_abs, n_opp, n_ks in ((g1, 6, 15, 12), (plain, 10, 30, 20)):
+    for key, n_abs, n_ax, n_opp, n_ks in ((g1, 6, 6, 15, 12), (plain, 10, 20, 30, 20)):
         assert C.classify({**z, "cnt": n_abs, "rv": 80, "frc": 100, "key": key}, "normal") == "abs"
         assert C.classify({**z, "cnt": n_abs - 1, "rv": 80, "frc": 100, "key": key}, "normal") is None
-        assert C.classify({**z, "cnt": n_abs, "fv": 80, "top5": 90, "key": key}, "normal") == "axis"
-        assert C.classify({**z, "cnt": n_abs - 1, "fv": 80, "top5": 90, "key": key}, "normal") is None
+        assert C.classify({**z, "cnt": n_ax, "fv": 80, "top5": 90, "key": key}, "normal") == "axis"
+        assert C.classify({**z, "cnt": n_ax - 1, "fv": 80, "top5": 90, "key": key}, "normal") is None
         assert C.classify({**z, "cnt": n_opp, "fv": 60, "top5": 70, "key": key}, "normal") == "opp"
         assert C.classify({**z, "cnt": n_opp - 1, "fv": 60, "top5": 70, "key": key}, "normal") is None
         assert C.classify({**z, "cnt": n_ks, "fv": 4.9, "top5": 9.9, "key": key}, "normal") == "keshi"
@@ -443,7 +464,7 @@ def test_classify_rare_keys_and_high_return():
     # 結合データを渡さなければ希少条件ではない（KEY_COLUMN の名前でも渡せる）
     assert C.classify({**z, "cnt": 6, "rv": 80, "frc": 100}, "normal") is None
     assert C.classify({**z, "cnt": 6, "rv": 80, "frc": 100, "結合データ": g1}, "normal") == "abs"
-    # 高回収率基準（軸候補）: 10倍未満・10〜50倍のときだけ
+    # 高回収率基準（軸候補）: 2〜10倍未満・10〜50倍のときだけ
     # （回収値は 単勝適正回収値 で試す。複勝回収値 ≥ 150 だと、もとからある相手候補の条件にも当たるため）
     hr1 = {**z, "cnt": 30, "fv": 35, "top5": 50, "tra": 200}
     hr2 = {**z, "cnt": 30, "fv": 50, "tra": 150}
@@ -468,6 +489,11 @@ def test_classify_rare_keys_and_high_return():
     assert any("高回収率" in x for x in d["axis"]) and all(any("希少条件" in x for x in d[c]) for c in C.CATEGORIES)
     s = C.rule_settings()
     assert s["RARE_TOKENS"] == list(C.RARE_TOKENS) and s["HR_CNT"] == 30 and s["RARE_KS_CNT"] == 12
+    # 軸候補の最低件数（2026-11-14 に 10 → 20）。ほかの下限はそのまま。説明の文も同じ値
+    assert (s["AX_CNT"], s["ABS_CNT"], s["OP_CNT"], s["KS_CNT"]) == (20, 10, 30, 20)
+    assert (s["RARE_AX_CNT"], s["RARE_ABS_CNT"], s["RARE_OP_CNT"], s["RARE_HR_CNT"]) == (6, 6, 15, 15)
+    assert all(x.startswith("件数 ≥ 20 かつ") for x in d["axis"][:4]) and d["abs"][0].startswith("件数 ≥ 10 かつ")
+    assert "件数 ≥ 6（高回収率は 件数 ≥ 15）" in d["axis"][-1] and "件数 ≥ 30" in d["axis"][4]
 
 
 # ---------------------------------------------------------------- WEDGE

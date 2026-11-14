@@ -638,3 +638,42 @@ def test_last_mask_in_compute_indicator():
     z = compute_indicator(pd.Series(["90", "95", "0", "80"]), pd.Series(["a"] * 4), spec_for("ZI"),
                           last=pd.Series([False, False, True, False]))
     assert z["順位"].tolist() == [2, 1, 4, 3]
+
+
+# ---------------------------------------------------------------- 2026-11-14: odds10u = 2.0倍以上 10.0倍未満
+def test_odds10u_excludes_horses_under_two(tmp_path, monkeypatch):
+    """単勝1倍台の馬は odds10u（2〜10倍未満）に入れず、通常（normal）にだけ入る。境目は 2.0 が入り 1.9 は入らない。"""
+    import aggregate_stats_ver2
+    import replace_csv_ver3 as r
+    from shisu.aggstore import read_agg_tables
+    monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path))
+    odds = ["1.5", "1.9", "2.0", "9.9", "10.0", "49.9", "50.0", "60.0", "70.0", "80.0", "90.0", "100.0"]
+    frames = []
+    for k in range(8):                                  # 8レース（件数5以上で成績表に出る）。指数の順位 = 馬番
+        df = _race([str(200 - i) for i in range(12)], [str(i) for i in range(1, 13)], [str(i) for i in range(1, 13)],
+                   rid=f"202610{10 + k}04040304")
+        df["単勝オッズ"] = odds
+        frames.append(df)
+    synth.write_cp932(pd.concat(frames, ignore_index=True), tmp_path / "csv" / "新潟_タイムM.csv")
+    assert r.main(["--csv-dir", str(tmp_path / "csv"), "--no-ext", "--master-dir", str(tmp_path / "m")]) == 0
+    m = pd.read_csv(tmp_path / "m" / "master_新潟_タイムM.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
+    band = m.drop_duplicates("馬番").set_index("馬番")["オッズ帯"].to_dict()
+    assert [band[str(u)] for u in range(1, 8)] == ["", "", "odds10u", "odds10u", "odds10_50", "odds10_50", "odds50p"]
+    assert aggregate_stats_ver2.main(["--in-dir", str(tmp_path / "m"), "--out-dir", str(tmp_path / "agg"),
+                                      "--wedge-min-year-count", "0", "--no-compact"]) == 0
+    t = read_agg_tables(tmp_path / "agg")
+
+    def ranks(mode):                                    # family normal のキーの末尾（指数順位）→ 件数
+        prefix = "" if mode == "normal" else mode + "_"
+        tb = t.get(f"foragg_{prefix}normal_新潟_タイムM.csv")
+        return {} if tb is None else {k.rsplit("×", 1)[1]: int(n) for k, n in zip(tb["結合データ"], tb["件数"])}
+    assert ranks("normal") == {str(u): 8 for u in range(1, 13)}                    # 1倍台も通常には入る
+    assert ranks("odds10u") == {"3": 8, "4": 8}                                    # 2.0・9.9 だけ（1.5・1.9・10.0 は入らない）
+    assert ranks("odds10_50") == {"5": 8, "6": 8}
+    assert ranks("odds50p") == {str(u): 8 for u in range(7, 13)}
+    import json
+    stamp = json.loads((tmp_path / "agg" / "agg_master_新潟_タイムM.csv.gz.done").read_text(encoding="utf-8"))
+    assert stamp["odds_breaks"] == [2.0, 10.0, 50.0]
+    assert json.loads((tmp_path / "agg" / "agg_settings.json").read_text(encoding="utf-8"))["odds"]["breaks"] == [2.0, 10.0, 50.0]
+    F.reset()
+

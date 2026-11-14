@@ -566,9 +566,15 @@ def test_classify_thresholds_are_part_of_settings(monkeypatch):
     assert settings_hash(agg.settings_of([], set(), {}, on)) != h_on        # コンパクト化で残す行が変わる
     assert settings_hash(agg.settings_of([], set(), {}, off)) == h_off      # 全部の行を書くなら関係ない
     from shisu import odds, wedge
-    monkeypatch.setattr(odds, "ODDS_BREAKS", (8.0, 50.0))                 # オッズ帯の境目
+    assert agg.settings_of([], set(), {}, off)["odds"]["breaks"] == [2.0, 10.0, 50.0]    # odds10u の下限も設定に入る
+    monkeypatch.setattr(odds, "ODDS_BREAKS", odds.LEGACY_BREAKS)          # 2026-11-13 までの境目（下限なし）で作った成績表
+    h_legacy = settings_hash(agg.settings_of([], set(), {}, off))
+    assert h_legacy != h_off                                               # → --resume は作り直す
+    monkeypatch.setattr(odds, "ODDS_BREAKS", (2.0, 8.0, 50.0))            # オッズ帯の境目
     h2 = settings_hash(agg.settings_of([], set(), {}, off))
-    assert h2 != h_off
+    assert h2 != h_off and h2 != h_legacy
+    monkeypatch.setattr(odds, "ODDS_BREAKS", (1.5, 10.0, 50.0))           # 下限だけ変えても変わる
+    assert settings_hash(agg.settings_of([], set(), {}, off)) not in (h_off, h2)
     monkeypatch.setattr(wedge, "EDGE_TABLE", wedge.EDGE_TABLE[:-1])       # EDGE の表
     assert settings_hash(agg.settings_of([], set(), {}, off)) != h2
 

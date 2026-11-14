@@ -31,6 +31,7 @@ __tables_meta__ の kind=foragg・前の版の foragg_*）は触らない（前�
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import re
@@ -46,8 +47,8 @@ from shisu import config
 from shisu import families as fam_registry
 from shisu.conditions import CONDITION_COLUMNS, derive, load_inner_lookup, standardize_entries
 from shisu.csvio import norm_series, norm_text, read_csv_any
-from shisu.matching import (HIT_COLUMNS, HORSE_COLUMNS, PART_FIELDS, STAT_COLUMNS, UNIFIED, indicator_bases,
-                            match_entry_row, rank_text, unified_status)
+from shisu.matching import (HIT_COLUMNS, HORSE_COLUMNS, PART_FIELDS, STAT_COLUMNS, UNIFIED, HitCache, indicator_bases,
+                            iter_hit_rows, rank_text, unified_status)
 from shisu.aggstore import (FLOAT_COLUMNS, INT_COLUMNS, RATE_NAMES, ROW_META, agg_master_files,  # noqa: F401
                             IDENTITY_KEYS, STAMP_SUFFIX, estimate_percent, iter_agg_chunks, legacy_files,
                             master_identity, prepare_agg_frame, read_stamp)
@@ -55,6 +56,7 @@ from shisu.csvio import READ_ENCODINGS
 from shisu.indicators import canonical_indicator, is_known_indicator
 from shisu.naming import (ENTRIES_ALL, ENTRIES_PREFIX, file_stem, parse_agg_master_name,
                           parse_foragg_stem, table_name_for_entries, table_name_for_foragg, xjoin_table_for)
+from shisu.odds import ODDS_BREAKS, ODDS_LABELS
 from shisu.normalize import (apply_age_class_rule, apply_distance_rules, class_series, distance_series,
                              entry_inner_outer, frame_group_series, infer_entry_weight, race_date,
                              race_id_without_horse, split_surface_distance, weight_series)
@@ -80,7 +82,10 @@ UNIFIED_STATS = ("件数", "勝率", "連対率", "複勝率", "2着率", "3着�
                  "勝率_val", "連対率_val", "複勝率_val", "2着率_val", "3着率_val", "掲示板率_val") + WEDGE_COLUMNS
 UNIFIED_META = ROW_META        # ("family", "odds_mode", "rank_scheme", "indicator", "region", "テーブル名")
 FACET_COLUMNS = ("場所", "芝・ダ", "距離", "芝(内・外)")
-XJOIN_CACHE_LIMIT = 20_000
+XJOIN_CACHE_LIMIT = 20_000      # 照合結果のキャッシュの件数の上限（照合1回ごとに見る。shisu.matching.HitCache）
+XJOIN_CACHE_ROWS = 50_000       # キャッシュが持つ行数の上限
+XJOIN_BATCH = 5_000             # この行数ごとに INSERT する（1頭ぶんをまとめて持たない）
+XJOIN_PROGRESS_EVERY = 50       # 何頭ごとに進み具合を出すか
 ENTRIES_ALL_COLUMNS = ("日付", "レースID(新)", "レースID(新/馬番無)", "場 R", "場所", "芝・ダ", "距離",
                        "芝(内・外)", "クラス名", "重量種別", "頭数", "枠番", "枠番グループ", "馬番", "馬名",
                        "騎手", "source_table")
@@ -121,6 +126,9 @@ def table_exists(con: sqlite3.Connection, name: str) -> bool:
 
 BUILD_INFO = "__build_info__"          # DB の作り直しの印（key, value）
 UNIFIED_STAMP = "unified_stamp"        # unified_all を入れ替えるたびに変わる値
+ODDS_LABELS_OLD = "10倍未満"            # 2026-11-13 までの odds10u（下限なし）
+ODDS_INFO = "odds_breaks"              # unified_all の成績表を集計したときのオッズ帯の境目（JSON のリスト。分からなければ "null"）
+ODDS_INFO_BUILD = "odds_breaks:build"  # 作り直し中（unified_all__build）の分。swap_unified で ODDS_INFO に移す
 XJOIN_INFO = "xjoin_of:"               # + xjoin のテーブル名 → その照合結果が何から作られたか（JSON。xjoin_record）
 
 
@@ -265,6 +273,8 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
     legacy = legacy_files(agg_dir)
     if not masters and not legacy:
         print(f"[foragg] 集計CSVがありません: {agg_dir}（aggregate_stats_ver2.py を先に実行）")
+        set_info(con, ODDS_INFO_BUILD, json.dumps(list(ODDS_BREAKS)))
+        con.commit()
         return [], 0, {c: set() for c in FACET_COLUMNS}
     _create_unified(con, UNIFIED_BUILD)
     con.commit()
@@ -272,6 +282,7 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
     load = _AggLoad(con, active)
     skipped, old_format, shadowed = 0, [], 0
     stamps: dict[str, str] = {}
+    breaks_seen: set[str] = set()         # 成績表ごとの、集計したときのオッズ帯の境目（印に無ければ "null" = 前の版）
     rebuilt: list[str] = []
     master_dir = config.master_dir()
     # 旧来の foragg_*.csv を使わない master = agg_master のファイルがある master（読めなかったものも。
@@ -311,6 +322,7 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
         loaded_sources.add(source)
         st = read_stamp(p) or {}
         stamps[p.name] = st.get("settings", "")
+        breaks_seen.add(json.dumps(st.get("odds_breaks")))
         # 成績表を作ったあとに replace が master を作り直したか（読んだ場所に無ければ master_csv の同じ名前で。
         # 比べるのは大きさと中身の指紋。更新時刻はコピー・Docker のマウントで変わるので使わない）
         m = Path(st.get("master_path") or "")
@@ -376,6 +388,15 @@ def load_agg_tables(con: sqlite3.Connection, agg_dir: Path) -> tuple[list[dict],
     if rebuilt:
         print(f"[WARN] 成績表を作ったあとに master が作り直されています（{len(rebuilt)} 本。例: {rebuilt[0]}）。"
               "aggregate_stats_ver2.py --resume で作り直してください", file=sys.stderr)
+    # オッズ帯の境目: 全部の成績表が同じ境目で集計されていればその値、混ざっている・印に無い（前の版）・旧来のファイルなら "null"
+    if legacy_sources:
+        breaks_seen.add("null")
+    breaks = breaks_seen.pop() if len(breaks_seen) == 1 else ("null" if breaks_seen else json.dumps(list(ODDS_BREAKS)))
+    set_info(con, ODDS_INFO_BUILD, breaks)
+    if breaks != json.dumps(list(ODDS_BREAKS)):
+        print(f"[INFO] この成績表は、オッズ帯の前の区切り（{ODDS_LABELS_OLD}。単勝{ODDS_BREAKS[0]:g}倍未満の馬も入る）で集計したものを"
+              f"含みます。「{ODDS_LABELS['odds10u']}」にするには aggregate_stats_ver2.py（--resume でも全部作り直します）→ "
+              "build_db.py --fresh を実行してください（それまで画面に注意書きが出ます）")
     con.commit()
     return rows, len(old_format) + len(load.failed), load.facets
 
@@ -402,6 +423,8 @@ def swap_unified(con: sqlite3.Connection, facets: dict[str, set] | None = None) 
     _create_unified_indexes(con)
     rebuild_facets(con, facets)
     set_info(con, UNIFIED_STAMP, uuid.uuid4().hex)    # これより前に作った照合結果（xjoin）は古い成績表のもの
+    set_info(con, ODDS_INFO, get_info(con, ODDS_INFO_BUILD) or "null")
+    con.execute(f"DELETE FROM {BUILD_INFO} WHERE key = ?", (ODDS_INFO_BUILD,))
     n = con.execute(f"SELECT COUNT(*) FROM {UNIFIED}").fetchone()[0]
     print(f"[foragg] unified_all: {n} rows" + (f"（前の版の1表ずつのテーブル foragg_* {n_old} 個を消しました）" if n_old else ""))
     if n_left:
@@ -532,6 +555,33 @@ def build_entries_all(con: sqlite3.Connection, loaded: list[dict]) -> None:
                     (t["table_name"],))
 
 
+def insert_hits(con: sqlite3.Connection, xname: str, rows: list[dict], bases: list[str], entries_table: str,
+                families: tuple, progress: bool = False) -> int:
+    """rows（出馬表の馬）× bases（指数）を unified_all と照合して xname に INSERT する。戻り値: 入れた行数。
+
+    メモリを増やさないための形（family 数千 × 指数 数十では、1頭で数十万回の照合・数十万行のヒットになる）:
+    ・ヒット行は iter_hit_rows から1行ずつ受け取り、XJOIN_BATCH 行たまるごとに INSERT する（1頭ぶんの dict のリストを作らない）
+    ・キャッシュは HitCache（件数・行数の上限を照合1回ごとに見る。1頭を回し終えるまで膨らむことが無い）"""
+    ins = (f"INSERT INTO {q(xname)} ({', '.join(q(c) for c in HIT_COLUMNS)}) "
+           f"VALUES ({', '.join('?' * len(HIT_COLUMNS))})")
+    cache = HitCache(XJOIN_CACHE_LIMIT, XJOIN_CACHE_ROWS)
+    total, batch = 0, []
+    for i, row in enumerate(rows, 1):
+        if bases:
+            for t in iter_hit_rows(con, row, bases, entries_table, families, cache):
+                batch.append(t)
+                if len(batch) >= XJOIN_BATCH:
+                    con.executemany(ins, batch)
+                    total += len(batch)
+                    batch.clear()
+        if progress and (i % XJOIN_PROGRESS_EVERY == 0 or i == len(rows)):
+            print(f"[xjoin] {xname}: {i}/{len(rows)} 頭, hits {total + len(batch)}", flush=True)
+    if batch:
+        con.executemany(ins, batch)
+        total += len(batch)
+    return total
+
+
 def build_xjoin(con: sqlite3.Connection, entries_table: str, families=None) -> dict:
     """entries_table の全馬を unified_all と照合して entries_xjoin_* に保存する。"""
     families = tuple(families or fam_registry.active_names())
@@ -543,23 +593,7 @@ def build_xjoin(con: sqlite3.Connection, entries_table: str, families=None) -> d
     names = [d[0] for d in cur.description]
     rows = [dict(zip(names, r)) for r in cur.fetchall()]
     bases = indicator_bases(names)
-    ins = (f"INSERT INTO {q(xname)} ({', '.join(q(c) for c in HIT_COLUMNS)}) "
-           f"VALUES ({', '.join('?' * len(HIT_COLUMNS))})")
-    # 照合結果のキャッシュは上限付き（上限なしだと大きい出馬表で数GBになる。2万件で空にしても速度は同じ）
-    cache: dict = {}
-    total = 0
-    batch = []
-    for i, row in enumerate(rows, 1):
-        if len(cache) > XJOIN_CACHE_LIMIT:
-            cache.clear()
-        for h in match_entry_row(con, row, bases, entries_table, families, cache):
-            batch.append(tuple(h.get(c) for c in HIT_COLUMNS))
-        if len(batch) >= 5000 or i == len(rows):
-            con.executemany(ins, batch)
-            total += len(batch)
-            batch = []
-        if i % 200 == 0 or i == len(rows):
-            print(f"[xjoin] {xname}: {i}/{len(rows)} 頭, hits {total}", flush=True)
+    total = insert_hits(con, xname, rows, bases, entries_table, families, progress=True)
     con.execute(f'CREATE INDEX {q("idx_" + xname + "_race")} ON {q(xname)}("レースID(新/馬番無)")')
     return {"table_name": xname, "source_file": entries_table, "kind": "xjoin", "n_rows": total,
             "indicator": ",".join(bases)}
@@ -621,7 +655,7 @@ def partial_blocker(rec: dict | None, now: dict, targets) -> str | None:
 
 def refresh_xjoin(con: sqlite3.Connection, entries_table: str, targets: list[str], families=None) -> dict | None:
     """entries_xjoin_* のうち、base が targets の指数の行だけを作り直す（ほかの指数の行はそのまま）。
-    照合は build_xjoin と同じ match_entry_row。xjoin が無い・列の形が今と違うときは None（呼び出し側で全部作り直す）。"""
+    照合は build_xjoin と同じ insert_hits。xjoin が無い・列の形が今と違うときは None（呼び出し側で全部作り直す）。"""
     families = tuple(families or fam_registry.active_names())
     xname = xjoin_table_for(entries_table)
     if not table_exists(con, xname):
@@ -634,20 +668,7 @@ def refresh_xjoin(con: sqlite3.Connection, entries_table: str, targets: list[str
     all_bases = indicator_bases(names)
     bases = [b for b in all_bases if b in set(targets)]
     con.execute(f"DELETE FROM {q(xname)} WHERE base IN ({','.join('?' * len(targets))})", list(targets))
-    ins = (f"INSERT INTO {q(xname)} ({', '.join(q(c) for c in HIT_COLUMNS)}) "
-           f"VALUES ({', '.join('?' * len(HIT_COLUMNS))})")
-    cache: dict = {}
-    total, batch = 0, []
-    for i, row in enumerate(rows, 1):
-        if len(cache) > XJOIN_CACHE_LIMIT:
-            cache.clear()
-        if bases:
-            for h in match_entry_row(con, row, bases, entries_table, families, cache):
-                batch.append(tuple(h.get(c) for c in HIT_COLUMNS))
-        if len(batch) >= 5000 or i == len(rows):
-            con.executemany(ins, batch)
-            total += len(batch)
-            batch = []
+    total = insert_hits(con, xname, rows, bases, entries_table, families, progress=True)
     n = con.execute(f"SELECT COUNT(*) FROM {q(xname)}").fetchone()[0]
     missing = [t for t in targets if t not in all_bases]
     print(f"[xjoin] {xname}: {'・'.join(targets)} の行だけ作り直しました（{len(rows)} 頭, その指数の hits {total}, 全体 {n} 行）"
@@ -797,6 +818,7 @@ def main(argv=None) -> int:
         entries = load_entries_tables(con, Path(args.entries_dir))
         build_entries_all(con, entries)
         con.commit()                         # 出馬表はここまでで確定（照合結果は下で、テーブルごとに1つのトランザクション）
+        gc.collect()                         # 正規化に使った DataFrame を手放してから照合に入る（照合がいちばんメモリを使う）
         keep |= {t["table_name"] for t in entries} | {ENTRIES_ALL}
         meta_rows = list(entries)
         status = unified_status(con)
