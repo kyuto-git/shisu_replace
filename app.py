@@ -850,8 +850,10 @@ HOT_CATEGORIES = ("abs", "axis")
 FAV_MODE = "odds10u"                   # 2〜10倍未満のオッズ帯
 CUT_CATEGORIES = ("axis", "opp")       # 過剰人気カットの対象の区分（絶対軸はもともと回収値100以上が条件・消しは対象外）
 CUT_MIN_RETURN = 100.0                 # 複勝回収値・単勝適正回収値のどちらもこれ未満なら、過剰人気（当たっても増えない）として除く
-KESHI_DOMINANT_RATIO = 1.0             # 消し(2〜10倍未満)の行数 ≥ 軸の行数 × これ → 「消優勢」
-KESHI_CAUTION_RATIO = 0.5              # 消し(2〜10倍未満)の行数 ≥ 軸の行数 × これ → 「要注意」
+# 消優勢・要注意の判定（2026-11-14〜。軸候補の最低件数を 20 に上げて軸の行が減ったので、1〜2行の偶発的な消しでは付けない）
+KESHI_DOMINANT_MIN_ROWS = 3            # 「消優勢」に要る 消し(2〜10倍未満) の行数
+KESHI_DOMINANT_MIN_INDS = 2            # 「消優勢」に要る、消し(2〜10倍未満) が出た指数の数
+KESHI_CAUTION_MIN_ROWS = 2             # 「要注意」に要る 消し(2〜10倍未満) の行数
 DANGER_LABELS = {"dominant": "⚠️消優勢", "caution": "要注意"}
 
 
@@ -870,12 +872,16 @@ def is_low_return(h: dict) -> bool:
     return not any(v is not None and v >= CUT_MIN_RETURN for v in (_num(h.get("複勝回収値")), _num(h.get("単勝適正回収値"))))
 
 
-def danger_level(axis_rows: int, keshi_fav: int) -> str:
-    """軸の行数（絶対軸 + 軸候補）と 消し(2〜10倍未満)の行数の比べ方。
-    'dominant'（消優勢）= 消しが1行以上あり、軸の行数以上 ／ 'caution'（要注意）= 軸があり、消しが軸の半分以上 ／ ''。"""
-    if keshi_fav > 0 and keshi_fav >= axis_rows * KESHI_DOMINANT_RATIO:
+def danger_level(abs_rows: int, axis_rows: int, keshi_fav: int, keshi_fav_inds: int) -> str:
+    """消し(2〜10倍未満) と軸の比べ方。abs_rows = 絶対軸の行数、axis_rows = 軸の合計の行数（絶対軸 + 軸候補）、
+    keshi_fav = 消し(2〜10倍未満) の行数、keshi_fav_inds = それが出た指数の数。
+    'dominant'（消優勢）= 絶対軸が1行も無く、消しが3行以上・2指数以上で、軸の合計より多い
+    'caution'（要注意） = 消優勢ではなく、軸が1行以上あり、消しが2行以上で、軸の合計以上（絶対軸のある馬で消しが上回るときもここ）
+    ''                  = どちらでもない（1行だけの消し・軸の無い馬の1指数だけの消しには付けない）"""
+    if (abs_rows == 0 and keshi_fav >= KESHI_DOMINANT_MIN_ROWS and keshi_fav_inds >= KESHI_DOMINANT_MIN_INDS
+            and keshi_fav > axis_rows):
         return "dominant"
-    if axis_rows > 0 and keshi_fav > 0 and keshi_fav >= axis_rows * KESHI_CAUTION_RATIO:
+    if axis_rows >= 1 and keshi_fav >= KESHI_CAUTION_MIN_ROWS and keshi_fav >= axis_rows:
         return "caution"
     return ""
 
@@ -900,7 +906,7 @@ def horse_stats(race: list[dict], buckets: dict[str, list[dict]]) -> dict[str, d
     for s in out.values():
         s["axis_rows"] = s["abs"] + s["axis"]
         s["keshi_fav_inds"] = len(s["keshi_fav_by"])
-        s["danger"] = danger_level(s["axis_rows"], s["keshi_fav"])
+        s["danger"] = danger_level(s["abs"], s["axis_rows"], s["keshi_fav"], s["keshi_fav_inds"])
     return out
 
 
@@ -984,8 +990,8 @@ HITS_BODY = """
 <div class="card"><h1>指数クロス好走馬（絶対軸・軸候補が複数の指数で同時に出ている馬）：{{ cross_hits|length }}頭</h1>
 <div class="muted">絶対軸・軸候補の行がある指数を馬ごとに数えます。{{ cross.xmin }} 指数以上{% if cross.a or cross.b %}・{{ [cross.a, cross.b]|select|join(' と ') }} の両方で軸{% endif %} の馬。
 <span class="hotnum">赤字</span> = 10〜50倍・50倍以上のオッズ帯で軸に当たった指数（狙い目の穴）<br>
-<span class="kd">{{ DANGER_LABELS.dominant }}</span> = 消し(2〜10倍未満)の行数が、軸の行数（絶対軸＋軸候補）以上 ／
-<span class="kd caution">{{ DANGER_LABELS.caution }}</span> = 消し(2〜10倍未満)の行数が、軸の行数の半分以上 ／
+<span class="kd">{{ DANGER_LABELS.dominant }}</span> = 絶対軸が無く、消し(2〜10倍未満)が {{ kd_rule.dom_rows }} 行以上・{{ kd_rule.dom_inds }} 指数以上で、軸の行数（絶対軸＋軸候補）より多い ／
+<span class="kd caution">{{ DANGER_LABELS.caution }}</span> = 軸があり、消し(2〜10倍未満)が {{ kd_rule.cau_rows }} 行以上で、軸の行数以上（絶対軸のある馬はここまで）／
 <span class="tag clash">指数 絶対軸 / 軸候補 <span class="ks">(消n)</span></span> = 同じ指数で、軸と 消し(2〜10倍未満) の両方が出ている（n = 消しの行数）</div>
 """ + CROSS_FORM + """
 <div class="scroll" style="margin-top:8px"><table><thead><tr><th>馬番</th><th>馬名</th><th>騎手</th><th>判定</th><th class="num">軸の指数数</th><th class="num">うち穴</th>
@@ -1090,7 +1096,8 @@ def axis_cross(race: list[dict], buckets: dict[str, list[dict]], a: str = "", b:
     return out
 
 
-app.jinja_env.globals.update(is_hot=is_hot, DANGER_LABELS=DANGER_LABELS)
+app.jinja_env.globals.update(is_hot=is_hot, DANGER_LABELS=DANGER_LABELS, kd_rule={
+    "dom_rows": KESHI_DOMINANT_MIN_ROWS, "dom_inds": KESHI_DOMINANT_MIN_INDS, "cau_rows": KESHI_CAUTION_MIN_ROWS})
 
 
 def cut_low_request() -> bool:
