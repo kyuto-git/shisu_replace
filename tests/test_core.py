@@ -334,12 +334,22 @@ def test_entries_table_names():
 
 
 def test_odds_modes():
-    o = pd.Series(["1.5", "9.9", "10.0", "49.9", "50.0", "", "abc"])
+    """odds10u は 2.0倍以上 10.0倍未満（2026-11-14〜。1.9倍以下は normal にだけ入る。モード名はそのまま）。"""
+    o = pd.Series(["1.5", "9.9", "10.0", "49.9", "50.0", "", "abc", "1.9", "2.0", "2", "１.９", "２．０", "1.99", "0", "-3"])
     assert odds.odds_mask(o, "normal").all()
-    assert odds.odds_mask(o, "odds10u").tolist() == [True, True, False, False, False, False, False]
-    assert odds.odds_mask(o, "odds10_50").tolist() == [False, False, True, True, False, False, False]
-    assert odds.odds_mask(o, "odds50p").tolist() == [False, False, False, False, True, False, False]
-    assert odds.odds_bucket(o).tolist() == ["odds10u", "odds10u", "odds10_50", "odds10_50", "odds50p", "", ""]
+    assert odds.odds_mask(o, "odds10u").tolist() == [False, True, False, False, False, False, False,
+                                                     False, True, True, False, False, False, False, False]
+    assert odds.odds_mask(o, "odds10_50").tolist() == [False, False, True, True] + [False] * 11
+    assert odds.odds_mask(o, "odds50p").tolist() == [False, False, False, False, True] + [False] * 10
+    assert odds.odds_bucket(o).tolist() == ["", "odds10u", "odds10_50", "odds10_50", "odds50p", "", "",
+                                            "", "odds10u", "odds10u", "", "", "", "", ""]
+    # 1頭は normal 以外では高々1つの帯に入り、帯の分け方は odds_bucket と同じ
+    for m in ("odds10u", "odds10_50", "odds50p"):
+        assert odds.odds_mask(o, m).tolist() == (odds.odds_bucket(o) == m).tolist()
+    num = pd.to_numeric(o, errors="coerce")
+    assert odds.odds_mask_numeric(num, "odds10u").tolist() == odds.odds_mask(o, "odds10u").tolist()
+    assert odds.ODDS_BREAKS == (2.0, 10.0, 50.0) and odds.ODDS_LABELS["odds10u"] == "2〜10倍未満" == odds.FAV_LABEL
+    assert odds.ODDS_MODES == ("normal", "odds10u", "odds10_50", "odds50p")      # モード名は互換のため変えない
     assert "odds5p" not in odds.ODDS_MODES
 
 
@@ -443,7 +453,7 @@ def test_classify_rare_keys_and_high_return():
     # 結合データを渡さなければ希少条件ではない（KEY_COLUMN の名前でも渡せる）
     assert C.classify({**z, "cnt": 6, "rv": 80, "frc": 100}, "normal") is None
     assert C.classify({**z, "cnt": 6, "rv": 80, "frc": 100, "結合データ": g1}, "normal") == "abs"
-    # 高回収率基準（軸候補）: 10倍未満・10〜50倍のときだけ
+    # 高回収率基準（軸候補）: 2〜10倍未満・10〜50倍のときだけ
     # （回収値は 単勝適正回収値 で試す。複勝回収値 ≥ 150 だと、もとからある相手候補の条件にも当たるため）
     hr1 = {**z, "cnt": 30, "fv": 35, "top5": 50, "tra": 200}
     hr2 = {**z, "cnt": 30, "fv": 50, "tra": 150}

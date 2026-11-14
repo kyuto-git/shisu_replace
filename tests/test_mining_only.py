@@ -256,18 +256,18 @@ def test_build_db_mining_only_rematches_only_those_indicators(mo, tmp_path, monk
         before_other = con.execute(f'SELECT rowid, * FROM "{XJOIN}" {others} ORDER BY rowid').fetchall()
         before_mining = _xjoin_rows(d["db"], "WHERE base IN ('タイムM', '対戦M')")
     seen: list[tuple] = []
-    real = build_db.match_entry_row
+    real = build_db.iter_hit_rows
 
     def spy(con, row, bases, *a, **k):
         seen.append(tuple(bases))
         return real(con, row, bases, *a, **k)
-    monkeypatch.setattr(build_db, "match_entry_row", spy)
+    monkeypatch.setattr(build_db, "iter_hit_rows", spy)
     capsys.readouterr()
     assert build_db.main(["--entries-only", "--mining-only", "--entries-dir", str(d["out"]), "--db-path", str(d["db"])]) == 0
     log = capsys.readouterr().out
     assert "タイムM・対戦M の行だけ作り直しました" in log and "mode=entries" in log
     assert seen and set(seen) == {("タイムM", "対戦M")}                    # 照合したのは2指数だけ
-    monkeypatch.setattr(build_db, "match_entry_row", real)
+    monkeypatch.setattr(build_db, "iter_hit_rows", real)
     assert build_db.main(["--entries-only", "--entries-dir", str(f["out"]), "--db-path", str(f["db"])]) == 0
     assert _xjoin_rows(d["db"]) == _xjoin_rows(f["db"]) and _xjoin_rows(d["db"])
     with sqlite3.connect(d["db"]) as con, sqlite3.connect(f["db"]) as con2:
@@ -297,18 +297,18 @@ def test_build_db_mining_only_rematches_everything_when_other_things_changed(mo,
         assert _calc(d, "--mining-only") == 0
         pd.testing.assert_frame_equal(read_csv_any(d["out"] / MERGED), read_csv_any(f["out"] / MERGED))
         seen: list[tuple] = []
-        real = build_db.match_entry_row
+        real = build_db.iter_hit_rows
 
         def spy(con, row, bases, *a, _seen=seen, _real=real, **k):
             _seen.append(tuple(bases))
             return _real(con, row, bases, *a, **k)
-        monkeypatch.setattr(build_db, "match_entry_row", spy)
+        monkeypatch.setattr(build_db, "iter_hit_rows", spy)
         capsys.readouterr()
         assert build_db.main(["--entries-only", "--mining-only", "--entries-dir", str(d["out"]), "--db-path", str(d["db"])]) == 0
         log = capsys.readouterr().out
         assert "全部の指数を照合し直します" in log and "行だけ作り直しました" not in log, name
         assert seen and all(set(b) == set(INDICATORS) for b in seen), name       # 全部の指数を照合した
-        monkeypatch.setattr(build_db, "match_entry_row", real)
+        monkeypatch.setattr(build_db, "iter_hit_rows", real)
         assert build_db.main(["--entries-only", "--entries-dir", str(f["out"]), "--db-path", str(f["db"])]) == 0
         assert _xjoin_rows(d["db"]) == _xjoin_rows(f["db"]) and _xjoin_rows(d["db"]), name
     # 乗り替わった馬の行は、ほかの指数でも新しい騎手になっている
@@ -381,7 +381,7 @@ def test_build_db_mining_only_after_interrupted_runs(mo, tmp_path, monkeypatch, 
     assert _calc(d, "--mining-only") == 0
     args = ["--entries-only", "--mining-only", "--entries-dir", str(d["out"]), "--db-path", str(d["db"])]
     before = _xjoin_rows(d["db"])
-    real, calls = build_db.match_entry_row, []
+    real, calls = build_db.iter_hit_rows, []
 
     def dies(con, row, bases, *a, **k):
         calls.append(1)
@@ -389,7 +389,7 @@ def test_build_db_mining_only_after_interrupted_runs(mo, tmp_path, monkeypatch, 
             raise KeyboardInterrupt
         return real(con, row, bases, *a, **k)
     # 1回目: 乗り替わりを見つけて全部の照合を始め、20頭目で止まる
-    monkeypatch.setattr(build_db, "match_entry_row", dies)
+    monkeypatch.setattr(build_db, "iter_hit_rows", dies)
     with pytest.raises(KeyboardInterrupt):
         build_db.main(args)
     import gc
@@ -399,7 +399,7 @@ def test_build_db_mining_only_after_interrupted_runs(mo, tmp_path, monkeypatch, 
         assert build_db.load_xjoin_record(con, XJOIN) != build_db.xjoin_record(con, "entries_merged_hensachi")
         assert con.execute("SELECT 1 FROM sqlite_master WHERE name = ?", ("idx_" + XJOIN + "_race",)).fetchone()
     # 2回目（同じコマンド）: 出馬表のテーブルはもう新しいが、照合結果の記録が前の出馬表のものなので、全部の指数を照合し直す
-    monkeypatch.setattr(build_db, "match_entry_row", real)
+    monkeypatch.setattr(build_db, "iter_hit_rows", real)
     capsys.readouterr()
     assert build_db.main(args) == 0
     log = capsys.readouterr().out
@@ -486,6 +486,128 @@ def test_pages_show_confirmed_values_after_mining_only(mo, tmp_path, monkeypatch
     hits = c.get("/entries/hits", query_string=q).get_data(as_text=True)
     am.DB_PATH = str(f["db"])
     assert hits == c.get("/entries/hits", query_string=q).get_data(as_text=True) and "照合: xjoin" in hits
+
+
+# ---------------------------------------------------------------- 照合（xjoin）のメモリ（2026-11-14）
+def test_hit_cache_is_bounded_by_keys_and_rows(monkeypatch):
+    """キャッシュは「入れるたび」に上限を見る（件数と、持っている行数の両方）。ふつうの dict を渡されても件数の上限は守る。"""
+    from shisu import matching as M
+    c = M.HitCache(max_keys=3, max_rows=5)
+    seen = []
+    for i, n in enumerate([1, 1, 1, 1, 4, 1, 1, 0, 0, 0, 9, 0]):
+        c.put(("k", i), [("r",)] * n)
+        seen.append((len(c), c.rows))
+        assert len(c) <= 3 and (c.rows <= 5 or len(c) == 1)            # 上限より大きい1件だけは、それだけを持つ
+        assert c.rows == sum(len(v) for v in c.values())
+    assert seen[3] == (1, 1) and seen[4] == (2, 5) and seen[5] == (1, 1) and seen[10] == (1, 9) and seen[11] == (1, 0)
+    c.clear()
+    assert len(c) == 0 and c.rows == 0
+    monkeypatch.setattr(M, "CACHE_MAX_KEYS", 4)
+    plain: dict = {}
+    for i in range(20):
+        M._cache_put(plain, ("k", i), [])
+        assert len(plain) <= 4
+    assert M.HitCache().max_keys == 20_000 and M.HitCache().max_rows == 50_000    # 既定（引数の既定は定義時の値）
+
+
+def test_iter_hit_rows_equals_match_entry_row_and_cache_stays_bounded(mo):
+    """1行ずつ返す iter_hit_rows は match_entry_row（dict のリスト）と同じ中身・同じ順。キャッシュをどれだけ小さくしても
+    結果は変わらず、1頭を回している途中でも上限を超えない（family・指数が多いと1頭で数十万回の照合になる）。"""
+    from shisu import families as F
+    from shisu import matching as M
+    con = sqlite3.connect(mo / "racing.db")
+    con.row_factory = None
+    F.set_active(F.load_from_db(con), "db")
+    cur = con.execute("SELECT * FROM entries_merged_hensachi")
+    names = [d[0] for d in cur.description]
+    rows = [dict(zip(names, r)) for r in cur.fetchall()]
+    bases = M.indicator_bases(names)
+    peak = {"keys": 0, "rows": 0, "puts": 0}
+
+    class Watch(M.HitCache):
+        def put(self, key, hits):
+            super().put(key, hits)
+            peak["keys"], peak["rows"], peak["puts"] = max(peak["keys"], len(self)), max(peak["rows"], self.rows), peak["puts"] + 1
+
+    small, big = Watch(max_keys=7, max_rows=11), M.HitCache()
+    total = 0
+    for row in rows:
+        ref = M.match_entry_row(con, row, bases, "t")                    # キャッシュなし（この1頭の中だけ）
+        got = list(M.iter_hit_rows(con, row, bases, "t", cache=small))
+        assert [dict(zip(M.HIT_COLUMNS, t)) for t in got] == ref
+        assert list(M.iter_hit_rows(con, row, bases, "t", cache=big)) == got
+        assert all(isinstance(t, tuple) and len(t) == len(M.HIT_COLUMNS) for t in got)
+        total += len(got)
+    assert total > 1000 and peak["puts"] > 1000
+    assert peak["keys"] <= 7 and peak["rows"] <= max(11, M.DEFAULT_LIMIT)   # 上限を超えるのは、1件でそれより大きいものだけ
+    assert len(big) <= M.CACHE_MAX_KEYS and big.rows <= M.CACHE_MAX_ROWS
+    # query_unified（dict）は今までどおり
+    key, fam, base = next(iter(big))
+    assert M.query_unified(con, key, fam, base) == [dict(zip(M.META_COLUMNS + M.STAT_COLUMNS, r)) for r in big[(key, fam, base)]]
+    con.close()
+    F.reset()
+
+
+def test_xjoin_is_streamed_in_batches_with_a_bounded_cache(mo, tmp_path, monkeypatch, capsys):
+    """build_db の xjoin: ヒット行を XJOIN_BATCH 行ごとに INSERT し（1頭ぶんをまとめて持たない）、キャッシュは照合1回ごとに
+    上限を見る。上限・まとまりを極端に小さくしても、結果は行の順まで同じ。出馬表を読んだあと・照合の前に gc.collect() を呼ぶ。"""
+    import build_db
+    from shisu import matching as M
+    d = _work(mo, tmp_path / "a")
+    f = _work(mo, tmp_path / "b")
+    args = ["--entries-only", "--entries-dir"]
+    assert build_db.main([*args, str(f["out"]), "--db-path", str(f["db"])]) == 0          # 既定の大きさ
+    monkeypatch.setattr(build_db, "XJOIN_BATCH", 7)
+    monkeypatch.setattr(build_db, "XJOIN_CACHE_LIMIT", 3)
+    monkeypatch.setattr(build_db, "XJOIN_CACHE_ROWS", 5)
+    events: list[str] = []
+    sizes: list[int] = []
+    real_gc, real_iter, real_put = build_db.gc.collect, build_db.iter_hit_rows, M.HitCache.put
+
+    def put(self, key, hits):
+        real_put(self, key, hits)
+        sizes.append(len(self))
+        assert len(self) <= 3
+
+    def it(con, row, bases, table, families, cache):
+        events.append("match")
+        assert isinstance(cache, M.HitCache) and (cache.max_keys, cache.max_rows) == (3, 5)
+        return real_iter(con, row, bases, table, families, cache)
+
+    monkeypatch.setattr(build_db.gc, "collect", lambda *a: (events.append("gc"), real_gc(*a))[1])
+    monkeypatch.setattr(build_db, "iter_hit_rows", it)
+    monkeypatch.setattr(M.HitCache, "put", put)
+    assert build_db.main([*args, str(d["out"]), "--db-path", str(d["db"])]) == 0
+    assert "gc" in events and events.index("gc") < events.index("match") and sizes and max(sizes) <= 3
+    q = f'SELECT * FROM "{XJOIN}" ORDER BY rowid'
+    with sqlite3.connect(d["db"]) as c1, sqlite3.connect(f["db"]) as c2:
+        a, b = c1.execute(q).fetchall(), c2.execute(q).fetchall()
+        assert a == b and len(a) > 1000                                    # 行の順まで同じ
+        assert c1.execute("SELECT 1 FROM sqlite_master WHERE name = ?", ("idx_" + XJOIN + "_race",)).fetchone()
+    # insert_hits が1回に INSERT する行数は XJOIN_BATCH まで（偽の接続で数える）
+    monkeypatch.setattr(M.HitCache, "put", real_put)
+    monkeypatch.setattr(build_db, "iter_hit_rows", real_iter)
+    con = sqlite3.connect(d["db"])
+    cur = con.execute("SELECT * FROM entries_merged_hensachi")
+    names = [x[0] for x in cur.description]
+    rows = [dict(zip(names, r)) for r in cur.fetchall()]
+    batches: list[int] = []
+
+    class Counting:
+        def execute(self, *a):
+            return con.execute(*a)
+
+        def executemany(self, sql, batch):
+            batches.append(len(batch))
+            assert sql.startswith("INSERT INTO")
+
+    from shisu import families as F
+    F.set_active(F.load_from_db(con), "db")
+    n = build_db.insert_hits(Counting(), XJOIN, rows, M.indicator_bases(names), "entries_merged_hensachi", F.active_names())
+    assert n == sum(batches) == len(a) and max(batches) == 7 and batches.count(7) == len(a) // 7
+    assert build_db.insert_hits(Counting(), XJOIN, rows, [], "entries_merged_hensachi", F.active_names()) == 0   # 指数なし
+    con.close()
+    F.reset()
 
 
 # ---------------------------------------------------------------- 列の組み立て

@@ -70,26 +70,69 @@ def entry_fields(row: Mapping, base: str) -> dict:
     return out
 
 
+# 照合結果のキャッシュの上限（件数と、持っている行数の両方）。family が数千・指数が数十だと1頭で数十万回の照合になるので、
+# 上限は「照合1回ごと」に見る（1頭を回し終えてから見ると、その間は無制限に膨らむ）
+CACHE_MAX_KEYS = 20_000
+CACHE_MAX_ROWS = 50_000
+_HIT_SELECT = ", ".join(f'"{c}"' for c in META_COLUMNS + STAT_COLUMNS)
+_HIT_SQL = (f'SELECT {_HIT_SELECT} FROM "{UNIFIED}" WHERE "結合データ" = ? AND "family" = ? AND "indicator" = ? '
+            f'ORDER BY "複勝率_val" DESC, "連対率_val" DESC LIMIT ?')
+
+
+class HitCache(dict):
+    """照合結果のキャッシュ: (結合データ, family, 指数) → ヒット行（META_COLUMNS + STAT_COLUMNS の値のタプルのリスト）。
+    件数が max_keys、または持っている行数が max_rows を超えそうになったら空にしてから入れる（どんな family 数・指数数でも
+    この大きさを超えない）。同じレースの馬どうしで同じキーを引き直すのを省くためのもので、空にしても結果は変わらない。"""
+
+    def __init__(self, max_keys: int = CACHE_MAX_KEYS, max_rows: int = CACHE_MAX_ROWS):
+        super().__init__()
+        self.max_keys = max(1, int(max_keys))
+        self.max_rows = max(1, int(max_rows))
+        self.rows = 0
+
+    def put(self, key: tuple, hits: list) -> None:
+        if len(self) >= self.max_keys or self.rows + len(hits) > self.max_rows:
+            self.clear()
+        self[key] = hits
+        self.rows += len(hits)
+
+    def clear(self) -> None:
+        super().clear()
+        self.rows = 0
+
+
+def _cache_put(cache: dict, key: tuple, hits: list) -> None:
+    if isinstance(cache, HitCache):
+        cache.put(key, hits)
+        return
+    if len(cache) >= CACHE_MAX_KEYS:        # ふつうの dict を渡された場合も、件数の上限は守る
+        cache.clear()
+    cache[key] = hits
+
+
+def query_hit_rows(conn: sqlite3.Connection, key: str, family: str, indicator: str,
+                   limit: int = DEFAULT_LIMIT) -> list[tuple]:
+    """unified_all の完全一致の行（META_COLUMNS + STAT_COLUMNS の順の値のタプル）。"""
+    return conn.execute(_HIT_SQL, (key, family, indicator, limit)).fetchall()
+
+
 def query_unified(conn: sqlite3.Connection, key: str, family: str, indicator: str,
                   limit: int = DEFAULT_LIMIT) -> list[dict]:
-    cols = ", ".join(f'"{c}"' for c in META_COLUMNS + STAT_COLUMNS)
-    sql = (f'SELECT {cols} FROM "{UNIFIED}" WHERE "結合データ" = ? AND "family" = ? AND "indicator" = ? '
-           f'ORDER BY "複勝率_val" DESC, "連対率_val" DESC LIMIT ?')
-    cur = conn.execute(sql, (key, family, indicator, limit))
-    names = [d[0] for d in cur.description]
-    return [dict(zip(names, r)) for r in cur.fetchall()]
+    names = META_COLUMNS + STAT_COLUMNS
+    return [dict(zip(names, tuple(r))) for r in query_hit_rows(conn, key, family, indicator, limit)]
 
 
-def match_entry_row(conn: sqlite3.Connection, row: Mapping, bases: Iterable[str], source_table: str,
-                    families: Iterable[str] | None = None, cache: dict | None = None,
-                    limit: int = DEFAULT_LIMIT) -> list[dict]:
-    """出馬表1頭ぶんのヒット行（HIT_COLUMNS の dict）を返す。"""
-    cache = {} if cache is None else cache
+def iter_hit_rows(conn: sqlite3.Connection, row: Mapping, bases: Iterable[str], source_table: str,
+                  families: Iterable[str] | None = None, cache: dict | None = None,
+                  limit: int = DEFAULT_LIMIT):
+    """出馬表1頭ぶんのヒット行を、HIT_COLUMNS の順の値のタプルで1行ずつ返す（ジェネレータ）。
+    1頭ぶんをまとめて持たないので、family・指数が多くてもメモリは増えない（build_db の xjoin はこれをそのまま INSERT する）。
+    cache は HitCache（上限つき）。省略するとこの1頭の中だけのキャッシュ。"""
+    cache = HitCache() if cache is None else cache
     families = tuple(families) if families is not None else _families.active_names()
     if is_jump_row(row):              # 障害レース: 過去側は集計していない（コースを含まない family でも照合しない）
-        return []
-    horse = {c: norm_text(row.get(c)) for c in HORSE_COLUMNS}
-    out: list[dict] = []
+        return
+    horse = (source_table,) + tuple(norm_text(row.get(c)) for c in HORSE_COLUMNS)
     for base in bases:
         fields = entry_fields(row, base)
         for fam, cands in entry_key_candidates(fields, families).items():
@@ -97,10 +140,16 @@ def match_entry_row(conn: sqlite3.Connection, row: Mapping, bases: Iterable[str]
                 ck = (key, fam, base)
                 hits = cache.get(ck)
                 if hits is None:
-                    hits = query_unified(conn, key, fam, base, limit)
-                    cache[ck] = hits
-                for h in hits:
-                    rec = {"source_table": source_table, **horse, "base": base, "key": key}
-                    rec.update(h)
-                    out.append(rec)
-    return out
+                    hits = query_hit_rows(conn, key, fam, base, limit)
+                    _cache_put(cache, ck, hits)
+                if hits:
+                    head = horse + (base, key)
+                    for h in hits:
+                        yield head + tuple(h)
+
+
+def match_entry_row(conn: sqlite3.Connection, row: Mapping, bases: Iterable[str], source_table: str,
+                    families: Iterable[str] | None = None, cache: dict | None = None,
+                    limit: int = DEFAULT_LIMIT) -> list[dict]:
+    """出馬表1頭ぶんのヒット行（HIT_COLUMNS の dict）を返す（画面のその場照合用。中身は iter_hit_rows と同じ）。"""
+    return [dict(zip(HIT_COLUMNS, t)) for t in iter_hit_rows(conn, row, bases, source_table, families, cache, limit)]

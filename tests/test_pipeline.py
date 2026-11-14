@@ -415,7 +415,7 @@ def test_ranking_view_sorted_by_adjusted_wedge(base, monkeypatch):
 
 
 def test_ranking_preset_matches_classify(base, monkeypatch):
-    """横断ランキングのプリセットは、オッズ帯ごとの判定（消し候補の10倍未満ルール）まで classify と一致する。"""
+    """横断ランキングのプリセットは、オッズ帯ごとの判定（消し候補の2〜10倍未満ルール）まで classify と一致する。"""
     from shisu.classify import classify
     am = _app(base, monkeypatch)
     am.RANK_LIMIT = 10_000
@@ -712,11 +712,11 @@ def test_hits_page_drops_redundant_normal_marks_hot_rows_and_scrolls(base, monke
     summary = body.split("</table>", 1)[0]
     row1 = _re.search(r"<tr[^>]*><td>%s</td><td>%s</td>(.*?)</tr>" % (r1["馬番"], _re.escape(r1["馬名"])), summary, _re.S).group(1)
     nums = _re.findall(r'<td class="num[^"]*">\s*(?:<b>)?([^<]*)', row1)
-    # 絶対軸1（通常は数えない）・軸1・消し・相手・穴の軸2・軸の指数数2・消し(10倍未満)・その指数数
+    # 絶対軸1（通常は数えない）・軸1・消し・相手・穴の軸2・軸の指数数2・消し(2〜10倍未満)・その指数数
     assert [v.strip() for v in nums] == ["1", "1", "", "", "2", "2", "", ""]
-    # 並び: 軸候補は 10倍未満 → 50倍以上 → 通常
+    # 並び: 軸候補は 2〜10倍未満 → 50倍以上 → 通常
     axis_tbl = body.split('class="card cat-axis"', 1)[1].split("</table>", 1)[0]
-    order = [m for m in _re.findall(r"<td>(10倍未満|10〜50倍|10~50倍|50倍以上|通常)</td>", axis_tbl)]
+    order = [m for m in _re.findall(r"<td>(2〜10倍未満|10〜50倍|10~50倍|50倍以上|通常)</td>", axis_tbl)]
     assert order == [am.odds_label("odds10u"), am.odds_label("odds50p"), am.odds_label("normal")]
     # 指数クロス好走馬: 馬1は SAV と ZI の2指数で軸
     assert "指数クロス好走馬（絶対軸・軸候補が複数の指数で同時に出ている馬）：1頭" in page
@@ -809,7 +809,7 @@ def test_wedge_page_collapses_filters_and_keeps_matrix_on_top(base, monkeypatch)
 
 
 def test_hits_page_favorite_cut_keshi_counts_and_danger_badges(base, monkeypatch):
-    """条件ヒット馬（2026-11-13）: 過剰人気カット（既定 ON・切り替え）、消し(10倍未満) の行数と指数数、
+    """条件ヒット馬（2026-11-13）: 過剰人気カット（既定 ON・切り替え）、消し(2〜10倍未満) の行数と指数数、
     同じ指数で軸と消しが出ているタグ、消優勢・要注意の判定。"""
     import re as _re
     am = _app(base, monkeypatch)
@@ -821,15 +821,15 @@ def test_hits_page_favorite_cut_keshi_counts_and_danger_badges(base, monkeypatch
     def good(h):                                    # 回収値100以上の軸
         return {**h, "複勝回収値": 130.0}
     fake = [
-        # 馬1: 買える人気馬（10倍未満の軸が回収値100以上で2指数・消しなし）
+        # 馬1: 買える人気馬（2〜10倍未満の軸が回収値100以上で2指数・消しなし）
         good(_fake_hit(r1, "SAV", "odds10u", 30, "axis")), good(_fake_hit(r1, "ZI", "odds10u", 30, "axis")),
-        # 馬2: 軸は過剰人気（回収値80）だけ → カットで軸0・消し(10倍未満)1 → 消優勢
+        # 馬2: 軸は過剰人気（回収値80）だけ → カットで軸0・消し(2〜10倍未満)1 → 消優勢
         _fake_hit(r2, "SAV", "odds10u", 30, "axis"), _fake_hit(r2, "ZI", "odds10u", 30, "axis"),
         _fake_hit(r2, "SAV", "odds10u", 25, "keshi", family="rankB"),
-        # 馬3: 同じ指数 SAV で 絶対軸1・軸1（回収値100以上）と 消し(10倍未満)1、ZI にも軸 → 軸3・消し1 → 判定なし（1 < 1.5）
+        # 馬3: 同じ指数 SAV で 絶対軸1・軸1（回収値100以上）と 消し(2〜10倍未満)1、ZI にも軸 → 軸3・消し1 → 判定なし（1 < 1.5）
         _fake_hit(r3, "SAV", "odds10u", 12, "abs"), good(_fake_hit(r3, "SAV", "odds10u", 30, "axis", family="rankJ")),
         good(_fake_hit(r3, "ZI", "odds10_50", 30, "axis")), _fake_hit(r3, "SAV", "odds10u", 25, "keshi", family="rankB"),
-        # 馬4: 軸2（SAV・ZI）・消し(10倍未満)1（先行）→ 要注意。通常の消しは 消し(10倍未満) に数えない
+        # 馬4: 軸2（SAV・ZI）・消し(2〜10倍未満)1（先行）→ 要注意。通常の消しは 消し(2〜10倍未満) に数えない
         good(_fake_hit(r4, "SAV", "odds10u", 30, "axis")), good(_fake_hit(r4, "ZI", "odds10u", 30, "axis")),
         _fake_hit(r4, "先行", "odds10u", 25, "keshi"), _fake_hit(r4, "先行", "normal", 60, "keshi", family="rankB"),
     ]
@@ -851,9 +851,9 @@ def test_hits_page_favorite_cut_keshi_counts_and_danger_badges(base, monkeypatch
     assert "cut_low_10u=0" in page.split("カットせずに全部表示する", 1)[0].rsplit("<a href=", 1)[1]
     body = page.split("馬ごとの該当数", 1)[1]
     assert "絶対軸（1）" in body and "軸候補（6）" in body and "消し候補（4）" in body
-    assert "過剰人気カットで、10倍未満・回収値100未満の 2 行を除いています" in body
+    assert "過剰人気カットで、2〜10倍未満・回収値100未満の 2 行を除いています" in body
     summ = rows_of(page, "馬ごとの該当数")
-    # 列: 絶対軸・軸候補・消し候補・相手候補・穴の軸・軸の指数数・消し(10倍未満)・消し(10倍未満)の指数数
+    # 列: 絶対軸・軸候補・消し候補・相手候補・穴の軸・軸の指数数・消し(2〜10倍未満)・消し(2〜10倍未満)の指数数
     assert nums(summ[r1["馬番"]]) == ["", "2", "", "", "", "2", "", ""] and "kd" not in summ[r1["馬番"]].split("</td>", 3)[2]
     assert nums(summ[r2["馬番"]]) == ["", "", "1", "", "", "", "1", "1"]
     assert 'class="kd-dominant"' in summ[r2["馬番"]] and '<span class="kd">⚠️消優勢</span>' in summ[r2["馬番"]]
@@ -861,7 +861,7 @@ def test_hits_page_favorite_cut_keshi_counts_and_danger_badges(base, monkeypatch
     assert nums(summ[r4["馬番"]]) == ["", "2", "2", "", "", "2", "1", "1"]
     assert 'class="kd-caution"' in summ[r4["馬番"]] and '<span class="kd caution">要注意</span>' in summ[r4["馬番"]]
     assert "馬ごとの該当数（⚠️消優勢 1頭・要注意 1頭）" in page
-    for th in ("<th class=\"num\">消し(10倍未満)</th>", "<th class=\"num\">消し(10倍未満)の指数数</th>"):
+    for th in ("<th class=\"num\">消し(2〜10倍未満)</th>", "<th class=\"num\">消し(2〜10倍未満)の指数数</th>"):
         assert page.count(th) == 2                                           # 指数クロス好走馬・馬ごとの該当数の両方
     # 指数クロス好走馬: 馬2 は軸が無くなったので出ない。馬3 の SAV のタグに (消1)（同じ指数で軸と消し）
     assert "：3頭" in page.split("指数クロス好走馬（", 1)[1][:60]
@@ -872,7 +872,7 @@ def test_hits_page_favorite_cut_keshi_counts_and_danger_badges(base, monkeypatch
     assert '<span class="tag clash">SAV 1 / 1 <span class="ks">(消1)</span></span>' in cross[r3["馬番"]]
     assert 'class="tag hotnum">ZI 0 / 1</span>' in cross[r3["馬番"]]
     assert "(消" not in cross[r1["馬番"]] and "(消" not in cross[r4["馬番"]]   # 馬4 の消しは別の指数（先行）
-    assert nums(cross[r3["馬番"]])[:5] == ["2", "1", "3", "1", "1"]             # 軸の指数数・うち穴・軸の行数・消し(10倍未満)・その指数数
+    assert nums(cross[r3["馬番"]])[:5] == ["2", "1", "3", "1", "1"]             # 軸の指数数・うち穴・軸の行数・消し(2〜10倍未満)・その指数数
     assert nums(cross[r4["馬番"]])[:5] == ["2", "", "2", "1", "1"] and 'class="kd-caution"' in cross[r4["馬番"]]
     # 4区分の表でも、判定の付いた馬の馬名にバッジ
     keshi_tbl = body.split('class="card cat-keshi"', 1)[1].split("</table>", 1)[0]
@@ -904,4 +904,94 @@ def test_hits_page_favorite_cut_keshi_counts_and_danger_badges(base, monkeypatch
     assert "過剰人気カットは切ってあります" in c.get("/entries/hits", query_string={**q, "cut_low_10u": "junk"}).get_data(as_text=True)
     # 出馬表のページにはこのチェックは出ない
     assert "cut_low_10u" not in c.get("/entries/race", query_string=q).get_data(as_text=True)
+
+
+# ---------------------------------------------------------------- 2026-11-14: オッズ帯の境目（odds10u = 2〜10倍未満）と前の区切りの DB
+def test_db_records_odds_breaks_and_old_db_gets_a_notice(base, monkeypatch, tmp_path, capsys):
+    """build_db は、成績表を集計したときのオッズ帯の境目を DB に残す。今の境目（2〜10倍未満）で集計した DB には注意書きを出さず、
+    前の区切り（10倍未満。1倍台も入る）で集計した DB・分からない DB では、オッズ帯を出す画面に注意書きを出す。"""
+    import json
+    import build_db
+    from shisu import odds
+    with db(base) as con:
+        info = dict(con.execute("SELECT key, value FROM __build_info__"))
+    assert json.loads(info["odds_breaks"]) == [2.0, 10.0, 50.0] and "odds_breaks:build" not in info
+    am = _app(base, monkeypatch)
+    rid = _race_id(base)
+    c = am.app.test_client()
+    q = {"table": "entries_merged_hensachi", "rid": rid}
+    pages = {"/": {"submitted": "1", "family": "normal"}, "/entries/hits": q, "/entries/wedge": q,
+             "/entries/key": {"key": "東京×ダ×1600"}}
+    note = "オッズ帯の前の区切り（10倍未満"
+    for url, args in pages.items():
+        page = c.get(url, query_string=args).get_data(as_text=True)
+        assert note not in page, url
+    hits = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert "2〜10倍未満（odds10u）の軸・相手は回収値100以上のみ（過剰人気カット）" in hits
+    assert "消し(2〜10倍未満)" in hits and "消し(10倍未満)" not in hits.replace("消し(2〜10倍未満)", "")
+    assert am.odds_label("odds10u") == "2〜10倍未満" == odds.FAV_LABEL
+    assert any("（2〜10倍未満）件数" in line for line in am.description_lines()["keshi"])
+    assert any("2〜10倍未満・10〜50倍 のときだけ" in line for line in am.description_lines()["axis"])
+    # 前の版で集計した成績表（印に境目が無い）から作った DB・記録の無い DB には注意書き
+    agg = tmp_path / "agg"
+    shutil.copytree(base / "agg_csv", agg)
+    for p in agg.glob("*.done"):
+        st = json.loads(p.read_text(encoding="utf-8"))
+        st.pop("odds_breaks")
+        p.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    old = tmp_path / "old.db"
+    shutil.copy(base / "racing.db", old)
+    capsys.readouterr()
+    assert build_db.main(["--mode", "foragg", "--agg-dir", str(agg), "--db-path", str(old)]) == 0
+    assert "オッズ帯の前の区切り（10倍未満" in capsys.readouterr().out
+    norec = tmp_path / "norec.db"
+    shutil.copy(base / "racing.db", norec)
+    with sqlite3.connect(norec) as con:
+        con.execute("DELETE FROM __build_info__ WHERE key = 'odds_breaks'")
+    mixed = tmp_path / "mixed.db"                              # 一部の成績表だけ前の区切り
+    first = sorted(agg.glob("*.done"))[0]
+    shutil.copy(base / "agg_csv" / first.name, first)
+    shutil.copy(base / "racing.db", mixed)
+    assert build_db.main(["--mode", "foragg", "--agg-dir", str(agg), "--db-path", str(mixed)]) == 0
+    for path in (old, norec, mixed):
+        with sqlite3.connect(path) as con:
+            got = dict(con.execute("SELECT key, value FROM __build_info__")).get("odds_breaks")
+        assert got in (None, "null"), path.name
+        am = _app(base, monkeypatch, path)
+        c = am.app.test_client()
+        for url, args in pages.items():
+            assert note in c.get(url, query_string=args).get_data(as_text=True), (path.name, url)
+        assert note not in c.get("/entries/race", query_string=q).get_data(as_text=True)      # オッズ帯を出さない画面
+        assert note not in c.get("/entries").get_data(as_text=True)
+    # 今の境目で集計し直した成績表から作り直せば消える。ただし成績表だけを作り直した（--mode foragg）あとは、照合結果（xjoin）が
+    # 前の成績表のままなので、照合結果を読む画面（条件ヒット馬・WEDGE 一覧）には別の注意書きを出す（--entries-only で消える）
+    stale = "この出馬表の照合結果（下の行）は、今の成績表より前に作ったものです"
+    assert build_db.main(["--mode", "foragg", "--agg-dir", str(base / "agg_csv"), "--db-path", str(old)]) == 0
+    am = _app(base, monkeypatch, old)
+    c = am.app.test_client()
+    for url in ("/entries/hits", "/entries/wedge"):
+        page = c.get(url, query_string=q).get_data(as_text=True)
+        assert note not in page and stale in page, url
+    for url, args in (("/", pages["/"]), ("/entries/key", pages["/entries/key"]), ("/entries/race", q)):
+        assert stale not in c.get(url, query_string=args).get_data(as_text=True), url      # 照合結果を読まない画面
+    assert stale not in c.get("/entries/wedge.csv", query_string=q).get_data(as_text=True)
+    assert build_db.main(["--entries-only", "--entries-dir", str(base / "entries_out"), "--db-path", str(old)]) == 0
+    am = _app(base, monkeypatch, old)
+    c = am.app.test_client()
+    for url in ("/entries/hits", "/entries/wedge"):
+        page = c.get(url, query_string=q).get_data(as_text=True)
+        assert note not in page and stale not in page, url
+    # 作ったままの DB（照合結果は今の成績表から）・記録の仕組みが無い DB（前の版）には出さない
+    am = _app(base, monkeypatch)
+    assert stale not in am.app.test_client().get("/entries/hits", query_string=q).get_data(as_text=True)
+    noinfo = tmp_path / "noinfo.db"
+    shutil.copy(base / "racing.db", noinfo)
+    with sqlite3.connect(noinfo) as con:
+        con.execute("DROP TABLE __build_info__")
+    am = _app(base, monkeypatch, noinfo)
+    c = am.app.test_client()
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert stale not in page and note in page and "照合: xjoin" in page
+    with sqlite3.connect(am.DB_PATH) as con:                    # その場照合のときは出さない（今の成績表と照合している）
+        assert am.xjoin_note(con, "entries_merged_hensachi", "on-the-fly") == ""
 

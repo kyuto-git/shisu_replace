@@ -10,7 +10,7 @@
 判定順は 消し → 絶対軸 → 軸候補 → 相手 で、最初に当てはまった区分を1つだけ返す。
 
 2026-11-12 に足した規則:
-  - 高回収率基準（軸候補）: オッズ帯が 10倍未満・10〜50倍 のときだけ（50倍以上・通常は、100倍超の一発で
+  - 高回収率基準（軸候補）: オッズ帯が 2〜10倍未満（odds10u）・10〜50倍 のときだけ（50倍以上・通常は、100倍超の一発で
     回収値が跳ねるので使わない）
       件数 ≥ 30 かつ 複勝率 ≥ 35% かつ 掲示板率 ≥ 50% かつ（複勝回収値 ≥ 200 または 単勝適正回収値 ≥ 200）
       件数 ≥ 30 かつ 複勝率 ≥ 50% かつ（複勝回収値 ≥ 150 または 単勝適正回収値 ≥ 150）
@@ -64,7 +64,7 @@ OP_TOP5_50 = 50.0
 KS_CNT = 20
 KS_PLC_MAX_ANY = 5.0       # 全モード: 複勝率 < 5
 KS_TOP5_MAX_ANY = 10.0     #           かつ 掲示板率 < 10
-KS_PLC_MAX_10U = 20.0      # odds10u: 複勝率 < 20
+KS_PLC_MAX_10U = 20.0      # odds10u（2〜10倍未満）: 複勝率 < 20
 # --- 希少条件（結合データの部品にこのどれかがあれば、最低件数を下の値に下げる）---
 RARE_TOKENS = ("G1", "重賞", "準OP・OP", "芝長", "ダ長")
 RARE_ABS_CNT = 6
@@ -290,7 +290,8 @@ def sql_condition(category: str, mode: str, key_col: str = KEY_COLUMN) -> str:
 
 def description_lines() -> dict[str, list[str]]:
     """画面に表示する条件の説明。"""
-    hr = "・".join({"odds10u": "10倍未満", "odds10_50": "10〜50倍"}[m] for m in HR_MODES)
+    from .odds import ODDS_LABELS
+    hr = "・".join(ODDS_LABELS[m] for m in HR_MODES)
     rare = "・".join(RARE_TOKENS)
     return {
         "abs": [f"件数 ≥ {ABS_CNT} かつ 連対率 ≥ {ABS_REN:g}% かつ（複勝回収値 ≥ {ABS_FRC:g} または 単勝適正回収値 ≥ {ABS_TRA:g}）",
@@ -308,7 +309,7 @@ def description_lines() -> dict[str, list[str]]:
         ],
         "keshi": [
             f"（全モード）件数 ≥ {KS_CNT} かつ 複勝率 < {KS_PLC_MAX_ANY:g}% かつ 掲示板率 < {KS_TOP5_MAX_ANY:g}%",
-            f"（10倍未満）件数 ≥ {KS_CNT} かつ 複勝率 < {KS_PLC_MAX_10U:g}%",
+            f"（{ODDS_LABELS['odds10u']}）件数 ≥ {KS_CNT} かつ 複勝率 < {KS_PLC_MAX_10U:g}%",
             f"※ 希少条件（結合データに {rare} のどれか）は 件数 ≥ {RARE_KS_CNT}",
         ],
         "opp": [

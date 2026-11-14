@@ -233,8 +233,10 @@ def write_stamp(agg_path, settings_id: str, master, rows: int) -> None:
     import json
     agg_path = Path(agg_path)
     ident = master if isinstance(master, dict) else master_identity(master)
+    from .odds import ODDS_BREAKS
     data = {"settings": settings_id, **ident, "rows": int(rows),
-            "bytes": agg_path.stat().st_size if agg_path.exists() else 0}
+            "bytes": agg_path.stat().st_size if agg_path.exists() else 0,
+            "odds_breaks": list(ODDS_BREAKS)}     # この成績表を集計したときのオッズ帯の境目（build_db が DB に残し、画面が確かめる）
     sp = stamp_path(agg_path)
     tmp = sp.with_name(sp.name + PART_SUFFIX)
     with open(tmp, "w", encoding="utf-8") as f:

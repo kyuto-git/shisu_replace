@@ -1,6 +1,6 @@
 # CLAUDE.md — shisu_replace（競馬 外部指数の集計・照合システム）
 
-最終更新: 2026-11-13（条件ヒット馬の人気馬の見分け: 過剰人気カット `cut_low_10u`・消し(10倍未満) の行数と指数数・同じ指数で軸と消しが出ているタグ・消優勢／要注意の判定）／2026-11-12（/ingest の取得元を同時に実行・馬体重発表後の差分更新 `--mining-only`／`--indicators`・区分に高回収率の基準と希少条件の最低件数の緩和・条件ヒット馬の「通常」の重複排除と穴の軸の赤字・表の見出し固定・WEDGE 一覧の絞り込みの折りたたみ・指数クロス・StridePlus のボーダーのファイルを読まない）／2026-11-10（成績表を master 1本につき1ファイル `agg_master_*.csv.gz` に・DB の1表ずつのテーブル `foragg_*` を廃止して unified_all に一本化・aggregate の `--compact`（既定 ON）・`--resume`・並列のまとまり）／2026-11-09（screen_families の `--from-report`・選抜の既定の変更・replace の子プロセスの作り直し・lxml 6.1.3・build_db `--entries-only`）／2026-11-08（raw_csv/ の列パッチCSV（レースID(新) と前走の列だけ）を 全場_*.csv に横結合する（§3.9）・出馬表への ext_indices の自動結合・/ingest の出力を ext_indices へコピー・raw_csv/ の過去基本CSVの統合・単独の部品 場所/距離/芝(内・外)・screen_families の候補の拡大（骨格・因果トリオ・冗長の除外・複勝スプレッド）を反映。それ以前の変更は §11）
+最終更新: 2026-11-14（build_db の照合（xjoin）のメモリを一定に: ヒット行を1行ずつ・5,000行ごとに INSERT・照合のキャッシュを照合1回ごとに上限管理／オッズ帯 odds10u を「2.0倍以上 10.0倍未満」に: 表記は「2〜10倍未満」・`ODDS_BREAKS` に下限 2.0・前の区切りで集計した DB には画面に注意書き）／2026-11-13（条件ヒット馬の人気馬の見分け: 過剰人気カット `cut_low_10u`・消し(2〜10倍未満) の行数と指数数・同じ指数で軸と消しが出ているタグ・消優勢／要注意の判定）／2026-11-12（/ingest の取得元を同時に実行・馬体重発表後の差分更新 `--mining-only`／`--indicators`・区分に高回収率の基準と希少条件の最低件数の緩和・条件ヒット馬の「通常」の重複排除と穴の軸の赤字・表の見出し固定・WEDGE 一覧の絞り込みの折りたたみ・指数クロス・StridePlus のボーダーのファイルを読まない）／2026-11-10（成績表を master 1本につき1ファイル `agg_master_*.csv.gz` に・DB の1表ずつのテーブル `foragg_*` を廃止して unified_all に一本化・aggregate の `--compact`（既定 ON）・`--resume`・並列のまとまり）／2026-11-09（screen_families の `--from-report`・選抜の既定の変更・replace の子プロセスの作り直し・lxml 6.1.3・build_db `--entries-only`）／2026-11-08（raw_csv/ の列パッチCSV（レースID(新) と前走の列だけ）を 全場_*.csv に横結合する（§3.9）・出馬表への ext_indices の自動結合・/ingest の出力を ext_indices へコピー・raw_csv/ の過去基本CSVの統合・単独の部品 場所/距離/芝(内・外)・screen_families の候補の拡大（骨格・因果トリオ・冗長の除外・複勝スプレッド）を反映。それ以前の変更は §11）
 
 ## この文書の扱い
 
@@ -22,6 +22,7 @@ TARGET frontier JV で出力した過去レースCSVに外部指数を付け、�
 - **列パッチ（2026-11-08〜）**: 基本CSVを前走データ読込なしで速く出し、前走の列は `レースID(新)` と前走の列だけの軽いCSVで別に出して `raw_csv/` に置く。raw_merge が 全場_タイムM・全場_対戦M の両方に横結合（上書き・補完）する（§3.9）
 - **出馬表（2026-11-07〜）**: `entries_in/` にはマイニング値だけの出馬表CSV 1本を置けばよい。calc_entry_hensachi が ext_indices の外部指数を過去側と同じ関数で各馬に付けてから偏差値・順位を計算する（§3.3）。`/ingest` の TARGET 取込用CSVは既定で ext_indices/ にもコピーされる（§3.6）
 - **当日の差分更新（2026-11-12〜）**: 馬体重の発表後にマイニングの確定値が出たら、`calc_entry_hensachi.py --mining-only` → `build_db.py --entries-only --mining-only` で タイムM・対戦M の列と照合結果（xjoin のその2指数の行）だけを入れ替える（ext_indices は読み直さない。§3.3・§3.4）
+- **オッズ帯（2026-11-14〜）**: `odds10u` は単勝 **2.0倍以上 10.0倍未満**（表記「2〜10倍未満」。1.9倍以下の馬は normal にだけ入る。モード名は変えていない）。成績表に効くのは次に aggregate を回したとき。前の区切りで集計した DB では画面に注意書きが出る（§5.6）
 - **成績表の持ち方（2026-11-10〜）**: aggregate は master 1本（地域×指数）につき1ファイル `agg_csv/agg_master_{地域}_{指数名}.csv.gz` に、family・スキーム・オッズ帯の成績表を縦に並べて書く（旧版は1表1ファイルで、数千 family × 33指数で数十万ファイル・140GB 超になった）。既定でコンパクト化（区分・WEDGE の上位・layer A・件数30以上の行だけ）。build_db は1表ずつのテーブルを作らず unified_all に直接入れる（§3.2・§3.4）
 - **キーの型 = family**: 部品（コース・重量種別・クラス名・枠番グループ・騎手・芝・ダ・場所・距離・芝(内・外) と 22条件）＋末尾の指数の部品（指数順位 / 指数順位帯 s1・s2 / 偏差値帯）。初期セットは 49 の型（83 family・スキーム込み 129 通り。§5.3）。`screen_families.py` で全掛け合わせ候補を採点して選んだ `selected_families.json` があれば、初期セットの代わりにそれを使う（集計・DB・照合・画面）
 - 順位帯（指数順位・前走着順・前走人気・前走上がり3F順で共通）は **s1 = 1 / 2~3 / 4~5 / 6~9 / 10~（排他）、s2 = 1~3 / 1~5 / 6~（重なりあり。2位は 1~3 と 1~5 の両方）**
@@ -138,13 +139,13 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 |---|---|
 | csv_files・raw_csv・ext_indices（過去データ）・キーの部品の規則（`shisu/` の normalize・conditions・course・data/） | replace → （screen）→ aggregate → build_db --mode both |
 | 使う family（selected_families.json を作り直した・消した） | aggregate --clean → build_db --fresh（master はそのまま使える） |
-| 集計の条件（推定方法・MIN_SAMPLE・オッズ帯の定義・WEDGE の年の最低件数・遡る年数・減衰率・窓・コンパクト化の設定など） | aggregate --clean → build_db --fresh（`--resume` で回すと、今の設定で作っていない成績表だけ作り直す。設定のハッシュに入るのは、aggregate の引数・環境変数（AGG_*）・family の定義・区分の閾値・オッズ帯の境目（`shisu/odds.py` の `ODDS_BREAKS`）・EDGE の表（`shisu/wedge.py`）。それ以外のコード（`shisu/*.py`）を変えたときは `--resume` では気づかないので `--clean`） |
+| 集計の条件（推定方法・MIN_SAMPLE・オッズ帯の定義・WEDGE の年の最低件数・遡る年数・減衰率・窓・コンパクト化の設定など） | aggregate --clean → build_db --fresh（`--resume` で回すと、今の設定で作っていない成績表だけ作り直す。設定のハッシュに入るのは、aggregate の引数・環境変数（AGG_*）・family の定義・区分の閾値・オッズ帯の境目（`shisu/odds.py` の `ODDS_BREAKS`。2026-11-14 に下限 2.0 を足したので、それより前に作った成績表は `--resume` で全部作り直しになる）・EDGE の表（`shisu/wedge.py`）。それ以外のコード（`shisu/*.py`）を変えたときは `--resume` では気づかないので `--clean`） |
 | 出馬表・ext_indices（出馬表の日の外部指数）・騎手の乗り替わりや取消のあった出馬表 | calc_entry_hensachi --merge-only --clean → build_db --entries-only（＝ `--mode entries`。古い出馬表を消すなら `--prune`） |
 | 馬体重発表後のマイニング確定値（entries_in の出馬表を上書き） | calc_entry_hensachi --mining-only → build_db --entries-only --mining-only（タイムM・対戦M の列と xjoin のその2指数の行だけ。騎手の乗り替わり・馬の増減などマイニング以外の照合に関わる値も変わっていたら、自動で全部の計算・全部の照合に切り替わる） |
 | 画面（app.py） | app の再起動だけ |
 | 区分の閾値（`shisu/classify.py`） | コンパクト化（既定）しているなら aggregate（`--resume` で、閾値が変わった成績表を作り直す。閾値は設定のハッシュに入る）→ build_db --fresh → app の再起動。`--no-compact` なら app の再起動だけ |
 
-- `build_db --mode foragg` だけ回すと xjoin（照合結果）が古いまま残るので、警告が出る。続けて `--mode entries` を回す。
+- `build_db --mode foragg` だけ回すと xjoin（照合結果）が古いまま残るので、警告が出る。続けて `--mode entries` を回す（回すまで、条件ヒット馬・WEDGE 一覧の画面に「照合結果が今の成績表より前のもの」の注意書きが出る。§3.5）。
 - `--prune` は今回作り直した出馬表の古いテーブル（entries_*・entries_xjoin_*）だけを消す。成績表（unified_all・__tables_meta__ の集計表の行）は触らない（前の版の1表ずつのテーブル foragg_* は `--mode foragg` の入れ替えで消える。多すぎて残ったときは `--fresh`）。
 - family を入れ替えたら `aggregate --clean`（古い family の成績表を agg_csv に残さない）と `build_db --fresh`。
 - 画面は `__tables_meta__` に載っている集計表だけを使う。family の名前・ラベル・照合に使う family は DB の `__families__` から読む。
@@ -168,12 +169,12 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 | `families.py` | family の定義・台帳（初期セット・selected_families.json・DB の `__families__`）・部品（`PART_TOKENS`。COURSE と単独の 場所・距離・芝(内・外) を含む）・キーの組み立て（過去側のベクトル版 `build_keys` と出馬表側の候補 `entry_keys` / `entry_key_candidates`） |
 | `keys.py` | キーの窓口（families.py の再エクスポートと `all_families()`・`is_band_family()` など） |
 | `hensachi.py` | レース内の偏差値・順位・偏差値帯、順位帯（新8区分。`band_labels`。前走着順・前走人気・前走上がり3F順と共通） |
-| `odds.py` | オッズ4区分（normal / odds10u / odds10_50 / odds50p） |
+| `odds.py` | オッズ4区分（normal / odds10u（2.0倍以上 10.0倍未満）/ odds10_50 / odds50p）。境目 `ODDS_BREAKS = (2.0, 10.0, 50.0)`（集計の設定のハッシュ・成績表の印・DB に残る）・表記 `ODDS_LABELS`・`FAV_LABEL`（§5.6） |
 | `naming.py` | 成績表のファイル名の規約と解析（`agg_master_{地域}_{指数名}.csv.gz`、旧来の `foragg_*.csv`。family 名は台帳から長い順に当てる。「_」の位置で切って台帳の集合と照らすので family が数千でも速い）、テーブル名（unified_all の「テーブル名」。旧来の成績表のテーブル名と同じ） |
 | `finish.py` | 着順の正規化（取消・除外・失格・中止、1文字表記対応） |
 | `estimates.py` | ベイズ推定（Beta 分位点・事後平均） |
 | `classify.py` | 条件ヒット馬の分類（Python の1行版 `classify`・ベクトル版 `classify_frame`（aggregate のコンパクト化）・SQL 版 `sql_condition`。3つの一致はテストで確認）。高回収率の基準・希少条件（`is_rare_key`・`rare_sql`）の最低件数の緩和（§6.1）。`rule_settings()` は閾値の一覧（集計の設定のハッシュに入る） |
-| `matching.py` | 出馬表1頭 × unified_all の完全一致照合（xjoin 構築と画面のその場照合で共通） |
+| `matching.py` | 出馬表1頭 × unified_all の完全一致照合（xjoin 構築と画面のその場照合で共通）。`iter_hit_rows`（ヒット行を1行ずつ返す。xjoin 構築はこれを使う）・`match_entry_row`（同じ中身の dict のリスト）・`HitCache`（照合のキャッシュ。入れるたびに件数と行数の上限を見る。§3.4） |
 | `wedge.py` | WIN・EDGE・WEDGE・年度加重 adjusted_WEDGE |
 | `ingest/`・`yasui_extractor.py` | 外部指数の取得（§3.6・§3.7） |
 
@@ -277,15 +278,25 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
   - 旧来の foragg_*.csv を使わない master = agg_master のファイルがある master と、今の版で集計して0行だった master（印だけがある）
   - `--prune` は成績表を触らない（前の版の1表ずつのテーブルは入れ替えのときに扱い、__tables_meta__ の集計表の行は入れ替えで作り直す）
   - 旧来の1表1ファイル（`foragg_*.csv`）も読める（互換）。同じ master の `agg_master_*.csv.gz` があれば、その master の旧来のファイルは使わない（二重に入れない）
+  - **オッズ帯の境目の記録（2026-11-14〜）**: 読んだ agg_master の印の `odds_breaks`（その成績表を集計したときの `ODDS_BREAKS`）が全部同じならその値を、違うものが混ざる・印に無い（前の版の aggregate）・旧来の foragg_*.csv を使った なら `null` を、unified_all の入れ替えと同じトランザクションで `__build_info__` の `odds_breaks` に書く（作っている間は `odds_breaks:build`）。今の `ODDS_BREAKS` と違えば `[INFO]` を出す。画面はこれを見て注意書きを出す（§3.5）
   - 読める成績表が0本なら DB に触らず終了コード2（空にしたいときだけ `--allow-empty`）。WEDGE 列の無い旧形式の成績表は取り込まず終了コード1
   - families.json に無い family・スキームの行・ファイル（前の実行の残り）は取り込まず、行数・本数を警告する
 - entries: `normalize_entries_df`（キー部品の正規化と22条件。前走の内外は `master_csv/__inner_outer__.csv.gz` で引く。**障害レース**（今芝ダ=障・レース名が 障害…・トラックコード51以上。TARGET の出馬表は 芝ダ に「ダ」「芝」と入る）は 芝・ダ を「障」にし、照合しない）→ テーブル → entries_all → xjoin（各馬 × 指数 × family × キー候補を unified_all と完全一致照合）。`--mode entries` では DB の `__families__` の family で照合する（DB を作ったときの family）
   - unified_all が無い・旧形式なら xjoin を作らず終了コード1
+  - **照合（xjoin）のメモリ（2026-11-14〜）**: 全部の照合（`build_xjoin`）も一部の作り直し（`refresh_xjoin`）も `insert_hits` を通る。メモリに持つのは、INSERT 待ちの行（`XJOIN_BATCH` 5,000行まで）と照合のキャッシュ（`HitCache`: `XJOIN_CACHE_LIMIT` 20,000件・`XJOIN_CACHE_ROWS` 50,000行まで）だけで、family・指数・馬の数に依らない
+    - `shisu.matching.iter_hit_rows` がヒット行を `HIT_COLUMNS` の順のタプルで1行ずつ返し、`insert_hits` が 5,000行たまるごとに `executemany` する（旧版は `match_entry_row` で1頭ぶんを dict のリストにしてから INSERT していた。数千 family × 34指数だと1頭で数十万回の照合・数十万行）
+    - キャッシュの上限は `HitCache.put` が**照合1回ごと**に見る（件数が上限に達した・行数が上限を超えるなら空にしてから入れる。上限より大きい1件はそれだけを持つ）。旧版は馬1頭を回し終えてから `len(cache) > XJOIN_CACHE_LIMIT` を見ていたので、1頭の途中で数十万件まで膨らんだ。ふつうの dict を渡した `match_entry_row` も件数の上限（`matching.CACHE_MAX_KEYS`）は守る。画面のその場照合（`collect_hits`）も `HitCache`
+    - `main` は出馬表のテーブル（`load_entries_tables`・`build_entries_all`）を確定したあと、照合の前に `gc.collect()` を呼ぶ（正規化に使った DataFrame を手放す）
+    - 出力は旧版と同じ（行の順まで）。進み具合は `[xjoin] {テーブル}: i/n 頭, hits …` を50頭ごと（`XJOIN_PROGRESS_EVERY`）
+    - **トランザクションは分けていない**（出馬表のテーブルごとに BEGIN → DELETE／DROP・CREATE → INSERT → 記録 → commit の1つ。途中で止まれば前の照合結果と記録に戻る、という `--mining-only` の保証のため）。SQLite は大きいトランザクションをメモリではなく WAL ファイル（ディスク）に書くので、メモリのピークには効かない（下の実測）。ディスクは書き換えたページのぶん（一部の作り直しで約220MB）要る
+    - 実測（2026-11-14。合成のストレス DB: 4,635 family・34指数・6頭・照合 146万回・unified_all 134万行）: 全部の照合 旧 92.3秒・最大 RSS 1,555MB → 新 71.3秒・126MB（xjoin 155万行は行の順まで同じ）。一部の作り直し（タイムM・対戦M＋安井8指数）は 20.6秒・124MB・WAL の最大 221MB。旧版のメモリは1頭ぶんの行数に比例するので、実データ（4,868通り・34指数。ユーザーの環境で Exit 137）ではこれより大きい
   - レースID(新) が無い出馬表は「日付_場 R」をレースの識別子にする。旧形式の出馬表（`X_順位帯_s1` が無い）は警告
 
 ### 3.5 app.py（Flask）
 
 - 接続のたびに DB の `__families__` を family の台帳に反映する（DB が変わったときだけ読み、台帳を作り直す。同じ名前で部品が変わっても置き換わる。無ければ初期セット）。family の選択肢・ラベル・その場照合・`/entries/wedge` の family 絞り込みはこの family
+- **オッズ帯の注意書き（2026-11-14〜。`_odds_note`）**: DB の `__build_info__` の `odds_breaks` が今の `ODDS_BREAKS`（`[2.0, 10.0, 50.0]`）と違う（記録が無い・`null`・前の区切り）とき、オッズ帯を出す画面（`/`・`/entries/key`・`/entries/hits`・`/entries/wedge`）の上に「この DB の成績表は、オッズ帯の前の区切り（10倍未満。単勝2倍未満の馬も入る）で集計したものです。…」を出す（`show_odds_note=True` を渡した render だけ。出馬表・レース一覧・/ingest には出さない）。成績表が無い DB には出さない。family の台帳と同じく DB が変わったときだけ読む。表記は集計し直す前から「2〜10倍未満」になるので、その間 中身と表記が食い違うことを知らせるためのもの
+- **古い照合結果の注意書き（2026-11-14〜。`xjoin_note`）**: `/entries/hits`・`/entries/wedge` が照合結果（xjoin）を読んだとき、その照合結果の記録（`__build_info__` の `xjoin_of:{xjoin}` の `unified`）が今の成績表の印（`unified_stamp`）と違う・無いなら、「この出馬表の照合結果（下の行）は、今の成績表より前に作ったものです…build_db.py --entries-only を実行すると、今の成績表で照合し直します」を出す（成績表だけを作り直した `build_db --mode foragg` のあと。オッズ帯の区切りを変えて集計し直したあとにこれをすると、オッズ帯の注意書きは消えるのに、この2画面の行は前の区切りの数字のまま残るため）。その場照合のとき・`unified_stamp` の無い DB（2026-11-11 までの版で作った。見分けられない）には出さない。CSV には出さない
 - `/`: 条件（場所・芝・ダ・距離・芝(内・外)・地域）、family、指数、オッズ帯、プリセット（絶対軸・軸候補・相手候補・消し候補。判定は `classify` と同じ SQL）、下限（件数・WEDGE・adjusted_WEDGE）で絞り込む
   - 表示は2通り: 「集計表ごと」（最大100表・各200行）と「まとめて」（unified_all の横断ランキング、上位500行。既定の並びは adjusted_WEDGE の大きい順）
   - 「集計表ごと」の中身（2026-11-10〜）: 常に unified_all の「テーブル名」が同じ行（`WHERE "テーブル名" = ?`。並べ替えの列の索引を使わせず `+列` で並べ、同点は rowid＝成績表の行の順）。前の版の DB に1表ずつのテーブル `foragg_*` が残っていても使わない（前の版の unified_all はそのテーブルを同じ順で詰め直したものなので表示は同じ。古い中身のテーブルが残っていても影響しないことをテストで確認）
@@ -296,16 +307,16 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 - `/entries/race`: 出馬表（各馬の順位・偏差値・帯。順位3位以内は太字、偏差値61以上は緑の背景）。上に**指数クロス**（2026-11-12〜。`cross_rows`）: 複数の指数で同時に上位の馬の一覧。上位 = 順位3位以内 または 偏差値61以上（`CROSS_RANK_MAX`・`CROSS_HEN_MIN`。基準は `xc` = either／rank／hen／both で選ぶ）。`xmin`（何指数以上。既定2）、`xa`・`xb`（この2指数の両方が上位）、`xonly=1`（下の出馬表を該当馬だけに）。表は独立スクロール・見出し固定
 - `/entries/hits`: 指数クロス好走馬・馬ごとの該当数の要約・区分ごとの表（WEDGE・adjusted_WEDGE・年数の列あり）。xjoin が古い形式ならその場の照合に切り替えて、その旨を表示
   - **冗長な「通常」の行を省く（2026-11-12〜。`drop_redundant_normal`）**: 同じ馬・指数（base）・family（スキーム・地域も）・結合データで、オッズ帯 normal とオッズ帯別（odds10u・odds10_50・odds50p のどれか）が**同じ区分**に当たり、件数の差が3以内（`REDUNDANT_NORMAL_DIFF`）なら、normal の行を表からも馬ごとの該当数からも除く（省いた行数を画面の上に出す）。件数が離れている・区分が違う・オッズ帯別の行が区分に入らないときは残す。`/entries/wedge`・CSV は省かない（全件）
-  - 並びは オッズ帯（**10倍未満 → 10〜50倍 → 50倍以上 → 通常**。`HITS_ODDS_RANK`）→ 馬番 → 複勝率（消しは昇順）→ 指数（台帳の順）・family・スキーム・結合データ・テーブル名（同点の並びも決める。表示の上限で出る行が xjoin の行の順に左右されない）。横断検索 `/` のオッズ帯の並び（`shisu.odds.ODDS_RANK`）は変えていない
+  - 並びは オッズ帯（**2〜10倍未満 → 10〜50倍 → 50倍以上 → 通常**。`HITS_ODDS_RANK`）→ 馬番 → 複勝率（消しは昇順）→ 指数（台帳の順）・family・スキーム・結合データ・テーブル名（同点の並びも決める。表示の上限で出る行が xjoin の行の順に左右されない）。横断検索 `/` のオッズ帯の並び（`shisu.odds.ODDS_RANK`）は変えていない
   - 区分ごとに約500行まで表示（`HITS_VIEW_LIMIT`・`spread_cap`）。先頭から切らずに (馬番, オッズ帯) ごとの上限をそろえる（行の少ない組は全部出し、余った枠は多い組に回す）。**枠はオッズ帯別の組に先に配り、通常の組は残りの枠**（どの組も最低1行は出す）。見出しと馬ごとの該当数は（冗長な通常を除いた）全件で数え、全件は `/entries/wedge.csv`（CSV には条件ヒット馬と同じ判定の「区分」列がある）
   - **穴の軸の強調**: odds_mode が odds10_50・odds50p で 絶対軸・軸候補 の行は `<tr class="hot">`（行全体が赤の太字・薄い赤の背景。`is_hot`）。馬ごとの該当数に「穴の軸（10倍以上）」の列
   - **表の独立スクロールと見出し固定**: どの表も `<div class="scroll">`（`max-height:520px; overflow:auto`）の中で、`thead th` は `position:sticky; top:0; z-index:2`
-  - **過剰人気カット（2026-11-13〜。`cut_low_10u`。既定 ON）**: オッズ帯が odds10u（`FAV_MODE`）で区分が 軸候補・相手候補（`CUT_CATEGORIES`）の行のうち、複勝回収値も単勝適正回収値も 100（`CUT_MIN_RETURN`）未満の行（`is_low_return_favorite`）を除いてから、4区分の表・馬ごとの該当数・指数クロス好走馬を数える（`classify_hits(..., cut_low=True)` → `drop_redundant_normal(rows, cut_low)`）
+  - **過剰人気カット（2026-11-13〜。`cut_low_10u`。既定 ON。チェックの表記は「2〜10倍未満（odds10u）の軸・相手は回収値100以上のみ（過剰人気カット）」。引数の名前は変えていない）**: オッズ帯が odds10u（`FAV_MODE`）で区分が 軸候補・相手候補（`CUT_CATEGORIES`）の行のうち、複勝回収値も単勝適正回収値も 100（`CUT_MIN_RETURN`）未満の行（`is_low_return_favorite`）を除いてから、4区分の表・馬ごとの該当数・指数クロス好走馬を数える（`classify_hits(..., cut_low=True)` → `drop_redundant_normal(rows, cut_low)`）
     - 値の無い（NULL・数でない）回収値は「100以上」ではないものとして除く（classify の「欠損は満たさない」と同じ見方）。絶対軸（回収値100以上が条件）・消し候補・ほかのオッズ帯は対象外
     - 冗長な「通常」の行との組み合わせ（`drop_redundant_normal`）: 冗長かどうかはカットの前の行で決める。カットした odds10u の行とほぼ同じ中身（同じ区分・件数差3以内）の「通常」の行は、カット ON でも出さない（同じ過剰人気の条件が「通常」として出直さない）。**その「通常」の行自身の回収値が100以上でも出さない**（件数差3以内なので、その上振れは10倍以上の馬1〜3頭ぶんでしかない。つまりカット ON の表 = カット OFF の表 − カットの条件に当たる行）。件数が離れた「通常」の行は別の情報なので、回収値に関係なく残る（カットの対象は odds10u だけ）。行の順には依らない。回収値100以上の「通常」を残したくなったら、`drop_redundant_normal` で、カットされる行を冗長の相手から外し、通常の行自身が回収値100未満のときだけ省くようにする
     - 引数: 絞り込みフォームは hidden の `cut_low_10u=0` とチェックボックスの `cut_low_10u=1` を送る。`1` が1つでもあれば ON、引数があって `1` が無ければ OFF、引数が無ければ ON（`cut_low_request`）。画面の上に除いた行数（軸候補・相手候補）と、ほかの絞り込みを保ったまま ON／OFF を入れ替えるリンクを出す。出馬表（/entries/race）のフォームにはこのチェックは出ない
     - 画面だけの絞り込み: DB・xjoin・`/entries/wedge`・`/entries/wedge.csv`（「区分」列）は変えない
-  - **消し(10倍未満) の集計と判定（2026-11-13〜。`horse_stats`・`danger_level`）**: 馬ごとに、odds10u の消し候補の行数 `keshi_fav` と、それが出た指数の数 `keshi_fav_inds`（指数ごとの内訳 `keshi_fav_by`）を数え、「指数クロス好走馬」「馬ごとの該当数」の両方の列に出す（normal・odds10_50・odds50p の消しは数えない。消し候補の合計の列は今までどおり）
+  - **消し(2〜10倍未満) の集計と判定（2026-11-13〜。表記は 2026-11-14 から。`horse_stats`・`danger_level`）**: 馬ごとに、odds10u の消し候補の行数 `keshi_fav` と、それが出た指数の数 `keshi_fav_inds`（指数ごとの内訳 `keshi_fav_by`）を数え、「指数クロス好走馬」「馬ごとの該当数」の両方の列に出す（normal・odds10_50・odds50p の消しは数えない。消し候補の合計の列は今までどおり）
     - 指数クロス好走馬のタグ: 同じ馬・同じ指数に odds10u の消しがあれば `{指数} {abs} / {axis} (消{n})`（`<span class="tag clash">`。同じ指数の中で軸と消しが出ている）
     - 判定: 軸の行数 `axis_rows` = 絶対軸 + 軸候補 の行数。`keshi_fav > 0 かつ keshi_fav >= axis_rows`（`KESHI_DOMINANT_RATIO` 1.0。軸0行で消しだけの馬も）→ `dominant`（⚠️消優勢・青紫 `.kd`・行 `tr.kd-dominant`）、そうでなく `axis_rows > 0 かつ keshi_fav >= axis_rows × 0.5`（`KESHI_CAUTION_RATIO`）→ `caution`（要注意・グレー）。両方の表の「判定」の列と行の背景、4区分の表の馬名の横のバッジ、馬ごとの該当数の見出しの頭数
     - 行数はどれも過剰人気カット・冗長な通常の除外のあとの数（カット ON だと軸が減るので、判定は厳しくなる）。馬ごとの該当数は `axis_cross` の結果（指数クロスと同じ集計）から作る
@@ -464,7 +475,7 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 
 - `agg_master_{地域}_{指数名}.csv.gz`（2026-11-10〜。master 1本につき1ファイル・cp932・gzip）: 下の表の列 ＋ `family, odds_mode, rank_scheme, indicator, region, テーブル名`。1つの成績表（family × スキーム × オッズ帯）の行は続けて並び、中の並びは結合データの昇順。テーブル名 = 旧来のファイル名（拡張子なし）を SQLite 用に安全化したもの
 - 旧来の `foragg_{オッズ接頭辞}{rankband_スキーム_}{family}_{地域}_{指数名}.csv`（2026-11-09 まで。1表1ファイル）も build_db が読める。`shisu.aggstore.read_agg_tables` は両方を旧来の1表1ファイルの形（{ファイル名: 成績表}）に分けて返す（確認・テスト用）
-- `agg_master_{地域}_{指数名}.csv.gz.done`: 書き終わりの印（JSON: settings（設定のハッシュ）, master, master_size, master_fingerprint（gzip の末尾8バイト。gz でなければ sha256）, master_path, master_mtime_ns（確認用。比べない）, rows, bytes）。`--resume` と build_db の確認が見る
+- `agg_master_{地域}_{指数名}.csv.gz.done`: 書き終わりの印（JSON: settings（設定のハッシュ）, master, master_size, master_fingerprint（gzip の末尾8バイト。gz でなければ sha256）, master_path, master_mtime_ns（確認用。比べない）, rows, bytes, odds_breaks（2026-11-14〜。集計したときの `ODDS_BREAKS`。build_db が DB に残す））。`--resume` と build_db の確認が見る
 - `agg_settings.json`: 集計の設定（family の定義・スキーム・WEDGE・推定・コンパクト化・区分の閾値）。`--resume` のとき、前回と違えば項目をログに出す
 
 | 列 | 内容 |
@@ -536,7 +547,7 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 | （`foragg_*`） | 2026-11-09 までの build_db が作った成績表1本=1テーブル。今は作らない（前の DB に残っていれば foragg の作り直しで消す。5,000本（`DROP_TABLE_LIMIT`）を超えるときは消さずに WARN。画面は使わない。消すには `--fresh`） |
 | `__facets__` | 画面の選択肢（col, val） |
 | `__families__` | family の定義（name, parts（JSON）, tail, label, layer, schemes）。aggregate の `agg_csv/families.json` から。照合・画面はこれを使う |
-| `__build_info__` | 作り直しの印（key, value。2026-11-12〜）: `unified_stamp`（unified_all を入れ替えるたびに変わる）・`xjoin_of:{xjoin のテーブル名}`（その照合結果が何から作られたかの記録。JSON: unified・plain・bases。照合結果と同じトランザクションで書く）。`--mining-only` が一部の作り直しで済ませてよいかの判定に使う（§3.4） |
+| `__build_info__` | 作り直しの印（key, value。2026-11-12〜）: `unified_stamp`（unified_all を入れ替えるたびに変わる）・`xjoin_of:{xjoin のテーブル名}`（その照合結果が何から作られたかの記録。JSON: unified・plain・bases。照合結果と同じトランザクションで書く）。`--mining-only` が一部の作り直しで済ませてよいかの判定に使う（§3.4）。`odds_breaks`（2026-11-14〜。unified_all の成績表を集計したときのオッズ帯の境目の JSON。分からない・混ざっているときは `null`。画面の注意書きが見る。§3.5） |
 | `entries_*` | 出馬表（元の列 ＋ 正規化したキー部品 `場所/芝・ダ/距離/芝(内・外)/重量種別/クラス名/枠番グループ/騎手`、22条件の列、`日付`、`レースID(新/馬番無)`、`距離_raw`、`クラス名_raw`） |
 | `entries_all` | 全出馬表の主要列の縦結合（画面では使わない） |
 | `entries_xjoin_*` | 照合結果: source_table, 日付, レースID(新), レースID(新/馬番無), 場 R, 馬番, 枠番, 枠番グループ, 騎手, 馬名, base(指数), key, テーブル名, family, odds_mode, rank_scheme, indicator, region, 成績列（WEDGE 系を含む） |
@@ -652,7 +663,11 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 
 ### 5.6 オッズ帯（`shisu/odds.py`）
 
-aggregate が master を過去レースの**確定単勝オッズ**で絞って集計する: `normal`（なし）/ `odds10u`（10倍未満）/ `odds10_50`（10以上50未満）/ `odds50p`（50倍以上）。成績表のファイル名の接頭辞は `odds10u_` / `odds10_50_` / `odds50p_`。オッズ欠損の馬は normal にだけ入る。
+aggregate が master を過去レースの**確定単勝オッズ**で絞って集計する: `normal`（なし）/ `odds10u`（**2.0以上 10.0未満**。表記「2〜10倍未満」。2026-11-13 までは 10倍未満）/ `odds10_50`（10以上50未満）/ `odds50p`（50倍以上）。境目は `ODDS_BREAKS = (2.0, 10.0, 50.0)`（odds10u の下限・odds10u と odds10_50 の境・odds10_50 と odds50p の境）。成績表のファイル名の接頭辞は `odds10u_` / `odds10_50_` / `odds50p_`。オッズ欠損の馬と、単勝 2.0倍未満（1.9倍以下）の馬は normal にだけ入る（1倍台の馬が入ると odds10u の勝率・複勝率が上振れするため）。
+- モード名 `odds10u`・ファイル名の接頭辞・DB の odds_mode の値・引数 `cut_low_10u` は変えていない（前の DB・entries_xjoin_* と同じ名前のまま読める）
+- **成績表に効くのは次に aggregate を回したとき**: `ODDS_BREAKS` は集計の設定のハッシュに入るので、`aggregate --resume` でも全部の master を作り直す（`agg_settings.json` の `odds.breaks` が `[10.0, 50.0]` → `[2.0, 10.0, 50.0]`）。aggregate は master の `単勝オッズ` を `odds_mask_numeric` で絞るので、replace（master）は作り直さなくてよい（master の `オッズ帯` 列は表示用で、集計は読まない。2.0倍未満の馬のこの列が空になるのは、次に replace を回したとき）
+- それまでの DB（前の区切りで集計した成績表）は、表記だけ「2〜10倍未満」で中身に1倍台の馬が入っている。成績表の印（`odds_breaks`）→ DB（`__build_info__`）→ 画面の注意書きで知らせる（§3.4・§3.5）
+- 区分の規則（§6.1 の odds10u の消し・高回収率の基準）と条件ヒット馬の画面（過剰人気カット・消し(2〜10倍未満)・消優勢）は、モード名で見ているので変わらない
 画面の「オッズ帯」は「過去にそのオッズ帯だった馬の成績」で、当日の馬のオッズとは無関係に全馬へ表示される。
 
 ---
@@ -728,11 +743,12 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - `tests/test_aggstore.py`（2026-11-10）: master ごとの1ファイルとメタ列・テーブル名、`classify_frame` と1行版の一致（境界値・欠損・4オッズ帯）、旧来のファイル名の速い解析が前の当て方と同じこと、**コンパクト化で残る行が仕様の条件から独立に計算した行と完全に一致**すること・DB の4区分と WEDGE≧0.70 の行が全部の行の DB と同じこと・layer A は全部残ること・下限のオプション、`--resume`（済んだ master を触らない・書きかけを消す・設定を変えた実行が途中で止まっても今の設定にそろう・途中で切れたファイルと作り直した master は作り直す・--clean と一緒なら止める）、全部の master が失敗したときの終了コードとメッセージ、下限の `none` と 0 以下を弾くこと、並列のまとまり（子プロセスを作り直しても1プロセスと同じバイト列）、build_db が旧来の1表1ファイルからでも同じ unified_all・__tables_meta__ を作ること・agg_master と重なる旧来のファイルを使わないこと・前の版の1表ずつのテーブルを消すこと（多すぎれば残して WARN）・読める成績表が無ければ DB を変えないこと・途中で切れたファイルを飛ばして [ERROR]・違う設定の混ざりの WARN、__facets__、**「集計表ごと」の画面が、前の版の DB（1表ずつのテーブルあり・古い中身のテーブルあり）でも新しい DB でも同じ HTML**になること。2回目の検証で再現した不具合の再発防止（master が読めないときに前の成績表を残さない・集計の間に master が作り直されたら印を書かない・区分の閾値が設定のハッシュに入る・先頭から壊れたファイルと gzip でないファイルを [ERROR] にし旧来のファイルで代用しない・旧来のファイルとの混ざりと master の作り直しの WARN・`--prune` が集計表の一覧を消さない）、3回目の検証の分（印の無い成績表だけでも WARN・0行で終わった master の旧来のファイルを使わない・更新時刻だけ変わった master は作り直さず、中身が変わったものは作り直す・オッズ帯の境目と EDGE の表が設定のハッシュに入る・印を書かなかった master も年度の窓のまとめに入る）
 - `tests/test_screen_families.py` に選抜の新しい規則（基準B の絶対軸・基準A の adj 上位）と `--from-report`（採点し直さず同じ選抜になる・基準を変えると減る・基準が JSON に残る・読んだファイルに書き戻す・ファイル名なしの --from-report に --report を付けると --report を読む・レポートが無い/形が違うと終了コード2）・同じ値の並びに依らない選抜、`tests/test_pipeline.py` に `build_db --entries-only`（`--fresh`・`--mode foragg` と一緒なら弾く）と replace の `--workers 2`（まとまりごとに子プロセスを作り直しても1プロセスと同じ master・子プロセスが止められてもそのまとまりを [ERROR] にして残りを続ける）
 - `tests/test_mining_only.py`（2026-11-12）: `--mining-only` の結果が全部の計算と同じファイルになること・ext_indices を読まないこと、別名・`--clean`・不正な指数名、`--indicators オメガ指数`（ext の1指数だけ）、全部の計算への切り替え（統合ファイルが無い・新しい馬・レースから馬が消えた）と入力に無いレースの行を残すこと、build_db が タイムM・対戦M の行だけを照合し直し、ほかの指数の行に触らず、全部作り直した xjoin と同じになること、**マイニング以外の照合に関わる値が変わったとき（騎手の乗り替わり・馬が消えた）・成績表を作り直したあと・途中で止まった実行のあと・記録の無い照合結果では全部の照合に切り替わり、通常の2コマンドと同じ DB になる**こと（止まった実行は前の照合結果と記録に戻る）、`partial_blocker` が指定した指数と馬体重の違いを無視し、ほかの指数・騎手・前走の条件・馬の増減を拾うこと、オプションの組み合わせ（空の `--indicators` を弾く）と xjoin が無いときの切り替え、画面（出馬表・条件ヒット馬・WEDGE 一覧の CSV）が全部作り直した DB と同じ中身になること、`process_df` が34指数でも PerformanceWarning を出さないこと
-- `tests/test_views.py`（2026-11-12。DB を使わない関数単位）: 冗長な「通常」の行（件数の差3以内・同じ馬/指数/family/スキーム/地域/結合データ/区分のときだけ除く）、並び（10倍未満 → 10〜50倍 → 50倍以上 → 通常）、表示上限でオッズ帯別を先に配ること、穴の軸の判定、指数クロス好走馬（軸の指数数・指数A・B）、出馬表の指数クロス（順位・偏差値の4つの基準）
+- `tests/test_views.py`（2026-11-12。DB を使わない関数単位）: 冗長な「通常」の行（件数の差3以内・同じ馬/指数/family/スキーム/地域/結合データ/区分のときだけ除く）、並び（2〜10倍未満 → 10〜50倍 → 50倍以上 → 通常）、表示上限でオッズ帯別を先に配ること、穴の軸の判定、指数クロス好走馬（軸の指数数・指数A・B）、出馬表の指数クロス（順位・偏差値の4つの基準）
 - `tests/test_pipeline.py` の末尾（2026-11-12）: 条件ヒット馬のページ（冗長な通常を表と該当数から除く・`<tr class="hot">`・全部の表が `.scroll` の中・並び・指数クロスの絞り込み）、出馬表のページ（指数クロスの頭数を DB の値から独立に数えて比べる）、WEDGE 一覧のページ（`<details>` の折りたたみと選択中の数・「馬 × 指数」が絞り込みのすぐ下・列がそのまま）
 - `tests/test_views.py`・`tests/test_pipeline.py` の末尾（2026-11-13）: 過剰人気カット（odds10u の軸候補・相手候補だけ・境界 100・値なし・絶対軸と消しとほかのオッズ帯は対象外・カットした行と重なる「通常」の行は回収値に関係なく出さない・行の順に依らない）、`danger_level`（依頼の式との一致）、`horse_stats`・`axis_cross`（odds10u の消しだけを数える・指数ごとの内訳・カットのあとの行数で判定）、ページ（既定 ON と除いた行数・ON/OFF のリンクとフォームの 0/1・リンクがほかの絞り込みを保つ・両方の表の列・`(消n)` のタグ・消優勢/要注意の行とバッジ・出馬表にはチェックが出ない・選択肢に無い「何指数以上」も選ばれた状態で出る）。`tests/test_ingest.py` に、動いている取得元への中止（最初のアクセスの中で中止 → 次のアクセスをしない）・同時実行中の Ctrl-C（止めてから伝わる）・失敗のログ（名前つきの1メッセージ）・ジョブ画面の「実行中」の表示
 - `tests/test_core.py`・`tests/test_aggstore.py` に、高回収率の基準と希少条件（1行版・ベクトル版・SQL 版の一致。部品の完全一致・境界値・4オッズ帯）、`tests/test_ext_indices.py` にボーダーのファイルを読まないこと、`tests/test_ingest.py` に取得元の同時実行（同時に動いていること・順に実行したときと同じ出力・取得元ごとの間隔・中止と失敗がほかの取得元に及ばないこと・ジョブ画面の進み具合・`--sequential`）
-- 件数: 534（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
+- 2026-11-14 の分: `tests/test_mining_only.py` に照合のメモリ（`HitCache` が件数・行数の上限を入れるたびに守る・ふつうの dict でも件数の上限・`iter_hit_rows` が `match_entry_row` と同じ中身と順で、キャッシュを極端に小さくしても結果が変わらず1頭の途中でも上限を超えない・build_db が XJOIN_BATCH 行ごとに INSERT し、上限とまとまりを極端に小さくしても xjoin が行の順まで同じ・出馬表を読んだあと照合の前に `gc.collect()`）。`tests/test_core.py` にオッズ帯の境目（1.9・1.99 は入らず 2.0・2 は入る・全角・0・負・空）、`tests/test_aggstore.py` に `ODDS_BREAKS` の下限が設定のハッシュに入ること（前の境目 `LEGACY_BREAKS` と違うハッシュ）、`tests/test_verified_fixes.py` に集計まで通した確認（単勝 1.5・1.9 の馬は normal にだけ入り、odds10u は 2.0・9.9 だけ。master の オッズ帯 列・成績表の印・agg_settings.json）、`tests/test_pipeline.py` に DB の記録と注意書き（今の境目で集計した DB には出さない・印に境目の無い成績表／記録の無い DB／一部だけ前の区切りの成績表では、オッズ帯を出す4画面に出て、出馬表・レース一覧には出ない・成績表だけ作り直したあとは条件ヒット馬と WEDGE 一覧に「古い照合結果」の注意書きが出て、`--entries-only` で消える・画面の表記「2〜10倍未満」）
+- 件数: 539（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
 
 ---
 
@@ -770,7 +786,9 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 30. **条件ヒット馬の「通常」の重複排除は画面だけ**: `/entries/wedge`・`/entries/wedge.csv`（「区分」列）・横断検索 `/` は全件のまま。件数の差の基準（3）は `app.REDUNDANT_NORMAL_DIFF`
 31. **指数クロスの基準は固定**: 上位 = 順位3位以内・偏差値61以上（`app.CROSS_RANK_MAX`・`CROSS_HEN_MIN`）。順位・偏差値の無い指数（そのレースで使わない指数）は数えない。指数クロス好走馬（軸）は、冗長な通常を除いたあとの 絶対軸・軸候補 の行で数える
 32. **過剰人気カットは既定で ON**（2026-11-13〜）: `/entries/hits` を引数なしで開くと、odds10u の軸候補・相手候補のうち回収値100未満の行は表にも該当数にも出ない（画面の上に除いた行数とリンクが出る）。全部見るときは `cut_low_10u=0`。`/entries/wedge`・CSV・横断検索 `/` は全件のまま。配当の列の無い過去データ（回収値がすべて 0）では、odds10u の軸候補・相手候補が全部カットされる
-33. **消優勢・要注意は行数の比べ方**: 行の重み（件数・回収値・family の重なり）は見ていない。同じ指数の family 違いで似た条件が何行も出れば、その分だけ行数が増える。目安として使い、(消n) の付いた指数と行の中身を見て判断する。消し(10倍未満) は odds10u の消し候補だけ（normal の消しは「消し候補」の列で見る）
+33. **消優勢・要注意は行数の比べ方**（消し(2〜10倍未満) = odds10u の消し候補）: 行の重み（件数・回収値・family の重なり）は見ていない。同じ指数の family 違いで似た条件が何行も出れば、その分だけ行数が増える。目安として使い、(消n) の付いた指数と行の中身を見て判断する。消し(2〜10倍未満) は odds10u の消し候補だけ（normal の消しは「消し候補」の列で見る）
+34. **オッズ帯 odds10u の変更は次の集計から**（2026-11-14〜）: 表記はすぐ「2〜10倍未満」になるが、DB の成績表は集計し直すまで前の区切り（1倍台の馬も入る）のまま。その間は画面に注意書きが出る（前の版で作った DB には記録が無いので、作り直すまで出続ける）。集計し直すと odds10u の件数が減るので、件数の下限（軸10・相手30・消し20。コンパクト化の件数30）を割って区分・DB から外れる行が出る。1倍台の馬は normal の成績表にだけ入る（オッズ帯別の3つを足しても normal にならない）
+35. **照合（xjoin）のトランザクションは1つのまま**: メモリは一定だが、WAL ファイル（ディスク）は書き換える行のぶん大きくなる（全部の照合なら xjoin の大きさほど）。ディスクの空きが要る。照合のキャッシュは上限つきなので、数千 family では1頭の中でも何度も空になり、再利用はほとんど効かない（時間は照合の回数に比例する）
 
 ---
 
@@ -785,6 +803,16 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 ---
 
 ## 11. 変更履歴
+
+### 2026-11-14 照合（xjoin）のメモリ・オッズ帯 odds10u を 2〜10倍未満に
+- 背景: 3,531 family（4,868通り）・34指数の DB で `build_db.py --entries-only --mining-only --indicators 安井_…` が、`[entries] loaded` の直後（照合中）に Docker の OOM（Exit 137）で止まった（ユーザーの実運用）。odds10u（10倍未満）は単勝1倍台の馬が入って勝率・複勝率が上振れしていた
+- build_db・shisu/matching.py: 照合のヒット行を1行ずつ受けて 5,000行ごとに INSERT（`iter_hit_rows`・`insert_hits`。全部の照合と一部の作り直しで共通）、照合のキャッシュ `HitCache` は入れるたびに件数（2万）・行数（5万）の上限を見る（旧版は1頭を回し終えてから件数だけを見ていた）、出馬表を読んだあと照合の前に `gc.collect()`。出力は行の順まで同じ。合成のストレス DB（4,635 family・34指数）で最大 RSS 1,555MB → 126MB・92秒 → 71秒
+  - 原因の切り分け: メモリを使っていたのは Python 側（1頭ぶんの dict のリストと、1頭の途中で膨らむキャッシュ）。「DELETE のあと同じトランザクションで大量に INSERT」は SQLite が WAL ファイル（ディスク）に書くのでメモリのピークには効いていなかった → 途中で止まっても前の照合結果に戻る1つのトランザクションはそのまま
+- shisu/odds.py: odds10u = 単勝 2.0倍以上 10.0倍未満（`ODDS_BREAKS = (2.0, 10.0, 50.0)`・表記「2〜10倍未満」・モード名はそのまま）。1.9倍以下の馬は normal だけ。設定のハッシュが変わるので、次の aggregate は `--resume` でも全部の master を作り直す
+- 表記と中身の食い違いを知らせる仕組み: 成績表の印に `odds_breaks` → build_db が `__build_info__` の `odds_breaks` に残す → 画面は今の境目と違う DB（前の版で作った DB はすべて）で、オッズ帯を出す4画面に注意書きを出す
+- app.py・shisu/classify.py・Readme.txt: 表記を「2〜10倍未満」に（引数 `cut_low_10u`・モード名・並びは変えていない）。Readme.txt の毎週のルーティンと当日更新コマンド（main で追記された分）はそのまま
+- 検証（照合のメモリ・オッズ帯のデータ側・画面側の3領域を指摘役が再現つきで確認し、反証役が再確認）の指摘を反映: 成績表だけを作り直した（`build_db --mode foragg`）あと、オッズ帯の注意書きは消えるのに、条件ヒット馬・WEDGE 一覧は前の区切りの照合結果（xjoin）を出し続けた → 照合結果の記録が今の成績表の印と違うとき、この2画面に「古い照合結果」の注意書き（`xjoin_note`）
+- テスト: test_mining_only・test_core・test_aggstore・test_verified_fixes・test_pipeline に追加。539件
 
 ### 2026-11-13 条件ヒット馬の人気馬（10倍未満）の見分け
 - 背景: odds10u では、複勝率・掲示板率が高いだけで回収値が70〜80の過剰人気の条件が軸候補・相手候補に大量に当たり、買える人気馬と切るべき人気馬が見分けにくかった（ユーザーの実運用）
