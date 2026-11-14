@@ -563,6 +563,7 @@ def test_xjoin_is_streamed_in_batches_with_a_bounded_cache(mo, tmp_path, monkeyp
     events: list[str] = []
     sizes: list[int] = []
     real_gc, real_iter, real_put = build_db.gc.collect, build_db.iter_hit_rows, M.HitCache.put
+    real_load = build_db.load_entries_tables
 
     def put(self, key, hits):
         real_put(self, key, hits)
@@ -575,10 +576,14 @@ def test_xjoin_is_streamed_in_batches_with_a_bounded_cache(mo, tmp_path, monkeyp
         return real_iter(con, row, bases, table, families, cache)
 
     monkeypatch.setattr(build_db.gc, "collect", lambda *a: (events.append("gc"), real_gc(*a))[1])
+    monkeypatch.setattr(build_db, "load_entries_tables", lambda *a, **k: (events.append("load"), real_load(*a, **k))[1])
     monkeypatch.setattr(build_db, "iter_hit_rows", it)
     monkeypatch.setattr(M.HitCache, "put", put)
     assert build_db.main([*args, str(d["out"]), "--db-path", str(d["db"])]) == 0
-    assert "gc" in events and events.index("gc") < events.index("match") and sizes and max(sizes) <= 3
+    # 出馬表を読む → gc.collect() → 最初の照合、の順（読む前の gc では、正規化に使った DataFrame を手放せない）
+    first = events.index("match")
+    last_load = max(i for i, e in enumerate(events[:first]) if e == "load")
+    assert "gc" in events[last_load + 1:first] and sizes and max(sizes) <= 3
     q = f'SELECT * FROM "{XJOIN}" ORDER BY rowid'
     with sqlite3.connect(d["db"]) as c1, sqlite3.connect(f["db"]) as c2:
         a, b = c1.execute(q).fetchall(), c2.execute(q).fetchall()
@@ -592,6 +597,7 @@ def test_xjoin_is_streamed_in_batches_with_a_bounded_cache(mo, tmp_path, monkeyp
     names = [x[0] for x in cur.description]
     rows = [dict(zip(names, r)) for r in cur.fetchall()]
     batches: list[int] = []
+    flow = {"yielded": 0, "inserted": 0, "pending": 0}
 
     class Counting:
         def execute(self, *a):
@@ -599,12 +605,23 @@ def test_xjoin_is_streamed_in_batches_with_a_bounded_cache(mo, tmp_path, monkeyp
 
         def executemany(self, sql, batch):
             batches.append(len(batch))
+            flow["inserted"] += len(batch)
             assert sql.startswith("INSERT INTO")
 
+    def counted(*a, **k):
+        # 受け取ったのにまだ INSERT していない行は、いつも XJOIN_BATCH 行まで（1頭ぶん・全部をためてから切り分けて入れても通らない）
+        for t in real_iter(*a, **k):
+            flow["yielded"] += 1
+            flow["pending"] = max(flow["pending"], flow["yielded"] - flow["inserted"])
+            assert flow["yielded"] - flow["inserted"] <= 7
+            yield t
+
+    monkeypatch.setattr(build_db, "iter_hit_rows", counted)
     from shisu import families as F
     F.set_active(F.load_from_db(con), "db")
     n = build_db.insert_hits(Counting(), XJOIN, rows, M.indicator_bases(names), "entries_merged_hensachi", F.active_names())
     assert n == sum(batches) == len(a) and max(batches) == 7 and batches.count(7) == len(a) // 7
+    assert flow["yielded"] == flow["inserted"] == len(a) and flow["pending"] == 7
     assert build_db.insert_hits(Counting(), XJOIN, rows, [], "entries_merged_hensachi", F.active_names()) == 0   # 指数なし
     con.close()
     F.reset()

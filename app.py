@@ -822,7 +822,10 @@ def collect_hits(con, table: str, race_rows: list[dict]) -> tuple[list[dict], st
             return hits, "xjoin"
         note = "on-the-fly（照合結果 xjoin が古い形式のため。build_db.py --mode entries で作り直してください）"
     bases = indicator_bases(race_rows[0].keys())
-    cache = HitCache()                      # 上限つき（同じレースの馬どうしの引き直しを省く）
+    # 上限つき（同じレースの馬どうしの引き直しを省く）。family が数千あると1頭で上限を超えて何度も空になり、馬どうしの再利用が
+    # 減る（合成のストレス DB で照合の回数 +18%・時間 +12%。代わりにメモリは約3割減）。ふつうの規模（初期セット）では変わらない。
+    # その場照合は xjoin が無い・古い形式のときだけの経路なので、メモリを優先して build_db と同じ上限にしている
+    cache = HitCache()
     hits: list[dict] = []
     for r in race_rows:
         hits.extend(match_entry_row(con, r, bases, table, cache=cache))
