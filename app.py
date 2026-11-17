@@ -27,15 +27,21 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import unicodedata
+from collections import OrderedDict
 from contextlib import contextmanager
 
-from flask import Flask, Response, redirect, render_template_string, request, url_for
+from flask import Flask, Response, abort, g, has_request_context, redirect, render_template_string, request, url_for
+from markupsafe import Markup
 
 from shisu import config
-from shisu.classify import CATEGORIES, CATEGORY_LABELS, classify, description_lines, sql_condition
-from shisu.indicators import INDICATOR_ORDER
+from shisu import drill
+from shisu import notes as notes_store
+from shisu.classify import CATEGORIES, CATEGORY_LABELS, classify, description_lines, keshi_rule, sql_condition
+from shisu.indicators import INDICATOR_ORDER, TRADEOFF_GROUPS, tradeoff_opponents
 from shisu.ingest.web import make_blueprint as make_ingest_blueprint
+from shisu.ingest.web import allowed_host, same_origin
 from shisu import families as fam_registry
 from shisu.matching import HIT_COLUMNS, UNIFIED, HitCache, indicator_bases, match_entry_row, unified_status
 from shisu.naming import ENTRIES_ALL, XJOIN_PREFIX, xjoin_table_for
@@ -211,6 +217,60 @@ def family_label(fam: str, scheme: str = "") -> str:
 app.jinja_env.globals.update(fmt=fmt, fmt_cell=fmt_cell, odds_label=odds_label, family_label=family_label,
                              CATEGORY_LABELS=CATEGORY_LABELS)
 
+# ========================= 危険条件メモ・逆引きへのリンク =========================
+DRILL_FIELDS = ("region", "indicator", "family", "rank_scheme", "odds_mode", "key")
+NOTE_SHOW = 200                         # 表の中に出すメモの長さ（これより長いメモは「…」で切る。全文は title と逆引きページ）
+NOTE_STYLE = "color:#b91c1c;font-weight:700"
+
+
+def current_notes() -> dict:
+    """このリクエストで使う危険条件メモ（1回だけ読む。読めないときは空で、理由を g.shisu_notes_error に残す）。"""
+    if not has_request_context():
+        return notes_store.load_safe()[0]
+    if "shisu_notes" not in g:
+        g.shisu_notes, g.shisu_notes_error = notes_store.load_safe()
+    return g.shisu_notes
+
+
+def notes_error() -> str:
+    current_notes()
+    return g.get("shisu_notes_error", "") if has_request_context() else ""
+
+
+def condition_of(h) -> dict:
+    """ヒット行（照合結果の1行）→ 条件の6項目（DRILL_FIELDS）。指数は indicator（無ければ base）。"""
+    return {"region": str(h.get("region") or ""), "indicator": str(h.get("indicator") or h.get("base") or ""),
+            "family": str(h.get("family") or ""), "rank_scheme": str(h.get("rank_scheme") or ""),
+            "odds_mode": str(h.get("odds_mode") or "normal"), "key": str(h.get("key") or "")}
+
+
+def note_of(h) -> str:
+    """この行の条件に付いている危険条件メモ（無ければ ''）。その地域のメモ → 全地域共通のメモ の順に探す。"""
+    c = condition_of(h)
+    hit = notes_store.lookup(current_notes(), c["indicator"], c["family"], c["rank_scheme"], c["odds_mode"], c["region"], c["key"])
+    return hit[0] if hit else ""
+
+
+def drill_url(h) -> str:
+    """この行の条件の逆引きページ（/entries/drill）。"""
+    return url_for("entries_drill", **condition_of(h))
+
+
+def note_cell(note: str, url: str, key_url: str | None = None) -> Markup:
+    """「危険条件メモ / 調査」の列のセル。メモがあれば赤の太字で本文（逆引きへのリンク）、無くても「調査」のリンク。"""
+    parts = []
+    if note:
+        short = note if len(note) <= NOTE_SHOW else note[:NOTE_SHOW] + "…"
+        parts.append(Markup('<a class="notetext" style="{}" href="{}" target="_blank">{}</a> ').format(NOTE_STYLE, url, short))
+    parts.append(Markup('<a href="{}" target="_blank">調査</a>').format(url))
+    if key_url:
+        parts.append(Markup(' ／ <a href="{}" target="_blank">成績表</a>').format(key_url))
+    title = Markup(' title="{}"').format(note) if note else Markup("")
+    return Markup('<td class="note"{}>{}</td>').format(title, Markup("").join(parts))
+
+
+app.jinja_env.globals.update(note_of=note_of, drill_url=drill_url, note_cell=note_cell)
+
 LAYOUT = """<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><title>{{ title }}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -253,11 +313,24 @@ tr.kd-dominant td{background:#e0e7ff} tr.kd-caution td{background:#f1f5f9}
 .kdnum{color:#4338ca;font-weight:700}
 td.top3{font-weight:700} td.hen61{background:#ecfdf5} td.top3.hen61{background:#d1fae5}
 details.filters>summary{cursor:pointer;font-size:13px;color:#1d4ed8;padding:4px 0}
+/* 危険条件メモ（条件ヒット馬・WEDGE 一覧の「危険条件メモ / 調査」の列）と逆引きページ */
+td.note{white-space:pre-wrap;min-width:10em;max-width:26em}
+.notetext{color:#b91c1c;font-weight:700}
+td.hasnote{box-shadow:inset 3px 0 0 #b91c1c}
+.notebox{border:2px solid #fca5a5;background:#fff7f7} .notebox textarea{width:100%;box-sizing:border-box;font-size:14px;padding:6px;border:1px solid #fca5a5;border-radius:8px}
+textarea.ids{width:100%;box-sizing:border-box;height:150px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.chip{display:inline-block;border:1px solid #cbd5e1;border-radius:10px;padding:1px 7px;margin:1px 2px 1px 0;font-size:12px;white-space:nowrap}
+.chip.core{border-color:#16a34a;background:#f0fdf4} .chip.single{border-style:dashed;color:#64748b}
+.chip.danger{border-color:#b91c1c;background:#fef2f2;color:#b91c1c;font-weight:700}
+td.chips{white-space:normal;min-width:22em}
+tr.good td{background:#f0fdf4} tr.good.win td{font-weight:700} tr.bad td{background:#fef2f2} tr.out td{color:#94a3b8}
+button.sub{background:#64748b} button.del{background:#b91c1c}
 </style></head><body><header>{{ title }}</header><div class="container">
 <div class="nav"><a href="{{ url_for('index') }}">横断検索</a><a href="{{ url_for('entries_index') }}">出馬表</a><a href="{{ url_for('ingest.index') }}">指数の取得</a></div>
 {% if db_warning %}<div class="card warn">{{ db_warning }}</div>{% endif %}
 {% if odds_note %}<div class="card warn">{{ odds_note }}</div>{% endif %}
 {% if xjoin_note %}<div class="card warn">{{ xjoin_note }}</div>{% endif %}
+{% if notes_error %}<div class="card warn">危険条件メモを読めません: {{ notes_error }}（メモなしで表示しています）</div>{% endif %}
 {BODY}
 </div></body></html>"""
 
@@ -266,6 +339,7 @@ def render(title: str, body: str, **ctx):
     ctx.setdefault("db_warning", "")
     ctx.setdefault("odds_note", odds_note() if ctx.pop("show_odds_note", False) else "")
     ctx.setdefault("xjoin_note", "")
+    ctx.setdefault("notes_error", "")
     return render_template_string(LAYOUT.replace("{BODY}", body), title=title, **ctx)
 
 
@@ -855,6 +929,8 @@ KESHI_DOMINANT_MIN_ROWS = 3            # 「消優勢」に要る 消し(2〜10�
 KESHI_DOMINANT_MIN_INDS = 2            # 「消優勢」に要る、消し(2〜10倍未満) が出た指数の数
 KESHI_CAUTION_MIN_ROWS = 2             # 「要注意」に要る 消し(2〜10倍未満) の行数
 DANGER_LABELS = {"dominant": "⚠️消優勢", "caution": "要注意"}
+AXIS_CATEGORIES = ("abs", "axis")      # 軸（絶対軸・軸候補）
+TRADEOFF_TEXT = " ／ ".join(f"{name}: {'・'.join(a)} ⇔ {'・'.join(b)}" for name, a, b in TRADEOFF_GROUPS)
 
 
 def is_hot(h: dict, cat: str | None) -> bool:
@@ -910,6 +986,33 @@ def horse_stats(race: list[dict], buckets: dict[str, list[dict]]) -> dict[str, d
     return out
 
 
+def keshi_rule_of(h: dict) -> str | None:
+    """ヒット行が消し候補になる理由（'any' = 全モード共通の規則 / 'fav' = 2〜10倍未満専用の規則だけ / None）。"""
+    return keshi_rule({"cnt": h.get("件数"), "fv": h.get("複勝率_val"), "top5": h.get("掲示板率_val"), "key": h.get("key")},
+                      h.get("odds_mode") or "normal")
+
+
+def tradeoff_keshi(rows: list[tuple[dict, str]]) -> set[int]:
+    """負の相関（トレードオフ）にある指数の軸ヒットで除く消し候補の行（id(h) の集合）。rows = (ヒット行, 区分) の並び。
+
+    ある馬が、片方の指数（例: 先行）で 絶対軸・軸候補 に1行でも当たっていれば、その馬の、対になる指数（例: 瞬発）の
+    「2〜10倍未満（odds10u）専用の規則（複勝率 < 20%）だけで消し候補になっている行」を除く（先行力の高い馬は瞬発力が
+    低く出る、という指数の性質から出ているだけの消し）。全モード共通の規則（複勝率 < 5% かつ 掲示板率 < 10%）も満たす行と、
+    ほかのオッズ帯の消し候補は除かない。組は shisu.indicators.TRADEOFF_GROUPS（双方向）。"""
+    axis_bases: dict[str, set] = {}
+    for h, cat in rows:
+        if cat in AXIS_CATEGORIES:
+            axis_bases.setdefault(str(h.get("馬番")), set()).add(h.get("base"))
+    out: set[int] = set()
+    for h, cat in rows:
+        if cat != "keshi" or (h.get("odds_mode") or "normal") != FAV_MODE:
+            continue
+        bases = axis_bases.get(str(h.get("馬番")))
+        if bases and (tradeoff_opponents(h.get("base")) & bases) and keshi_rule_of(h) == "fav":
+            out.add(id(h))
+    return out
+
+
 def drop_redundant_normal(rows: list[tuple[dict, str]], cut_low: bool = False
                           ) -> tuple[list[tuple[dict, str]], int, dict[str, int]]:
     """(ヒット行, 区分) の並びから、冗長な「通常」の行を除く。cut_low=True なら過剰人気の行（is_low_return_favorite）も除く。
@@ -950,13 +1053,21 @@ def classify_hits(hits: list[dict], info: dict | None = None, cut_low: bool = Fa
     """ヒット行を区分ごとに分ける（重複と、冗長な「通常」の行を除く）。info を渡すと、除いた行数を info["dropped"] に入れる。
     cut_low=True なら、過剰人気の行（2〜10倍未満の軸候補・相手候補で回収値100未満）も除き、区分ごとの行数を info["cut"] に入れる。
     カットした2〜10倍未満の行とほぼ同じ中身の「通常」の行（冗長な通常）は、カット ON でも出さない（drop_redundant_normal）。
+    負の相関にある指数の軸ヒットがある馬の、対の指数の「2〜10倍未満だけの消し候補」も除く（tradeoff_keshi。行数は info["tradeoff"]）。
     並びは オッズ帯（2〜10倍未満 → 10〜50倍 → 50倍以上 → 通常）→ 馬番 → 複勝率（消しは昇順）→ 指数・パターン・キー・集計表
     （同点の並びも決めるので、表示の上限で出る行が、照合結果の行の順に左右されない）。"""
-    rows = [(h, cat) for h in dedupe_hits(hits) for cat in (hit_category(h),) if cat]
-    rows, dropped, cut = drop_redundant_normal(rows, cut_low)
+    every = [(h, cat) for h in dedupe_hits(hits) for cat in (hit_category(h),) if cat]
+    rows, dropped, cut = drop_redundant_normal(every, cut_low)
+    # 負の相関にある指数の軸ヒット（冗長な通常・過剰人気カットを除いたあとの軸）で、対の指数の「2〜10倍未満だけの消し」を除く。
+    # 除いたあとでもう一度、冗長な通常を決め直す（除いた消しと重なるというだけで省かれていた「通常」の消しは、
+    # 全モード共通の規則による別の消しなので残す）。軸の行は消しの行に左右されないので、決め直しても同じ。
+    trade = tradeoff_keshi(rows)
+    if trade:
+        rows, dropped, cut = drop_redundant_normal([(h, cat) for h, cat in every if id(h) not in trade], cut_low)
     if info is not None:
         info["dropped"] = dropped
         info["cut"] = cut
+        info["tradeoff"] = len(trade)
     buckets: dict[str, list[dict]] = {c: [] for c in CATEGORIES}
     for h, cat in rows:
         buckets[cat].append(h)
@@ -983,8 +1094,9 @@ HITS_BODY = """
 <div class="muted">照合: {{ path }} ／ 率は DB の推定値（複勝率・連対率）と頻度（掲示板率）
 {% if dropped %} ／ オッズ帯別の行と同じ区分・件数の差{{ diff }}件以内の「通常」の行 {{ dropped }} 行は、重なるので省いています{% endif %}</div>
 {% if cut_low %}<div class="warn" style="margin-top:4px">過剰人気カット中: 2〜10倍未満の軸候補・相手候補のうち、複勝回収値も単勝適正回収値も {{ cut_min }} 未満の行を除いています（軸候補 {{ cut.axis }} 行・相手候補 {{ cut.opp }} 行。下の表・該当数・指数クロスはすべて除いたあとの数）。
-<a href="{{ cut_toggle }}">カットせずに全部表示する</a></div>
-{% else %}<div class="muted" style="margin-top:4px">過剰人気カットは切ってあります（2〜10倍未満の軸・相手を回収値に関係なく全部表示中）。<a href="{{ cut_toggle }}">回収値{{ cut_min }}以上だけにする</a></div>{% endif %}
+<a href="{{ cut_toggle }}">カットせずに全部表示する</a></div>{% endif %}
+{% if tradeoff %}<div class="warn" style="margin-top:4px">負の相関にある指数の軸ヒットにより除外した消し候補 {{ tradeoff }} 行（片方の指数で絶対軸・軸候補に当たった馬の、対になる指数の「2〜10倍未満だけの消し候補」。下の表・該当数・消し(2〜10倍未満)・判定はすべて除いたあとの数。組: {{ tradeoff_pairs }}）</div>{% endif %}
+{% if not cut_low %}<div class="muted" style="margin-top:4px">過剰人気カットは切ってあります（2〜10倍未満の軸・相手を回収値に関係なく全部表示中）。<a href="{{ cut_toggle }}">回収値{{ cut_min }}以上だけにする</a></div>{% endif %}
 <div style="margin-top:6px"><a href="{{ url_for('entries_race', table=table, rid=rid) }}">出馬表（指数クロス）</a> ／
 <a href="{{ url_for('entries_wedge', table=table, rid=rid) }}" target="_blank">このレースの WEDGE 一覧（閾値なし・全キー）</a></div></div>
 <div class="card"><h1>指数クロス好走馬（絶対軸・軸候補が複数の指数で同時に出ている馬）：{{ cross_hits|length }}頭</h1>
@@ -1018,13 +1130,14 @@ HITS_BODY = """
 {% if view[c]|length < buckets[c]|length %}<div class="warn">{{ view[c]|length }} 行だけ表示しています（全 {{ buckets[c]|length }} 行。馬・オッズ帯ごとに偏らないように選び、オッズ帯別の行を通常の行より先に出しています）。全件は <a href="{{ url_for('entries_wedge_csv', table=table, rid=rid, odds_mode='all') }}">WEDGE 一覧の CSV</a>（「区分」列で絞れます）</div>{% endif %}
 <div class="scroll"><table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
 <th>件数</th><th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>勝率</th><th>連対率</th><th>複勝率</th>
-<th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th></tr></thead><tbody>
-{% for h in view[c] %}{% set dg = danger_by.get(h['馬番']|string) %}<tr{% if is_hot(h, c) %} class="hot"{% endif %}><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}{% if dg %} <span class="kd{{ ' caution' if dg == 'caution' else '' }}">{{ DANGER_LABELS[dg] }}</span>{% endif %}</td><td>{{ h['騎手'] }}</td>
-<td>{{ h['base'] }}</td><td>{{ family_label(h['family'], h['rank_scheme']) }}</td><td>{{ odds_label(h['odds_mode']) }}</td><td>{{ h['region'] }}</td><td>{{ h['key'] }}</td>
+<th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th><th>危険条件メモ / 調査</th></tr></thead><tbody>
+{% for h in view[c] %}{% set dg = danger_by.get(h['馬番']|string) %}{% set nt = note_of(h) %}{% set du = drill_url(h) %}<tr{% if is_hot(h, c) %} class="hot"{% endif %}><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}{% if dg %} <span class="kd{{ ' caution' if dg == 'caution' else '' }}">{{ DANGER_LABELS[dg] }}</span>{% endif %}</td><td>{{ h['騎手'] }}</td>
+<td>{{ h['base'] }}</td><td>{{ family_label(h['family'], h['rank_scheme']) }}</td><td>{{ odds_label(h['odds_mode']) }}</td><td>{{ h['region'] }}</td><td{% if nt %} class="hasnote" title="{{ nt }}"{% endif %}><a href="{{ du }}" target="_blank">{{ h['key'] }}</a></td>
 <td class="num">{{ h['件数'] }}</td>{% for k in ['勝率_val','連対率_val','複勝率_val','掲示板率_val'] %}<td class="num">{{ fmt(h[k]) }}</td>{% endfor %}
 <td>{{ h['勝率'] }}</td><td>{{ h['連対率'] }}</td><td>{{ h['複勝率'] }}</td>
-{% for k in ['平均着順','単勝回収値','複勝回収値','単勝適正回収値','WEDGE','adjusted_WEDGE','adjusted_WEDGE_年数'] %}<td class="num">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}</tr>
-{% else %}<tr><td colspan="24">該当なし</td></tr>{% endfor %}</tbody></table></div></div>
+{% for k in ['平均着順','単勝回収値','複勝回収値','単勝適正回収値','WEDGE','adjusted_WEDGE','adjusted_WEDGE_年数'] %}<td class="num">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}
+{{ note_cell(nt, du) }}</tr>
+{% else %}<tr><td colspan="25">該当なし</td></tr>{% endfor %}</tbody></table></div></div>
 {% endfor %}
 """
 HITS_ORDER = ("abs", "axis", "keshi", "opp")
@@ -1146,6 +1259,7 @@ def entries_hits():
                   cross_bases=bases, cross_criteria=CROSS_CRITERIA, cross_crit=None,
                   cross_min_choices=min_choices(cross["xmin"]), cross_hidden=[("table", table), ("rid", rid)],
                   cut_low=cut_low, cut=info.get("cut", {}), cut_min=f"{CUT_MIN_RETURN:g}", cut_toggle=toggle,
+                  tradeoff=info.get("tradeoff", 0), tradeoff_pairs=TRADEOFF_TEXT, notes_error=notes_error(),
                   danger_by=danger_by, n_dominant=sum(1 for x in xs if x["danger"] == "dominant"),
                   n_caution=sum(1 for x in xs if x["danger"] == "caution"))
 
@@ -1289,14 +1403,15 @@ WEDGE = WIN + EDGE（1.00以上=トップ級、0.62前後=平均、0.50未満=�
 
 <div class="card"><h1>全該当キー（{{ total }}行{% if total > shown|length %}・画面は先頭 {{ shown|length }} 行。残りは CSV で{% endif %}）</h1>
 <div class="scroll tall"><table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>指数</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ</th>
-<th>件数</th><th>WIN</th><th>EDGE</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th><th>年の件数計</th><th>最終年</th>
+<th>件数</th><th>WIN</th><th>EDGE</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th><th>危険条件メモ / 調査</th><th>年の件数計</th><th>最終年</th>
 <th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>単勝回収値</th><th>複勝回収値</th></tr></thead><tbody>
-{% for h in shown %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
+{% for h in shown %}{% set nt = note_of(h) %}{% set du = drill_url(h) %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
 <td>{{ h['base'] }}</td><td>{{ family_label(h['family'], h['rank_scheme']) }}</td><td>{{ odds_label(h['odds_mode']) }}</td><td>{{ h['region'] }}</td>
-<td><a href="{{ url_for('entries_key', key=h['key']) }}" target="_blank">{{ h['key'] }}</a></td><td class="num">{{ h['件数'] }}</td>
+<td{% if nt %} class="hasnote" title="{{ nt }}"{% endif %}><a href="{{ du }}" target="_blank">{{ h['key'] }}</a></td><td class="num">{{ h['件数'] }}</td>
 {% for k in ['WIN','EDGE','WEDGE','adjusted_WEDGE'] %}<td class="num {{ wedge_class(h.get(k)) if k in ('WEDGE','adjusted_WEDGE') else '' }}">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}
-{% for k in ['adjusted_WEDGE_年数','adjusted_WEDGE_件数','adjusted_WEDGE_最終年','勝率_val','連対率_val','複勝率_val','掲示板率_val','単勝回収値','複勝回収値'] %}<td class="num">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}</tr>
-{% else %}<tr><td colspan="23">該当なし（この出馬表の馬の条件に合う集計行がありません）</td></tr>{% endfor %}</tbody></table></div></div>
+<td class="num">{{ fmt_cell('adjusted_WEDGE_年数', h.get('adjusted_WEDGE_年数')) }}</td>{{ note_cell(nt, du, url_for('entries_key', key=h['key'])) }}
+{% for k in ['adjusted_WEDGE_件数','adjusted_WEDGE_最終年','勝率_val','連対率_val','複勝率_val','掲示板率_val','単勝回収値','複勝回収値'] %}<td class="num">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}</tr>
+{% else %}<tr><td colspan="24">該当なし（この出馬表の馬の条件に合う集計行がありません）</td></tr>{% endfor %}</tbody></table></div></div>
 """
 
 
@@ -1350,7 +1465,7 @@ def entries_wedge():
     args.update({"table": [p["table"]], "rid": [rid]})
     head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}　WEDGE 一覧'
     sub = f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")} / {h.get("クラス名_raw", "")} / {len(race)}頭'
-    return render("WEDGE一覧", WEDGE_BODY, show_odds_note=True, xjoin_note=p.get("xjoin_note", ""), head=head, sub=sub, path=path, table=p["table"], rid=rid, race=race,
+    return render("WEDGE一覧", WEDGE_BODY, show_odds_note=True, xjoin_note=p.get("xjoin_note", ""), notes_error=notes_error(), head=head, sub=sub, path=path, table=p["table"], rid=rid, race=race,
                   bases=bases, families=fam_registry.active_names(), odds_modes=ODDS_MODES, sorts=WEDGE_SORTS,
                   q_odds=p["odds_mode"], q_inds=p["inds"], q_fams=p["fams"], q_uma=p["uma"], q_sort=p["sort"],
                   q_dir=p["dir"], matrix=wedge_matrix(matrix_race, rows, matrix_bases), matrix_bases=matrix_bases,
@@ -1376,6 +1491,239 @@ def entries_wedge_csv():
     name = re.sub(r"[^0-9A-Za-z_-]", "_", str(rid))
     return Response(buf.getvalue().encode("utf-8-sig"), mimetype="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="wedge_{name}.csv"'})
+
+
+# ========================= 逆引き（/entries/drill）と危険条件メモ（/entries/note） =========================
+DRILL_VIEW_LIMIT = 2000        # 明細の表に出す行数（全件は CSV）
+DRILL_CACHE_SIZE = 6           # 取り出した行を覚えておく条件の数（メモの保存のあとの再表示・CSV で master を読み直さない）
+_DRILL_CACHE: "OrderedDict[tuple, object]" = OrderedDict()
+_DRILL_LOCK = threading.Lock()
+
+DRILL_BODY = """
+<div class="card"><h1>逆引き: {{ p.key or '（結合データなし）' }}</h1>
+<div class="muted">指数 <b>{{ p.indicator }}</b> ／ パターン <b>{{ family_label(p.family, p.rank_scheme) }}</b>（{{ p.family }}）／ オッズ帯 <b>{{ odds_label(p.odds_mode) }}</b> ／ 地域 <b>{{ p.region or '（なし）' }}</b></div>
+{% if stat %}<div class="muted" style="margin-top:4px">成績表（DB）: 件数 {{ stat['件数'] }} ／ 勝率 {{ stat['勝率'] }} ／ 連対率 {{ stat['連対率'] }} ／ 複勝率 {{ stat['複勝率'] }} ／ 掲示板率 {{ fmt(stat['掲示板率_val']) }}% ／ 単勝回収値 {{ fmt(stat['単勝回収値']) }} ／ 複勝回収値 {{ fmt(stat['複勝回収値']) }} ／ WEDGE {{ fmt(stat['WEDGE'], 3) }}{% if stat_cat %} ／ 区分 <b>{{ CATEGORY_LABELS[stat_cat] }}</b>{% endif %}</div>
+{% elif stat_missing %}<div class="muted" style="margin-top:4px">この条件の行は、今の DB の成績表にありません（コンパクト化で省かれた行・前の集計の条件など）。</div>{% endif %}
+{% if error %}<div class="warn" style="margin-top:6px">{{ error }}</div>{% endif %}
+</div>
+{% if can_note %}
+<div class="card notebox"><h1 style="color:#b91c1c">⚠️ 危険条件・死角メモ（ここに書くと条件ヒット馬の表に赤字で表示されます）</h1>
+{% if flash %}<div class="warn" style="margin-bottom:6px">{{ flash }}</div>{% endif %}
+<form method="post" action="{{ url_for('entries_note') }}">
+{% for f in fields %}<input type="hidden" name="{{ f }}" value="{{ p[f] }}">{% endfor %}
+<textarea name="note" rows="3" maxlength="{{ note_max }}" placeholder="例: ⚠️馬体重478kg以下は危険 ／ ⚠️前走4角10番手以下は消し">{{ note }}</textarea>
+<div style="margin-top:6px">
+<label class="cb"><input type="checkbox" name="all_regions" value="1" {{ 'checked' if note_scope == 'common' or not p.region else '' }}{{ ' disabled' if not p.region else '' }}>全地域共通のメモにする（地域が違っても、同じ指数・パターン・オッズ帯・結合データの行に表示）</label>
+<button type="submit" name="action" value="save">保存</button>
+{% if note %}<button type="submit" name="action" value="delete" class="del">このメモを削除</button>{% endif %}
+<span class="muted">{% if note %}いまのメモ: {{ 'この地域（' ~ p.region ~ '）だけ' if note_scope == 'region' else '全地域共通' }}{% if note_updated %}・{{ note_updated }} 更新{% endif %} ／ {% endif %}保存先: {{ notes_file }}（racing.db を作り直しても消えません。本文を空にして保存すると消えます）</span>
+</div></form></div>
+{% endif %}
+{% if ov %}
+<div class="card"><h1>TARGET 貼付用のレースID（{{ ov.n }}件: 好走 {{ ov.good }}・凡走 {{ ov.bad }}{% if ov.rate is not none %}・好走率 {{ '%.1f'|format(ov.rate * 100) }}%{% endif %}）</h1>
+<div class="muted">この条件に当たった過去の馬（master_csv/{{ master_name }} から。好走 = 3着以内、凡走 = 4着以下・失格・中止。取消・除外 {{ ov.excluded }} 頭は集計の分母に入らないので除いています）。
+{% if stat and stat['件数'] != ov.n %}<span class="warn">成績表（DB）の件数 {{ stat['件数'] }} と、いまの master から取り出した件数 {{ ov.n }} が違います（成績表を集計したあとに master を作り直した・オッズ帯の区切りが変わった などのとき）。</span>{% endif %}</div>
+<div class="cbs" style="margin:8px 0">
+<label class="cb"><input type="radio" name="idkind" value="all" checked>全件（{{ lists.all.horse|length }}）</label>
+<label class="cb"><input type="radio" name="idkind" value="good">好走 1〜3着のみ（{{ lists.good.horse|length }}）</label>
+<label class="cb"><input type="radio" name="idkind" value="bad">凡走 4着以下のみ（{{ lists.bad.horse|length }}）</label>
+<a href="{{ csv_url }}">明細CSVをダウンロード（全 {{ ov.rows }} 行）</a></div>
+<div class="grid" style="grid-template-columns:1fr 1fr">
+<div><label>レースID(新) 18桁（馬単位）<span id="n-horse">{{ lists.all.horse|length }}</span> 件</label>
+<textarea class="ids" id="ids-horse" readonly>{{ lists.all.horse|join('\\n') }}</textarea>
+<button type="button" class="sub" data-copy="ids-horse" data-label="コピー（馬単位）">コピー（馬単位）</button></div>
+<div><label>レースID(新/馬番無) 16桁（レース単位・重複なし）<span id="n-race">{{ lists.all.race|length }}</span> 件</label>
+<textarea class="ids" id="ids-race" readonly>{{ lists.all.race|join('\\n') }}</textarea>
+<button type="button" class="sub" data-copy="ids-race" data-label="コピー（レース単位）">コピー（レース単位）</button></div>
+</div>
+<script>
+(function () {
+  var data = {{ lists|tojson }}, kind = 'all';
+  function fill() {
+    ['horse', 'race'].forEach(function (t) {
+      document.getElementById('ids-' + t).value = data[kind][t].join('\\n');
+      document.getElementById('n-' + t).textContent = data[kind][t].length;
+    });
+  }
+  function sync() {
+    var r = document.querySelector('input[name=idkind]:checked');
+    kind = r && data[r.value] ? r.value : 'all';
+    fill();
+  }
+  document.querySelectorAll('input[name=idkind]').forEach(function (r) { r.addEventListener('change', sync); });
+  // 「戻る」・タブの復元ではブラウザがラジオの選択だけを戻す（change は起きない）ので、表示のたびに選択に合わせ直す
+  window.addEventListener('pageshow', sync);
+  sync();
+  document.querySelectorAll('button[data-copy]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var el = document.getElementById(b.getAttribute('data-copy')), ok = false;
+      el.focus(); el.select();
+      try { ok = document.execCommand('copy'); } catch (e) {}
+      if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(el.value); ok = true; }
+      b.textContent = ok ? 'コピーしました' : '選択しました（Ctrl+C でコピー）';
+      setTimeout(function () { b.textContent = b.getAttribute('data-label'); }, 1500);
+    });
+  });
+})();
+</script></div>
+
+<div class="card"><h1>コア分布サマリー（大多数が収まる範囲と、そこから外れた危険候補）</h1>
+<div class="muted">項目ごとに、この条件に当たった {{ ov.n }} 件がどの値に集まっているか。
+<span class="chip core">緑の枠</span> = コア（全体の{{ core_pct }}%以上が収まる範囲。数・オッズの帯は連続したいちばん狭い範囲、騎手などは単独1件を除いて件数の多い値から）／
+<span class="chip single">点線</span> = コアの外の単独1件（飛び地）／
+<span class="chip danger">赤</span> = 凡走の集まり（{{ bad_min }}件以上で、好走率が全体（{{ '%.0f'|format((ov.rate or 0) * 100) }}%）の半分以下）。
+各値は「値：件数（好走の数）」。master に無い項目（馬体重・4角位置など）は、上のレースIDを TARGET に貼って調べてください。</div>
+<div class="scroll tall" style="margin-top:8px"><table><thead><tr><th>項目</th><th>コア（大多数）</th><th class="num">コアの割合</th><th>危険候補（単独1件・凡走の集まり）</th><th>内訳（値：件数（好走の数））</th></tr></thead><tbody>
+{% for it in summary %}<tr><td><b>{{ it.name }}</b><div class="muted">{{ it.n }}件・{{ it.kinds }}種{% if it.n_empty %}・値なし{{ it.n_empty }}{% endif %}</div></td>
+<td style="white-space:normal">{{ it.core_text }}</td><td class="num">{{ '%.0f'|format(it.core_cover * 100) }}%</td>
+<td class="chips">{% for d in it.dangers[:12] %}<span class="chip {{ 'danger' if d.flag == 'bad' else 'single' }}{{ ' danger' if d.flag == 'single' and not d.good else '' }}">{{ d.value }}：{{ d.n }}件（好走{{ d.good }}）{{ '単独1件' if d.flag == 'single' else '凡走集中' }}</span>{% endfor %}{% if it.dangers|length > 12 %}<span class="muted">ほか{{ it.dangers|length - 12 }}</span>{% endif %}</td>
+<td class="chips">{% for v in it['items'] %}<span class="chip{{ ' core' if v.core else '' }}{{ ' danger' if v.flag == 'bad' else '' }}{{ ' single' if v.flag == 'single' else '' }}">{{ v.value }}：{{ v.n }}件（好走{{ v.good }}）</span>{% endfor %}{% if it.hidden %}<span class="muted">ほか{{ it.hidden }}種</span>{% endif %}</td></tr>
+{% else %}<tr><td colspan="5">該当する行がありません</td></tr>{% endfor %}</tbody></table></div></div>
+
+<div class="card"><h1>該当した過去走の明細（{{ ov.rows }}行{% if ov.rows > rows|length %}・画面は新しい順に {{ rows|length }} 行。全件は CSV{% endif %}）</h1>
+<div class="muted"><span class="chip core">緑</span> = 好走（1〜3着。1着は太字）／ <span class="chip danger">赤</span> = 凡走（4着以下・失格・中止）／ 灰色の字 = 取消・除外（集計外）</div>
+<div class="scroll tall" style="margin-top:8px"><table><thead><tr><th>区分</th>{% for c in columns %}<th>{{ column_labels.get(c, c) }}</th>{% endfor %}</tr></thead><tbody>
+{% for r in rows %}<tr class="{{ 'out' if r['区分'] == '集計外' else ('good' ~ (' win' if r['_win'] else '') if r['区分'] == '好走' else 'bad') }}"><td>{{ r['区分'] }}</td>{% for c in columns %}<td>{{ r[c] }}</td>{% endfor %}</tr>
+{% else %}<tr><td colspan="{{ columns|length + 1 }}">該当する行がありません</td></tr>{% endfor %}</tbody></table></div></div>
+{% endif %}
+"""
+DRILL_COLUMN_LABELS = {"距離_raw": "距離", "指数": "指数値"}
+
+
+def _drill_request(src=None) -> dict:
+    """逆引き・メモの条件（DRILL_FIELDS）。指数は indicator（無ければ base）。前後の空白を除く。"""
+    a = request.args if src is None else src
+    p = {f: (a.get(f) or "").strip() for f in DRILL_FIELDS}
+    p["indicator"] = p["indicator"] or (a.get("base") or "").strip()
+    p["odds_mode"] = p["odds_mode"] or "normal"
+    return p
+
+
+def _drill_stat(con, p: dict) -> dict | None:
+    """この条件の成績表の行（DB の unified_all。無ければ None）。"""
+    if unified_status(con) != "ok":
+        return None
+    cols = table_columns(con, UNIFIED)
+    region = 'AND IFNULL("region", \'\') = ?' if "region" in cols else ""
+    r = con.execute(
+        f'SELECT * FROM {UNIFIED} WHERE "結合データ" = ? AND "family" = ? AND "indicator" = ? AND "odds_mode" = ? '
+        f'AND IFNULL("rank_scheme", \'\') = ? {region} LIMIT 1',
+        (p["key"], p["family"], p["indicator"], p["odds_mode"], p["rank_scheme"]) + ((p["region"],) if region else ())).fetchone()
+    return dict(r) if r is not None else None
+
+
+def drill_frame(p: dict):
+    """(取り出した行の DataFrame, master のパス)。master が無ければ (None, None)。引数が合わなければ DrillError。
+    取り出した行は、条件と master（場所・更新時刻・大きさ）ごとに DRILL_CACHE_SIZE 個まで覚えておく。"""
+    fam = fam_registry.get(p["family"]) if p["family"] in fam_registry.active_names() else None
+    drill.check_args(fam, p["rank_scheme"], p["odds_mode"])
+    path = drill.find_master(p["region"], p["indicator"])
+    if path is None:
+        return None, None
+    st = path.stat()
+    ck = (str(path), st.st_mtime_ns, st.st_size, fam.name, tuple(fam.parts), fam.tail, p["rank_scheme"], p["odds_mode"], p["key"])
+    with _DRILL_LOCK:
+        df = _DRILL_CACHE.get(ck)
+        if df is not None:
+            _DRILL_CACHE.move_to_end(ck)
+            return df, path
+    df = drill.extract(path, fam, p["rank_scheme"], p["odds_mode"], p["key"])
+    with _DRILL_LOCK:
+        _DRILL_CACHE[ck] = df
+        while len(_DRILL_CACHE) > DRILL_CACHE_SIZE:
+            _DRILL_CACHE.popitem(last=False)
+    return df, path
+
+
+def _drill_load(p: dict):
+    """(DataFrame か None, master のパス か None, 成績表の行 か None, DB に成績表があるか, エラーの文)。"""
+    stat, has_db, error, df, path = None, False, "", None, None
+    with connect() as con:                                   # DB の family の定義を台帳に入れる
+        try:
+            has_db = unified_status(con) == "ok"
+            stat = _drill_stat(con, p) if has_db else None
+        except sqlite3.Error:
+            stat = None
+    if not (p["key"] and p["family"] and p["indicator"]):
+        return None, None, stat, has_db, "指数・パターン・結合データを指定してください（条件ヒット馬・WEDGE 一覧の表のリンクから開けます）"
+    try:
+        df, path = drill_frame(p)
+        if path is None:
+            error = (f"master_csv に 地域「{p['region']}」・指数「{p['indicator']}」の master がありません"
+                     "（replace_csv_ver3.py を実行した環境で使えます）。メモの登録・確認はできます。")
+    except drill.DrillError as e:
+        error = str(e)
+    return df, path, stat, has_db, error
+
+
+@app.route("/entries/drill", methods=["GET"])
+def entries_drill():
+    p = _drill_request()
+    df, path, stat, has_db, error = _drill_load(p)
+    notes = current_notes()
+    hit = notes_store.lookup(notes, p["indicator"], p["family"], p["rank_scheme"], p["odds_mode"], p["region"], p["key"])
+    note, scope = hit if hit else ("", "")
+    k = notes_store.ident(p["indicator"], p["family"], p["rank_scheme"], p["odds_mode"], p["region"] if scope == "region" else "", p["key"])
+    flash = {"saved": "メモを保存しました。", "deleted": "メモを削除しました。", "none": "削除するメモはありませんでした。",
+             "error": "メモを保存できませんでした: " + (request.args.get("why") or "")}.get(request.args.get("note_result", ""), "")
+    ctx = dict(p=p, stat=stat, stat_missing=has_db and stat is None and bool(p["key"]), error=error, fields=DRILL_FIELDS,
+               stat_cat=hit_category({**stat, "key": p["key"]}) if stat else None,
+               can_note=bool(p["key"] and p["family"] and p["indicator"]), note=note, note_scope=scope,
+               note_updated=(notes.get(k) or {}).get("updated", ""), note_max=notes_store.MAX_NOTE, flash=flash,
+               notes_file=notes_store.config.notes_path().name, notes_error=notes_error(), ov=None)
+    if df is not None:
+        columns = [c for c in drill.DETAIL_COLUMNS if c in df.columns]
+        shown = df.head(DRILL_VIEW_LIMIT)
+        rows = [{**{c: r[c] for c in columns}, "区分": r[drill.RESULT], "_win": r[drill.FINISH] == 1}
+                for r in shown.to_dict("records")]
+        ctx.update(ov=drill.overview(df), lists=drill.id_lists(df), summary=drill.summarize(df), rows=rows, columns=columns,
+                   column_labels=DRILL_COLUMN_LABELS, master_name=path.name, csv_url=url_for("entries_drill_csv", **p),
+                   core_pct=int(drill.CORE_TARGET * 100), bad_min=drill.BAD_MIN_COUNT)
+    return render("逆引き", DRILL_BODY, show_odds_note=True, **ctx)
+
+
+@app.route("/entries/drill.csv", methods=["GET"])
+def entries_drill_csv():
+    p = _drill_request()
+    df, _path, _stat, _has_db, error = _drill_load(p)
+    if df is None:
+        return Response(error or "master がありません", status=404, mimetype="text/plain; charset=utf-8")
+    columns = [drill.RESULT] + [c for c in df.columns if not c.startswith("_") and c != drill.RESULT]
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerow(columns)
+    for r in df[columns].itertuples(index=False, name=None):
+        w.writerow(["" if v is None else v for v in r])
+    name = re.sub(r"[^0-9A-Za-z_-]", "_", f"{p['family']}_{p['odds_mode']}")
+    return Response(buf.getvalue().encode("utf-8-sig"), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="drill_{name}.csv"'})
+
+
+@app.route("/entries/note", methods=["POST"])
+def entries_note():
+    """危険条件メモの保存・削除（逆引きページのフォームから）。終わったら逆引きページへ戻る。"""
+    if not (same_origin() and allowed_host()):       # 別のサイトのページ・DNS リバインディング（Host が別の名前）からの POST は断る
+        abort(403)
+    p = _drill_request(request.form)
+    if not (p["key"] and p["family"] and p["indicator"]) or max(map(len, p.values())) > notes_store.MAX_FIELD:
+        abort(400)
+    common = request.form.get("all_regions") == "1" or not p["region"]
+    region = "" if common else p["region"]
+    text = "" if request.form.get("action") == "delete" else request.form.get("note", "")
+    args = dict(p)
+    try:
+        if request.form.get("action") == "delete":
+            # いま表示されているメモ（その地域のメモがあればそれ、無ければ全地域共通）を消す
+            hit = notes_store.lookup(notes_store.load(), p["indicator"], p["family"], p["rank_scheme"], p["odds_mode"], p["region"], p["key"])
+            region = p["region"] if hit and hit[1] == "region" else ""
+        result = notes_store.save(p["indicator"], p["family"], p["rank_scheme"], p["odds_mode"], region, p["key"], text)
+        if result == "saved" and common and p["region"]:
+            # 全地域共通にしたら、この地域だけのメモは消す（残すと、そちらが優先されて共通のメモが出ない）
+            notes_store.delete(p["indicator"], p["family"], p["rank_scheme"], p["odds_mode"], p["region"], p["key"])
+        args["note_result"] = result
+    except notes_store.NotesError as e:
+        args.update(note_result="error", why=str(e))
+    return redirect(url_for("entries_drill", **args), code=303)
 
 
 @app.route("/healthz")

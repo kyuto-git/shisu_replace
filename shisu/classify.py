@@ -21,6 +21,11 @@
   - 軸候補（高回収率基準ではないほう）の最低件数を 10 → 20 に（AX_CNT。10〜19件の少ない標本で率だけ高い行を軸にしない）。
     絶対軸（10）・希少条件（軸候補 6）・高回収率基準（30）・相手候補（30）・消し候補（20）はそのまま。
     件数 10〜19 で絶対軸の条件（連対率 ≥ 80 かつ 回収値 ≥ 100）を満たす行は、今までどおり絶対軸
+2026-11-16 に足した規則:
+  - 指数が下位の条件を 絶対軸・軸候補・相手候補 にしない（TAIL_*）。結合データを「×」で分けた末尾の部品（指数の順位・
+    順位帯・偏差値帯）が下位（6~9位・10位~・6位~・41~50・40以下、指数順位そのものなら 6 以上）なら、騎手や前走の条件が
+    強くて率が高くても、この3区分にはしない。消し候補にはこの制限をかけない。結合データが無い・末尾がどの形でもない
+    ときは制限しない（上位の形: 1位・2~3位・4~5位・1~3位・1~5位・71以上・66~70・61~65・51~60・指数順位 1〜5）
 classify（1行）・classify_frame（ベクトル）・sql_condition（SQL）は同じ規則（tests/test_core.py・test_aggstore.py で照合）。
 
 旧版との違い:
@@ -78,6 +83,12 @@ RARE_KS_CNT = 12
 RARE_HR_CNT = 15
 KEY_SEP = "×"
 KEY_COLUMN = "結合データ"
+# --- 指数の上限ゲート（2026-11-16〜）: 結合データの末尾（指数の順位・順位帯・偏差値帯）が下位なら TAIL_GATED の区分にしない ---
+TAIL_OK_TOKENS = ("1位", "2~3位", "4~5位", "1~3位", "1~5位", "71以上", "66~70", "61~65", "51~60")   # 上位（説明用。判定は下位の側で見る）
+TAIL_LOW_TOKENS = ("6~9位", "10位~", "6位~", "41~50", "40以下")                                     # 下位の順位帯・偏差値帯
+TAIL_LOW_RANK_MIN = 6                    # 末尾が整数（指数順位そのもの）なら、この順位以上は下位（1〜5 は上位）
+TAIL_GATED = ("abs", "axis", "opp")      # 消し候補（keshi）は制限しない
+_DIGITS = "0123456789"
 
 
 def is_rare_key(key) -> bool:
@@ -87,11 +98,29 @@ def is_rare_key(key) -> bool:
     return any(t in RARE_TOKENS for t in str(key).split(KEY_SEP))
 
 
+def tail_token(key) -> str:
+    """結合データを「×」で分けた末尾の部品（指数の順位・順位帯・偏差値帯）。結合データが無ければ ''。"""
+    return "" if key is None else str(key).rsplit(KEY_SEP, 1)[-1]
+
+
+def is_low_tail(key) -> bool:
+    """指数が下位の条件か: 末尾の部品が TAIL_LOW_TOKENS のどれか、または数字だけ（指数順位そのもの）で TAIL_LOW_RANK_MIN 以上。
+    結合データが無い・空・末尾がどの形でもない（上位の形も含む）ときは False。数字は ASCII の 0-9 だけを見る（SQL 版と同じ）。"""
+    t = tail_token(key)
+    if t in TAIL_LOW_TOKENS:
+        return True
+    if t and not t.strip(_DIGITS):
+        v, m = t.lstrip("0"), str(TAIL_LOW_RANK_MIN)          # 桁数 → 文字列の順で比べる（長い数字でもあふれない）
+        return len(v) > len(m) or (len(v) == len(m) and v >= m)
+    return False
+
+
 def rule_settings() -> dict:
     """判定規則の値（集計のコンパクト化の設定のハッシュに入れる。値を変えたら成績表を作り直す）。"""
     g = globals()
     nums = {k: g[k] for k in sorted(g) if k.isupper() and isinstance(g[k], (int, float)) and not isinstance(g[k], bool)}
-    return {**nums, "HR_MODES": list(HR_MODES), "RARE_TOKENS": list(RARE_TOKENS)}
+    return {**nums, "HR_MODES": list(HR_MODES), "RARE_TOKENS": list(RARE_TOKENS),
+            "TAIL_LOW_TOKENS": list(TAIL_LOW_TOKENS), "TAIL_GATED": list(TAIL_GATED)}
 
 
 def _ge(v, t) -> bool:
@@ -122,7 +151,8 @@ def classify(rec: Mapping, mode: str) -> str | None:
     frc = _num(rec.get("frc"))
     tra = _num(rec.get("tra"))
     key = rec.get("key")
-    rare = is_rare_key(key if key is not None else rec.get(KEY_COLUMN))
+    key = key if key is not None else rec.get(KEY_COLUMN)
+    rare = is_rare_key(key)
     ks_cnt, abs_cnt, ax_cnt, op_cnt, hr_cnt = (
         (RARE_KS_CNT, RARE_ABS_CNT, RARE_AX_CNT, RARE_OP_CNT, RARE_HR_CNT) if rare
         else (KS_CNT, ABS_CNT, AX_CNT, OP_CNT, HR_CNT))
@@ -133,6 +163,8 @@ def classify(rec: Mapping, mode: str) -> str | None:
     )
     if keshi:
         return "keshi"
+    if is_low_tail(key):                 # 指数が下位の条件は、絶対軸・軸候補・相手候補にしない（消し候補は上で判定済み）
+        return None
 
     if _ge(cnt, abs_cnt) and _ge(rv, ABS_REN) and (_ge(frc, ABS_FRC) or _ge(tra, ABS_TRA)):
         return "abs"
@@ -159,6 +191,22 @@ def classify(rec: Mapping, mode: str) -> str | None:
     return None
 
 
+def keshi_rule(rec: Mapping, mode: str) -> str | None:
+    """消し候補になる理由: 'any' = 全モード共通の規則（複勝率 < 5 かつ 掲示板率 < 10）を満たす ／
+    'fav' = 2〜10倍未満（odds10u）専用の規則（複勝率 < 20）だけで消し候補になっている ／ None = 消し候補ではない。
+    classify() の消し候補の判定と同じ値・同じ件数の下限（希少条件も）で見る。"""
+    cnt, fv, top5 = _num(rec.get("cnt")), _num(rec.get("fv")), _num(rec.get("top5"))
+    key = rec.get("key")
+    ks_cnt = RARE_KS_CNT if is_rare_key(key if key is not None else rec.get(KEY_COLUMN)) else KS_CNT
+    if not _ge(cnt, ks_cnt):
+        return None
+    if _lt(fv, KS_PLC_MAX_ANY) and _lt(top5, KS_TOP5_MAX_ANY):
+        return "any"
+    if mode == "odds10u" and _lt(fv, KS_PLC_MAX_10U):
+        return "fav"
+    return None
+
+
 # DB の列 → classify の値（cnt, fv, rv, top5, frc, tra）
 FIELD_COLUMNS = {"cnt": "件数", "fv": "複勝率_val", "rv": "連対率_val", "top5": "掲示板率_val",
                  "frc": "複勝回収値", "tra": "単勝適正回収値"}
@@ -181,12 +229,21 @@ def classify_frame(df, mode: str):
     cnt, fv, rv, top5, frc, tra = (col(f) for f in ("cnt", "fv", "rv", "top5", "frc", "tra"))
     key_col = "key" if "key" in df.columns else KEY_COLUMN if KEY_COLUMN in df.columns else None   # classify() と同じ順
     rare = np.zeros(len(df), dtype=bool)
+    low = np.zeros(len(df), dtype=bool)                # 指数が下位の条件（is_low_tail と同じ見方）
     if key_col is not None:
         # SQL 版（rare_sql）と同じ見方: 「×」+ 結合データ +「×」に「×」+ 部品 +「×」が入っているか（正規表現は使わない）
         k = df[key_col].astype(object)
-        wrapped = KEY_SEP + k.where(k.notna(), "").astype(str) + KEY_SEP
+        text = k.where(k.notna(), "").astype(str)
+        wrapped = KEY_SEP + text + KEY_SEP
         for t in RARE_TOKENS:
             rare |= wrapped.str.contains(KEY_SEP + t + KEY_SEP, regex=False).to_numpy(dtype=bool)
+        tail = text.str.rsplit(KEY_SEP, n=1).str[-1].astype(object)
+        tail = tail.where(tail.notna(), "").astype(str)
+        low = np.array(tail.isin(TAIL_LOW_TOKENS), dtype=bool)        # 書き換えるので写しを作る（pandas 3 は読み取り専用を返す）
+        digits = ((tail != "") & (tail.str.strip(_DIGITS) == "")).to_numpy(dtype=bool)
+        v, m = tail.str.lstrip("0"), str(TAIL_LOW_RANK_MIN)
+        n = v.str.len().to_numpy(dtype=float, na_value=0)
+        low |= digits & ((n > len(m)) | ((n == len(m)) & (v >= m).to_numpy(dtype=bool)))
     ks_cnt = np.where(rare, RARE_KS_CNT, KS_CNT)
     abs_cnt = np.where(rare, RARE_ABS_CNT, ABS_CNT)
     ax_cnt = np.where(rare, RARE_AX_CNT, AX_CNT)
@@ -207,6 +264,7 @@ def classify_frame(df, mode: str):
         opp = (cnt >= op_cnt) & (((fv >= OP_FV_60) & (top5 >= OP_TOP5_70))
                                  | ((rv >= OP_RV_50) & (top5 >= OP_TOP5_70))
                                  | ((fv >= OP_FV_33) & (frc >= OP_FRC_150) & (top5 >= OP_TOP5_50)))
+    absolute, axis, opp = absolute & ~low, axis & ~low, opp & ~low     # TAIL_GATED: 指数が下位ならこの3区分にしない
     out = np.full(len(df), None, dtype=object)
     for name, mask in (("opp", opp), ("axis", axis), ("abs", absolute), ("keshi", keshi)):   # 判定順の逆に上書き
         out[mask] = name
@@ -243,6 +301,22 @@ def rare_sql(key_col: str = KEY_COLUMN) -> str:
     return _or(*(f"instr({wrapped}, '{KEY_SEP}{t}{KEY_SEP}') > 0" for t in RARE_TOKENS))
 
 
+def low_tail_sql(key_col: str = KEY_COLUMN) -> str:
+    """指数が下位の条件かどうかの SQL（is_low_tail と同じ）。結合データの前に「×」を付けて、末尾が「×」+ 下位の部品か、
+    「×」+ 数字だけ（rtrim で数字を落とすと「×」で終わる）で TAIL_LOW_RANK_MIN 以上かを見る。NULL・空は下位ではない。"""
+    k = f"('{KEY_SEP}' || IFNULL({_q(key_col)}, ''))"
+    toks = [f"substr({k}, -{len(t) + 1}) = '{KEY_SEP}{t}'" for t in TAIL_LOW_TOKENS]
+    head = f"rtrim({k}, '{_DIGITS}')"
+    rank = _and(f"substr({head}, -1) = '{KEY_SEP}'", f"length({k}) > length({head})",
+                f"CAST(substr({k}, length({head}) + 1) AS INTEGER) >= {int(TAIL_LOW_RANK_MIN)}")
+    return _or(*toks, rank)
+
+
+def _gate(cond: str, key_col: str) -> str:
+    """TAIL_GATED の区分の条件に、指数が下位でないことを足す（文字列の処理は、数の条件を満たした行でだけ評価される）。"""
+    return _and(cond, f"NOT {low_tail_sql(key_col)}")
+
+
 def _cnt(normal: int, rare: int, key_col: str) -> str:
     """件数の条件（希少条件なら rare 件以上でよい）。文字列の処理は、件数が rare 以上 normal 未満の行でだけ評価される。
     AND の最後に置く（数の条件で落ちる行で文字列の処理をしないため。横断検索は全行を見る）。"""
@@ -257,8 +331,8 @@ def _sql_raw(category: str, mode: str, key_col: str = KEY_COLUMN) -> str:
             return _or(any_mode, _and(_c("fv", "<", KS_PLC_MAX_10U), cnt))
         return any_mode
     if category == "abs":
-        return _and(_c("rv", ">=", ABS_REN), _or(_c("frc", ">=", ABS_FRC), _c("tra", ">=", ABS_TRA)),
-                    _cnt(ABS_CNT, RARE_ABS_CNT, key_col))
+        return _gate(_and(_c("rv", ">=", ABS_REN), _or(_c("frc", ">=", ABS_FRC), _c("tra", ">=", ABS_TRA)),
+                          _cnt(ABS_CNT, RARE_ABS_CNT, key_col)), key_col)
     if category == "axis":
         base = _and(_or(
             _and(_c("fv", ">=", AX_FV_80), _c("top5", ">=", AX_TOP5_90)),
@@ -267,19 +341,19 @@ def _sql_raw(category: str, mode: str, key_col: str = KEY_COLUMN) -> str:
             _and(_c("rv", ">=", AX_RV_50), _c("top5", ">=", AX_TOP5_80), _c("frc", ">=", AX_FRC_100)),
         ), _cnt(AX_CNT, RARE_AX_CNT, key_col))
         if mode not in HR_MODES:
-            return base
+            return _gate(base, key_col)
         high = _and(_or(
             _and(_c("fv", ">=", HR1_FV), _c("top5", ">=", HR1_TOP5),
                  _or(_c("frc", ">=", HR1_RET), _c("tra", ">=", HR1_RET))),
             _and(_c("fv", ">=", HR2_FV), _or(_c("frc", ">=", HR2_RET), _c("tra", ">=", HR2_RET))),
         ), _cnt(HR_CNT, RARE_HR_CNT, key_col))
-        return _or(base, high)
+        return _gate(_or(base, high), key_col)
     if category == "opp":
-        return _and(_or(
+        return _gate(_and(_or(
             _and(_c("fv", ">=", OP_FV_60), _c("top5", ">=", OP_TOP5_70)),
             _and(_c("rv", ">=", OP_RV_50), _c("top5", ">=", OP_TOP5_70)),
             _and(_c("fv", ">=", OP_FV_33), _c("frc", ">=", OP_FRC_150), _c("top5", ">=", OP_TOP5_50)),
-        ), _cnt(OP_CNT, RARE_OP_CNT, key_col))
+        ), _cnt(OP_CNT, RARE_OP_CNT, key_col)), key_col)
     raise ValueError(category)
 
 
@@ -297,6 +371,17 @@ def description_lines() -> dict[str, list[str]]:
     from .odds import ODDS_LABELS
     hr = "・".join(ODDS_LABELS[m] for m in HR_MODES)
     rare = "・".join(RARE_TOKENS)
+    gate = (f"※ 指数が下位の条件（結合データの末尾が {'・'.join(TAIL_LOW_TOKENS)}、または指数順位 {TAIL_LOW_RANK_MIN} 位以下）は対象外"
+            f"（上位 = {'・'.join(TAIL_OK_TOKENS)}・指数順位 1〜{TAIL_LOW_RANK_MIN - 1}）")
+    lines = _description_lines(hr, rare)
+    for c in TAIL_GATED:
+        lines[c].append(gate)
+    lines["keshi"].append("※ 消し候補は、指数の順位・順位帯・偏差値帯では絞らない（下位の条件も対象）")
+    return lines
+
+
+def _description_lines(hr: str, rare: str) -> dict[str, list[str]]:
+    from .odds import ODDS_LABELS
     return {
         "abs": [f"件数 ≥ {ABS_CNT} かつ 連対率 ≥ {ABS_REN:g}% かつ（複勝回収値 ≥ {ABS_FRC:g} または 単勝適正回収値 ≥ {ABS_TRA:g}）",
                 f"※ 希少条件（結合データに {rare} のどれか）は 件数 ≥ {RARE_ABS_CNT}"],

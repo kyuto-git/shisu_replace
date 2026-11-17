@@ -130,3 +130,33 @@ def parse_source_name(stem: str) -> tuple[str, str]:
     if len(parts) >= 2:
         return unicodedata.normalize("NFKC", parts[0]), canonical_indicator("_".join(parts[1:]))
     return "", canonical_indicator(stem)
+
+
+# ---------------------------------------------------------------------------
+# 負の相関（トレードオフ）にある指数（2026-11-16〜。条件ヒット馬の画面で使う）
+# 同じ取得元の中で、片方が高い馬はもう片方が低く出やすい組。片方の指数で軸（絶対軸・軸候補）に当たった馬の、
+# もう片方の指数の「2〜10倍未満だけの消し候補」は、指数の性質から出ているだけなので数えない（app.py）。
+# 名前は台帳の正式名。(取得元, 片方の指数, もう片方の指数)。双方向。
+# ---------------------------------------------------------------------------
+TRADEOFF_GROUPS = (
+    ("StridePlus", ("先行", "想定前半", "ST指数"), ("瞬発", "想定後半", "追走", "持久", "持続")),
+    ("吉馬", ("吉馬_先行力",), ("吉馬_末脚力",)),
+    ("安井式", ("安井_スピード",), ("安井_スタミナ", "安井_パワー", "安井_根性")),
+)
+
+
+def _tradeoff_map() -> dict[str, frozenset[str]]:
+    out: dict[str, set[str]] = {}
+    for _, left, right in TRADEOFF_GROUPS:
+        for a, others in ((left, right), (right, left)):
+            for name in a:
+                out.setdefault(name, set()).update(others)
+    return {k: frozenset(v) for k, v in out.items()}
+
+
+_TRADEOFF = _tradeoff_map()
+
+
+def tradeoff_opponents(name) -> frozenset[str]:
+    """name（正式名）と負の相関にある指数（無ければ空）。"""
+    return _TRADEOFF.get(str(name or ""), frozenset())
