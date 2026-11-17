@@ -244,7 +244,7 @@ def test_cut_row_does_not_come_back_as_its_redundant_normal_twin():
     rows = [twin, fav, far, fav2, good_twin, fav3]
     for order in itertools.permutations(rows):
         got = app.classify_hits(list(order), info := {}, cut_low=True)
-        assert got["axis"] == [far] and info == {"dropped": 2, "cut": {"axis": 3, "opp": 0}}
+        assert got["axis"] == [far] and info == {"dropped": 2, "cut": {"axis": 3, "opp": 0}, "tradeoff": 0}
     # カット OFF でも「通常」の2行は冗長として出ていない（カット ON の表 = OFF の表 − 依頼の条件に当たる行）
     off = app.classify_hits(rows, info := {})
     assert off["axis"] == [fav, fav2, fav3, far] and info["dropped"] == 2
@@ -362,4 +362,137 @@ def test_horse_stats_and_axis_cross_count_favorite_keshi_per_indicator():
     assert (st2["5"]["axis_rows"], st2["5"]["danger"]) == (0, "dominant")
     assert (st2["7"]["axis_rows"], st2["7"]["danger"]) == (3, "caution")
     assert [x["uma"] for x in app.axis_cross(race, cut) if x["hit"]] == ["1", "7"]
+
+
+# ---------------------------------------------------------------- 負の相関にある指数の消し候補（2026-11-16）
+FAV_ONLY = {"複勝率_val": 15.0, "掲示板率_val": 50.0}      # 2〜10倍未満専用の規則（複勝率 < 20）だけで消し候補になる成績
+GOOD = {"複勝回収値": 130.0}                                # 過剰人気カットの対象にならない軸
+
+
+def test_tradeoff_keshi_rows_are_excluded_when_the_opposite_indicator_has_an_axis_hit():
+    """片方の指数で絶対軸・軸候補に当たった馬の、対になる指数の「2〜10倍未満だけの消し候補」を除く（双方向・3つの組）。"""
+    for axis_base, keshi_base in (("先行", "瞬発"), ("瞬発", "先行"), ("想定前半", "持続"), ("追走", "ST指数"), ("持久", "想定前半"),
+                                  ("想定後半", "ST指数"), ("吉馬_先行力", "吉馬_末脚力"), ("吉馬_末脚力", "吉馬_先行力"),
+                                  ("安井_スピード", "安井_スタミナ"), ("安井_パワー", "安井_スピード"), ("安井_根性", "安井_スピード")):
+        for cat in ("abs", "axis"):
+            ax = hit(1, axis_base, "odds10_50", 22, cat)
+            ks = hit(1, keshi_base, "odds10u", 25, "keshi", **FAV_ONLY)
+            b = app.classify_hits([ax, ks], info := {})
+            assert b["keshi"] == [] and b[cat] == [ax] and info["tradeoff"] == 1, (axis_base, keshi_base, cat)
+            assert app.keshi_rule_of(ks) == "fav"
+    # 除かないもの
+    ax = hit(1, "先行", "odds10_50", 22, "axis")
+    keep = [
+        hit(1, "瞬発", "odds10u", 25, "keshi"),                                  # 全モード共通の規則（複勝率 < 5・掲示板率 < 10）も満たす
+        hit(1, "瞬発", "normal", 60, "keshi", family="k2"),                      # ほかのオッズ帯の消し
+        hit(1, "瞬発", "odds10_50", 25, "keshi", family="k3"),
+        hit(1, "Gold", "odds10u", 25, "keshi", **FAV_ONLY),                      # 負の相関の組に無い指数
+        hit(1, "想定前半", "odds10u", 25, "keshi", **FAV_ONLY),                  # 同じ側の指数（先行と想定前半は対ではない）
+        hit(1, "安井_スタミナ", "odds10u", 25, "keshi", **FAV_ONLY),             # 別の取得元の組
+        hit(2, "瞬発", "odds10u", 25, "keshi", **FAV_ONLY),                      # 別の馬（馬2 に先行の軸は無い）
+        hit(1, "先行", "odds10u", 25, "keshi", family="k4", **FAV_ONLY),         # 軸と同じ指数の消し（指数の中で評価が割れている → 残す）
+    ]
+    b = app.classify_hits([ax] + keep, info := {})
+    assert len(b["keshi"]) == len(keep) and info["tradeoff"] == 0
+    st = app.horse_stats([{"馬番": "1", "馬名": "馬1", "騎手": "J"}, {"馬番": "2", "馬名": "馬2", "騎手": "J"}], b)["1"]
+    assert st["keshi_fav_by"]["先行"] == 1                                     # 同じ指数の (消n) は今までどおり数える
+    # 相手候補・消し候補しか無い指数は「軸ヒット」ではない
+    opp = hit(1, "先行", "normal", 40, "opp")
+    ks = hit(1, "瞬発", "odds10u", 25, "keshi", **FAV_ONLY)
+    assert app.classify_hits([opp, ks], info := {})["keshi"] == [ks] and info["tradeoff"] == 0
+    # 複数行: 対の指数のぶんだけ除く（行数を数える）
+    rows = [ax, hit(1, "瞬発", "odds10u", 25, "keshi", family="a", **FAV_ONLY), hit(1, "持続", "odds10u", 25, "keshi", **FAV_ONLY),
+            hit(1, "追走", "odds10u", 30, "keshi", family="b", **FAV_ONLY), hit(1, "Gold", "odds10u", 25, "keshi", **FAV_ONLY)]
+    b = app.classify_hits(rows, info := {})
+    assert [h["base"] for h in b["keshi"]] == ["Gold"] and info["tradeoff"] == 3
+
+
+def test_tradeoff_uses_the_axis_rows_left_after_the_cut_and_feeds_every_count():
+    """軸ヒットは過剰人気カット・冗長な通常を除いたあとの行で見る。除いた消しは、消し(2〜10倍未満)の行数・指数数・判定にも入らない。"""
+    race = [{"馬番": str(u), "馬名": f"馬{u}", "騎手": "J"} for u in (1, 2)]
+    low_axis = hit(1, "先行", "odds10u", 22, "axis")                              # 回収値 80 → カット ON で除かれる軸
+    k1 = hit(1, "瞬発", "odds10u", 25, "keshi", family="a", **FAV_ONLY)
+    k2 = hit(1, "持続", "odds10u", 25, "keshi", family="b", **FAV_ONLY)
+    k3 = hit(1, "持久", "odds10u", 25, "keshi", family="c", **FAV_ONLY)
+    rows = [low_axis, k1, k2, k3]
+    off = app.classify_hits(rows, info := {})                                     # カット OFF: 先行の軸がある → 3行とも除く
+    assert off["keshi"] == [] and info["tradeoff"] == 3
+    st = app.horse_stats(race, off)["1"]
+    assert (st["keshi"], st["keshi_fav"], st["keshi_fav_inds"], st["danger"]) == (0, 0, 0, "")
+    on = app.classify_hits(rows, info := {}, cut_low=True)                        # カット ON: 軸が無くなる → 除かない → 消優勢
+    assert len(on["keshi"]) == 3 and on["axis"] == [] and info["tradeoff"] == 0 and info["cut"]["axis"] == 1
+    st = app.horse_stats(race, on)["1"]
+    assert (st["keshi_fav"], st["keshi_fav_inds"], st["danger"]) == (3, 3, "dominant")
+    # 回収値の伴う軸なら、カット ON でも除く
+    good_axis = hit(1, "先行", "odds10u", 22, "axis", **GOOD)
+    on = app.classify_hits([good_axis, k1, k2, k3], info := {}, cut_low=True)
+    assert on["keshi"] == [] and info["tradeoff"] == 3
+    xs = {x["uma"]: x for x in app.axis_cross(race, on, xmin=1)}
+    assert (xs["1"]["keshi_fav"], xs["1"]["keshi_fav_inds"], xs["1"]["danger"], xs["1"]["n_clash"]) == (0, 0, "", 0)
+    # カット ON で負の相関の除外が起きても、過剰人気カットは効いたまま（除外のあとの決め直しでカットを落とさない）
+    other = hit(2, "Gold", "odds10u", 22, "axis")                                 # 別の馬の、回収値 80 の軸 → カットされる
+    hot = hit(1, "先行", "odds10_50", 22, "axis", family="z")
+    on = app.classify_hits([hot, k1, other], info := {}, cut_low=True)
+    assert on["axis"] == [hot] and on["keshi"] == [] and info == {"dropped": 0, "cut": {"axis": 1, "opp": 0}, "tradeoff": 1}
+    # 画面に出ない軸は軸ヒットではない: 回収値 80 の 2〜10倍未満の軸（カット）と、それと重なる「通常」の軸（冗長として省く）しか
+    # 無い指数は、カット ON では軸が1行も出ない → 対の指数の消しは除かない
+    cut_axis = hit(1, "先行", "odds10u", 22, "axis", family="y")
+    twin_axis = hit(1, "先行", "normal", 23, "axis", family="y", **GOOD)
+    on = app.classify_hits([twin_axis, cut_axis, k1], info := {}, cut_low=True)
+    assert on["axis"] == [] and on["keshi"] == [k1] and info == {"dropped": 1, "cut": {"axis": 1, "opp": 0}, "tradeoff": 0}
+    off = app.classify_hits([twin_axis, cut_axis, k1], info := {})                # カット OFF なら 2〜10倍未満の軸が出る → 除く
+    assert off["axis"] == [cut_axis] and off["keshi"] == [] and info["tradeoff"] == 1
+    # 軸が「冗長な通常」として省かれる行だけでも、同じ中身のオッズ帯別の軸が残っているので軸ヒット
+    twin = hit(1, "先行", "normal", 23, "axis")
+    sub = hit(1, "先行", "odds10_50", 22, "axis")
+    b = app.classify_hits([twin, sub, k1], info := {})
+    assert b["axis"] == [sub] and b["keshi"] == [] and (info["dropped"], info["tradeoff"]) == (1, 1)
+
+
+def test_tradeoff_exclusion_does_not_hide_the_common_rule_keshi_of_the_same_condition():
+    """除いた「2〜10倍未満だけの消し」と件数の近い「通常」の消し（全モード共通の規則）は、重なる行として省かずに残す。"""
+    ax = hit(1, "先行", "odds10_50", 22, "axis")
+    fav = hit(1, "瞬発", "odds10u", 25, "keshi", **FAV_ONLY)
+    normal = hit(1, "瞬発", "normal", 26, "keshi")                                # 同じ条件の通常（複勝率 3・掲示板率 8）
+    # 軸が無ければ、通常は 2〜10倍未満の行と重なるので省く（今までどおり）
+    b = app.classify_hits([fav, normal], info := {})
+    assert b["keshi"] == [fav] and (info["dropped"], info["tradeoff"]) == (1, 0)
+    # 先行の軸があると 2〜10倍未満の行を除く → 通常の行は別の消し（共通の規則）なので出す
+    for order in ([ax, fav, normal], [normal, fav, ax], [fav, ax, normal]):
+        b = app.classify_hits(order, info := {})
+        assert b["keshi"] == [normal] and (info["dropped"], info["tradeoff"]) == (0, 1)
+    st = app.horse_stats([{"馬番": "1", "馬名": "馬1", "騎手": "J"}], b)["1"]
+    assert (st["keshi"], st["keshi_fav"]) == (1, 0)
+
+
+def test_low_index_hits_are_not_axis_on_the_hits_page():
+    """画面の区分も結合データの末尾を見る: 指数が下位の条件は軸・相手にならず、消しはそのまま。"""
+    low, top = "川田将雅×前走1~3着×6位~", "川田将雅×前走1~3着×1~3位"
+    for cat, cnt in (("abs", 22), ("axis", 22), ("opp", 40)):
+        row = {"odds_mode": "normal", "件数": cnt, **STATS[cat]}
+        assert app.hit_category({**row, "key": top}) == cat and app.hit_category({**row, "key": low}) is None
+        assert app.hit_category({**row, "key": "東京×芝×1600×定量×1・2_勝×9"}) is None
+    assert app.hit_category({"odds_mode": "normal", "件数": 25, **STATS["keshi"], "key": low}) == "keshi"
+    rows = [hit(1, "タイムM", "normal", 25, "keshi", key=low), {**hit(1, "タイムM", "normal", 22, "axis", family="a"), "key": low}]
+    b = app.classify_hits(rows)
+    assert len(b["keshi"]) == 1 and b["axis"] == []
+
+
+def test_note_cell_and_condition_of_escape_and_link():
+    """「危険条件メモ / 調査」のセル: メモは赤の太字・title に全文・別タブで逆引きへ。HTML はエスケープする。"""
+    h = hit(3, "SAV", "odds10u", 30, "axis", family="rankB", scheme="s2", region="全場")
+    assert app.condition_of(h) == {"region": "全場", "indicator": "SAV", "family": "rankB", "rank_scheme": "s2",
+                                   "odds_mode": "odds10u", "key": KEY}
+    assert app.condition_of({"indicator": "ZI", "base": "x", "odds_mode": None, "key": None}) == {
+        "region": "", "indicator": "ZI", "family": "", "rank_scheme": "", "odds_mode": "normal", "key": ""}
+    cell = str(app.note_cell('⚠️<b>危険</b> "478kg"', "/entries/drill?key=a&b=1"))
+    assert cell.startswith('<td class="note" title="⚠️&lt;b&gt;危険&lt;/b&gt; &#34;478kg&#34;">')
+    assert '<a class="notetext" style="color:#b91c1c;font-weight:700" href="/entries/drill?key=a&amp;b=1" target="_blank">⚠️&lt;b&gt;危険&lt;/b&gt;' in cell
+    assert cell.count('target="_blank"') == 2 and ">調査</a>" in cell and "<b>" not in cell
+    plain = str(app.note_cell("", "/d"))
+    assert plain == '<td class="note"><a href="/d" target="_blank">調査</a></td>'
+    assert str(app.note_cell("", "/d", "/k")) == ('<td class="note"><a href="/d" target="_blank">調査</a> ／ '
+                                                  '<a href="/k" target="_blank">成績表</a></td>')
+    long = str(app.note_cell("あ" * 500, "/d"))
+    assert "あ" * app.NOTE_SHOW + "…</a>" in long and 'title="' + "あ" * 500 + '"' in long
 

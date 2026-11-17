@@ -62,3 +62,10 @@ def ingest_out_dir() -> Path:  # 指数取得の出力（実行ごとのフォ�
 def db_path() -> Path:
     env = os.environ.get("DB_PATH")
     return Path(env) if env else base_dir() / "racing.db"
+
+
+def notes_path() -> Path:
+    """危険条件メモ（condition_notes.json）。DB（racing.db）を作り直しても消えないように、DB の外に持つ。"""
+    env = os.environ.get("NOTES_PATH")
+    return Path(env) if env else base_dir() / "condition_notes.json"
+

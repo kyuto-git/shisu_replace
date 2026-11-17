@@ -1018,3 +1018,410 @@ def test_db_records_odds_breaks_and_old_db_gets_a_notice(base, monkeypatch, tmp_
     with sqlite3.connect(am.DB_PATH) as con:                    # その場照合のときは出さない（今の成績表と照合している）
         assert am.xjoin_note(con, "entries_merged_hensachi", "on-the-fly") == ""
 
+
+# ---------------------------------------------------------------- 2026-11-16: 指数の上限ゲート・負の相関・逆引き・危険条件メモ
+def test_low_index_rows_in_the_db_are_never_axis_and_sql_presets_agree(base):
+    """DB の成績表で: 指数が下位の条件（末尾が 6位~・41~50・指数順位 6 以上 …）は絶対軸・軸候補・相手候補にならない。
+    横断検索のプリセット（SQL）と画面の区分（1行版）は同じ行を選ぶ。"""
+    from shisu import classify as C
+    from shisu.odds import ODDS_MODES
+    with db(base) as con:
+        con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in con.execute('SELECT rowid AS rid, * FROM unified_all')]
+        low = [r for r in rows if C.is_low_tail(r["結合データ"])]
+        assert len(low) > 100 and len(low) < len(rows)
+        tails = {C.tail_token(r["結合データ"]) for r in rows}
+        assert {"6~9位", "10位~", "6位~", "1位", "1~3位", "1", "6"} <= tails            # 順位帯（s1・s2）・指数順位
+        assert tails & {"41~50", "40以下"} and tails & {"51~60", "61~65", "66~70", "71以上"}     # 偏差値帯
+        n_gated = 0
+        for mode in ODDS_MODES:
+            part = [r for r in rows if r["odds_mode"] == mode]
+            py = {}
+            for r in part:
+                py[r["rid"]] = C.classify({"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
+                                           "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"]}, mode)
+                if C.is_low_tail(r["結合データ"]):
+                    assert py[r["rid"]] in (None, "keshi")
+                    # 同じ成績で末尾だけ上位の形にすると（ほかの部品＝希少条件かどうかは同じ）、軸・相手になる行がある
+                    upper = C.classify({"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
+                                        "frc": r["複勝回収値"], "tra": r["単勝適正回収値"],
+                                        "key": r["結合データ"].rsplit("×", 1)[0] + "×1位"}, mode)
+                    n_gated += upper in C.TAIL_GATED
+                    assert py[r["rid"]] == ("keshi" if upper == "keshi" else None)
+            for cat in C.CATEGORIES:
+                got = {x[0] for x in con.execute(
+                    f"SELECT rowid FROM unified_all WHERE odds_mode = ? AND {C.sql_condition(cat, mode)}", (mode,))}
+                assert got == {k for k, v in py.items() if v == cat}, (mode, cat)
+        assert n_gated > 0                                                  # 合成データにも、指数が下位なのに率の高い行がある
+
+
+def test_drill_rows_match_the_counts_in_the_db(base):
+    """逆引き（master から取り出した行）の件数・好走数は、成績表（DB）の 件数・複勝率（頻度）と一致する（どの family・スキーム・オッズ帯でも）。"""
+    import random
+    from shisu import drill
+    from shisu import families as F
+    with db(base) as con:
+        F.set_active(F.load_from_db(con), "db")
+        rows = con.execute('SELECT "結合データ", family, indicator, odds_mode, IFNULL(rank_scheme, \'\'), region, "件数", "複勝率", "勝率" '
+                           'FROM unified_all').fetchall()
+    rng = random.Random(16)
+    groups = {}
+    for r in rows:
+        groups.setdefault((r[1], r[3], r[4]), []).append(r)                 # family × オッズ帯 × スキーム ごとに1〜2行
+    sample = [r for g in groups.values() for r in rng.sample(g, min(2, len(g)))]
+    rng.shuffle(sample)
+    sample = sample[:260]
+    assert len({(r[1], r[4]) for r in sample}) > 60 and {r[3] for r in sample} == {"normal", "odds10u", "odds10_50", "odds50p"}
+    try:
+        for key, fam, ind, mode, scheme, region, cnt, plc, win in sample:
+            path = drill.find_master(region, ind)
+            assert path is not None, (region, ind)
+            df = drill.extract(path, fam, scheme, mode, key)
+            ov = drill.overview(df)
+            assert ov["n"] == cnt, (key, fam, mode, scheme, ov)
+            assert f"{ov['good'] / ov['n'] * 100:.2f}%" == plc.split("（")[0], (key, plc, ov)
+            wins = int((df[drill.FINISH] == 1).sum())
+            assert f"{wins / ov['n'] * 100:.2f}%" == win.split("（")[0]
+            ids = drill.id_lists(df)
+            assert len(ids["all"]["horse"]) == cnt == len(set(ids["all"]["horse"]))
+    finally:
+        F.reset()
+
+
+def _drill_row(base, where='odds_mode = \'normal\' AND family = \'normal\' AND "件数" >= 8'):
+    with db(base) as con:
+        r = con.execute('SELECT "結合データ", family, indicator, odds_mode, IFNULL(rank_scheme, \'\'), region, "件数" FROM unified_all '
+                        f'WHERE {where} ORDER BY "件数" DESC, "結合データ" LIMIT 1').fetchone()
+    return {"key": r[0], "family": r[1], "indicator": r[2], "odds_mode": r[3], "rank_scheme": r[4], "region": r[5]}, r[6]
+
+
+def test_drill_page_shows_target_ids_summary_details_and_csv(base, monkeypatch, tmp_path):
+    """/entries/drill: TARGET 貼付用のレースID（全件・好走・凡走）、コア分布のまとめ、明細の表、CSV。"""
+    import json
+    import re as _re
+    monkeypatch.setenv("NOTES_PATH", str(tmp_path / "notes.json"))
+    am = _app(base, monkeypatch)
+    c = am.app.test_client()
+    q, cnt = _drill_row(base)
+    r = c.get("/entries/drill", query_string=q)
+    page = r.get_data(as_text=True)
+    assert r.status_code == 200 and f"逆引き: {q['key']}" in page and f"成績表（DB）: 件数 {cnt} " in page
+    assert "件数 %d と、いまの master から取り出した件数" % cnt not in page                # DB と master が合っている
+    m = _re.search(r"TARGET 貼付用のレースID（(\d+)件: 好走 (\d+)・凡走 (\d+)", page)
+    n, good, bad = (int(v) for v in m.groups())
+    assert n == cnt == good + bad
+    horse = _re.search(r'<textarea class="ids" id="ids-horse" readonly>([^<]*)</textarea>', page).group(1).split("\n")
+    race = _re.search(r'<textarea class="ids" id="ids-race" readonly>([^<]*)</textarea>', page).group(1).split("\n")
+    assert len(horse) == n and all(_re.fullmatch(r"\d{18}", v) for v in horse)
+    assert all(_re.fullmatch(r"\d{16}", v) for v in race) and len(set(race)) == len(race) and set(race) == {v[:16] for v in horse}
+    data = json.loads(_re.search(r"var data = (\{.*?\}), kind = 'all';", page, _re.S).group(1))   # 切り替え用（JS）
+    assert data["all"]["horse"] == horse and data["all"]["race"] == race
+    assert (len(data["good"]["horse"]), len(data["bad"]["horse"])) == (good, bad)
+    assert sorted(data["good"]["horse"] + data["bad"]["horse"]) == sorted(horse)
+    assert f"好走 1〜3着のみ（{good}）" in page and f"凡走 4着以下のみ（{bad}）" in page and "全件（%d）" % n in page
+    assert page.count('data-copy="ids-') == 2 and ".join('\\n')" in page and "明細CSVをダウンロード" in page
+    # コア分布のまとめ: 項目ごとの行。条件の部品（場所など）は1つの値に 100%
+    summ = page.split("コア分布サマリー", 1)[1].split("該当した過去走の明細", 1)[0]
+    for name in ("単勝オッズ", "枠番", "馬番", "頭数", "騎手", "間隔帯", "前走着順", "前走脚質"):
+        assert f"<td><b>{name}</b>" in summ, name
+    place_row = summ.split("<td><b>場所</b>", 1)[1].split("</tr>", 1)[0]
+    assert q["key"].split("×")[0] in place_row and ">100%<" in place_row
+    assert 'class="chip core"' in summ
+    # 明細の表: 好走は緑・凡走は赤の行。数は上の件数と同じ
+    detail = page.split("該当した過去走の明細", 1)[1]
+    assert detail.count('<tr class="good') == good and detail.count('<tr class="bad"') == bad
+    for col in ("日付", "場所", "レースID(新)", "馬番", "馬名", "騎手", "単勝オッズ", "着順", "指数値", "順位", "偏差値", "前走R印3"):
+        assert f"<th>{col}</th>" in detail, col
+    assert horse[0] in detail
+    # base= でも同じページ（条件ヒット馬の行は indicator と base が同じ）
+    alt = {k: v for k, v in q.items() if k != "indicator"}
+    assert c.get("/entries/drill", query_string={**alt, "base": q["indicator"]}).get_data(as_text=True) == page
+    # CSV: 区分の列つき・全行・BOM つき UTF-8
+    r = c.get("/entries/drill.csv", query_string=q)
+    text = r.data.decode("utf-8-sig")
+    lines = text.strip().split("\r\n")
+    assert r.status_code == 200 and r.data[:3] == b"\xef\xbb\xbf" and lines[0].startswith("区分,") and "レースID(新)" in lines[0]
+    assert len(lines) - 1 >= n and sum(line.startswith("好走,") for line in lines) == good
+    assert not any(col.startswith("_") for col in lines[0].split(","))
+    assert "attachment" in r.headers["Content-Disposition"]
+    # 順位帯の family・オッズ帯別でも開ける
+    q2, cnt2 = _drill_row(base, 'odds_mode = \'odds10u\' AND IFNULL(rank_scheme, \'\') = \'s2\' AND "件数" >= 6')
+    p2 = c.get("/entries/drill", query_string=q2).get_data(as_text=True)
+    assert f"TARGET 貼付用のレースID（{cnt2}件" in p2 and "2〜10倍未満" in p2
+    # 引数が足りない・合わないときは、理由を出す（500 にしない）。master が無くてもメモの欄は出る
+    for bad_q, msg, form in (({}, "指数・パターン・結合データを指定してください", False),
+                             ({**q, "family": "nope"}, "今の DB の定義にありません", True),
+                             ({**q, "odds_mode": "odds5p"}, "オッズ帯", True),
+                             ({**q, "rank_scheme": "s1"}, "スキームを持たないパターン", True),
+                             ({**q, "region": "どこにも無い場"}, "master がありません", True),
+                             ({**q, "indicator": "../../etc/passwd"}, "master がありません", True)):
+        r = c.get("/entries/drill", query_string=bad_q)
+        body = r.get_data(as_text=True)
+        assert r.status_code == 200 and msg in body and "TARGET 貼付用" not in body, bad_q
+        assert ("危険条件・死角メモ" in body) == form
+        assert c.get("/entries/drill.csv", query_string=bad_q).status_code == 404
+    # 当たる馬のいない結合データ: 0件として出る
+    none = c.get("/entries/drill", query_string={**q, "key": q["key"] + "×無い"}).get_data(as_text=True)
+    assert "TARGET 貼付用のレースID（0件" in none and "今の DB の成績表にありません" in none
+    assert not (tmp_path / "notes.json").exists()                                           # 見るだけではメモのファイルを作らない
+
+
+def test_drill_cache_follows_the_odds_band_and_the_master_and_the_detail_is_capped(base, monkeypatch, tmp_path):
+    """逆引きの覚えている結果は、オッズ帯・master（大きさ・更新時刻）ごと。明細の表は DRILL_VIEW_LIMIT 行まで（レースIDは全件）。
+    「戻る」でラジオの選択だけが戻っても、レースIDの欄を選択に合わせ直す（pageshow）。"""
+    import re as _re
+    import pandas as pd
+    monkeypatch.setenv("NOTES_PATH", str(tmp_path / "notes.json"))
+    am = _app(base, monkeypatch)
+    with db(base) as con:
+        row = con.execute(
+            'SELECT a."結合データ", a.family, a.indicator, a.region, a."件数", b."件数" FROM unified_all a JOIN unified_all b '
+            'ON a."結合データ" = b."結合データ" AND a.family = b.family AND a.indicator = b.indicator AND a.region = b.region '
+            "AND IFNULL(a.rank_scheme, '') = IFNULL(b.rank_scheme, '') "
+            "WHERE a.odds_mode = 'normal' AND b.odds_mode = 'odds10u' AND IFNULL(a.rank_scheme, '') = '' "
+            'AND b."件数" < a."件数" ORDER BY a."件数" DESC, a."結合データ", a.family, a.indicator LIMIT 1').fetchone()
+    q = {"key": row[0], "family": row[1], "indicator": row[2], "region": row[3], "rank_scheme": "", "odds_mode": "normal"}
+    n_all, n_fav = row[4], row[5]
+    assert n_all > n_fav >= 5
+    master = tmp_path / am.drill.find_master(q["region"], q["indicator"]).name
+    shutil.copy(am.drill.find_master(q["region"], q["indicator"]), master)
+    monkeypatch.setattr(am.drill, "find_master", lambda region, indicator, master_dir=None: master)
+    monkeypatch.setattr(am, "_DRILL_CACHE", type(am._DRILL_CACHE)())
+    c = am.app.test_client()
+
+    def count(mode):
+        page = c.get("/entries/drill", query_string={**q, "odds_mode": mode}).get_data(as_text=True)
+        return int(_re.search(r"TARGET 貼付用のレースID（(\d+)件", page).group(1)), page
+    # 同じ結合データを 通常 → 2〜10倍未満 → 通常 と続けて開いても、それぞれの成績表の件数
+    assert [count(m)[0] for m in ("normal", "odds10u", "normal", "odds10u")] == [n_all, n_fav, n_all, n_fav]
+    # 明細の表は上限まで。レースIDの欄・件数は全件のまま
+    monkeypatch.setattr(am, "DRILL_VIEW_LIMIT", 3)
+    n, page = count("normal")
+    detail = page.split("該当した過去走の明細", 1)[1]
+    assert n == n_all > 3 and len(_re.findall(r'<tr class="(?:good|bad|out)', detail)) == 3
+    horse = _re.search(r'<textarea class="ids" id="ids-horse" readonly>([^<]*)</textarea>', page).group(1).split("\n")
+    assert len(horse) == n_all
+    # master を作り直したら（1頭ぶん減らす）、覚えている結果を使わず読み直す
+    df = pd.read_csv(master, encoding="cp932", dtype=str, keep_default_na=False)
+    df[df["レースID(新)"] != horse[0]].to_csv(master, index=False, encoding="cp932", compression="gzip")
+    assert count("normal")[0] == n_all - 1
+    # ラジオの切り替え: 馬単位・レース単位の両方の欄と件数を入れ替え、表示のたび（pageshow）に選択へ合わせ直す
+    script = page.split("<script>", 1)[1].split("</script>", 1)[0]
+    assert "['horse', 'race'].forEach" in script and "getElementById('ids-' + t).value = data[kind][t]" in script
+    assert "getElementById('n-' + t).textContent = data[kind][t].length" in script
+    assert "window.addEventListener('pageshow', sync)" in script and "input[name=idkind]:checked" in script
+    assert _re.search(r"addEventListener\('change', sync\)", script) and script.rstrip().endswith("})();")
+
+
+def test_drill_page_warns_when_the_db_count_differs_from_the_master(base, monkeypatch, tmp_path):
+    """成績表（DB）の件数と、いまの master から取り出した件数が違えば知らせる（集計のあとに master を作り直した など）。"""
+    monkeypatch.setenv("NOTES_PATH", str(tmp_path / "notes.json"))
+    q, cnt = _drill_row(base)
+    other = tmp_path / "other.db"
+    shutil.copy(base / "racing.db", other)
+    with sqlite3.connect(other) as con:
+        con.execute('UPDATE unified_all SET "件数" = "件数" + 3 WHERE "結合データ" = ? AND family = ? AND indicator = ? AND odds_mode = ?',
+                    (q["key"], q["family"], q["indicator"], q["odds_mode"]))
+    am = _app(base, monkeypatch, other)
+    page = am.app.test_client().get("/entries/drill", query_string=q).get_data(as_text=True)
+    assert f"成績表（DB）の件数 {cnt + 3} と、いまの master から取り出した件数 {cnt} が違います" in page
+
+
+def test_notes_are_saved_and_shown_in_red_on_the_hits_and_wedge_pages(base, monkeypatch, tmp_path):
+    """危険条件メモ: 逆引きページで保存 → 条件ヒット馬・WEDGE 一覧の「危険条件メモ / 調査」の列に赤の太字。DB の外の JSON に残る。"""
+    import json
+    import re as _re
+    from urllib.parse import parse_qs, urlsplit
+    notes_file = tmp_path / "condition_notes.json"
+    monkeypatch.setenv("NOTES_PATH", str(notes_file))
+    am = _app(base, monkeypatch)
+    rid = _race_id(base)
+    with am.connect() as con:
+        race = am._race_rows(con, "entries_merged_hensachi", rid)
+    r1, r2 = race[0], race[1]
+    noted = {**_fake_hit(r1, "SAV", "odds10_50", 30, "axis"), "複勝回収値": 130.0}
+    same_other_band = {**_fake_hit(r1, "SAV", "odds10u", 30, "axis", family="rankB"), "複勝回収値": 130.0}
+    other_region = {**_fake_hit(r2, "ZI", "odds10_50", 30, "axis", family="rankJ"), "region": "全場", "複勝回収値": 130.0}
+    keshi = _fake_hit(r2, "SAV", "normal", 60, "keshi", family="rankB", key="東京×ダ×1600×定量×1・2_勝×10位~")
+    fake = [noted, same_other_band, other_region, keshi]
+    monkeypatch.setattr(am, "collect_hits", lambda con, table, rows: (list(fake), "xjoin"))
+    c = am.app.test_client()
+    q = {"table": "entries_merged_hensachi", "rid": rid, "cut_low_10u": "0"}
+
+    def trs(page, title):
+        body = page.split(title, 1)[1].split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        return [m.group(0) for m in _re.finditer(r"<tr.*?</tr>", body, _re.S)]
+
+    # ---- メモなし: 4区分の表に列があり、どの行も 結合データ と「調査」が別タブで逆引きへ
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert page.count("<th>年数</th><th>危険条件メモ / 調査</th></tr>") == 4 and "notetext" not in page.split("<body>", 1)[1]
+    row = next(t for t in trs(page, 'class="card cat-axis"') if "10〜50倍" in t and "SAV" in t)
+    links = _re.findall(r'<a href="(/entries/drill\?[^"]+)" target="_blank">([^<]*)</a>', row)
+    assert [text for _, text in links] == [noted["key"], "調査"] and links[0][0] == links[1][0]
+    args = {k: v[0] for k, v in parse_qs(urlsplit(links[0][0].replace("&amp;", "&")).query, keep_blank_values=True).items()}
+    assert args == {"region": "主5場", "indicator": "SAV", "family": "normal", "rank_scheme": "", "odds_mode": "odds10_50",
+                    "key": noted["key"]}
+    assert row.rstrip().endswith('<td class="note"><a href="%s" target="_blank">調査</a></td></tr>' % links[0][0])
+    # ---- 保存（逆引きページのフォームと同じ POST）
+    drill_page = c.get(links[0][0].replace("&amp;", "&")).get_data(as_text=True)
+    assert "⚠️ 危険条件・死角メモ（ここに書くと条件ヒット馬の表に赤字で表示されます）" in drill_page
+    assert 'action="/entries/note"' in drill_page and '<button type="submit" name="action" value="save">保存</button>' in drill_page
+    for f, v in args.items():
+        assert f'<input type="hidden" name="{f}" value="{v}">' in drill_page
+    text = '⚠️馬体重478kg以下は危険\n前走4角10番手以下は消し <script>alert(1)</script> "x"'
+    r = c.post("/entries/note", data={**args, "note": text, "action": "save"})
+    assert r.status_code == 303 and "/entries/drill?" in r.headers["Location"] and "note_result=saved" in r.headers["Location"]
+    saved = json.loads(notes_file.read_text(encoding="utf-8"))["notes"]
+    assert len(saved) == 1 and saved[0]["note"] == text and saved[0]["region"] == "主5場" and saved[0]["odds_mode"] == "odds10_50"
+    after = c.get(r.headers["Location"]).get_data(as_text=True)
+    assert "メモを保存しました。" in after and "⚠️馬体重478kg以下は危険\n前走4角10番手以下は消し &lt;script&gt;" in after
+    assert "いまのメモ: この地域（主5場）だけ" in after and "condition_notes.json" in after and "このメモを削除" in after
+    # ---- 条件ヒット馬: その条件の行だけ、赤の太字のメモ・title に全文・結合データのセルにも title
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert "<script>alert(1)</script>" not in page
+    rows = trs(page, 'class="card cat-axis"')
+    row = next(t for t in rows if "10〜50倍" in t and "SAV" in t)
+    esc = "⚠️馬体重478kg以下は危険\n前走4角10番手以下は消し &lt;script&gt;alert(1)&lt;/script&gt; &#34;x&#34;"
+    assert f'<td class="hasnote" title="{esc}"><a href="{links[0][0]}" target="_blank">{noted["key"]}</a></td>' in row
+    assert (f'<td class="note" title="{esc}"><a class="notetext" style="color:#b91c1c;font-weight:700" href="{links[0][0]}" '
+            f'target="_blank">{esc}</a> <a href="{links[0][0]}" target="_blank">調査</a></td>') in row
+    assert ".notetext{color:#b91c1c;font-weight:700}" in page
+    others = [t for t in rows if t is not row] + trs(page, 'class="card cat-keshi"')
+    assert len(others) == 3 and all("notetext" not in t and "hasnote" not in t and ">調査</a>" in t for t in others)
+    # ---- WEDGE 一覧: 年数 の右隣の列。結合データ・調査は逆引き、成績表は今までのキーの画面
+    wq = {"table": "entries_merged_hensachi", "rid": rid, "odds_mode": "all"}
+    wedge = c.get("/entries/wedge", query_string=wq).get_data(as_text=True)
+    assert "<th>adjusted_WEDGE</th><th>年数</th><th>危険条件メモ / 調査</th><th>年の件数計</th>" in wedge
+    wrows = trs(wedge, "全該当キー")
+    wrow = next(t for t in wrows if "10〜50倍" in t and "SAV" in t)
+    assert len(wrows) == 4 and f'<a class="notetext" style="color:#b91c1c;font-weight:700" href="{links[0][0]}" target="_blank">{esc}</a>' in wrow
+    assert f'<td class="hasnote" title="{esc}"><a href="{links[0][0]}" target="_blank">' in wrow
+    assert wrow.count(">調査</a>") == 1 and ">成績表</a>" in wrow and "/entries/key?" in wrow
+    assert sum("notetext" in t for t in wrows) == 1
+    cells = _re.findall(r"<td[^>]*>", wrow)
+    assert cells[15] == f'<td class="note" title="{esc}">'                                    # 枠…adjusted_WEDGE・年数 の次（16列目）
+    assert "危険条件メモ" not in c.get("/entries/wedge.csv", query_string=wq).data.decode("utf-8-sig").split("\r\n")[0]
+    # ---- 全地域共通のメモ: 地域が違う同じ条件の行にも出る。その地域のメモがあればそちらを優先
+    cond2 = am.condition_of(other_region)
+    r = c.post("/entries/note", data={**cond2, "region": "主5場", "note": "共通メモ", "all_regions": "1", "action": "save"})
+    assert r.status_code == 303 and {n["region"] for n in json.loads(notes_file.read_text(encoding="utf-8"))["notes"]} == {"主5場", ""}
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    row2 = next(t for t in trs(page, 'class="card cat-axis"') if "ZI" in t)
+    assert ">共通メモ</a>" in row2 and "<td>全場</td>" in row2
+    d2 = c.get("/entries/drill", query_string=cond2).get_data(as_text=True)
+    assert "いまのメモ: 全地域共通" in d2 and 'name="all_regions" value="1" checked' in d2
+    c.post("/entries/note", data={**cond2, "note": "全場だけ", "action": "save"})
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert ">全場だけ</a>" in next(t for t in trs(page, 'class="card cat-axis"') if "ZI" in t)
+    assert "いまのメモ: この地域（全場）だけ" in c.get("/entries/drill", query_string=cond2).get_data(as_text=True)
+    # 全地域共通で保存し直すと、この地域だけのメモは消える（残すと共通のメモが出ない）
+    c.post("/entries/note", data={**cond2, "note": "共通に戻す", "all_regions": "1", "action": "save"})
+    assert ">共通に戻す</a>" in c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert sorted(n["region"] for n in json.loads(notes_file.read_text(encoding="utf-8"))["notes"]) == ["", "主5場"]
+    # ---- 消し候補の行（指数が下位の条件）にも付けられる。削除は「このメモを削除」か、空で保存
+    cond3 = am.condition_of(keshi)
+    c.post("/entries/note", data={**cond3, "note": "消しのメモ", "action": "save"})
+    assert ">消しのメモ</a>" in next(t for t in trs(c.get("/entries/hits", query_string=q).get_data(as_text=True), 'class="card cat-keshi"'))
+    r = c.post("/entries/note", data={**cond3, "note": "消しのメモ", "action": "delete"})
+    assert "note_result=deleted" in r.headers["Location"] and "メモを削除しました。" in c.get(r.headers["Location"]).get_data(as_text=True)
+    r = c.post("/entries/note", data={**args, "note": "   ", "action": "save"})
+    assert "note_result=deleted" in r.headers["Location"]
+    assert "note_result=none" in c.post("/entries/note", data={**args, "note": "", "action": "save"}).headers["Location"]
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert "消しのメモ" not in page and "馬体重478kg" not in page and len(json.loads(notes_file.read_text(encoding="utf-8"))["notes"]) == 1
+    # ---- 別のサイトからの POST・条件の足りない POST は受けない
+    before = notes_file.read_bytes()
+    assert c.post("/entries/note", data={**args, "note": "x", "action": "save"}, headers={"Origin": "http://evil.example"}).status_code == 403
+    assert c.post("/entries/note", data={**args, "note": "x"}, headers={"Sec-Fetch-Site": "cross-site"}).status_code == 403
+    assert c.post("/entries/note", data={**{k: v for k, v in args.items() if k != "key"}, "note": "x"}).status_code == 400
+    assert c.get("/entries/note").status_code == 405 and notes_file.read_bytes() == before
+    # DNS リバインディング（Host も Origin も別の名前）・長すぎる条件も受けない（/ingest の POST と同じ見方）。IP アドレスの Host は通す
+    evil = {"Host": "evil.example:8000", "Origin": "http://evil.example:8000", "Sec-Fetch-Site": "same-origin"}
+    assert c.post("/entries/note", data={**args, "note": "x", "action": "save"}, headers=evil).status_code == 403
+    assert c.post("/entries/note", data={**args, "action": "delete"}, headers=evil).status_code == 403
+    assert c.post("/entries/note", data={**args, "key": "k" * (am.notes_store.MAX_FIELD + 1), "note": "x"}).status_code == 400
+    assert notes_file.read_bytes() == before
+    lan = {"Host": "192.168.0.5:8000", "Origin": "http://192.168.0.5:8000", "Sec-Fetch-Site": "same-origin"}
+    # 戻り先の URL は条件の6項目と結果だけで作る（フォームに混ぜた _external・_anchor などは使わない）
+    r = c.post("/entries/note", headers=lan, data={**args, "note": "", "action": "save", "_external": "1", "_anchor": "x",
+                                                   "_scheme": "ftp", "_method": "POST", "extra": "1"})
+    loc = urlsplit(r.headers["Location"])
+    assert r.status_code == 303 and loc.path == "/entries/drill" and not loc.fragment and not loc.scheme and not loc.netloc
+    assert set(parse_qs(loc.query, keep_blank_values=True)) <= set(args) | {"note_result"} and notes_file.read_bytes() == before
+
+    # ---- 「該当なし」の行は、足した列も含めた表の幅（見出しの列の数）
+    def empty_rows(html):
+        out = []
+        for m in _re.finditer(r"<table>.*?</table>", html, _re.S):
+            e = _re.search(r'<td colspan="(\d+)">該当なし', m.group(0))
+            if e:
+                out.append((int(e.group(1)), len(_re.findall(r"<th[ >]", m.group(0).split("</thead>", 1)[0]))))
+        return out
+    assert empty_rows(c.get("/entries/hits", query_string=q).get_data(as_text=True)) == [(25, 25), (25, 25)]      # 絶対軸・相手候補
+    assert empty_rows(c.get("/entries/wedge", query_string={**wq, "uma": "99"}).get_data(as_text=True)) == [(24, 24)]
+    # ---- メモは DB の外: DB を別のファイルに替えても（作り直しても）同じメモが出る
+    other = tmp_path / "rebuilt.db"
+    shutil.copy(base / "racing.db", other)
+    am2 = _app(base, monkeypatch, other)
+    monkeypatch.setattr(am2, "collect_hits", lambda con, table, rows: (list(fake), "xjoin"))
+    assert ">共通に戻す</a>" in am2.app.test_client().get("/entries/hits", query_string=q).get_data(as_text=True)
+    # ---- メモのファイルが壊れていても画面は出る（メモなし・理由を表示）。保存はしない（人が書いたメモを上書きしない）
+    notes_file.write_text('{"notes": [', encoding="utf-8")
+    for url, args_ in (("/entries/hits", q), ("/entries/wedge", wq), ("/entries/drill", args)):
+        body = c.get(url, query_string=args_).get_data(as_text=True)
+        assert "危険条件メモを読めません" in body and "notetext" not in body.split("<body>", 1)[1], url
+    r = c.post("/entries/note", data={**args, "note": "x", "action": "save"})
+    assert "note_result=error" in r.headers["Location"] and notes_file.read_text(encoding="utf-8") == '{"notes": ['
+    failed = c.get(r.headers["Location"]).get_data(as_text=True)
+    assert _re.search(r"メモを保存できませんでした: condition_notes\.json の形を読めません（[^<]+）。直すか、別の名前に変えてください", failed)
+
+
+def test_hits_page_excludes_tradeoff_keshi_and_shows_the_gate_in_the_rules(base, monkeypatch, tmp_path):
+    """条件ヒット馬: 負の相関にある指数の軸ヒットがある馬の「2〜10倍未満だけの消し候補」を除き、行数を上に出す。
+    区分の説明に、指数が下位の条件は対象外であることを出す。"""
+    import re as _re
+    monkeypatch.setenv("NOTES_PATH", str(tmp_path / "notes.json"))
+    am = _app(base, monkeypatch)
+    rid = _race_id(base)
+    with am.connect() as con:
+        race = am._race_rows(con, "entries_merged_hensachi", rid)
+    r1, r2 = race[0], race[1]
+
+    def fav_only(h):                                    # 2〜10倍未満専用の規則（複勝率 < 20）だけで消し候補になる成績
+        return {**h, "複勝率_val": 15.0, "掲示板率_val": 50.0}
+
+    axis = {**_fake_hit(r1, "先行", "odds10_50", 30, "axis"), "複勝回収値": 130.0}
+    fake = [axis,
+            fav_only(_fake_hit(r1, "SAV", "odds10u", 25, "keshi")),                        # 負の相関の組に無い指数 → 残す
+            fav_only(_fake_hit(r2, "ZI", "odds10u", 25, "keshi")),                         # 軸の無い馬 → 残す
+            _fake_hit(r1, "ZI", "odds10u", 25, "keshi", family="rankB")]                    # 共通の規則の消し → 残す
+    tradeoff = [fav_only({**_fake_hit(r1, "SAV", "odds10u", 25, "keshi", family=f), "base": b, "indicator": b})
+                for f, b in (("rankJ", "瞬発"), ("rankBJ", "持続"), ("normalJ", "追走"))]   # 先行と負の相関 → 除く
+    monkeypatch.setattr(am, "collect_hits", lambda con, table, rows: (list(fake + tradeoff), "xjoin"))
+    c = am.app.test_client()
+    q = {"table": "entries_merged_hensachi", "rid": rid}
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert "負の相関にある指数の軸ヒットにより除外した消し候補 3 行" in page
+    assert "StridePlus: 先行・想定前半・ST指数 ⇔ 瞬発・想定後半・追走・持久・持続" in page and "吉馬: 吉馬_先行力 ⇔ 吉馬_末脚力" in page
+    assert "安井式: 安井_スピード ⇔ 安井_スタミナ・安井_パワー・安井_根性" in page
+    body = page.split("馬ごとの該当数", 1)[1]
+    assert "軸候補（1）" in body and "消し候補（3）" in body
+    keshi_tbl = body.split('class="card cat-keshi"', 1)[1].split("</table>", 1)[0]
+    assert "瞬発" not in keshi_tbl and "持続" not in keshi_tbl and "追走" not in keshi_tbl
+    summary = body.split("</table>", 1)[0]
+    row1 = _re.search(r"<tr[^>]*><td>%s</td><td>%s</td>(.*?)</tr>" % (r1["馬番"], _re.escape(r1["馬名"])), summary, _re.S).group(1)
+    nums = [v.strip() for v in _re.findall(r'<td class="num[^"]*">\s*(?:<b>)?([^<]*)', row1)]
+    # 絶対軸・軸候補・消し候補・相手候補・穴の軸・軸の指数数・消し(2〜10倍未満)・その指数数（除いた3行は数えない → 判定も付かない）
+    assert nums == ["", "1", "2", "", "1", "1", "2", "2"] and "kd-" not in row1
+    # 軸が無ければ除かない（3行とも消し候補に出て、消優勢になる）
+    monkeypatch.setattr(am, "collect_hits", lambda con, table, rows: (list(fake[1:] + tradeoff), "xjoin"))
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert "負の相関にある指数の軸ヒットにより除外した消し候補" not in page
+    assert "消し候補（6）" in page.split("馬ごとの該当数", 1)[1] and "⚠️消優勢 1頭" in page
+    # 区分の説明: 絶対軸・軸候補・相手候補には「指数が下位の条件は対象外」、消し候補には「絞らない」
+    for cat in ("abs", "axis", "opp"):
+        card = page.split(f'class="card cat-{cat}"', 1)[1].split("<table", 1)[0]
+        assert "指数が下位の条件（結合データの末尾が 6~9位・10位~・6位~・41~50・40以下、または指数順位 6 位以下）は対象外" in card, cat
+    keshi_card = page.split('class="card cat-keshi"', 1)[1].split("<table", 1)[0]
+    assert "指数が下位の条件" not in keshi_card and "指数の順位・順位帯・偏差値帯では絞らない" in keshi_card
+

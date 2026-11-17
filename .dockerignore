@@ -29,3 +29,6 @@ __pycache__/
 # 同梱のマスタ（コース属性・輸送距離など）は追跡する
 !shisu/data/
 !shisu/data/*.csv
+# 危険条件メモ（/entries/drill で書く。人が書いたデータなのでリポジトリ・イメージに入れない）
+condition_notes.json
+condition_notes.json.*.tmp
