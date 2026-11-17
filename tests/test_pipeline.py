@@ -706,7 +706,7 @@ def test_hits_page_drops_redundant_normal_marks_hot_rows_and_scrolls(base, monke
     assert "「通常」の行 1 行は、重なるので省いています" in page
     assert page.count('<tr class="hot">') == 2 and "tr.hot td{color:#b91c1c;font-weight:700;background:#fef2f2}" in page
     assert ".scroll{max-height:520px;overflow:auto" in page and ".scroll thead th{position:sticky;top:0;z-index:2" in page
-    assert page.count('<div class="scroll"') == 6                       # 指数クロス・馬ごとの該当数・4区分の表
+    assert page.count('<div class="scroll"') == 7                       # 指数クロス・馬ごとの該当数・4区分の表・条件特化ヒット
     assert page.count("<thead>") == page.count('<div class="scroll"')   # どの表も見出しがスクロールの枠の中
     body = page.split("馬ごとの該当数", 1)[1]
     assert "絶対軸（1）" in body and "軸候補（3）" in body and "消し候補（1）" in body and "相手候補（0）" in body
@@ -1254,7 +1254,7 @@ def test_notes_are_saved_and_shown_in_red_on_the_hits_and_wedge_pages(base, monk
 
     # ---- メモなし: 4区分の表に列があり、どの行も 結合データ と「調査」が別タブで逆引きへ
     page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
-    assert page.count("<th>年数</th><th>危険条件メモ / 調査</th></tr>") == 4 and "notetext" not in page.split("<body>", 1)[1]
+    assert page.count("<th>年数</th><th>危険条件メモ / 調査</th></tr>") == 5 and "notetext" not in page.split("<body>", 1)[1]   # 4区分 + 条件特化ヒット
     row = next(t for t in trs(page, 'class="card cat-axis"') if "10〜50倍" in t and "SAV" in t)
     links = _re.findall(r'<a href="(/entries/drill\?[^"]+)" target="_blank">([^<]*)</a>', row)
     assert [text for _, text in links] == [noted["key"], "調査"] and links[0][0] == links[1][0]
@@ -1357,7 +1357,7 @@ def test_notes_are_saved_and_shown_in_red_on_the_hits_and_wedge_pages(base, monk
             if e:
                 out.append((int(e.group(1)), len(_re.findall(r"<th[ >]", m.group(0).split("</thead>", 1)[0]))))
         return out
-    assert empty_rows(c.get("/entries/hits", query_string=q).get_data(as_text=True)) == [(25, 25), (25, 25)]      # 絶対軸・相手候補
+    assert empty_rows(c.get("/entries/hits", query_string=q).get_data(as_text=True)) == [(25, 25), (25, 25), (27, 27)]   # 絶対軸・相手候補・条件特化ヒット
     assert empty_rows(c.get("/entries/wedge", query_string={**wq, "uma": "99"}).get_data(as_text=True)) == [(24, 24)]
     # ---- メモは DB の外: DB を別のファイルに替えても（作り直しても）同じメモが出る
     other = tmp_path / "rebuilt.db"
@@ -1424,4 +1424,80 @@ def test_hits_page_excludes_tradeoff_keshi_and_shows_the_gate_in_the_rules(base,
         assert "指数が下位の条件（結合データの末尾が 6~9位・10位~・6位~・41~50・40以下、または指数順位 6 位以下）は対象外" in card, cat
     keshi_card = page.split('class="card cat-keshi"', 1)[1].split("<table", 1)[0]
     assert "指数が下位の条件" not in keshi_card and "指数の順位・順位帯・偏差値帯では絞らない" in keshi_card
+
+
+def test_hits_page_lists_condition_special_hits_below_the_four_tables(base, monkeypatch, tmp_path):
+    """条件ヒット馬: 4区分の表の下に「条件特化ヒット」（指数が下位でも絶対軸・軸候補の基準を満たす行）。
+    同じ条件は代表の1行にまとめ、元区分・指数数・指数名を出す。件数・結合データ・メモの列・指数名から逆引きを別タブで開ける。"""
+    import re as _re
+    from urllib.parse import parse_qs, urlsplit
+    notes_file = tmp_path / "notes.json"
+    monkeypatch.setenv("NOTES_PATH", str(notes_file))
+    am = _app(base, monkeypatch)
+    rid = _race_id(base)
+    with am.connect() as con:
+        race = am._race_rows(con, "entries_merged_hensachi", rid)
+    r1, r2 = race[0], race[1]
+    head = "騎手A×前走1着"
+
+    def low(r, ind, mode, cnt, cat, tail, fv=None, frc=None):
+        stats = {"abs": (85.0, 90.0, 95.0, 120.0), "axis": (55.0, 82.0, 92.0, 80.0)}[cat]
+        h = _fake_hit(r, "SAV", mode, 60, "keshi", family="B_jk_prevfin", key=f"{head}×{tail}")
+        h.update({"base": ind, "indicator": ind, "rank_scheme": "s1", "テーブル名": f"t_{mode}_{ind}_{tail}", "件数": cnt,
+                  "連対率_val": stats[0], "複勝率_val": stats[1] if fv is None else fv, "掲示板率_val": stats[2],
+                  "複勝回収値": stats[3] if frc is None else frc})
+        assert am.hit_category(h) is None and am.low_tail_category(h) == cat
+        return h
+    rep = low(r1, "瞬発", "normal", 22, "axis", "10位~", fv=85.0)
+    twin = {**low(r1, "先行", "normal", 31, "axis", "6~9位", fv=81.0), "テーブル名": "t_twin"}     # 同じ指数の行がもう1つ（指数数は3のまま）
+    fake = [low(r1, "先行", "normal", 30, "axis", "6~9位"), twin, rep, low(r1, "SAV", "normal", 12, "abs", "6~9位", fv=84.0),
+            low(r2, "ZI", "odds10u", 30, "axis", "6~9位"),                                   # 回収値 80 → 過剰人気カットの対象
+            low(r2, "BC", "odds10u", 30, "axis", "6~9位", frc=130.0),
+            _fake_hit(r1, "ZI", "odds10_50", 22, "axis"),                                     # 末尾が上位の軸（4区分の表）
+            _fake_hit(r2, "SAV", "normal", 60, "keshi", family="rankB", key="東京×ダ×1600×定量×1・2_勝×10位~")]
+    monkeypatch.setattr(am, "collect_hits", lambda con, table, rows: (list(fake), "xjoin"))
+    c = am.app.test_client()
+    q = {"table": "entries_merged_hensachi", "rid": rid}
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    title = "条件特化ヒット（指数が下位帯でも絶対軸・軸候補の基準を満たす強い条件）"
+    assert page.count(title) == 1 and page.index('class="card cat-opp"') < page.index('class="card cat-special"')   # 4区分の下
+    assert f"{title}：2 行" in page and "過剰人気カットで、2〜10倍未満・回収値100未満の 1 行を除いています（まとめる前の行数）" in page
+    card = page.split('class="card cat-special"', 1)[1]
+    assert "6~9位・10位~・6位~・41~50・40以下・指数順位 6 位以下" in card and "複勝率_val が最大（同じなら件数が最大）の1行" in card
+    assert ("<th>元区分</th><th class=\"num\">指数数</th><th>指数（末尾）</th>" in card
+            and card.split("</thead>", 1)[0].rstrip().endswith("<th>年数</th><th>危険条件メモ / 調査</th></tr>"))
+    rows = [m.group(0) for m in _re.finditer(r"<tr>.*?</tr>", card.split("<tbody>", 1)[1].split("</tbody>", 1)[0], _re.S)]
+    assert len(rows) == 2 and len(_re.findall(r"<td[ >]", rows[1])) == 27 == len(_re.findall(r"<th[ >]", card.split("</thead>", 1)[0]))
+    row = next(t for t in rows if r1["馬名"] in t)
+    assert "<td>軸候補</td><td class=\"num\"><b>3</b></td>" in row and f">{head}×10位~</a>" in row       # 代表 = 複勝率が最大の行
+    links = _re.findall(r'<a(?: class="tag")? href="(/entries/drill\?[^"]+)" target="_blank">(.*?)</a>', row)
+    assert [t for _, t in links] == ["<b>SAV 6~9位</b>", "先行 6~9位", "瞬発 10位~", f"{head}×10位~", "22", "調査"]   # 指数は台帳の順・絶対軸は太字
+
+    def args(url):
+        return {k: v[0] for k, v in parse_qs(urlsplit(url.replace("&amp;", "&")).query, keep_blank_values=True).items()}
+    want = {"region": "主5場", "indicator": "瞬発", "family": "B_jk_prevfin", "rank_scheme": "s1", "odds_mode": "normal",
+            "key": f"{head}×10位~"}
+    assert args(links[3][0]) == args(links[4][0]) == args(links[5][0]) == args(links[2][0]) == want
+    assert args(links[0][0]) == {**want, "indicator": "SAV", "key": f"{head}×6~9位"}
+    assert c.get(links[3][0].replace("&amp;", "&")).status_code == 200
+    row2 = next(t for t in rows if r2["馬名"] in t)
+    assert "<b>1</b>" in row2 and ">BC 6~9位</a>" in row2 and "ZI" not in row2                          # カットした行は指数数にも入らない
+    # 4区分の表は今までどおり（指数が下位の行は軸にしない）
+    body = page.split("馬ごとの該当数", 1)[1]
+    assert "軸候補（1）" in body and "絶対軸（0）" in body and "消し候補（1）" in body
+    # カット OFF: 2〜10倍未満の回収値100未満の行も入る
+    off = c.get("/entries/hits", query_string={**q, "cut_low_10u": "0"}).get_data(as_text=True)
+    card = off.split('class="card cat-special"', 1)[1]
+    assert f"{title}：2 行" in off and "回収値100未満の 1 行を除いています" not in card
+    assert ">ZI 6~9位</a>" in card and "<b>2</b>" in card
+    # メモ: 代表の行のメモは赤の太字、まとめた指数のメモは指数名の枠と title に
+    am.notes_store.save("瞬発", "B_jk_prevfin", "s1", "normal", "主5場", f"{head}×10位~", "代表のメモ")
+    am.notes_store.save("SAV", "B_jk_prevfin", "s1", "normal", "主5場", f"{head}×6~9位", "SAV のメモ")
+    card = c.get("/entries/hits", query_string=q).get_data(as_text=True).split('class="card cat-special"', 1)[1]
+    assert '<a class="notetext" style="color:#b91c1c;font-weight:700"' in card and ">代表のメモ</a>" in card
+    assert _re.search(r'<a class="tag hasnote" href="[^"]+" target="_blank" title="SAV のメモ"><b>SAV 6~9位</b></a>', card)
+    # 指数クロスの該当馬だけにすると、この表も絞る（軸が2指数以上の馬はいない → 0 行）
+    only = c.get("/entries/hits", query_string={**q, "xonly": "1"}).get_data(as_text=True)
+    assert f"{title}：0 行（指数クロスの該当馬だけ）" in only and '<td colspan="27">該当なし</td>' in only
+    assert "回収値100未満の 1 行を除いています（まとめる前の行数・全馬の合計）" in only.split('class="card cat-special"', 1)[1]
 

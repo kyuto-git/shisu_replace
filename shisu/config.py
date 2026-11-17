@@ -64,6 +64,19 @@ def db_path() -> Path:
     return Path(env) if env else base_dir() / "racing.db"
 
 
+def result_indices_dir() -> Path:
+    """結果指数（SP指数・ST指数。レースのあとに確定する値）のファイル置き場。過去3走/5走の平均・最高の8指数の元
+    （shisu/past_perf_indices.py）。"""
+    env = os.environ.get("RESULT_INDICES_DIR")
+    return Path(env) if env else base_dir() / "result_indices"
+
+
+def past_perf_settings_path() -> Path:
+    """過去SP・ST指数の想定馬場状態（/ingest の画面で選んだ値）。calc_entry_hensachi が --baba-* の既定として読む。"""
+    env = os.environ.get("PAST_PERF_SETTINGS")
+    return Path(env) if env else base_dir() / "past_perf_settings.json"
+
+
 def notes_path() -> Path:
     """危険条件メモ（condition_notes.json）。DB（racing.db）を作り直しても消えないように、DB の外に持つ。"""
     env = os.environ.get("NOTES_PATH")

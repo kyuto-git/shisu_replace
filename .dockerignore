@@ -10,6 +10,8 @@ ingest_in/
 ingest_out/
 ext_indices/
 raw_csv/
+result_indices/
+past_perf_settings.json
 selected_families.json
 *.xlsx
 *.xlsm

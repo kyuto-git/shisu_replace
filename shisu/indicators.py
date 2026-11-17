@@ -30,6 +30,10 @@ _YOSHIUMA = ("吉馬_SP能力値", "吉馬_先行力", "吉馬_SP信頼", "吉�
 # 0 を欠損とみなすもの（4ファイルで値0は 0.1〜0.3%）と、0 が普通に出るもの（体力・やる気は約14%が0）
 _YASUI_ZERO_MISSING = ("安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー", "安井_根性", "安井_賢さ")
 _YASUI_ZERO_VALUE = ("安井_体力", "安井_やる気")
+# 結果指数（SP指数・ST指数）から作る「過去3走/5走の平均・最高」（shisu/past_perf_indices.py）。
+# 対象の過去走が無い馬は 0（空）＝欠損。大きいほど良い
+PAST_PERF_INDICATORS = ("過去SP_3走平均", "過去SP_5走平均", "過去SP_3走最高", "過去SP_5走最高",
+                        "過去ST_3走平均", "過去ST_5走平均", "過去ST_3走最高", "過去ST_5走最高")
 
 INDICATORS: tuple[IndicatorSpec, ...] = (
     IndicatorSpec("Gold", ("GoldAirplane", "Gold指数", "Gold_Airplane")),
@@ -60,6 +64,7 @@ INDICATORS: tuple[IndicatorSpec, ...] = (
     # 安井サロン（月別 Excel。shisu/yasui_extractor.py）
     *(IndicatorSpec(n, zero_missing=True) for n in _YASUI_ZERO_MISSING),
     *(IndicatorSpec(n) for n in _YASUI_ZERO_VALUE),
+    *(IndicatorSpec(n, reverse=False, zero_missing=True) for n in PAST_PERF_INDICATORS),
 )
 
 # 画面での並び順（台帳の順）

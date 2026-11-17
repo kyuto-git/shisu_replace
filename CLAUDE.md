@@ -1,6 +1,6 @@
 # CLAUDE.md — shisu_replace（競馬 外部指数の集計・照合システム）
 
-最終更新: 2026-11-16（指数が下位の条件を絶対軸・軸候補・相手候補にしない上限ゲート `TAIL_*`・負の相関にある指数の「2〜10倍未満だけの消し」を条件ヒット馬から除く・逆引きページ `/entries/drill`（master からの過去走の取り出し・TARGET 貼付用のレースID・コア分布のまとめ）・危険条件メモ `condition_notes.json`）／2026-11-14（軸候補の最低件数 `AX_CNT` 10 → 20・消優勢／要注意の判定を「絶対軸なし・消し3行以上・2指数以上・軸より多い」／「軸あり・消し2行以上・軸以上」に／build_db の照合（xjoin）のメモリを一定に: ヒット行を1行ずつ・5,000行ごとに INSERT・照合のキャッシュを照合1回ごとに上限管理／オッズ帯 odds10u を「2.0倍以上 10.0倍未満」に: 表記は「2〜10倍未満」・`ODDS_BREAKS` に下限 2.0・前の区切りで集計した DB には画面に注意書き）／2026-11-13（条件ヒット馬の人気馬の見分け: 過剰人気カット `cut_low_10u`・消し(2〜10倍未満) の行数と指数数・同じ指数で軸と消しが出ているタグ・消優勢／要注意の判定）／2026-11-12（/ingest の取得元を同時に実行・馬体重発表後の差分更新 `--mining-only`／`--indicators`・区分に高回収率の基準と希少条件の最低件数の緩和・条件ヒット馬の「通常」の重複排除と穴の軸の赤字・表の見出し固定・WEDGE 一覧の絞り込みの折りたたみ・指数クロス・StridePlus のボーダーのファイルを読まない）／2026-11-10（成績表を master 1本につき1ファイル `agg_master_*.csv.gz` に・DB の1表ずつのテーブル `foragg_*` を廃止して unified_all に一本化・aggregate の `--compact`（既定 ON）・`--resume`・並列のまとまり）／2026-11-09（screen_families の `--from-report`・選抜の既定の変更・replace の子プロセスの作り直し・lxml 6.1.3・build_db `--entries-only`）／2026-11-08（raw_csv/ の列パッチCSV（レースID(新) と前走の列だけ）を 全場_*.csv に横結合する（§3.9）・出馬表への ext_indices の自動結合・/ingest の出力を ext_indices へコピー・raw_csv/ の過去基本CSVの統合・単独の部品 場所/距離/芝(内・外)・screen_families の候補の拡大（骨格・因果トリオ・冗長の除外・複勝スプレッド）を反映。それ以前の変更は §11）
+最終更新: 2026-11-17（条件ヒット馬に「条件特化ヒット」の表（指数が下位でも数の基準は絶対軸・軸候補の行。`low_tail_axis_category`）・結果指数（SP指数・ST指数）から作る「過去3走／5走の平均・最高」の8指数 `shisu/past_perf_indices.py`（`result_indices/`・履歴 `__horse_perf_history__.csv.gz`・想定馬場状態 `--baba-turf`／`--baba-dirt` と /ingest のプルダウン））／2026-11-16（指数が下位の条件を絶対軸・軸候補・相手候補にしない上限ゲート `TAIL_*`・負の相関にある指数の「2〜10倍未満だけの消し」を条件ヒット馬から除く・逆引きページ `/entries/drill`（master からの過去走の取り出し・TARGET 貼付用のレースID・コア分布のまとめ）・危険条件メモ `condition_notes.json`）／2026-11-14（軸候補の最低件数 `AX_CNT` 10 → 20・消優勢／要注意の判定を「絶対軸なし・消し3行以上・2指数以上・軸より多い」／「軸あり・消し2行以上・軸以上」に／build_db の照合（xjoin）のメモリを一定に: ヒット行を1行ずつ・5,000行ごとに INSERT・照合のキャッシュを照合1回ごとに上限管理／オッズ帯 odds10u を「2.0倍以上 10.0倍未満」に: 表記は「2〜10倍未満」・`ODDS_BREAKS` に下限 2.0・前の区切りで集計した DB には画面に注意書き）／2026-11-13（条件ヒット馬の人気馬の見分け: 過剰人気カット `cut_low_10u`・消し(2〜10倍未満) の行数と指数数・同じ指数で軸と消しが出ているタグ・消優勢／要注意の判定）／2026-11-12（/ingest の取得元を同時に実行・馬体重発表後の差分更新 `--mining-only`／`--indicators`・区分に高回収率の基準と希少条件の最低件数の緩和・条件ヒット馬の「通常」の重複排除と穴の軸の赤字・表の見出し固定・WEDGE 一覧の絞り込みの折りたたみ・指数クロス・StridePlus のボーダーのファイルを読まない）／2026-11-10（成績表を master 1本につき1ファイル `agg_master_*.csv.gz` に・DB の1表ずつのテーブル `foragg_*` を廃止して unified_all に一本化・aggregate の `--compact`（既定 ON）・`--resume`・並列のまとまり）／2026-11-09（screen_families の `--from-report`・選抜の既定の変更・replace の子プロセスの作り直し・lxml 6.1.3・build_db `--entries-only`）／2026-11-08（raw_csv/ の列パッチCSV（レースID(新) と前走の列だけ）を 全場_*.csv に横結合する（§3.9）・出馬表への ext_indices の自動結合・/ingest の出力を ext_indices へコピー・raw_csv/ の過去基本CSVの統合・単独の部品 場所/距離/芝(内・外)・screen_families の候補の拡大（骨格・因果トリオ・冗長の除外・複勝スプレッド）を反映。それ以前の変更は §11）
 
 ## この文書の扱い
 
@@ -24,6 +24,8 @@ TARGET frontier JV で出力した過去レースCSVに外部指数を付け、�
 - **当日の差分更新（2026-11-12〜）**: 馬体重の発表後にマイニングの確定値が出たら、`calc_entry_hensachi.py --mining-only` → `build_db.py --entries-only --mining-only` で タイムM・対戦M の列と照合結果（xjoin のその2指数の行）だけを入れ替える（ext_indices は読み直さない。§3.3・§3.4）
 - **オッズ帯（2026-11-14〜）**: `odds10u` は単勝 **2.0倍以上 10.0倍未満**（表記「2〜10倍未満」。1.9倍以下の馬は normal にだけ入る。モード名は変えていない）。成績表に効くのは次に aggregate を回したとき。前の区切りで集計した DB では画面に注意書きが出る（§5.6）
 - **逆引きと危険条件メモ（2026-11-16〜）**: 条件ヒット馬・WEDGE 一覧の行から `/entries/drill` を開くと、その条件に当たった過去の馬を master_csv から集計と同じ規則で取り出して、TARGET に貼るレースID・項目ごとの分布・明細を出す。そこで書いたメモは `condition_notes.json`（DB の外）に残り、条件ヒット馬・WEDGE 一覧の行に赤字で出る（§3.5・§3.10・§4.8）
+- **条件特化ヒット（2026-11-17〜）**: 条件ヒット馬のページの4区分の表の下に、指数の上限ゲートで区分から外れたが件数・率・回収値の基準は絶対軸・軸候補を満たす行を、条件ごとに1行にまとめて出す（4区分の判定は変えない。§3.5・§6.1）
+- **過去SP・ST の8指数（2026-11-17〜）**: レースのあとに確定する結果指数（SP指数・ST指数。`result_indices/`）から、各レース・各馬の「その日より前・600日以内」の直近3走／5走の平均・最高を計算して外部指数にする（そのレースの結果そのものは使わない）。過去側は replace、出馬表側は calc_entry_hensachi（想定の馬場状態 `--baba-turf`／`--baba-dirt`）と /ingest が同じ関数で計算する（§3.11・§4.9）
 - **成績表の持ち方（2026-11-10〜）**: aggregate は master 1本（地域×指数）につき1ファイル `agg_csv/agg_master_{地域}_{指数名}.csv.gz` に、family・スキーム・オッズ帯の成績表を縦に並べて書く（旧版は1表1ファイルで、数千 family × 33指数で数十万ファイル・140GB 超になった）。既定でコンパクト化（区分・WEDGE の上位・layer A・件数30以上の行だけ）。build_db は1表ずつのテーブルを作らず unified_all に直接入れる（§3.2・§3.4）
 - **キーの型 = family**: 部品（コース・重量種別・クラス名・枠番グループ・騎手・芝・ダ・場所・距離・芝(内・外) と 22条件）＋末尾の指数の部品（指数順位 / 指数順位帯 s1・s2 / 偏差値帯）。初期セットは 49 の型（83 family・スキーム込み 129 通り。§5.3）。`screen_families.py` で全掛け合わせ候補を採点して選んだ `selected_families.json` があれば、初期セットの代わりにそれを使う（集計・DB・照合・画面）
 - 順位帯（指数順位・前走着順・前走人気・前走上がり3F順で共通）は **s1 = 1 / 2~3 / 4~5 / 6~9 / 10~（排他）、s2 = 1~3 / 1~5 / 6~（重なりあり。2位は 1~3 と 1~5 の両方）**
@@ -51,10 +53,12 @@ shisu_replace/
 ├─ csv_files/   入力: 過去レース（TARGET）       ├─ entries_in/   入力: 出馬表（TARGET）
 ├─ raw_csv/     入力: 追加分の過去基本CSV（replace が csv_files/全場_*.csv に統合。済んだものは raw_csv/merged_done/ へ。§3.9）
 ├─ ext_indices/ 入力: 外部指数CSV群（§4.2）       ├─ entries_out/  偏差値付き出馬表
-├─ master_csv/  1頭1行（.csv.gz。集計・選抜の入力）＋ __inner_outer__.csv.gz（前走の内外を引く表）
+├─ master_csv/  1頭1行（.csv.gz。集計・選抜の入力）＋ __inner_outer__.csv.gz（前走の内外を引く表）＋ __horse_perf_history__.csv.gz・.json（馬ごとの過去走と結果指数。§4.9）
 ├─ agg_csv/     成績表 agg_master_{地域}_{指数名}.csv.gz（master 1本につき1ファイル。1行=1結合データ）＋ families.json（集計に使った family）・agg_settings.json（集計の設定。--resume 用）
 ├─ racing.db    SQLite                            ├─ selected_families.json / screening_report.csv（screen_families の出力）
 ├─ condition_notes.json  危険条件メモ（/entries/drill で書く。DB の外。`NOTES_PATH` で場所を変えられる。§4.8）
+├─ result_indices/  入力: 結果指数（SP指数 SP*.csv・speed*.zip／ST指数 st_se*.csv・st_se*.zip。`RESULT_INDICES_DIR`。§4.9）
+├─ past_perf_settings.json  過去SP・ST指数の想定馬場状態（/ingest で選んだ値。`PAST_PERF_SETTINGS`。§4.9）
 ├─ replace_csv/ processed_*（normal family のキーの確認用。--processed のときだけ）
 ├─ ingest_in/ ingest_out/  指数の取得の入力・出力（§3.6）
 └─ foragg_csv/  旧版の集計素材（2026-11-06 から作らない。残っていても使わない。消してよい）
@@ -71,6 +75,7 @@ shisu_replace/
 - **追加分の過去データ**: 同じ ★6タブで追加の期間を出し、名前に「タイム」「マイニング」（タイムM）か「対戦」（対戦M）を入れて `raw_csv/` に置く。replace が `csv_files/全場_{種類}.csv` に統合する（§3.9）
 - **列パッチ**: 前走の列（間隔・休み明け～戦目・前走場所・前芝・ダ・前距離・前走斤量・前走人気・前走着順・前走脚質・前走上り3F順・前走レース印３・前走レースID(新) など）を TARGET の前走データ読込で出すときは、`レースID(新)` とその列だけ（`指数` 列を入れない）のCSVにして `raw_csv/` に置く（名前は自由。複数に分けてもよい）。全場_タイムM・全場_対戦M の両方の同じ馬の行に当たる（§3.9）
 - **出馬表**: TARGET 出馬表分析 ★4タブ → マイニング読込（外部指数1〜4 は読み込まなくてよい。読み込んだ指数は出馬表の値が使われる）→ 全選択 → CSV → `entries_in/shisu_YYYYMMDD_N.csv`（22条件に使う列: 所属・間隔・休明戦目・斤量・性・前場所・前芝ダ・前距離・前走開催・前着順・前人気・前3F順・前脚質・前レース印3・前斤量。`test.csv` の形）。ほかの外部指数は ext_indices から付く（§3.3）
+- **結果指数（過去SP・ST の8指数の元）**: SP指数・ST指数のファイル（見出しなし `レースID(新)18桁, 指数値`）を `result_indices/` に置く（サブフォルダ・ZIP も可。§4.9）。基本CSVには `馬場状態`・`年齢限定`・`血統登録番号` の列も入れて出す（無くても動くが、馬場状態での絞り込み・3歳限定の判定・馬の見分けが粗くなる。§3.11）
 
 ### 1.3 データの流れ
 
@@ -79,8 +84,10 @@ shisu_replace/
 raw_csv/*.csv（追加分の基本CSV・列パッチ） ─ replace の最初に統合・パッチ ─> csv_files/全場_タイムM.csv・全場_対戦M.csv（§3.9）
 csv_files/{地域}_タイムM.csv・{地域}_対戦M.csv（基本CSV） ＋ ext_indices/（外部指数CSV群）
 csv_files/{地域}_{指数名}.csv（従来の形）
+result_indices/（結果指数 SP・ST）＋ 基本CSV ─ 過去走の履歴 ─> 過去SP・ST の8指数（その日より前・600日以内の直近3走/5走。§3.11）
   └─ replace_csv_ver3.py ─┬─> master_csv/master_{地域}_{指数名}.csv.gz   1頭1行（キーの部品・22条件・偏差値・順位・成績）
                           ├─> master_csv/__inner_outer__.csv.gz         レースID16 → 芝(内・外)（前走の内外。出馬表側も使う）
+                          ├─> master_csv/__horse_perf_history__.csv.gz  馬ごとの過去走と結果指数（出馬表側の 過去SP・ST の計算が読む）
                           └─> replace_csv/processed_*.csv               確認用（--processed のときだけ）
   └─ screen_families.py（任意・推奨）  master → 候補の family を一括採点 → screening_report.csv / selected_families.json
   └─ aggregate_stats_ver2.py  master 1本 × family（selected_families.json があればそれ、無ければ初期セット）× スキーム
@@ -93,6 +100,7 @@ csv_files/{地域}_{指数名}.csv（従来の形）
 [B] 出馬表
 entries_in/*.csv（マイニング値だけの出馬表1本でよい） ＋ ext_indices/（過去側と同じ外部指数CSV群）
   └─ calc_entry_hensachi.py ─> entries_out/{元名}_hensachi.csv / entries_merged_hensachi.csv（--merge-*）
+        （過去SP・ST の8指数は master_csv/__horse_perf_history__.csv.gz から計算。想定の馬場状態は --baba-turf / --baba-dirt）
   └─ build_db.py --mode entries|both（unified_all が必要）
         entries_{元名}（キー部品と22条件を正規化）, entries_all, entries_xjoin_{元名}（照合結果。__families__ の family で照合）
 
@@ -109,7 +117,7 @@ entries_in/*.csv（マイニング値だけの出馬表1本でよい） ＋ ext_
 [D] 外部指数の取得（ingest.py / /ingest）
 ベースCSV（TARGET: レースID(新), 日付S, 枠番, 馬番, ワーク1）
   └─ ①Ω ②吉馬6 ③かよちん ④keibaAI（スクレイピング。⑤一隊は廃止）
-ラップCSV ─ ⑥ラップ6指数（手元で計算）／ 安井 Excel ─ 安井8指数
+ラップCSV ─ ⑥ラップ6指数（手元で計算）／ 安井 Excel ─ 安井8指数／ 出馬表の形のベースCSV ─ 過去SP・ST の8指数（手元で計算。想定馬場状態のプルダウン）
   ─> ingest_out/{実行日時}/{取得元}/{YYYYMMDD}_{名前}.csv（TARGET 取込用2列 = ext_indices の形式A）, *_merged.csv
   ─> ext_indices/{OMEGA,kichiuma,kayochin,keibaAI,yasui}/…（TARGET 取込用CSVのコピー。既定でコピーする。[A]・[B] がそのまま結び付ける）
 ```
@@ -131,6 +139,9 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources omega,kichiuma,kayochin
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources keibaai --keibaai-start 18952 --keibaai-end 18987
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources lap,yasui
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python ingest.py --sources past --base entries_in/shisu_YYYYMMDD_1.csv --baba-turf 良 --baba-dirt 稍・重
+# 過去SP・ST の想定馬場状態を指定して出馬表を計算（省くと /ingest で選んだ値。無ければ auto）
+docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --merge-only --clean --baba-turf 良 --baba-dirt 稍・重
 # 馬体重発表後のマイニング確定値（タイムM・対戦M だけの差分更新）
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python calc_entry_hensachi.py --mining-only
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entries-only --mining-only
@@ -146,6 +157,8 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 | 出馬表・ext_indices（出馬表の日の外部指数）・騎手の乗り替わりや取消のあった出馬表 | calc_entry_hensachi --merge-only --clean → build_db --entries-only（＝ `--mode entries`。古い出馬表を消すなら `--prune`） |
 | 馬体重発表後のマイニング確定値（entries_in の出馬表を上書き） | calc_entry_hensachi --mining-only → build_db --entries-only --mining-only（タイムM・対戦M の列と xjoin のその2指数の行だけ。騎手の乗り替わり・馬の増減などマイニング以外の照合に関わる値も変わっていたら、自動で全部の計算・全部の照合に切り替わる） |
 | 画面（app.py） | app の再起動だけ |
+| 結果指数（result_indices/ にファイルを足した・替えた） | 過去側の成績表に効かせる: replace → aggregate → build_db --mode both。出馬表側だけ: calc_entry_hensachi --merge-only --clean → build_db --entries-only（履歴は calc が自動で作り直す） |
+| 過去SP・ST の想定馬場状態（`--baba-turf`／`--baba-dirt`・/ingest のプルダウン） | calc_entry_hensachi --merge-only --clean → build_db --entries-only（過去側は実際の馬場状態で計算するので作り直さない） |
 | 区分の閾値（`shisu/classify.py`） | コンパクト化（既定）しているなら aggregate（`--resume` で、閾値が変わった成績表を作り直す。閾値は設定のハッシュに入る）→ build_db --fresh → app の再起動。`--no-compact` なら app の再起動だけ |
 
 - `build_db --mode foragg` だけ回すと xjoin（照合結果）が古いまま残るので、警告が出る。続けて `--mode entries` を回す（回すまで、条件ヒット馬・WEDGE 一覧の画面に「照合結果が今の成績表より前のもの」の注意書きが出る。§3.5）。
@@ -159,7 +172,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 
 | モジュール | 役割 |
 |---|---|
-| `config.py` | パス。危険条件メモは `notes_path()`（既定 `condition_notes.json`。`NOTES_PATH`）。ルートは `SHISU_BASE_DIR`（既定はリポジトリ直下）、DB は `DB_PATH`（既定 `racing.db`）、外部指数は `SHISU_EXT_DIR`（既定 `ext_indices/`）、family の選抜結果は `SHISU_FAMILIES_FILE`（既定 `selected_families.json`）、追加分の過去基本CSVは `raw_dir()`（`raw_csv/`） |
+| `config.py` | パス。危険条件メモは `notes_path()`（既定 `condition_notes.json`。`NOTES_PATH`）。結果指数は `result_indices_dir()`（`result_indices/`。`RESULT_INDICES_DIR`）、過去SP・ST の想定馬場状態は `past_perf_settings_path()`（`past_perf_settings.json`。`PAST_PERF_SETTINGS`）。ルートは `SHISU_BASE_DIR`（既定はリポジトリ直下）、DB は `DB_PATH`（既定 `racing.db`）、外部指数は `SHISU_EXT_DIR`（既定 `ext_indices/`）、family の選抜結果は `SHISU_FAMILIES_FILE`（既定 `selected_families.json`）、追加分の過去基本CSVは `raw_dir()`（`raw_csv/`） |
 | `csvio.py` | `norm_text`（NFKC・空白除去・欠損表記→""）、CSV 読み書き（読込 cp932→utf-8-sig→utf-8、**書出し cp932**） |
 | `normalize.py` | クラス名・重量種別・距離レンジ・枠番グループ・芝(内・外)・レースID/日付（`horse_race_id`）、`split_surface_distance`（距離「ダ1200」→ 芝・ダ と 距離） |
 | `indicators.py` | 負の相関にある指数の組（`TRADEOFF_GROUPS`・`tradeoff_opponents`。§3.5）、指数の台帳（正式名・別名・符号反転・ZI 特例・新馬除外・0=欠損）、廃止した指数（`DISCONTINUED`・`is_discontinued`）、ファイル名から地域/指数名の取り出し |
@@ -176,10 +189,11 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 | `naming.py` | 成績表のファイル名の規約と解析（`agg_master_{地域}_{指数名}.csv.gz`、旧来の `foragg_*.csv`。family 名は台帳から長い順に当てる。「_」の位置で切って台帳の集合と照らすので family が数千でも速い）、テーブル名（unified_all の「テーブル名」。旧来の成績表のテーブル名と同じ） |
 | `finish.py` | 着順の正規化（取消・除外・失格・中止、1文字表記対応） |
 | `estimates.py` | ベイズ推定（Beta 分位点・事後平均） |
-| `classify.py` | 条件ヒット馬の分類（Python の1行版 `classify`・ベクトル版 `classify_frame`（aggregate のコンパクト化）・SQL 版 `sql_condition`。3つの一致はテストで確認）。高回収率の基準・希少条件（`is_rare_key`・`rare_sql`）の最低件数の緩和（§6.1）。`rule_settings()` は閾値の一覧（集計の設定のハッシュに入る）。指数の上限ゲート（`TAIL_LOW_TOKENS`・`is_low_tail`・`low_tail_sql`）と、消し候補の理由（`keshi_rule`: 全モード共通の規則か、2〜10倍未満専用の規則だけか。§6.1） |
+| `classify.py` | 条件ヒット馬の分類（Python の1行版 `classify`・ベクトル版 `classify_frame`（aggregate のコンパクト化）・SQL 版 `sql_condition`。3つの一致はテストで確認）。高回収率の基準・希少条件（`is_rare_key`・`rare_sql`）の最低件数の緩和（§6.1）。`rule_settings()` は閾値の一覧（集計の設定のハッシュに入る）。指数の上限ゲート（`TAIL_LOW_TOKENS`・`is_low_tail`・`low_tail_sql`）と、消し候補の理由（`keshi_rule`: 全モード共通の規則か、2〜10倍未満専用の規則だけか。§6.1）、ゲートで外れた行のもとの区分（`low_tail_axis_category`。条件特化ヒット） |
 | `matching.py` | 出馬表1頭 × unified_all の完全一致照合（xjoin 構築と画面のその場照合で共通）。`iter_hit_rows`（ヒット行を1行ずつ返す。xjoin 構築はこれを使う）・`match_entry_row`（同じ中身の dict のリスト）・`HitCache`（照合のキャッシュ。入れるたびに件数と行数の上限を見る。§3.4） |
 | `drill.py` | 逆引き: (地域, 指数) の master を探し（`find_master`）、family・スキームのキーとオッズ帯が同じ馬の行を取り出す（`extract`。集計と同じ `build_keys`・`odds_mask`・重複の除き方・分母）。TARGET 用のレースID（`id_lists`）・項目ごとの分布のまとめ（`summarize`）（§3.10） |
 | `notes.py` | 危険条件メモの保存（JSON 1本。ロック・一時ファイルからの置き換え・地域ごと／全地域共通の引き方。§4.8） |
+| `past_perf_indices.py` | 結果指数（SP指数・ST指数）→ 過去3走／5走の平均・最高の8指数。結果ファイルの探索と読み込み（`find_result_files`・`load_results`）・計算に使う列（`target_frame`）・履歴（`history_rows`・`History`）・対象の走の決め方（`select_runs`）・値（`aggregate`）・`compute`・履歴のキャッシュ（`get_history`）・想定馬場状態の設定（`load_settings`・`save_settings`）（§3.11・§4.9） |
 | `wedge.py` | WIN・EDGE・WEDGE・年度加重 adjusted_WEDGE |
 | `ingest/`・`yasui_extractor.py` | 外部指数の取得（§3.6・§3.7） |
 
@@ -198,8 +212,12 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 3. ext の指数（`process_ext`）: 基本CSVの全馬に `shisu.ext_indices.attach_filled`（出馬表側と共通）で値を付けて 指数 列にする。形式B（StridePlus）・C（Gold）はファイルの順位を 指数順位 にし（ファイルに無い馬はレースの最下位・同順位。TARGET と同じ）、A・D は値から順位を計算する（基本CSVの タイムM の順位は使わない）。**ファイルに値の無い馬は 0**（TARGET は外部指数を取り込んでいない馬を 0 で出すので、出馬表側・従来の ★8 の過去CSVと同じ数え方。0 を欠損とする指数（安井のランク・5ステータス）は欠損に戻る）。ログに「外部指数が付いた馬 x/y」（0 で埋める前の数）
 4. `compute_indicator`（§5.5）で偏差値・順位・帯。**取消・除外の馬は計算に入れない**（TARGET は 指数 0・指数順位 0 を出す。入れると 0 が平均を動かす）。TARGET の順位に合わせて偏差値の向きを変えたときはログに出す。22条件（`shisu.conditions`。§5.2）を付ける。前走の内外は、地域ごとの基本CSV（無ければ最初のファイル）の レースID(新)・芝(内・外) から作った表で引く（`__inner_outer__.csv.gz` にも書く）
 5. 頭数10以上（頭数列が無ければ警告して絞らない）の馬を `master_{地域}_{指数名}.csv.gz` に書く。除外レース（欠損2頭以上・全頭同値・有効2頭未満）・新馬除外（ZI・吉馬6種）の馬は `指数有効=0` で残す（集計では使わない）
+6. **過去SP・ST の8指数（2026-11-17〜。§3.11）**: `result_indices/`（`--result-dir`）に結果指数のファイルがあれば、main が先に過去走の履歴を作って `master_csv/__horse_perf_history__.csv.gz` に書き（`past_perf_indices.get_history(rebuild=True)`）、地域ごとの基本CSV × 8指数の「perf」ジョブ（`plan_perf_jobs` → `process_perf`）を足す。各ジョブは基本CSVの全馬について、その日より前の走から値を計算して 指数 列にし（対象の走が無い馬は 0。台帳で 0 = 欠損）、`process_frame` に渡す（順位は値から。基本CSVの タイムM の順位は使わない）。ログに「過去走の結果指数が付いた馬 x/y（段階ごとの馬の数）」
+   - 優先: 同じ地域×指数のファイルが csv_files にあればそちら（ext と同じ決まり）。計算した値は `ext_indices/past_sp_st/` のファイル（/ingest の出力）より優先（INFO を出して ext のジョブを外す）。結果指数が無く ext のファイルだけがあれば、ほかの外部指数と同じに ext から付ける
+   - 1つのプロセスでの計算は基本CSV 1本につき1回（`_perf_values` の lru_cache。8指数ぶんの値を持つ）。`--workers` でも同じ master になる。`--no-past-perf` で計算しない（`ext_indices/past_sp_st/` にファイルがあれば、ほかの外部指数と同じにそこから付く）
+   - main の最初に `_read_base`・`_perf_values` のキャッシュを空にする（同じプロセスで続けて呼ばれても前の実行の値を使わない）
 - **family ごとの素材ファイルは作らない**（旧版は 20本×入力。今は aggregate が master からその場でキーを作る）
-- オプション: `--clean`（master と processed を空に）, `--workers N`, `--processed`, `--csv-dir`, `--ext-dir`, `--no-ext`, `--master-dir`, `--raw-dir`, `--no-raw-merge`
+- オプション: `--clean`（master と processed を空に）, `--workers N`, `--processed`, `--csv-dir`, `--ext-dir`, `--no-ext`, `--master-dir`, `--raw-dir`, `--no-raw-merge`, `--result-dir`（既定 `result_indices/`）, `--no-past-perf`
 - メモリ（2026-11-09〜）: raw_csv の統合と前走の内外の表を作ったあとに `gc.collect()` で手放す。`--workers` が2以上のとき、子プロセスは1つあたり `MAX_TASKS_PER_CHILD`（4）件ほどで作り直す（`run_parallel` → `shisu.parallel.run_batched`: ジョブを workers × 4 件ずつのまとまりに分け、まとまりごとに新しい `ProcessPoolExecutor` を作って閉じる。基本CSVのキャッシュなどがたまって Docker の OOM Killer に止められ `BrokenProcessPool` になるのを防ぐ）。`ProcessPoolExecutor(max_tasks_per_child=…)` は使わない（Python 3.11・3.12 では、子プロセスが規定の件数で終わったあとに代わりが起動されず親が止まったままになる。Docker の Python 3.11.18 で再現）。それでも子プロセスが止められたら、そのまとまりの終わっていないジョブを `[ERROR] … 子プロセスが止められました` にして次のまとまりへ進む（終了コード1）
 - 目安: 実サンプル `202610.csv`（3,447行）で 0.6秒
 
@@ -211,7 +229,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
   - 旧版は1表1ファイルだったため、数千 family × 33指数 × 4オッズ帯で数十万ファイル・140GB 超になり、Mac の Docker が止まった（ユーザーの実データ）
   - agg_csv に旧来の `foragg_*.csv` が残っていれば WARN（build_db は同じ master の agg_master があれば使わない。消すには `--clean`）
 - **コンパクト化（`--compact`。既定 ON。全部の行を書くのは `--no-compact`）**: 成績表の行のうち、次のどれかを満たすものだけを書く（`shisu.aggstore.compact_mask`）
-  - a) `classify` で 絶対軸・軸候補・相手候補・消し候補 のどれかになる（判定の値は build_db が DB に入れる値と同じ: 5つの率の `*_val` は文字列の括弧内の推定値。`classify_frame` で全行を一度に判定）
+  - a) `classify` で 絶対軸・軸候補・相手候補・消し候補 のどれかになる（判定の値は build_db が DB に入れる値と同じ: 5つの率の `*_val` は文字列の括弧内の推定値。`classify_frame` で全行を一度に判定）、または**条件特化ヒットの行**（2026-11-17〜。結合データの末尾が下位で区分なしだが、数の基準は絶対軸・軸候補。`low_tail_axis_frame`。§6.1）
   - b) `WEDGE >= 0.70` または `adjusted_WEDGE >= 0.70`（`--compact-min-wedge`。`none` ならこの条件を使わない）
   - c) family の layer が A（初期セットのコース固定15種）、または `件数 >= 30`（`--compact-min-count`。`none` なら件数の条件を使わない）
   - 下限は正の数か `none`。0 以下は受け付けない（0 を「使わない」にすると、下げたのに残る行が減る逆向きの動きになるため）
@@ -246,6 +264,11 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
   - ファイルに値の無い馬は 0・順位の付け方（形式B・C はファイルの順位、ファイルに無い馬は最下位）・0=欠損の指数の扱いは過去側（§3.1 の3）と同じ。ログに「外部指数 {指数} を ext_indices から付けました（値のある馬 a/b）」
   - レースID(新)・レースID(旧) が無い出馬表には付けられない（`[WARN] 外部指数を結び付けられません`）
   - `--ext-dir`（既定 `ext_indices/`。`SHISU_EXT_DIR`）、`--no-ext`（結合しない＝従来の動き）。出馬表が複数ファイルでも、同じ ext を各ファイルに付けてから従来どおり横結合する
+- **過去SP・ST の8指数（2026-11-17〜。§3.11）**: `past_perf_lookups` が、entries_in の全ファイルの各馬について `past_perf_indices.compute` で値を計算し、形式A の `ExtLookup`（レースID(新) → 値）にして ext の指数と同じ `attach_ext` に渡す（末尾に `過去SP_3走平均` などの列が足され、偏差値・順位・帯が付く。順位は値から）。計算した値は `ext_indices/past_sp_st/` のファイルより優先。ログは「外部指数 過去SP_3走平均 を 過去走の結果指数から計算して付けました（値のある馬 a/b）」
+  - 履歴は `past_perf_indices.get_history`: `master_csv/__horse_perf_history__.csv.gz`（replace が書く）の印が、今の基本CSV・結果指数のファイル（名前と大きさ）と同じならそれを読む。違えば作り直して書き直す（`[INFO] …作り直します`）。基本CSV・結果指数が無く履歴のファイルだけあれば、それを使う。どちらも無ければ8指数は付けない（ほかの処理はそのまま）
+  - **想定の馬場状態**: `--baba-turf`・`--baba-dirt`（`auto`／`良`／`稍・重`／`不`。`稍重`・`不良`・`自動` も受ける。知らない値は終了コード2）。`auto` は出馬表の `馬場状態`（`馬場`）の列（無ければ指定なし＝段階②から）。値を指定すると、その芝・ダのレースは列より指定を優先する。省いたほうは設定ファイル `past_perf_settings.json`（/ingest の画面で選んだ値）、それも無ければ `auto`（`resolve_baba`。ログに「想定の馬場状態は 引数／設定ファイル／既定 から」）
+  - `--result-dir`・`--csv-dir`・`--master-dir`（履歴の元と置き場所）、`--no-past-perf`（結果指数から計算しない。`ext_indices/past_sp_st/` にファイルがあれば、ほかの外部指数と同じにそこから付く。それも付けないなら `--no-ext` か、そのフォルダを消す）。`--indicators 過去SP_3走平均,…` の差し替えでも計算する。`--mining-only`（タイムM・対戦M だけ）は履歴も結果指数も読まない
+  - 計算に失敗しても（読めない基本CSV など）ほかの指数の処理は続け、終了コード1
 - 指数列は台帳で検出し正式名にする（`GoldAirplane→Gold`、`マイニング値→タイムM`、`対戦型マイニング値→対戦M`、`先行力→先行` など）
 - 各指数列の直後に `X_偏差値, X_偏差値帯, X_順位, X_順位帯_s1, X_順位帯_s2` を挿入。計算は過去側と同じ `compute_indicator`。`X_順位帯_s2` は重なる帯を「・」でつないだ表示用（例 `1~3位・1~5位`。キーは帯ごとに作る）
 - 順位は元ファイルの順位列を優先する。対応の付け方: ①明示列（`マイニング順位`・`対戦型マイニング順位`・`{列}順位`）→ ②指数列の**すぐ右**にある `指数順位N`（TARGET の並び）→ ③N 番目の枠（指数を読み込んでいない枠の見出し `指数N` も1枠と数える）→ ④指数が1種類なら無印 `指数順位`。どれも無ければ同値同順位で計算し `[INFO]` を出す
@@ -337,6 +360,11 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
     - 除いたあとで、冗長な通常をもう一度決め直す（`classify_hits`）: 除いた odds10u の消しと件数が近いというだけで省かれていた「通常」の消し（全モード共通の規則による別の消し）は残す。軸・相手の行は消しの行に左右されないので、決め直しても同じ
     - 画面だけ: DB・xjoin・`/entries/wedge`・CSV（「区分」列）は変えない
   - **「危険条件メモ / 調査」の列（2026-11-16〜）**: 4区分の表の `年数` の右隣。どの行も 結合データ のセルと「調査」が `/entries/drill`（その行の region・indicator・family・rank_scheme・odds_mode・key）を別タブ（`target="_blank"`）で開く。メモ（§4.8）のある行は、列の中に赤の太字（`style="color:#b91c1c;font-weight:700"`・class `notetext`）で本文（200文字 `NOTE_SHOW` まで。超えたら「…」）、結合データのセル（class `hasnote`）とメモのセルの `title` に全文。`note_of(h)`・`drill_url(h)`・`note_cell(...)`（jinja から呼ぶ。HTML はエスケープする）。メモのファイルが読めないときは、メモなしで表示して画面の上に理由を出す
+  - **条件特化ヒット（2026-11-17〜。`special_hits`）**: 4区分の表の下のカード「条件特化ヒット（指数が下位帯でも絶対軸・軸候補の基準を満たす強い条件）」（class `card cat-special`）。ヒット行のうち `low_tail_category(h)`（`classify.low_tail_axis_category`: 結合データの末尾が下位で4区分では区分なしだが、数の基準は絶対軸・軸候補。§6.1）が付く行
+    - まとめ方: (馬番, family, rank_scheme, odds_mode, region, 結合データから末尾の部品を除いた部分 `condition_part`) が同じ行は、代表の1行（`複勝率_val` が最大 → `件数` が最大 → 指数の台帳の順）にする。代表の行に `_cat`（代表の行の元区分）・`_members`（まとめた行を指数ごとに1つ: base・cat・tail・そのヒット行。台帳の順）・`_n_inds`（指数の数）・`_n_rows` を足して返す（もとのヒット行は書き換えない）
+    - 過剰人気カット（`cut_low_10u`）が ON なら、odds10u で複勝回収値も単勝適正回収値も 100 未満（値なしも）の行を、まとめる前に除く（行数は `info["special_cut"]`。カードに出す）。ほかのオッズ帯は対象外
+    - 列（27列）: 枠・馬番・馬名・騎手・元区分・指数数・指数（末尾）・パターン・オッズ帯・地域・結合データ（代表）・件数・率・回収値・WEDGE・年数・危険条件メモ / 調査。件数・結合データ・「調査」は代表の行の `/entries/drill`、指数名のタグはその指数の行の `/entries/drill` を別タブで開く（絶対軸の基準の指数は太字。メモのある指数は枠と `title`）
+    - 並び・表示の上限（`spread_cap`・`HITS_VIEW_LIMIT`）・`xonly=1` の絞り込みは4区分の表と同じ。4区分の表・馬ごとの該当数・消優勢の判定には入れない（判定は変えていない）。冗長な「通常」の除外・負の相関の除外はしない（オッズ帯が違えば別の行）。`/entries/wedge`・CSV は変えていない
   - **指数クロス好走馬**（`axis_cross`）: 馬ごとに、絶対軸・軸候補の行がある指数（base）を数える。`xmin`（既定2）指数以上、`xa`・`xb` を指定したときはその両方で軸の馬を一覧にする（軸に当たった指数ごとの 絶対軸/軸候補 の行数。穴の軸に当たった指数は赤字）。`xonly=1` で4区分の表を該当馬だけにする。引数は出馬表の指数クロスと共通（`cross_request`。hits では `xc` は使わない）
 - `/entries/key`: WEDGE・adjusted_WEDGE・年数の列あり
 - `/entries/wedge`（レース別 WEDGE 一覧。`/entries` のレース一覧・`/entries/race`・`/entries/hits` からリンク）: そのレースの全馬 × 照合で該当した全キー（条件ヒット馬と同じ照合結果。xjoin が無ければその場照合）を、**閾値で足切りせず**に並べる（ただし DB に入っている行だけ。aggregate をコンパクト化（既定）したときは、区分にも WEDGE≧0.70 にも入らず件数30未満の行は出ない。全部見るなら `--no-compact`）
@@ -363,6 +391,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 | keibaai ④ keibaAI | ベースCSV＋開始ID・終了ID | `muryou-keiba-ai.jp/predict/2021/01/06/{連番}/`（1連番。日付・場所・R はページの meta description / title） | 14桁 | `keibaAI/{YYYYMMDD}_keibaAI.csv` |
 | lap ⑥ ラップ6指数 | ラップCSV | なし（手元で計算） | — | `lap/{2F,1F,4F,33rap,rabbit_2F,rabbit_1F}/{日付S}_{名前}.csv`, `lap/pace/{実行日}_pace_of_racecoment.csv` |
 | yasui 安井 Excel | Excel（＋ベースCSV） | なし | 日付 + 場所コード + R + 馬番（14桁） | §3.7 |
+| past 過去SP・ST指数 | ベースCSV（馬名・芝ダ・距離・年限定 のある出馬表の形）＋ result_indices/・履歴 | なし（手元で計算。§3.11） | レースID(新) | `past_sp_st/past_{sp,st}_{avg,max}{3,5}/{YYYYMMDD}_past_….csv` と `{元名}_{key}_merged.csv` |
 
 - 出力は各取得元で共通: (a) マージ完全版 `{元ファイル名}_merged.csv`（ベースCSVの全列。ワーク1 は取得値だけ。取れなければ空欄。指数ごとにフォルダを分ける吉馬・安井は `{元ファイル名}_{key}_merged.csv`。旧 kichiuma と同じ名前）、(b) TARGET 取込用 `{YYYYMMDD}_{名前}.csv`（日付S ごとに `レースID(新), ワーク1` の2列・cp932。同じ レースID(新) は値のある行を優先して1行。旧 dedupe_keibaAI.py の処理も含む）
 - **ext_indices へのコピー（2026-11-07〜。既定でする）**: 取得元が成功したら、TARGET 取込用の日付別CSV（`{YYYYMMDD}_{名前}.csv`。`レースID(新)` の見出しで始まるものだけ。`*_merged.csv`・`*_noid.csv`・ベースCSVの無い日の `日付, 場所, …` の形は置かない）を `ext_indices/` の取得元のフォルダに同じ形でコピーする: omega → `OMEGA/`、kichiuma → `kichiuma/kichiuma_{key}/`、kayochin → `kayochin/`、keibaai → `keibaAI/`、yasui → `yasui/yasui_{key}/`。§4.2 の振り分けでそのまま見つかるので、replace（過去側）と calc_entry_hensachi（出馬表側）が自動で結び付ける。ラップ6指数は台帳に未登録（§9）なのでコピーしない。画面はチェックボックス「ext_indices/ にも置く」（既定 ON）、CLI は `--no-ext-copy` で止める。コピーしたファイルは `Outputs.ext_files`
@@ -381,7 +410,15 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
   - ジョブはログファイルに書けなくても（フォルダが消えた・容量不足）止まらず、どんな終わり方でも「実行中」のまま残らない
   - 画面の下に「過去基本CSV（タイムM・対戦M）の統合・列パッチ」（§3.9）: アップロード、または `raw_csv/` に置いたファイルを選んで（既定で全部に印）`POST /ingest/raw_merge` で統合する・パッチを当てる。結果（既存・追加・重複の置き換え・10年より古い行の削除・残した年、パッチは 全場_*.csv ごとの更新行数・対象列）を表示する
   - 別のサイトのページからの POST（Origin が違う・`Sec-Fetch-Site: cross-site`）は 403。Host が `localhost`・IP アドレス・環境変数 `SHISU_ALLOWED_HOSTS`（カンマ区切り）以外なら /ingest 全体を 403（DNS リバインディング対策。Mac のホスト名で開くなら `SHISU_ALLOWED_HOSTS=mymac.local` などを渡す）。ログインは無い（§9）
-- CLI: `python ingest.py --sources omega,kichiuma,…|all [--base …] [--lap …] [--yasui …] [--keibaai-start N --keibaai-end M] [--interval 秒] [--no-ext-copy] [--sequential] [--out DIR] [--run-id ID]`。入力の既定は `ingest_in/{base,lap,yasui}/` の全ファイル。終了コード: 0 正常 / 1 失敗した取得元あり / 2 入力の不足
+- **過去SP・ST指数（取得元 `past`。2026-11-17〜。`shisu/ingest/past_perf.py`）**: ベースCSVの各馬について `past_perf_indices.compute`（replace・calc と同じ関数）で8指数を計算し、TARGET 取込用CSVを `past_sp_st/{key}/` に出す（key = `past_sp_avg3`・`past_sp_avg5`・`past_sp_max3`・`past_sp_max5`・`past_st_…`）。ext_indices へのコピー先は `ext_indices/past_sp_st/{key}/`（形式A として、その指数に振り分けられる）
+  - ext_indices へのコピーは、この取得元だけ「今回のファイルにある馬は空欄でも今回の値」（`copy_to_ext(keep_old=False)`。空欄は「取れなかった」ではなく「対象の走が無い」なので、想定の馬場状態などを変えて計算し直したときに前の値を残さない。消した頭数をログに出す。今回のファイルに無い馬の行は残す）
+  - ベースCSVが複数で列の名前が違っても（`馬名`／`馬名S`・`年齢限定`／`年限定`・`芝・ダ`／`芝ダ`）、行ごとに値のある列から読む（`past_perf_indices._col`。縦につないだ表の NaN を "nan" という馬名・年齢にしない）。列の注意書き（年齢限定・血統登録番号が無い など）はファイルごとに名前つきで出す
+  - ベースCSVの `レースID(新)` がレース単位（16桁）なら、馬番を付けた18桁で TARGET 取込用CSV・マージ完全版を書く（16桁のままだと1レース1頭に潰れる）
+  - 画面: 「1. 取得元」の欄に「想定馬場状態（過去SP・ST指数用）」のプルダウン2つ（`baba_turf` 芝・`baba_dirt` ダ。選択肢は `自動（出馬表の列／無ければ指定なし）`（値 `auto`）/ `良` / `稍・重` / `不`。前に保存した値が選ばれている）。知らない値は 400。フォームを経ない POST（項目なし）は保存してある値
+  - 成功したら、選んだ値を `past_perf_settings.json` に保存する（calc_entry_hensachi の既定になる。ジョブ画面に案内）。失敗した実行・受け付けなかった POST では保存しない。保存できなくても（書けない場所）取得元は成功のまま `[WARN]`
+  - ベースCSVに 馬名・血統登録番号 のどちらの列も無ければ、この取得元だけ失敗（理由つき）。芝ダ・距離 の列が無ければ警告して、古馬戦でも600日以内の全走で計算する。結果指数（result_indices/）も履歴のファイルも無ければ失敗
+  - CLI: `--sources past --baba-turf 良 --baba-dirt 不`（省いたほうは保存してある値。知らない値は終了コード2）
+- CLI: `python ingest.py --sources omega,kichiuma,…|all [--base …] [--lap …] [--yasui …] [--keibaai-start N --keibaai-end M] [--interval 秒] [--no-ext-copy] [--sequential] [--baba-turf …] [--baba-dirt …] [--out DIR] [--run-id ID]`。入力の既定は `ingest_in/{base,lap,yasui}/` の全ファイル。終了コード: 0 正常 / 1 失敗した取得元あり / 2 入力の不足
 - テストはネットワークに出ない（偽のセッションと、旧スクレイパーの解析コードが前提にしている構造の合成 HTML。keibaAI は旧 Readme に残っていた実ページの断片をまねた）。この開発環境からは各サイトに接続できないため、実ページでの確認は未実施
 
 ### 3.7 安井サロン Excel（`shisu/yasui_extractor.py`。ingest の取得元 yasui）
@@ -475,6 +512,28 @@ DB を作らずにメモリ上で、family の候補を master ごとに**本番
 
 ---
 
+### 3.11 過去SP・ST の8指数（2026-11-17〜。`shisu/past_perf_indices.py`）
+
+SP指数・ST指数は**レースのあとに確定する値**なので、そのレースの値をそのレースの指数にしない（未来の情報）。各レース・各馬について「そのレースの日より前・600日以内の対象の走」の直近3走・5走の平均と最高だけを作る。過去側（replace）・出馬表側（calc_entry_hensachi）・/ingest が同じ `compute` を通る。
+
+- **8指数**（台帳に登録。`reverse=False`・`zero_missing=True`）: `過去SP_3走平均`・`過去SP_5走平均`・`過去SP_3走最高`・`過去SP_5走最高`・`過去ST_3走平均`・`過去ST_5走平均`・`過去ST_3走最高`・`過去ST_5走最高`（`INDICATORS`: 名前 → (種類, 走数, avg/max)。ファイルの名前は `KEYS`: `past_sp_avg3` など）
+- **過去走の履歴**（`history_rows`・`History`）: 基本CSV（`base_csv_paths`: `全場_タイムM.csv` → `全場_対戦M.csv` の順に、あれば1本。どちらも無ければ地域ごとの基本CSV（タイムM 優先）を全部つないで レースID(新) の重複を除く）の各行から、(馬ID, 馬名, 日付, レースID(新) 18桁, 芝・ダ, 距離, 馬場状態3区分, SP, ST)
+  - 馬の見分け（`History.runs`）: `血統登録番号`（数字10桁）を優先し、無ければ正規化した `馬名`（NFKC・空白除去・先頭の (外)・[地]・○ などを除く）。今走に番号があれば「その番号の走 ＋ 同じ馬名で番号の無い行の走」（番号の列が無い期間の基本CSVの分。同じ馬名でも別の番号の行＝別の馬は入れない）。今走に番号が無ければ（番号の列の無い出馬表など）、その馬名の全部の走
+  - 入れない走: 取消・除外（`parse_finish` の分母外。失格・中止は走ったので入れる）、障害（芝・ダ が「障」・トラックコード51以上）、SP も ST も値が無い走、レースID(新)・日付の読めない行、馬を見分けられない行
+  - SP・ST は別々の母集団（その指数の値がある走だけ）
+- **対象の走**（`select_runs`。今走の日 D・芝・ダ・距離・馬場状態3区分・限定戦かどうか）:
+  1. `D − 600日 ≦ 走った日 ＜ D`（`WINDOW_DAYS`。当日・未来は入らない）。新しい順（同じ日なら レースID の大きい順）
+  2. 今走が**2歳戦・3歳限定戦**（`age_limited`: `年齢限定`／`年限定` の列が `2歳`・`3歳`（全角も）。`3上`・`3歳以上`・`4上`・`4歳以上` は古馬戦。列が空・年齢として読めない値なら クラス名 が 新馬・未勝利、またはクラス名・レース名に「2歳」「3歳」があって「以上・上」が続かない）なら、1 の全部。列そのものが無いときは `column_notes` が `[WARN]` を出す（3歳限定の1勝クラス・オープン・重賞を見分けられず、`年限定` のある出馬表側と条件がずれるため）
+  3. 古馬戦は次の順に、**最初に1走以上見つかった段階**の走だけ（1〜2走でもそこで止める。0走のときだけ次へ）:
+     ① 同じ芝・ダ かつ 距離差400以内（`DIST_TOL`。400 ちょうどは入る）かつ 同じ馬場状態3区分（今走の馬場状態が空なら飛ばす）／ ② 同じ芝・ダ かつ 距離差400以内 ／ ③ 距離差400以内（今走の馬場状態があれば、同じ馬場状態も）／ ④ 同じ芝・ダ ／ ⑤ 1 の全部
+  - 馬場状態3区分（`baba3`）: 良 → `良`、稍・稍重・重 → `稍・重`、不・不良 → `不`、空・不明 → 空。今走・過去走の 芝・ダ／距離／馬場状態 が空なら、その条件を使う段階には当たらない
+- **値**（`aggregate`）: 対象の走（新しい順）の先頭3走・5走の平均（`Decimal` で計算し、小数第2位を四捨五入 `ROUND_HALF_UP` して小数第1位まで。`54.0` は `54`）と最高。例: 古い順に 65・48・50・55・52 なら 3走平均 52.3・5走平均 54・3走最高 55・5走最高 65。対象の走が無ければ空（指数としては 0 ＝ 欠損）。対象の走があるのに値が 0（丸めて 0）になったときは `0.1`（`ZERO_SUBSTITUTE`）にする（0 は欠損の印なので、そのままだと走のある馬が欠損に数えられ、欠損2頭でレースごと使えなくなる）
+- **今走の馬場状態**（`resolve_baba`）: 過去側は基本CSVの `馬場状態` の列（実際の馬場）。出馬表側・/ingest は想定の指定（芝・ダ別。`良`／`稍・重`／`不`）があれば、その芝・ダのレースは指定の値、`auto` なら列の値（無ければ空 ＝ 段階②から）
+- **履歴のキャッシュ**（`get_history`。§4.9）: 元（基本CSV・結果指数のファイル）の名前・大きさ・中身の CRC32 から作る印（`source_signature`。大きさが同じまま値だけ直したファイルも見分ける。更新時刻は使わない）が `master_csv/__horse_perf_history__.json` と同じなら履歴のファイルを読み、違えば元から作り直して書く。元が無く履歴のファイルだけあれば、それを使う（読めない履歴しか無ければ `[WARN]` を出して8指数を付けない）。replace は必ず作り直す（作れなければ `[ERROR] 過去SP・ST の履歴: …` を出して8指数だけ作らず、ほかの master は作って終了コード1）
+- 段階ごとの馬の数をログに出す（`stage_text`: 対象の走なし／①〜⑤／2歳・3歳限定）
+- 0 = 欠損（`zero_missing`）なので、対象の走が無い馬は順位・偏差値なし。同じレースに欠損が2頭以上いれば、そのレースはその指数では使わない（§5.5 の1。安井のランクなどと同じ）
+
+---
 ## 4. データ仕様
 
 ### 4.1 csv_files/*.csv（過去レース）
@@ -495,7 +554,7 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 
 | 形式 | 中身 | 指数（置き方の例） | 照合 |
 |---|---|---|---|
-| A 馬単位・新18桁 | `レースID(新), 指数値`（見出しは有っても無くても良い） | オメガ指数（`OMEGA/`・`*_omega.csv`）、かよちん指数（`kayochin/`）、keibaAI指数（`keibaAI/`）、吉馬6指数（`kichiuma_sp_ability/`・`kichiuma-sp_ability/`・`kichiuma/kichiuma_sp_ability/` など）、安井8指数（`yasui_rank/` など。`/ingest` の出力をそのまま） | レースID(新)。順位は値から計算 |
+| A 馬単位・新18桁 | `レースID(新), 指数値`（見出しは有っても無くても良い） | オメガ指数（`OMEGA/`・`*_omega.csv`）、かよちん指数（`kayochin/`）、keibaAI指数（`keibaAI/`）、吉馬6指数（`kichiuma_sp_ability/`・`kichiuma-sp_ability/`・`kichiuma/kichiuma_sp_ability/` など）、安井8指数（`yasui_rank/` など。`/ingest` の出力をそのまま）、過去SP・ST の8指数（`past_sp_st/past_sp_avg3/` など。名前に `past_{sp,st}_{avg,max}{3,5}`。/ingest の取得元 past の出力。結果指数があれば、計算した値のほうを使う。§3.11） | レースID(新)。順位は値から計算 |
 | B 馬単位・旧10桁 | `旧ID, 指数値, 順位`（見出しなし。例 `0520380101,54,6`） | `StridePlus/`（大小文字・`Stride_Plus` も可）の下でファイル名の接頭辞: `sav` SAV / `st` ST指数（`st_se` は成績ST指数＝廃止）/ `gokei` 合計値 / `tenkai` 展開 / `siagari` 仕上り / `senko` 先行 / `tsuiso` 追走 / `jikyu` 持久 / `jizoku` 持続 / `shunpatsu` 瞬発 / `mae_stime` 想定前半 / `ato_stime` 想定後半 | 旧10桁。順位はファイルの値 |
 | C レース単位・12桁 | `ID12, 指数1, 順位1, 指数2, 順位2, …`（馬番1から。例 `202609260601,64,1,13,13,…`） | Gold（`GoldAirplane/`・`gold*.csv`） | 12桁（YYYYMMDD+場2+R2）＋馬番。順位はファイルの値 |
 | D レース単位・旧8桁 | `ID8, 指数1, 指数2, …`（馬番1から値だけ） | BC（`BCindex/`・`BC*.csv`。先頭の `RX` を除く）、ZI（`ZI_DATA/`・`ZI*.CSV`） | 旧8桁＋馬番。順位は値から計算 |
@@ -591,6 +650,16 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 - 書くときは同じフォルダの一時ファイル（`condition_notes.json.{乱数}.tmp`）に書いて fsync してから置き換える（途中で止まっても前のファイルか新しいファイルのどちらかが残る）。権限は、前のファイルがあればそのまま、無ければ umask どおり（ふつう 0644。`mkstemp` の 0600 にしない: Docker の root で書いたメモを、Linux のホスト側で読める・コピーできるように）。プロセスの中ではロックして読み→直し→書く。読むのはファイルの更新時刻・大きさが変わったときだけ
 - 読めない形（壊れた JSON・`notes` が配列でない・片方だけのサロゲート `"\ud83d"` のように UTF-8 にできない文字 など）は `NotesError`。画面はメモなしで出して理由を表示し、保存は上書きしない。手で直すなら上の形（`notes` の配列だけの JSON でも読める）
 
+### 4.9 result_indices/・履歴・想定馬場状態の設定（過去SP・ST の8指数。`shisu/past_perf_indices.py`）
+
+- **`result_indices/`**（`config.result_indices_dir()`。`RESULT_INDICES_DIR`。`.gitignore`・`.dockerignore` に入れてある）: 下を再帰的に探す（`find_result_files`。名前の大文字小文字は問わない。`.` で始まるファイル・`__MACOSX` は見ない）
+  - SP指数: 名前が `SP` で始まる CSV（`SP01260101.csv`）／ `speed*.zip` の中の、名前が `SP` で始まる CSV
+  - ST指数: 名前が `st_se` で始まる CSV（`st_se_20261010.csv`）／ `st_se*.zip` の中の CSV
+  - 中身（`parse_result_text`）: 見出しなしの2列 `レースID(新) 18桁, 指数値`。負の値・0・小数も値（`Decimal`）。値が空の行は入れない。1行目の見出しは読み飛ばす。ID が18桁の数字でない行・値が数でない行・整数部が7桁以上（100万以上。ID が2つつながった行・`1e30` など）や無限大の値は飛ばして、件数と例を WARN に出す。3列目以降は見ない。文字コードは BOM → UTF-8 → cp932
+  - 同じ馬（レースID(新)）の値が複数あれば、後のファイル（相対パスの名前順。ZIP の中は名前順）の値。ZIP は中身を読むだけで展開しない。読めない ZIP は WARN を出して飛ばす
+  - ext_indices では `st_se` で始まる名前は「成績ST指数（廃止）」として読まない（§4.2）。結果指数は別のフォルダ `result_indices/` に置く
+- **`master_csv/__horse_perf_history__.csv.gz`**（**UTF-8**・gzip。内部のファイルなので cp932 にしない: cp932 で書けない文字のある馬名を落とすと馬名で引けなくなる）: `馬ID, 馬名, 日付, レースID(新), 芝・ダ, 距離, 馬場, SP, ST`（1行 = 結果指数のある1走。SP・ST は結果ファイルの値そのまま）。**`__horse_perf_history__.json`**: `{"version": 2, "signature": 元の印, "rows": 行数}`。一時ファイルから置き換える。版・列が違う・読めないファイルは使わない。行数が印と違う（途中で切れた）ファイルは、元と違うものとして作り直す
+- **`past_perf_settings.json`**（`config.past_perf_settings_path()`。`PAST_PERF_SETTINGS`）: `{"baba_turf": "auto|良|稍・重|不", "baba_dirt": …}`。/ingest の取得元 past が成功したときに書く。読めない・知らない値は `auto`
 ### 4.6 DB（racing.db）
 
 | テーブル | 内容 |
@@ -697,6 +766,7 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
 | 対戦M | 対戦型マイニング値, MatchM | |
 | 安井_ランク・安井_スピード・安井_スタミナ・安井_パワー・安井_根性・安井_賢さ | | 安井サロン Excel（§3.7）。0=欠損（zero_missing）・順位は値から計算 |
 | 安井_体力・安井_やる気 | | 安井サロン Excel（§3.7）。0 も普通の値 |
+| 過去SP_3走平均・過去SP_5走平均・過去SP_3走最高・過去SP_5走最高・過去ST_3走平均・過去ST_5走平均・過去ST_3走最高・過去ST_5走最高 | | 結果指数から計算（§3.11）。大きいほど良い・0=欠損（zero_missing）・順位は値から計算 |
 | ほか | オメガ指数(Ω指数), かよちん指数, keibaAI指数, SAV, ST指数(ST), 合計値, 仕上り(仕上がり), 圧勝力 | |
 | （廃止） | カツラキ, HPRTV5C, 成績ST指数, 結果分析スピード指数・一隊, 33rap, 上がり1F・上がり2F | 読まない |
 
@@ -747,6 +817,7 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - 結合データが無い（None・空）・末尾がどの形でもない（`0`・全角の数字・前後に空白・`前走6着~` など）ときは制限しない。見るのは末尾だけ（途中の部品が `6位~` の形でも関係ない）
 - 1行版は `rec["key"]`（無ければ `rec["結合データ"]`）、ベクトル版は列 `key`（無ければ `結合データ`）、SQL 版は `low_tail_sql(key_col)`（結合データの前に `×` を付け、末尾が `×`+下位の部品か、`rtrim` で数字を落とすと `×` で終わって数字が 6 以上か。数の条件のあとに評価する）。3つの一致と、上位・下位の部品が `shisu/hensachi.py` の帯の名前と同じであることをテストで確認。説明の文（`description_lines`）は 絶対軸・軸候補・相手候補 に「指数が下位の条件は対象外」、消し候補に「絞らない」
 - 値は `rule_settings()` に入る（集計の設定のハッシュが変わる。コンパクト化では、指数が下位で区分に入らなくなった行は WEDGE の下限・件数の下限・layer A のどれかでなければ残らない）
+**条件特化の行（2026-11-17〜。`low_tail_axis_category(rec, mode)`）**: 上のゲートで区分なしになった行のうち、数の基準は 絶対軸・軸候補 を満たす行のもとの区分（`"abs"`／`"axis"`／`None`）。`is_low_tail(key)` で、ゲートを外した判定（`_classify(rec, mode, gate=False)`。件数の下限・希少条件の緩和・高回収率の基準・消しを先に見る順は classify と同じ）が abs か axis のときだけ返す。末尾が下位でない行・消し候補になる行・相手候補の基準までの行は `None`。classify・classify_frame（既定の `gate=True`）・sql_condition の結果は変えていない。ベクトル版は `low_tail_axis_frame(df, mode)`（`classify_frame(df, mode, gate=False)` と末尾の判定から。1行版との一致をテストで確認）。条件ヒット馬の「条件特化ヒット」の表（§3.5）と、集計のコンパクト化（§3.2 の a。この行も残す）が使う。コンパクト化の残し方が変わるので、`rule_settings()` に `LOW_TAIL_AXIS_CATEGORIES` が入り、集計の設定のハッシュが変わる（次の `aggregate --resume` は全部の master を作り直す。§9 の41）
 **軸候補の最低件数 10 → 20（2026-11-14〜。`AX_CNT`）**: 上の表の「軸候補」の4つの条件だけ。消し候補（`KS_CNT` 20）と同じ基準にそろえた（10〜19件の少ない標本で率だけ高い行を軸にしない）。絶対軸（10）・高回収率（30）・相手（30）・消し（20）・希少条件の下限はそのまま。件数 10〜19 で絶対軸の条件（rv≥80 かつ 回収値≥100）を満たす行は今までどおり絶対軸、満たさない行はどの区分にもならない（相手は30件から・高回収率も30件からなので、ほかの区分に落ちることは無い）。1行版・ベクトル版・SQL 版・説明の文（`description_lines`）は同じ定数を読む。
 判定には結合データが要る: `classify(rec, mode)` は `rec["key"]`（無ければ `rec["結合データ"]`）、`classify_frame` は列 `key`（無ければ `結合データ`。1行版と同じ順。部品の一致は SQL 版と同じ「×で挟んで部分一致」で見る）、`sql_condition(category, mode, key_col="結合データ")` は列名を受ける（結合データが無ければ希少条件にならない＝通常の下限）。高回収率の基準は従来の軸候補の条件のあと・相手候補の前に見るので、相手候補の条件 `fv≥33&frc≥150&top5≥50` も満たす行は odds10u・odds10_50 では軸候補になる。
 
@@ -814,7 +885,14 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
   - `tests/test_views.py`: 負の相関の除外（3つの組・双方向・絶対軸でも軸候補でも・除かないもの（共通の規則の消し・ほかのオッズ帯・組に無い指数・同じ側・別の馬・相手候補しか無い指数）・カットのあとの軸で見ること・`keshi_fav`／判定に入らないこと・除いた消しと重なるだけの「通常」の消しを隠さないこと・行の順に依らないこと）、画面の区分が末尾を見ること、`note_cell`（エスケープ・赤の太字・title・別タブ・長いメモの切り方）
   - `tests/test_drill.py`（新規）: メモの保存（保存・上書き・削除・地域ごと／全地域共通と優先・長さの上限・不正な条件・壊れたファイルを上書きしない・外から直したファイルの読み直し・同時の保存で失われない・`NOTES_PATH`・書き込みの途中で失敗しても前のファイルが残る・権限が umask／前のファイルのまま・片方だけのサロゲートを断る）、空の master と単勝オッズ inf、逆引き（master の探し方・キー／オッズ帯／指数有効／重複／取消の扱い・s2 の重なり・小さく分けて読んでも同じ・gz でない／UTF-8 の master・不正な引数と読めない master・TARGET 用のレースIDの並び）、分布のまとめ（オッズの帯・並びのある項目のいちばん狭い範囲・並びの無い項目・単独1件・凡走の集まりと期待の好走数・全部が単独1件・空の値・種類の多い項目）
   - `tests/test_pipeline.py`: DB の成績表で、指数が下位の行が軸・相手にならず SQL のプリセットと1行版が同じ行を選ぶこと、**逆引きの件数・複勝率・勝率が DB の成績表と一致**すること（family × オッズ帯 × スキームごとに抜き出した260行）、逆引きのページ（レースIDの2つの欄と切り替え用の JSON・まとめ・明細の色分け・`base=` でも同じ・CSV・順位帯の family・引数が合わないときの理由・master が無くてもメモの欄・見るだけではメモのファイルを作らない・DB と master の件数が違うときの注意書き）、メモのページ（4区分の表と WEDGE 一覧の列の位置・リンクの6つの引数と別タブ・保存 → 赤の太字と title・その条件の行だけ・エスケープ・全地域共通と優先・削除・別サイトからの POST 403・Host が別の名前の POST 403・条件の足りない／長すぎる POST 400・戻り先の URL にフォームのほかの値を使わない・「該当なし」の行の幅・DB を替えても出る・壊れたファイルでも画面は出て保存はせず理由を出す）、逆引きの覚えている結果（同じ結合データを 通常 → 2〜10倍未満 と続けて開く・master を作り直す）と明細の表の上限・ラジオの切り替えのスクリプト、条件ヒット馬の「負の相関…除外した消し候補 N 行」と該当数、区分の説明の文
-- 件数: 586（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
+- 2026-11-17 の分:
+  - `tests/test_core.py`: `low_tail_axis_category`（下位の末尾で 絶対軸・軸候補・高回収率の軸 の基準を満たす行だけ・相手候補の基準まで／消し候補／上位・不明の末尾／結合データなしは None・件数の下限と希少条件・乱数の行で「末尾を上位に替えた classify が abs / axis」と一致・classify は今までどおり）
+  - `tests/test_views.py`: `special_hits`（代表の行 = 複勝率_val 最大 → 件数 最大 → 台帳の順・元区分・指数ごとの内訳と台帳の順・まとめない組（馬・パターン・スキーム・オッズ帯・地域・条件の部分）・入らない行・4区分に出ないこと・行の順に依らないこと・同じ指数の2行は指数1つ・馬番の数と文字／地域とオッズ帯の None と空）、その行のオッズ帯で元区分を決めること（高回収率は 2〜10倍未満・10〜50倍だけ・2〜10倍未満専用の消しは入らない・希少条件の下限）、過剰人気カット（odds10u の回収値100未満・値なしだけ。行数）と並び
+  - `tests/test_aggstore.py`: コンパクト化が条件特化ヒットの行を残すこと（件数・WEDGE の下限では残らない行で。相手候補の基準まで・件数不足は落とす）、`low_tail_axis_frame` と1行版の一致（4,000行 × 4オッズ帯）、「残る行 = 独立に計算した行」の照合に条件特化の行を追加
+  - `tests/test_pipeline.py`: 条件ヒット馬のページの「条件特化ヒット」（4区分の表の下・行数と過剰人気カットの行数・27列・代表の行・指数数と指数名（台帳の順・絶対軸は太字・同じ指数の2行でも指数数は変わらない）・件数／結合データ／調査／指数名のリンクの6つの引数と別タブ・カット OFF・メモ（代表の行は赤の太字、まとめた指数は枠と title）・`xonly`）
+  - `tests/test_past_perf.py`（新規）: 台帳と ext_indices の振り分け、馬場状態3区分・想定の指定・2歳／3歳限定の判定・馬名と血統登録番号の正規化、結果ファイルの読み方（負の値・0・小数・見出し・18桁でない ID・数でない値・桁あふれと無限大）と丸め（依頼の例・ROUND_HALF_UP・負の値・0 → 0.1）、結果ファイルの探索（サブフォルダ・大文字小文字・speed*.zip の SP*.csv だけ・st_se*.zip・読めない ZIP・後のファイル優先）、600日の窓（当日・未来・601日前は入らない）と並び、段階①〜⑤（1走でも止める・馬場状態なしは②から・③の2通り・芝ダ／距離が分からないとき）、履歴に入れる走（取消・除外・障害・馬の分からない行を除く・中止は入れる）、馬の見分け（番号 ＋ 番号の無い同じ馬名の行・同じ馬名の別の番号は別の馬・番号の無い今走は馬名）、列が無いときの注意書き、そのレースの結果を使わないことと想定の馬場状態（芝・ダ別）、**別に書いた計算（oracle）との全件一致**（8指数 × 想定3通り・血統登録番号なしでも同じ）、履歴のキャッシュ（再利用・結果ファイルの追加／同じ大きさの値の直し／基本CSVの直し／行数の違いで作り直す・`save=False`・`rebuild=True`・元が無いときは履歴だけで・読めない履歴の WARN・UTF-8 の馬名）、基本CSVの選び方と設定ファイル
+    - 組み込み（基本CSV・結果指数・出馬表を置いた場所で）: replace が8本の master と履歴を書き、全行が oracle と一致・0 = 欠損と「欠損2頭以上のレースは使わない」・順位は値から・その馬の最初の走は値なし・22条件は タイムM の master と同じ／`--no-past-perf`・結果指数なし・ext_indices より計算を優先・csv_files の同名を優先・結果指数が無ければ ext から・同じプロセスで結果指数を足して回し直すと新しい値・履歴を作れなくてもほかの master は作る・`--workers 2` でも同じバイト列／calc が8指数と派生の列を付け oracle と一致・`--baba-turf`／`--baba-dirt`・設定ファイルと引数の優先・知らない値は終了コード2・ext のファイルより計算を優先（全部の計算でも `--indicators` でも）・`--no-past-perf`・`--mining-only` は履歴を読まない・`--indicators 過去SP_3走平均` の差し替え／**過去の開催日を出馬表の形にすると master と値・順位・偏差値・帯が同じ**／古い履歴の作り直しと履歴だけでの計算／ingest の取得元 past（8指数のファイル・ext_indices へのコピーと振り分け・設定の保存・馬名の無いベースCSVは失敗・CLI・列の名前が違う2本のベースCSV・16桁の ID・コピーで前の値を残さない・芝ダ／距離の無いベースCSVの警告と全走での値・設定を保存できないときは警告だけ・結果指数が無ければ失敗と終了コード1・失敗した実行は設定を保存しない）／/ingest の画面（プルダウンの4つの選択肢・知らない値は 400・実行と保存・保存した値が選ばれる・フォームを経ない POST）
+- 件数: 615件（pandas 2.3.3・3.0.5・Docker（Python 3.11）で全件パス）
 
 ---
 
@@ -860,6 +938,16 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 38. **負の相関の除外は行の組み合わせだけを見る**（2026-11-16〜）: 「片方の指数に軸が1行でもある」かどうかで決まり、行の件数・回収値・family は見ない。軸ヒットは過剰人気カットのあとの行なので、カットの ON／OFF で除かれる消しが変わる。組（`TRADEOFF_GROUPS`）は固定。`/entries/wedge`・CSV・横断検索は全件のまま
 39. **逆引きは master が要る**（2026-11-16〜）: `master_csv/master_{地域}_{指数名}.csv.gz` を読むので、master の無い環境（DB だけ持ってきた など）では出ない（メモは使える）。10年分の master（約30万行）で1回 数秒（5万行ずつ読むのでメモリは増えない。同じ条件の2回目は覚えている結果を使う）。成績表を集計したあとに master を作り直した・前のオッズ帯の区切りで集計した DB では、DB の件数と合わない（注意書きが出る）。コア分布のまとめは master にある列だけ（馬体重・4角位置などは TARGET にレースIDを貼って調べる）。危険候補の印は目安（件数の少ない値の「凡走集中」は偶然でも付く）
 40. **危険条件メモは1ファイル・ログインなし**（2026-11-16〜）: `condition_notes.json` を1つのプロセスの中でロックして書く。app を2つ同時に動かして同じ瞬間に保存すると、あとから書いたほうが残る（ふつうの運用＝app 1つでは起きない）。メモは条件（指数・family・スキーム・オッズ帯・地域・結合データ）の文字が同じ行にだけ出る: family を選び直して名前が変わった・地域の名前が変わったときは、前のメモは出なくなる（ファイルには残る）。バックアップはこのファイルをコピーする
+41. **条件特化ヒットと、作ってある DB**（2026-11-17〜）: 表に出るのは DB にある行だけ。コンパクト化（既定）で集計した成績表では、区分に入らない行は 件数の下限以上・WEDGE の下限以上・layer A のどれかでなければ落ちている。2026-11-16 の上限ゲートより前に集計した DB には、指数が下位の軸の行が（その時点では区分に入っていたので）残っている → そのまま出る。上限ゲートのあと・この変更の前に集計し直した DB では、その行の多くが落ちている（とくに `--compact-min-count none --compact-min-wedge 1.0` で集計した DB）。この変更からコンパクト化は条件特化の行も残すので、次に aggregate を回せば出る（`rule_settings()` が変わるので `--resume` でも全部の master を作り直す）
+42. **条件特化ヒットは別枠の表だけ**: 4区分の表・馬ごとの該当数・指数クロス・消優勢の判定には入れない。冗長な「通常」の除外・負の相関の除外はしない（同じ条件の「通常」とオッズ帯別の行が両方出ることがある）。元区分は代表の行のもの（まとめたほかの指数は、指数名が太字なら絶対軸の基準）。`/entries/wedge`・CSV の「区分」列は変えていない
+43. **過去SP・ST は「基本CSVにある走」だけが過去走**（2026-11-17〜）: 履歴は csv_files の基本CSVから作るので、基本CSV（raw_csv への追加）が半年前までなら、直近半年の走は「無い」ものとして直近3走・5走を数える。結果指数のファイルだけ足しても、その走の行（馬・芝ダ・距離・馬場状態）が基本CSVに無ければ使えない。直近の走まで使うには、先週までの基本CSVを raw_csv に足して replace を回す（そのあと aggregate まで回すかは別。出馬表側だけなら calc が履歴を作り直す）
+44. **過去SP・ST の 0 = 欠損**: 対象の走が無い馬（新馬・600日以上の休み明け・結果指数や基本CSVに走が無い馬）は欠損で、同じレースに2頭以上いると、そのレースはその指数では使わない（§5.5 の1。2歳戦・3歳の春は多い。合成データでは 5〜6% のレース）。対象の走がある馬の値がちょうど 0 になったときは 0.1 にしている（§3.11）。結果ファイルの値 0 は値として数える
+45. **過去側は実際の馬場状態・出馬表側は想定の馬場状態**: 成績表（過去側）は、そのレースの実際の馬場状態で①の走を選んだ値から作る。出馬表側は想定（`auto` で 馬場状態 の列が無ければ②から）なので、想定が外れた・指定しなかったときは、同じ馬でも過去側の数え方と対象の走がずれる（値が少し変わる）。基本CSVに `馬場状態` の列が無いと、過去走の馬場状態が分からず①・③の「同じ馬場状態」には当たらない（WARN）
+46. **2歳・3歳限定の判定は列しだい**: 基本CSVに `年齢限定` の列が無いと、3歳限定の1勝クラス・オープン・重賞（レース名に「3歳」の無いもの）は古馬戦として絞り込む（WARN）。出馬表は `年限定` で判定するので、その条件のレースでは両側の対象の走がずれる。基本CSVに `年齢限定` を入れて出す
+47. **馬の見分け**: `血統登録番号` の列が無い出馬表・基本CSVでは馬名で見分ける（同じ馬名の別の馬が600日以内に走っていれば混ざる。JRA の現役馬では起きにくい）。番号のある今走は「その番号の走 ＋ 番号の無い同じ馬名の行」
+48. **結果指数のファイルの優先は名前の順**: 同じ馬の値が複数のファイルにあれば、相対パスの名前順で後のファイル（大文字は小文字より前）。障害の走は履歴に入れない
+49. **履歴の印は中身の CRC32**: calc・/ingest は実行のたびに基本CSV・結果指数のファイルを読んで CRC32 を取る（10年分の基本CSVで1秒前後）。違えば履歴を作り直す（基本CSVの必要な列だけを読む。数秒〜十数秒）
+50. **/ingest の取得元 past のベースCSV**: 馬名（または血統登録番号）・芝ダ・距離・年限定 のある出馬表の形が要る（スクレイピング用の ★5タブのベースCSV（レースID(新)・日付S・枠番・馬番・ワーク1）だけでは計算できない → この取得元だけ失敗）。ext_indices/past_sp_st へのコピーは、今回のファイルにある馬を今回の値に置き換える（空欄も。24 の「前の値を残す」とは違う。今回のファイルに無い馬の行は残る）。calc は計算した値を優先するので、ext のファイルは TARGET への取り込み用
 
 ---
 
@@ -874,6 +962,24 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 ---
 
 ## 11. 変更履歴
+
+### 2026-11-17 条件特化ヒット・過去SP・ST の8指数
+- 背景: 2026-11-16 の上限ゲートで、指数が下位の条件は 絶対軸・軸候補・相手候補 から外した。その中で「指数は下位でも、条件そのものは絶対軸・軸候補の数の基準を満たす」行を別枠で見たい。SP指数・ST指数はレースのあとに確定する値なので、そのレースの指数には使えない → その日より前の走の値から作る（ユーザーの依頼）
+- shisu/classify.py: `low_tail_axis_category`（1行版）・`low_tail_axis_frame`（ベクトル版）。`classify`・`classify_frame`（既定）・`sql_condition` の結果は変えていない。`rule_settings()` に `LOW_TAIL_AXIS_CATEGORIES`（集計の設定のハッシュが変わる）
+- shisu/aggstore.py: コンパクト化が条件特化の行も残す（残さないと、上限ゲートのあとに集計した DB には表に出す行がほとんど無い）
+- app.py: `special_hits`・条件ヒット馬のページのカード「条件特化ヒット」（4区分の表の下。過剰人気カット・条件ごとに代表の1行・元区分・指数数と指数名・`/entries/drill` へのリンク）
+- shisu/past_perf_indices.py（新規）: 結果指数の探索と読み込み・過去走の履歴・対象の走の決め方（600日の窓・2歳／3歳限定・古馬戦の段階①〜⑤）・値・履歴のキャッシュ・想定馬場状態の設定。shisu/indicators.py に8指数（0 = 欠損）、shisu/ext_indices.py に形式A の振り分け（`past_sp_st/`）、shisu/config.py に `result_indices_dir()`・`past_perf_settings_path()`
+- replace_csv_ver3.py: 履歴を作って `master_csv/__horse_perf_history__.csv.gz` に書き、基本CSV × 8指数の master を作る（`--result-dir`・`--no-past-perf`）
+- calc_entry_hensachi.py: 出馬表の各馬に同じ関数で8指数を付ける（`--baba-turf`／`--baba-dirt`・設定ファイル・`--result-dir`・`--csv-dir`・`--master-dir`・`--no-past-perf`）
+- shisu/ingest（`past_perf.py`・`__init__.py`・`web.py`）・ingest.py: 取得元 `past`・画面の「想定馬場状態（過去SP・ST指数用）」のプルダウン・`--baba-turf`／`--baba-dirt`・`past_perf_settings.json`
+- `.gitignore`・`.dockerignore`・Dockerfile: `result_indices/`・`past_perf_settings.json`
+- 検証（条件特化ヒット・過去SP・ST の計算・replace／calc への組み込み・/ingest の4領域を指摘役が再現つきで確認）の指摘を反映:
+  - 計算: 今走に血統登録番号があると、番号の列が無い期間の同じ馬名の走を落としていた・番号で見つからないと同じ馬名の別の馬の走を使っていた → 「その番号の走 ＋ 番号の無い同じ馬名の行」。対象の走がある馬の値がちょうど 0 になると欠損に数えられた → 0.1。結果ファイルの桁あふれ・無限大の値で計算全体が止まった → 読み込みで飛ばす。`年齢限定` の列が読めない値・列なしのとき黙って古馬戦になっていた → クラス名・レース名から判定し、列が無ければ WARN
+  - 条件特化ヒット: コンパクト化が条件特化の行を落としていた（上の aggstore）。カットの行数の説明に「全馬の合計」。テストの穴（元区分がその行のオッズ帯で決まること・指数数は行数でなく指数の数）
+  - 組み込み: 大きさが同じまま値だけ直した結果ファイル・基本CSVで古い履歴を使い続けた → 印に中身の CRC32・行数の確認。読めない基本CSVで replace がトレースバックで止まった → `[ERROR]` を出して8指数だけ作らず、ほかの master は作る（終了コード1）。cp932 で書けない馬名を履歴から落としていた → 履歴は UTF-8。読めない履歴しか無いとき黙って付けなかった → WARN。テストの穴（calc が ext のファイルより計算を優先すること・同じプロセスで回し直したときのキャッシュ）
+  - /ingest: 列の名前が違う複数のベースCSVで、片方の行の馬名・年齢が "nan" になった → 行ごとに値のある列から読む・NaN は空。ext_indices へのコピーが、対象の走が無くなった馬に前の値を残した → この取得元は今回の値で置き換える。16桁の レースID(新) のベースCSVで TARGET 取込用CSVが1レース1頭に潰れた → 18桁で書く。`--no-past-perf` でも ext_indices/past_sp_st のファイルからは付く → ヘルプと文書に明記。テストの穴（失敗した実行で設定を保存しない・結果指数なしの失敗と終了コード・設定を保存できないときの警告・芝ダ／距離なしの警告・ダの検証の文・設定の置き換え保存）
+  - 反証役（4領域とも完了。途中で利用上限に当たり、3領域は修正のあとに再開）: 指摘した製品コードの欠陥は、直したあとの作業ツリーでどれも再現しないことを、指摘役の再現スクリプトの再実行と別の入力で確認。条件特化ヒットは前の版との突き合わせ（classify 60万件で不一致0・4区分の表は前の版と同じ）。残っていたテストの穴1件（想定馬場状態は正しいが受け付けなかった POST・失敗したジョブで設定を保存しないこと）を追加。反証役が残した点: 履歴のファイルだけで動くとき（結果指数なし）は、行数が印と違う履歴でもそのまま使う（作り直す元が無いため。INFO に行数）
+- テスト: test_past_perf.py を追加、test_core・test_views・test_aggstore・test_pipeline・test_ext_indices に追加・更新。615件
 
 ### 2026-11-16 指数の上限ゲート・負の相関の消し・逆引き・危険条件メモ
 - 背景: 騎手や前走の条件が強いだけで、指数そのものは下位（6位~・40以下 など）の条件が 絶対軸・軸候補・相手候補 に出ていた。先行と瞬発のように負の相関にある指数では、片方が軸のとき、もう片方の人気帯の消しが性質上そろって出て「消優勢」になっていた。軸に当たった条件の中身（過去のどのレースか）を TARGET で調べ直す手段と、調べた結果を条件に残す場所が無かった（ユーザーの実運用）

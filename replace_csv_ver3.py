@@ -9,6 +9,9 @@
   (c) ext_indices/（外部指数CSV群。shisu/ext_indices.py）があれば、地域ごとの基本CSV（タイムM を優先、無ければ 対戦M）の
       各馬に外部指数を レースID(新)・レースID(旧) で結び付け、「{地域}_{指数名}」の入力があるものとして処理する
       （csv_files に同じ地域・指数のファイルがあれば、そちらを使う）
+  (d) result_indices/（結果指数 SP指数・ST指数。shisu/past_perf_indices.py）があれば、地域ごとの基本CSVの各馬について
+      「そのレースより前・600日以内の直近3走／5走の平均・最高」の8指数（過去SP_3走平均 など）を計算して、同じように処理する。
+      過去走の履歴は master_csv/__horse_perf_history__.csv.gz に残す（出馬表側 calc_entry_hensachi が読む）
   廃止した指数（カツラキ・HPRTV5C・成績ST指数・一隊・33rap・上がり1F/2F）は読まない
   raw_csv/ に未統合の基本CSV（追加抽出したタイムM・対戦M）があれば、先に csv_files/全場_タイムM.csv・全場_対戦M.csv に
   統合する（レースID(新) で重複を除き後のファイルを優先・最大10年分。shisu/raw_merge.py。--no-raw-merge で飛ばす）
@@ -238,6 +241,71 @@ def process_ext(base_path: str, indicator: str, master_dir: str, processed_dir: 
     return msg + f" / 外部指数が付いた馬 {hit}/{len(raw)}"
 
 
+@functools.lru_cache(maxsize=1)
+def _perf_values(base_path: str, master_dir: str):
+    """基本CSVの各馬の 過去SP・ST の8指数（指数名 → 値の Series。対象の走が無ければ ""）と、段階ごとの馬の数。
+    履歴は main が先に書いた master_csv/__horse_perf_history__.csv.gz。1つのプロセスで1回だけ計算する。"""
+    from shisu import past_perf_indices as PP
+    cached = PP.load_history_cache(master_dir)
+    if cached is None:
+        return None
+    raw = _read_base(base_path)
+    for note in PP.column_notes(raw.columns, Path(base_path).name):
+        if note.startswith("[WARN]"):            # 基本CSVに 年齢限定 が無い（馬場状態・血統登録番号は、履歴を作るときに出す）
+            print(note, file=sys.stderr)
+    comp = PP.compute(PP.target_frame(raw), PP.History(cached[0]))
+    return comp.values, comp.stages
+
+
+def process_perf(base_path: str, indicator: str, master_dir: str, processed_dir: str | None,
+                 inner_lookup: dict | None) -> str:
+    """基本CSV（地域ごと）の各馬に、過去走の結果指数から計算した指数（過去SP_3走平均 など）を付けて処理する。
+    対象の過去走が無い馬は 0（台帳で 0 = 欠損）。順位は値から計算する（基本CSVの タイムM の順位は使わない）。"""
+    from shisu import past_perf_indices as PP
+    base_path = Path(base_path)
+    region_raw = base_path.stem.rsplit("_", 1)[0] if "_" in base_path.stem else base_path.stem
+    region, _ = parse_source_name(base_path.stem)
+    got = _perf_values(str(base_path), str(master_dir))
+    if got is None:
+        return f"[SKIP] {base_path.name} + {indicator}: 過去走の履歴（{PP.HISTORY_FILE}）がありません"
+    values, stages = got
+    raw = _read_base(str(base_path)).copy()
+    vals = values[indicator]
+    absent = vals == ""
+    raw["指数"] = vals.where(~absent, "0")
+    if "指数順位" in raw.columns:
+        raw = raw.drop(columns=["指数順位"])
+    msg = process_frame(raw, f"{region_raw}_{indicator}", region, indicator, master_dir, processed_dir, inner_lookup,
+                        given_rank=False, label=f"{base_path.name} + 過去走の結果指数/{indicator}", absent=absent)
+    kind = PP.INDICATORS[indicator][0]
+    return msg + f" / 過去走の結果指数が付いた馬 {int((~absent).sum())}/{len(raw)}（{PP.stage_text(stages[kind])}）"
+
+
+def plan_perf_jobs(files: list[Path], indicators: list[str]) -> tuple[list[tuple[Path, str]], list[str]]:
+    """過去SP・ST の8指数の (基本CSV, 指数) の組とログ。地域ごとの基本CSV（タイムM を優先）に付ける。
+    同じ地域×指数のファイルが csv_files にあれば、そちらを使う（ext_indices と同じ決まり）。"""
+    notes: list[str] = []
+    present: set[tuple[str, str]] = set()
+    bases: dict[str, tuple[int, Path]] = {}
+    for p in files:
+        region, indicator = parse_source_name(p.stem)
+        if is_discontinued(indicator):
+            continue
+        present.add((region, canonical_indicator(indicator)))
+        if indicator in BASE_INDICATORS:
+            prio = BASE_INDICATORS.index(indicator)
+            if region not in bases or prio < bases[region][0]:
+                bases[region] = (prio, p)
+    pairs: list[tuple[Path, str]] = []
+    for region, (_prio, base) in sorted(bases.items()):
+        for ind in indicators:
+            if (region, ind) in present:
+                notes.append(f"[INFO] {region}_{ind}: csv_files のファイルを使います（過去走の結果指数からは計算しません）")
+                continue
+            pairs.append((base, ind))
+    return pairs, notes
+
+
 def collect_inner_lookup(paths: list[Path]) -> dict[str, str]:
     """前走の内外を引く表（レースID(新)先頭16桁 → 芝(内・外)）。地域ごとに1本読めば足りる。"""
     out: dict[str, str] = {}
@@ -293,6 +361,10 @@ def main(argv=None) -> int:
     ap.add_argument("--csv-dir", default=str(config.csv_dir()))
     ap.add_argument("--ext-dir", default=str(config.ext_dir()), help="外部指数CSV群のフォルダ（既定 ext_indices）")
     ap.add_argument("--no-ext", action="store_true", help="ext_indices を使わない")
+    ap.add_argument("--result-dir", default=str(config.result_indices_dir()),
+                    help="結果指数（SP指数・ST指数）のフォルダ（既定 result_indices）。あれば 過去SP・ST の8指数を計算する")
+    ap.add_argument("--no-past-perf", action="store_true", help="過去SP・ST の8指数を結果指数から計算しない（ext_indices/past_sp_st にファイルがあれば、ほかの外部指数と"
+                         "同じにそこから付く）")
     ap.add_argument("--raw-dir", default=None,
                     help="未統合の過去基本CSVのフォルダ（既定は --csv-dir と同じ階層の raw_csv。ふつうは リポジトリ直下の raw_csv）。"
                          "あれば csv_files/全場_タイムM.csv・全場_対戦M.csv に統合してから進む")
@@ -304,6 +376,8 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=1, help="並列数（既定1。メモリに余裕があれば 2〜4）")
     args = ap.parse_args(argv)
 
+    _read_base.cache_clear()            # 同じプロセスで続けて呼ばれても（テストなど）、前の実行の基本CSV・計算を使い回さない
+    _perf_values.cache_clear()
     if args.raw_dir is None:            # --csv-dir を別の場所にしたとき、本物の raw_csv を取り込んで動かさない
         args.raw_dir = str(Path(args.csv_dir).parent / config.raw_dir().name)
     if not args.no_raw_merge:
@@ -340,15 +414,40 @@ def main(argv=None) -> int:
     write_csv(pd.DataFrame({"レースID16": list(inner), "芝(内・外)": list(inner.values())}),
               Path(args.master_dir) / INNER_FILE)
 
+    # 過去SP・ST の8指数: 結果指数（result_indices）があれば、履歴を作って master_csv に書き、基本CSVの各馬について計算する
+    perf_pairs: list[tuple[Path, str]] = []
+    perf_error = ""
+    if not args.no_past_perf:
+        from shisu import past_perf_indices as PP
+        if PP.has_result_files(args.result_dir):
+            history = None
+            try:
+                history = PP.get_history(args.csv_dir, args.result_dir, args.master_dir, log=print, rebuild=True)
+            except Exception as e:      # 履歴を作れなくても（読めない基本CSV など）、ほかの指数の master は作る
+                perf_error = f"[ERROR] 過去SP・ST の履歴: {type(e).__name__}: {e}（過去SP・ST の8指数は作りません）"
+                print(perf_error)
+            if history is not None:
+                perf_pairs, perf_notes = plan_perf_jobs(files, list(PP.INDICATORS))
+                for n in perf_notes:
+                    print(n)
+                computed = {ind for _b, ind in perf_pairs}
+                dropped = sorted({ind for _b, ind in pairs if ind in computed})
+                if dropped:
+                    print(f"[INFO] {'・'.join(dropped)}: 過去走の結果指数から計算した値を使います（ext_indices のファイルは使いません）")
+                pairs = [(b, ind) for b, ind in pairs if ind not in computed]
+            del history
+            gc.collect()                # 履歴（馬ごとの走）を、並列の子プロセスを作る前に手放す
+
     jobs = [("file", str(p), args.master_dir, processed_dir, inner) for p in direct]
     jobs += [("ext", str(b), ind, args.master_dir, processed_dir, inner, str(ext_root)) for b, ind in pairs]
+    jobs += [("perf", str(b), ind, args.master_dir, processed_dir, inner) for b, ind in perf_pairs]
     if args.workers > 1:
         results = run_parallel(jobs, args.workers)
     else:
         results = [_run(j) for j in jobs]
     for r in results:
         print(r)
-    return 1 if any(r.startswith("[ERROR]") for r in results) else 0
+    return 1 if perf_error or any(r.startswith("[ERROR]") for r in results) else 0
 
 
 MAX_TASKS_PER_CHILD = 4
@@ -370,7 +469,9 @@ def run_parallel(jobs: list, workers: int) -> list[str]:
 def _run(job) -> str:
     kind, rest = job[0], job[1:]
     try:
-        return process_file(*rest) if kind == "file" else process_ext(*rest)
+        if kind == "file":
+            return process_file(*rest)
+        return process_perf(*rest) if kind == "perf" else process_ext(*rest)
     except Exception as e:  # 1ファイルの失敗で全体を止めない
         return f"[ERROR] {Path(rest[0]).name}{'' if kind == 'file' else ' + ' + rest[1]}: {type(e).__name__}: {e}"
 

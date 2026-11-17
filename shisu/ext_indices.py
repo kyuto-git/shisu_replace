@@ -41,6 +41,7 @@ import pandas as pd
 
 from .csvio import norm_text
 from .indicators import canonical_indicator
+from .past_perf_indices import KEYS as PAST_PERF_KEYS
 
 Logger = Callable[[str], None]
 
@@ -75,6 +76,7 @@ PATTERN_OF: dict[str, str] = {
     "オメガ指数": "A", "かよちん指数": "A", "keibaAI指数": "A",
     **{n: "A" for n in YOSHIUMA_KEYS.values()},
     **{n: "A" for n in YASUI_KEYS.values()},
+    **{n: "A" for n in PAST_PERF_KEYS},              # 過去SP・ST の8指数（past_sp_st/past_sp_avg3/ など。/ingest の出力）
     **{n: "B" for n in STRIDE_PREFIXES.values() if n},
     "Gold": "C", "BC": "D", "ZI": "D",
 }
@@ -232,6 +234,8 @@ def _nk(name: str) -> str:
 
 _KICHIUMA_RE = re.compile(r"(?:^|_)kichiuma_(" + "|".join(YOSHIUMA_KEYS) + r")(?![a-z])")
 _YASUI_RE = re.compile(r"(?:^|_)yasui_(" + "|".join(YASUI_KEYS) + r")(?![a-z])")
+_PAST_PERF_RE = re.compile(r"(?:^|_)(past_(?:sp|st)_(?:avg|max)[35])(?![a-z0-9])")
+_PAST_PERF_BY_KEY = {v: k for k, v in PAST_PERF_KEYS.items()}
 _NAME_RULES: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"(?:^|[^a-z])omega(?![a-z])"), "オメガ指数"),
     (re.compile(r"(?:^|[^a-z])kayochin(?![a-z])"), "かよちん指数"),
@@ -259,6 +263,9 @@ def _name_indicator(raw: str) -> str | None:
     m = _YASUI_RE.search(nk)
     if m:
         return YASUI_KEYS[m.group(1)]
+    m = _PAST_PERF_RE.search(nk)
+    if m:
+        return _PAST_PERF_BY_KEY[m.group(1)]
     for regex, name in _NAME_RULES:
         if regex.search(nk):
             return name

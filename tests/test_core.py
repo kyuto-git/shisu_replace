@@ -465,6 +465,58 @@ def test_low_index_conditions_are_never_abs_axis_or_opp():
     assert st["TAIL_LOW_TOKENS"] == list(C.TAIL_LOW_TOKENS) and st["TAIL_LOW_RANK_MIN"] == 6 and st["TAIL_GATED"] == ["abs", "axis", "opp"]
 
 
+def test_low_tail_axis_category_reports_the_rows_the_gate_removed():
+    """low_tail_axis_category: 末尾が下位のために区分なしになったが、数の基準は絶対軸・軸候補を満たす行の、もとの区分。
+    classify（ゲートつき）の仕様は変えない。"""
+    z = {"cnt": 60, "fv": 30, "rv": 0, "top5": 40, "frc": 0, "tra": 0}
+    head = "川田将雅×前走1~3着"
+    cases = {"abs": ({"rv": 85, "frc": 120}, "normal", "abs"), "abs_tra": ({"rv": 85, "tra": 100}, "odds50p", "abs"),
+             "axis": ({"fv": 82, "top5": 92}, "normal", "axis"), "axis_hr": ({"fv": 36, "top5": 55, "tra": 210}, "odds10_50", "axis"),
+             "hr_in_normal": ({"fv": 36, "top5": 55, "tra": 210}, "normal", None),        # 高回収率の基準は 2〜10倍未満・10〜50倍だけ
+             "opp": ({"fv": 62, "top5": 72}, "normal", None),                              # 相手候補の基準までの行は対象外
+             "none": ({}, "normal", None),
+             "keshi": ({"fv": 3, "top5": 8}, "normal", None),                              # 消し候補は末尾に関係なく先に決まる
+             "keshi_fav": ({"fv": 15, "rv": 90, "top5": 60, "frc": 150}, "odds10u", None),
+             "keshi_and_abs": ({"fv": 4, "rv": 90, "top5": 5, "frc": 200}, "normal", None)}
+    for name, (vals, mode, want) in cases.items():
+        for t in LOW_TAILS:
+            for key in (f"{head}×{t}", t):
+                rec = {**z, **vals, "key": key}
+                assert C.low_tail_axis_category(rec, mode) == want, (name, key)
+                assert C.low_tail_axis_category({**z, **vals, C.KEY_COLUMN: key}, mode) == want          # 結合データ の名前でも
+                assert C.classify(rec, mode) in (None, "keshi")                                         # 通常の区分は今までどおり
+        for key in [f"{head}×{t}" for t in OK_TAILS + ODD_TAILS] + [None, "", head]:                   # 末尾が下位でなければ None
+            assert C.low_tail_axis_category({**z, **vals, "key": key}, mode) is None, (name, key)
+        assert C.low_tail_axis_category({**z, **vals}, mode) is None
+    # 件数の下限・希少条件の緩和は classify と同じ
+    assert C.low_tail_axis_category({**z, "cnt": 9, "rv": 85, "frc": 120, "key": head + "×6位~"}, "normal") is None
+    assert C.low_tail_axis_category({**z, "cnt": 10, "rv": 85, "frc": 120, "key": head + "×6位~"}, "normal") == "abs"
+    assert C.low_tail_axis_category({**z, "cnt": 19, "fv": 82, "top5": 92, "key": head + "×6位~"}, "normal") is None
+    assert C.low_tail_axis_category({**z, "cnt": 20, "fv": 82, "top5": 92, "key": head + "×6位~"}, "normal") == "axis"
+    assert C.low_tail_axis_category({**z, "cnt": 6, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×7"}, "normal") == "abs"
+    assert C.low_tail_axis_category({**z, "cnt": 6, "fv": 82, "top5": 92, "key": "騎手A×芝長×40以下"}, "normal") == "axis"
+    assert C.low_tail_axis_category({**z, "cnt": 6, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×5"}, "normal") is None
+    # 乱数の行で: 末尾を上位の部品に替えたときの classify が abs / axis の行だけ、その区分を返す（ほかは None）
+    rng = random.Random(5)
+    heads = ["東京×ダ×1600×定量×G1", "騎手A×前走6着~", "芝×芝長×高", "阪神×芝×16-18"]
+    n_hit = 0
+    for _ in range(6000):
+        rec = {"cnt": rng.choice([5, 6, 9, 10, 15, 19, 20, 29, 30, 60]), "fv": rng.choice([3, 15, 34, 36, 50, 62, 70, 82]),
+               "rv": rng.choice([0, 50, 60, 85]), "top5": rng.choice([5, 49, 55, 72, 80, 92]),
+               "frc": rng.choice([None, 0, 99, 100, 150, 210]), "tra": rng.choice([None, 0, 100, 150, 210])}
+        mode = rng.choice(odds.ODDS_MODES)
+        h = rng.choice(heads)
+        t = rng.choice(LOW_TAILS + OK_TAILS + ODD_TAILS)
+        got = C.low_tail_axis_category({**rec, "key": f"{h}×{t}"}, mode)
+        upper = C.classify({**rec, "key": f"{h}×1位"}, mode)
+        want = upper if t in LOW_TAILS and upper in ("abs", "axis") else None
+        assert got == want, (rec, mode, h, t)
+        if got:
+            n_hit += 1
+            assert C.classify({**rec, "key": f"{h}×{t}"}, mode) is None
+    assert n_hit > 100
+
+
 def test_low_tail_gate_is_the_same_in_row_frame_and_sql():
     """指数の上限ゲートを入れても、1行版・ベクトル版・SQL 版（結合データ／key のどちらの列名でも）が同じ区分を返す。"""
     rng = random.Random(11)

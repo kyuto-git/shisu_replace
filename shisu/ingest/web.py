@@ -280,6 +280,14 @@ FORM_BODY = """
     <input name="interval_{{ s.name }}" value="{{ q['interval_' ~ s.name] or s.default_interval }}" style="width:100%"></div>{% endfor %}
 </div>
 <div class="muted" style="margin-top:6px">アクセス間隔は {{ min_interval }} 秒未満にできません。keibaAI は muryou-keiba-ai.jp の連番ID（URL の最後の数字）を範囲で指定します。</div>
+<h2 style="margin-top:12px">想定馬場状態（過去SP・ST指数用）</h2>
+<div class="grid">
+  {% for field, label in (('baba_turf', '芝'), ('baba_dirt', 'ダ')) %}<div><label>{{ label }}</label><select name="{{ field }}" style="width:100%">
+    {% for v, text in baba_choices %}<option value="{{ v }}" {{ 'selected' if q.get(field, baba_saved[field]) == v else '' }}>{{ text }}</option>{% endfor %}</select></div>{% endfor %}
+</div>
+<div class="muted" style="margin-top:6px">「過去SP・ST指数」は、<code>result_indices/</code> の結果指数（SP*.csv・speed*.zip／st_se*.csv・st_se*.zip）と過去の基本CSVから、
+各馬の「今走より前・600日以内」の直近3走・5走の平均と最高（8指数）を計算します（結果そのものは使いません）。ベースCSVには 馬名・芝ダ・距離・年限定 のある出馬表CSVを選んでください。
+古馬戦は 芝ダ・距離差400m以内・馬場状態 が同じ走を優先します。ここで選んだ想定馬場状態は保存され、calc_entry_hensachi.py の既定にもなります。</div>
 <input type="hidden" name="to_ext_shown" value="1">
 <label class="cb" style="margin-top:8px"><input type="checkbox" name="to_ext" value="1" {{ 'checked' if q.get('to_ext', True) else '' }}>TARGET 取込用CSVを <code>ext_indices/</code> にも置く（過去レースの replace と出馬表の calc_entry_hensachi が自動で結び付けます。Ω・吉馬・かよちん・keibaAI・安井）</label>
 </div>
@@ -340,6 +348,16 @@ JOB_BODY = """
 """
 
 
+# 想定馬場状態のプルダウン（値, 表示）
+BABA_OPTIONS = (("auto", "自動（出馬表の列／無ければ指定なし）"), ("良", "良"), ("稍・重", "稍・重"), ("不", "不"))
+
+
+def _baba_saved() -> dict[str, str]:
+    """前に選んだ想定馬場状態（past_perf_settings.json。無ければ 自動）。"""
+    from ..past_perf_indices import load_settings
+    return load_settings()
+
+
 def _int_or_none(v: str):
     v = unicodedata.normalize("NFKC", v or "").strip().replace(",", "")
     return int(v) if re.fullmatch(r"\d+", v) else None
@@ -375,6 +393,7 @@ def make_blueprint(render) -> Blueprint:
         return render("指数の取得", FORM_BODY, sources=[SOURCES[n] for n in ORDER], kinds=INPUT_KINDS,
                       listed=listed, errors=list(errors), running=running_job(), busy=busy(), past=past,
                       q=q, q_src=set(q.get("src", [])), q_pick=picks, min_interval=MIN_INTERVAL,
+                      baba_choices=BABA_OPTIONS, baba_saved=_baba_saved(),
                       raw_listed=raw_listed(), raw_errors=list(raw_errors)), status
 
     @bp.route("/raw_merge", methods=["POST"])
@@ -432,6 +451,9 @@ def make_blueprint(render) -> Blueprint:
             q[f"interval_{n}"] = f.get(f"interval_{n}", "")
         for k in INPUT_KINDS:
             q[f"{k}_pick"] = f.getlist(f"{k}_pick")
+        saved = _baba_saved()
+        for k in ("baba_turf", "baba_dirt"):                       # フォームを経ない POST は保存してある値（無ければ 自動）
+            q[k] = (f.get(k) or saved[k]).strip()
         if not same_origin():
             abort(403)
         root = config.ingest_out_dir()
@@ -445,6 +467,8 @@ def make_blueprint(render) -> Blueprint:
             if not errors:
                 job = Job(run_id, root / run_id, req)
                 job.log(f"[INFO] 取得元: {', '.join(SOURCES[s].label for s in req.sources)}")
+                if "past" in req.sources:
+                    job.log(f"[INFO] 想定馬場状態（過去SP・ST指数用）: 芝 {req.baba_turf}・ダ {req.baba_dirt}")
                 for kind in INPUT_KINDS:
                     for p in paths[kind]:
                         job.log(f"[INFO] 入力（{INPUT_KINDS[kind][0]}）: {p.name}")
@@ -492,7 +516,8 @@ def make_blueprint(render) -> Blueprint:
             bad.append("keibaAI の開始ID・終了IDは数で入れてください")
         req = IngestRequest(sources=[s for s in q["src"] if s in SOURCES], base_paths=paths["base"],
                             lap_paths=paths["lap"], yasui_paths=paths["yasui"], keibaai_start=ks, keibaai_end=ke,
-                            intervals=intervals, ext_dir=config.ext_dir() if q["to_ext"] else None)
+                            intervals=intervals, ext_dir=config.ext_dir() if q["to_ext"] else None,
+                            baba_turf=q["baba_turf"], baba_dirt=q["baba_dirt"])
         return bad + validate(req), req, paths
 
     @bp.route("/job/<run_id>", methods=["GET"])

@@ -496,3 +496,109 @@ def test_note_cell_and_condition_of_escape_and_link():
     long = str(app.note_cell("あ" * 500, "/d"))
     assert "あ" * app.NOTE_SHOW + "…</a>" in long and 'title="' + "あ" * 500 + '"' in long
 
+
+# ---------------------------------------------------------------- 条件特化ヒット（指数が下位でも軸の基準を満たす行）
+JK = "騎手A×前走1着"
+
+
+def low(uma, base, mode, cnt, cat, tail="6~9位", head=JK, family="B_jk_prevfin", scheme="s1", region="主5場", **more):
+    """末尾が下位の結合データのヒット行。4区分ではどれにもならず、条件特化ヒットの元区分が cat。"""
+    h = {"馬番": str(uma), "枠番": "1", "馬名": f"馬{uma}", "騎手": "騎手", "base": base, "family": family,
+         "rank_scheme": scheme, "odds_mode": mode, "region": region, "key": f"{head}×{tail}", "件数": cnt,
+         "テーブル名": f"t_{mode}_{family}_{scheme}_{region}_{base}_{tail}", **STATS[cat], **more}
+    assert app.hit_category(h) is None and app.low_tail_category(h) == cat, (cat, cnt, mode, tail)
+    return h
+
+
+def test_special_hits_group_low_index_axis_rows_into_one_row_per_condition():
+    """条件特化ヒット: 同じ馬・パターン・スキーム・オッズ帯・地域・条件（末尾を除いた部分）の行は代表の1行
+    （複勝率_val 最大 → 件数 最大）にまとめ、元区分と、当たった指数（台帳の順）を持つ。"""
+    assert [app.condition_part(k) for k in ("A×B×6位~", "6位~", "", None, "A×10")] == ["A×B", "", "", "", "A"]
+    a = low(1, "先行", "normal", 30, "axis")                                            # 複勝率 82
+    b = low(1, "瞬発", "normal", 22, "axis", tail="10位~", **{"複勝率_val": 85.0})       # 複勝率が最大 → 代表
+    c = low(1, "SAV", "normal", 12, "abs", **{"複勝率_val": 84.0})
+    out = app.special_hits([a, b, c], False, info := {})
+    assert len(out) == 1 and info == {"special_cut": 0}
+    row = out[0]
+    assert row["base"] == "瞬発" and row["key"] == f"{JK}×10位~" and row["_cat"] == "axis" and row["件数"] == 22
+    assert (row["_n_inds"], row["_n_rows"]) == (3, 3)
+    assert [(m["base"], m["cat"], m["tail"]) for m in row["_members"]] == [
+        ("SAV", "abs", "6~9位"), ("先行", "axis", "6~9位"), ("瞬発", "axis", "10位~")]      # 台帳の順
+    assert [m["h"] for m in row["_members"]] == [c, a, b]
+    assert a.get("_cat") is None and "_members" not in b                                 # もとのヒット行は書き換えない
+    # 複勝率が同じなら件数の多い行、それも同じなら指数（台帳の順）
+    d = low(1, "ZI", "normal", 40, "axis", **{"複勝率_val": 85.0})
+    assert app.special_hits([a, b, c, d])[0]["base"] == "ZI"
+    e = low(1, "Gold", "normal", 22, "axis", **{"複勝率_val": 85.0})
+    assert app.special_hits([b, e])[0]["base"] == "Gold" and app.special_hits([e, b])[0]["base"] == "Gold"
+    # まとめないもの: 馬・パターン・スキーム・オッズ帯・地域・条件の部分のどれかが違う行
+    others = [low(2, "先行", "normal", 30, "axis"), low(1, "先行", "normal", 30, "axis", family="B_jk_prevpop"),
+              low(1, "先行", "normal", 30, "axis", scheme="s2", tail="6位~"), low(1, "先行", "odds10_50", 30, "axis"),
+              low(1, "先行", "normal", 30, "axis", region="全場"), low(1, "先行", "normal", 30, "axis", head="騎手A×前走2~3着")]
+    out = app.special_hits([a, b, c] + others)
+    assert len(out) == 7 and sorted(r["_n_inds"] for r in out) == [1, 1, 1, 1, 1, 1, 3]
+    # 入らないもの: 末尾が上位の軸・相手候補の基準まで・消し候補・どの区分でもない行
+    plain = [hit(1, "先行", "normal", 30, "axis"), hit(1, "先行", "normal", 40, "opp"), hit(1, "先行", "normal", 25, "keshi"),
+             {**low(1, "BC", "normal", 30, "axis"), **STATS["opp"]}, {**low(1, "BC", "normal", 30, "axis"), **STATS["keshi"]},
+             {**low(1, "BC", "normal", 30, "axis"), "件数": 19}]
+    assert app.special_hits(plain) == []
+    # 4区分の表には出ない（ゲートはそのまま）。行の順に依らない
+    assert all(v == [] for v in app.classify_hits([a, b, c] + others).values())
+    import random as _r
+    rows = [a, b, c, d, e] + others
+    want = [(r["馬番"], r["base"], r["key"], r["_n_inds"]) for r in app.special_hits(rows)]
+    for seed in range(5):
+        sh = rows[:]
+        _r.Random(seed).shuffle(sh)
+        assert [(r["馬番"], r["base"], r["key"], r["_n_inds"]) for r in app.special_hits(sh)] == want
+    # 同じ指数が同じ条件に2行（別の集計表）あっても、指数は1つに数える
+    twin = {**a, "テーブル名": "t_other", "件数": 31}
+    row = app.special_hits([a, twin])[0]
+    assert (row["_n_inds"], row["_n_rows"], row["件数"]) == (1, 2, 31) and row["_members"][0]["h"] is twin
+
+
+def test_special_hits_use_each_rows_own_odds_band_and_count_indicators_not_rows():
+    """元区分はその行のオッズ帯で決める（高回収率の基準は 2〜10倍未満・10〜50倍だけ。2〜10倍未満専用の消しは対象外）。
+    指数数は指数の数（同じ指数の行が2つあっても1つ）。"""
+    hr = {"複勝率_val": 36.0, "連対率_val": 10.0, "掲示板率_val": 55.0, "複勝回収値": 0.0, "単勝適正回収値": 210.0}
+    rows = [{**low(1, "先行", "normal", 30, "axis"), **hr, "odds_mode": m, "テーブル名": f"t_{m}"}
+            for m in ("normal", "odds10u", "odds10_50", "odds50p")]
+    assert [app.low_tail_category(h) for h in rows] == [None, "axis", "axis", None]
+    assert [r["odds_mode"] for r in app.special_hits(rows)] == ["odds10u", "odds10_50"]
+    # 2〜10倍未満では複勝率 < 20 は消し候補（末尾に関係なく先に決まる）→ 絶対軸の数字でも入らない。ほかのオッズ帯では絶対軸の基準
+    ab = {"複勝率_val": 15.0, "連対率_val": 85.0, "掲示板率_val": 60.0, "複勝回収値": 150.0}
+    fav, mid = ({**low(2, "SAV", "normal", 25, "abs"), **ab, "odds_mode": m, "テーブル名": f"u_{m}"} for m in ("odds10u", "odds10_50"))
+    assert app.hit_category(fav) == "keshi" and app.low_tail_category(fav) is None and app.low_tail_category(mid) == "abs"
+    assert [(r["馬番"], r["odds_mode"], r["_cat"]) for r in app.special_hits([fav, mid])] == [("2", "odds10_50", "abs")]
+    # 希少条件の下がった最低件数（絶対軸 6）も同じ
+    rare = low(3, "ZI", "normal", 12, "abs", head="東京×芝×23-24×定量×G1", tail="7")
+    assert app.low_tail_category({**rare, "件数": 6}) == "abs" and app.low_tail_category({**low(3, "ZI", "normal", 12, "abs"), "件数": 6}) is None
+    # 指数数 = 指数の数。地域・オッズ帯の None と空・通常は同じ組（馬番は数でも文字でも）
+    a = low(1, "先行", "normal", 30, "axis")
+    twin = {**a, "テーブル名": "t_twin", "馬番": 1, "odds_mode": None}
+    b = {**low(1, "瞬発", "normal", 30, "axis"), "region": "主5場"}
+    row = app.special_hits([a, twin, b])
+    assert len(row) == 1 and (row[0]["_n_inds"], row[0]["_n_rows"]) == (2, 3)
+    assert len(app.special_hits([{**a, "region": None}, {**b, "region": ""}])) == 1
+
+
+def test_special_hits_follow_the_overpopular_cut_and_the_table_order():
+    """過剰人気カット ON なら、2〜10倍未満（odds10u）で複勝回収値も単勝適正回収値も 100 未満の行を先に除く（ほかのオッズ帯は対象外）。"""
+    weak = low(1, "先行", "odds10u", 30, "axis")                                          # 回収値 80 / 80
+    good = low(1, "瞬発", "odds10u", 30, "axis", **{"複勝回収値": 100.0})
+    tra = low(2, "SAV", "odds10u", 30, "axis", **{"単勝適正回収値": 130.0})
+    none = low(3, "ZI", "odds10u", 30, "axis", **{"複勝回収値": None, "単勝適正回収値": None})
+    ab = low(4, "BC", "odds10u", 12, "abs")                                               # 絶対軸は回収値100以上が条件
+    other = [low(1, "先行", m, 30, "axis") for m in ("normal", "odds10_50", "odds50p")]
+    rows = [weak, good, tra, none, ab] + other
+    off = app.special_hits(rows, False, info := {})
+    assert info == {"special_cut": 0} and len(off) == 7
+    assert next(r for r in off if r["馬番"] == "1" and r["odds_mode"] == "odds10u")["_n_inds"] == 2
+    on = app.special_hits(rows, True, info := {})
+    assert info == {"special_cut": 2} and len(on) == 6 and all(r["馬番"] != "3" for r in on)
+    one = next(r for r in on if r["馬番"] == "1" and r["odds_mode"] == "odds10u")
+    assert one["base"] == "瞬発" and one["_n_inds"] == 1                                 # カットした行は代表にも指数数にも入らない
+    # 並び: オッズ帯（2〜10倍未満 → 10〜50倍 → 50倍以上 → 通常）→ 馬番 → 複勝率の大きい順
+    assert [(r["odds_mode"], r["馬番"]) for r in on] == [("odds10u", "1"), ("odds10u", "2"), ("odds10u", "4"),
+                                                         ("odds10_50", "1"), ("odds50p", "1"), ("normal", "1")]
+
