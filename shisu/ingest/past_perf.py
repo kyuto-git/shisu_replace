@@ -24,7 +24,7 @@ def run(base: pd.DataFrame, out_dir: Path, log: Logger = default_log, baba_turf:
         baba_dirt: str = PP.BABA_AUTO, csv_dir=None, result_dir=None, master_dir=None, settings_path=None) -> Outputs:
     turf, dirt = PP.norm_baba_choice(baba_turf), PP.norm_baba_choice(baba_dirt)
     history = PP.get_history(csv_dir, result_dir, master_dir, log)
-    if history is None:
+    if history is None or not history.has_results:
         raise RuntimeError("結果指数がありません。result_indices/ に SP指数（SP*.csv・speed*.zip）・ST指数（st_se*.csv・st_se*.zip）を"
                            "置き、csv_files/ に過去の基本CSV（全場_タイムM.csv など）がある状態で実行してください")
     t = PP.target_frame(base)

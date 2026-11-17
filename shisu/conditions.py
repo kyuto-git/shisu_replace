@@ -1,4 +1,4 @@
-"""集計キーに使う条件（22種）の導出。過去側（TARGET ★6タブの過去レースCSV）と出馬表側（TARGET 出馬表）で共通。
+"""集計キーに使う条件（22種 ＋ 外部レース印の前走条件4種 ＋ 近5走の要約2種）の導出。過去側（TARGET ★6タブの過去レースCSV）と出馬表側（TARGET 出馬表）で共通。
 
 両側の列名の違いは standardize_history / standardize_entries で吸収し、同じ derive() を通す
 （過去側と出馬表側でキーの部品が必ず同じ値になるようにするため）。
@@ -21,7 +21,16 @@
   距離増減      今走 − 前走: 同距離 / 延長200 / 延長400 / 延長400超 / 短縮200 / 短縮400 / 短縮400超
   前走着順・前走人気・前走上り3F順   1以上の整数（帯はキーを作るときに s1/s2 で付ける。上り3F順の 0 は空）
   前走脚質      逃げ / 先行 / 中団 / 後方（出馬表の 逃/先/中/後 も同じに。マクリ・不明は空）
-  前走R印3      HHH~HH / H / M / S / SS~SSS
+  前走R印3      HHH~HH / H / M / S / SS~SSS（空なら、外部レース印のペース判定 pace*.csv で補う）
+外部レース印（shisu/race_marks.py。前走のレースID(新)先頭16桁 = 前走RID16 で引く。印が無ければ空）:
+  前走メンバーLv    A / B / C / D / E
+  前走タイムLv      S / A / B / C / D / E
+  前走クッション帯  前走が芝のときだけ: 軟(8.9以下) / 標準(9.0~9.9) / 硬(10.0以上)
+  前走含水率帯      前走が芝: 芝乾(9.9以下) / 芝標準(10.0~14.9) / 芝湿(15.0以上)
+                    前走がダ: ダ乾(4.9以下) / ダ標準(5.0~9.9) / ダ湿(10.0以上)
+近5走の要約（shisu/past_perf_indices.py の recent_form。馬ごとの過去走の履歴から。derive には recent で渡す）:
+  近5走同条件      600日以内の直近5走のうち、同じ芝・ダ・距離差200以内の走の最高着順: 同条件連対あり / 同条件3着あり / 同条件4着以下
+  近5走同場        同じく、同じ場所・同じ芝・ダの走の最高着順: 同場連対あり / 同場3着あり / 同場4着以下
 """
 from __future__ import annotations
 
@@ -37,6 +46,10 @@ from . import course
 CONDITION_COLUMNS = ("時期", "輸送距離", "間隔帯", "叩き", "R値帯", "直線帯", "初角帯", "CFS帯", "F係数帯",
                      "今走クワドラント", "左右", "左右遷移", "距離帯", "坂", "前走クワドラント", "斤量帯", "斤量増減",
                      "牝馬限定", "距離増減", "前走着順", "前走人気", "前走上り3F順", "前走脚質", "前走R印3")
+# 外部レース印（race_marks/）から作る前走条件と、馬ごとの過去走の履歴から作る近5走の要約（2026-11-17〜）
+MARK_CONDITIONS = ("前走メンバーLv", "前走タイムLv", "前走クッション帯", "前走含水率帯")
+RECENT_CONDITIONS = ("近5走同条件", "近5走同場")
+CONDITION_COLUMNS = CONDITION_COLUMNS + MARK_CONDITIONS + RECENT_CONDITIONS
 # 帯をキーのときに付ける条件（値は整数）と、その帯の名前の種類（hensachi.BAND_UNITS）
 BANDED_CONDITIONS = {"前走着順": "finish", "前走人気": "pop", "前走上り3F順": "agari"}
 STD_COLUMNS = ("日付", "場所", "芝・ダ", "距離_raw", "芝(内・外)", "所属", "間隔", "休明戦目", "斤量", "前走斤量",
@@ -270,10 +283,72 @@ def distance_change(cur: str, prev: str) -> str:
     return f"{word}400超"
 
 
-def derive(std: pd.DataFrame, inner_lookup: Mapping[str, str] | None = None) -> pd.DataFrame:
+MEMBER_LEVELS = ("A", "B", "C", "D", "E")
+TIME_LEVELS = ("S", "A", "B", "C", "D", "E")
+CUSHION_BANDS = ((9.0, "軟(8.9以下)"), (10.0, "標準(9.0~9.9)"), (None, "硬(10.0以上)"))
+MOISTURE_BANDS = {"芝": ((10.0, "芝乾(9.9以下)"), (15.0, "芝標準(10.0~14.9)"), (None, "芝湿(15.0以上)")),
+                  "ダ": ((5.0, "ダ乾(4.9以下)"), (10.0, "ダ標準(5.0~9.9)"), (None, "ダ湿(10.0以上)"))}
+
+
+def _level(v, allowed: tuple[str, ...]) -> str:
+    s = _n(v).upper()
+    return s if s in allowed else ""
+
+
+def member_level(v) -> str:
+    """メンバーレベル（レース印の値）→ A〜E。それ以外は ''。"""
+    return _level(v, MEMBER_LEVELS)
+
+
+def time_level(v) -> str:
+    """タイムレベル（レース印の値）→ S・A〜E。それ以外は ''。"""
+    return _level(v, TIME_LEVELS)
+
+
+def pace_r3(v) -> str:
+    """ペース判定（レース印の値・TARGET のレース印3）→ 前走R印3 の区分。"""
+    return _R3.get(_n(v).upper(), "")
+
+
+def _measure(v) -> float | None:
+    """クッション値・含水率の数。読めない・0 以下（計測なしの印）は None。"""
+    s = _n(v).replace("%", "")
+    try:
+        f = float(s)
+    except ValueError:
+        return None
+    return f if math.isfinite(f) and f > 0 else None
+
+
+def _band(f: float, bands) -> str:
+    for hi, label in bands:
+        if hi is None or f < hi:
+            return label
+    return ""
+
+
+def cushion_band(v, prev_surface) -> str:
+    """前走クッション帯。前走が芝で、値が数のときだけ。"""
+    f = _measure(v) if _n(prev_surface) == "芝" else None
+    return "" if f is None else _band(f, CUSHION_BANDS)
+
+
+def moisture_band(turf, dirt, prev_surface) -> str:
+    """前走含水率帯。前走が芝なら芝の含水率（含水率のファイルの1行目）、ダならダートの含水率（2行目）。"""
+    sd = _n(prev_surface)
+    if sd not in MOISTURE_BANDS:
+        return ""
+    f = _measure(turf if sd == "芝" else dirt)
+    return "" if f is None else _band(f, MOISTURE_BANDS[sd])
+
+
+def derive(std: pd.DataFrame, inner_lookup: Mapping[str, str] | None = None, marks=None,
+           recent: pd.DataFrame | None = None) -> pd.DataFrame:
     """STD_COLUMNS の DataFrame → CONDITION_COLUMNS の DataFrame（index は同じ。値は文字列、分からなければ ''）。
 
     inner_lookup: 前走のレースID(新)先頭16桁 → 芝(内・外)。内外の分からない前走コースを引くときに使う。
+    marks: 外部レース印（shisu.race_marks.RaceMarks）。前走RID16 で引いて 前走メンバーLv などにする。無ければ空。
+    recent: 近5走の要約（RECENT_CONDITIONS の列。index は std と同じ。past_perf_indices.recent_form の結果）。無ければ空。
     """
     out = pd.DataFrame(index=std.index)
     out["時期"] = std["日付"].map(season)
@@ -306,7 +381,24 @@ def derive(std: pd.DataFrame, inner_lookup: Mapping[str, str] | None = None) -> 
     out["前走人気"] = std["前走人気"]
     out["前走上り3F順"] = std["前走上り3F順"].map(lambda s: s if s and int(s) >= 1 else "")
     out["前走脚質"] = std["前走脚質"].map(lambda s: _STYLE.get(s, ""))
-    out["前走R印3"] = std["前走R印3"].map(lambda s: _R3.get(s, ""))
+    r3 = std["前走R印3"].map(lambda s: _R3.get(s, ""))
+    prev_sd = std["前走芝ダ"].tolist()
+    if marks is not None and len(marks):
+        recs = [marks.get(r) for r in std["前走RID16"].tolist()]
+    else:
+        recs = [None] * len(std)
+    get = lambda rec, f: rec[f] if rec else ""
+    # 前走R印3: 出馬表・基本CSVに値があればそれ、空ならペース判定のレース印で補う
+    out["前走R印3"] = [v or pace_r3(get(rec, "pace")) for v, rec in zip(r3.tolist(), recs)]
+    out["前走メンバーLv"] = [member_level(get(rec, "member")) for rec in recs]
+    out["前走タイムLv"] = [time_level(get(rec, "time")) for rec in recs]
+    out["前走クッション帯"] = [cushion_band(get(rec, "cushion"), sd) for rec, sd in zip(recs, prev_sd)]
+    out["前走含水率帯"] = [moisture_band(get(rec, "moist_turf"), get(rec, "moist_dirt"), sd) for rec, sd in zip(recs, prev_sd)]
+    for c in RECENT_CONDITIONS:
+        if recent is not None and c in recent.columns:
+            out[c] = recent[c].reindex(std.index).fillna("").astype(object)
+        else:
+            out[c] = ""
     return out[list(CONDITION_COLUMNS)].astype(object)
 
 

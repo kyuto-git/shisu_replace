@@ -184,15 +184,38 @@ def _paired_frames(seed: int = 5, heads: int = 12):
     return pd.DataFrame(hist), pd.DataFrame(ent)
 
 
-def _history_conditions(hist: pd.DataFrame, lookup) -> pd.DataFrame:
+def _history_conditions(hist: pd.DataFrame, lookup, marks=None) -> pd.DataFrame:
     import replace_csv_ver3 as r
     norm = r.normalize_history(hist)
-    return pd.concat([norm, C.derive(C.standardize_history(hist, norm), lookup)], axis=1)
+    return pd.concat([norm, C.derive(C.standardize_history(hist, norm), lookup, marks)], axis=1)
 
 
-def _entry_conditions(ent: pd.DataFrame, lookup) -> pd.DataFrame:
+def _entry_conditions(ent: pd.DataFrame, lookup, marks=None) -> pd.DataFrame:
     import build_db
-    return build_db.normalize_entries_df(ent, lookup)
+    return build_db.normalize_entries_df(ent, lookup, marks)
+
+
+def _marks_for(hist: pd.DataFrame, ent: pd.DataFrame):
+    """前走（JRA のレース）ごとの外部レース印。過去側は 前走レースID(新)、出馬表側は 前走開催 から同じレースを引く。
+    合成データの 前走レースID(新) は場所コードが形だけ（東京・京都以外も 05）なので、両側の ID のどちらでも同じ値が引けるように、
+    値は日付と R だけで決める。"""
+    from shisu import race_marks as RM
+    table = {}
+
+    def put(rid16: str) -> None:
+        rng = random.Random(rid16[:8] + rid16[14:16])
+        table[RM.rx_of(rid16)] = {
+            "member": rng.choice("ABCDE"), "time": rng.choice("SABCDE"), "pace": rng.choice(["HH", "M", "SS"]),
+            "cushion": f"{rng.uniform(8.0, 11.0):.1f}", "moist_turf": f"{rng.uniform(7.0, 18.0):.1f}",
+            "moist_dirt": f"{rng.uniform(2.0, 13.0):.1f}"}
+    for rid, place in zip(hist["前走レースID(新)"].fillna(""), hist["前走場所"].fillna("")):
+        if rid and place in synth.PLACE_CHAR:
+            put(rid[:16])
+    for k in ent["前走開催"].fillna(""):
+        rid16 = C._prev_rid16_from_kaisai(k)
+        if rid16:
+            put(rid16)
+    return RM.RaceMarks(table)
 
 
 @pytest.fixture(scope="module")
@@ -201,7 +224,8 @@ def paired():
     # 前走の内外の表: 過去データ（前走レースID の先頭16桁）→ 芝(内・外)。前走が京都芝1600 の馬にも効くように全部入れる
     lookup = {rid[:16]: random.Random(i).choice(["内", "外"])
               for i, rid in enumerate(hist["前走レースID(新)"].fillna("")) if rid}
-    return _history_conditions(hist, lookup), _entry_conditions(ent, lookup)
+    marks = _marks_for(hist, ent)
+    return _history_conditions(hist, lookup, marks), _entry_conditions(ent, lookup, marks)
 
 
 def test_conditions_equal_between_history_and_entries(paired):
@@ -211,8 +235,12 @@ def test_conditions_equal_between_history_and_entries(paired):
         assert h[c].tolist() == e[c].tolist(), c
     # 一致が空どうしの一致ばかりでないこと
     filled = {c: (h[c] != "").mean() for c in C.CONDITION_COLUMNS}
-    assert all(v > 0.5 for k, v in filled.items() if k not in ("前走クワドラント", "輸送距離", "左右遷移")), filled
+    partly = ("前走クワドラント", "輸送距離", "左右遷移", "前走クッション帯") + C.RECENT_CONDITIONS
+    assert all(v > 0.5 for k, v in filled.items() if k not in partly), filled
     assert filled["輸送距離"] > 0.3 and filled["前走クワドラント"] > 0.3
+    assert filled["前走クッション帯"] > 0.2                      # 前走が芝の馬だけ
+    # 近5走の要約は馬ごとの履歴から（ここでは渡していないので空。両側の一致は tests/test_condition_only.py）
+    assert all(filled[c] == 0 for c in C.RECENT_CONDITIONS)
     assert set(h["牝馬限定"]) == {"牝馬限定", "混合"}
     assert set(h["間隔帯"]) >= {"連闘", "中2-3"}
     assert set(h["前走脚質"]) >= {"逃げ", "先行", "中団", "後方"}

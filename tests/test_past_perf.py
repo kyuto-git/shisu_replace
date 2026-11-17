@@ -141,9 +141,10 @@ def test_runs_must_be_strictly_before_the_race_day_and_within_600_days():
     assert PP.select_runs(runs[:2], day, "芝", 1600, "良", True) == ([], 0)
     assert PP.select_runs([], day, "芝", 1600, "良", False) == ([], 0)
     # 新しい順（同じ日なら レースID の大きい順）は History が並べる
-    frame = pd.DataFrame([["", "ウマ", "20260101", "202601010501010201", "芝", "1600", "良", "10", ""],
-                          ["", "ウマ", "20260301", "202603010501010101", "芝", "1600", "良", "30", ""],
-                          ["", "ウマ", "20260101", "202601010501011101", "芝", "1600", "良", "20", ""]], columns=PP.HISTORY_COLUMNS)
+    frame = pd.DataFrame([["", "ウマ", "20260101", "202601010501010201", "東京", "芝", "1600", "良", "1", "10", ""],
+                          ["", "ウマ", "20260301", "202603010501010101", "東京", "芝", "1600", "良", "2", "30", ""],
+                          ["", "ウマ", "20260101", "202601010501011101", "東京", "芝", "1600", "良", "3", "20", ""]],
+                         columns=PP.HISTORY_COLUMNS)
     assert [r[5] for r in PP.History(frame).runs("SP", "", "ウマ")] == [D(30), D(20), D(10)]
 
 
@@ -495,7 +496,8 @@ def test_history_cache_keeps_names_that_cp932_cannot_encode(tmp_path):
     m = tmp_path / "master_csv"
     assert PP.get_history(tmp_path / "csv_files", tmp_path / "result_indices", m) is not None
     frame, _sig = PP.load_history_cache(m)
-    assert sorted(frame["馬名"]) == ["ホース🐎A", "ホース🐴A"]
+    assert sorted(frame["馬名"]) == ["ホース🐎A", "ホース🐎A", "ホース🐴A", "ホース🐴A"]        # 結果指数の無い走も履歴に入る
+    assert sorted(frame.loc[frame["SP"] != "", "馬名"]) == ["ホース🐎A", "ホース🐴A"]
     comp = PP.compute(PP.target_frame(raw), PP.History(frame))
     assert comp.values["過去SP_3走平均"].tolist() == ["", "", "80", "40"]
 
@@ -625,9 +627,9 @@ def test_replace_precedence_and_switches(site, tmp_path, monkeypatch, capsys):
     root, base, sp, st = site
     import replace_csv_ver3 as R
     out = tmp_path / "m"
-    # --no-past-perf: 8指数を作らない（履歴も書かない）
+    # --no-past-perf: 8指数を作らない（履歴は、近5走の条件のために書く）
     assert R.main(["--master-dir", str(out), "--no-past-perf"]) == 0
-    assert sorted(p.name for p in out.glob("master_*")) == ["master_全場_タイムM.csv.gz"] and not (out / PP.HISTORY_FILE).exists()
+    assert sorted(p.name for p in out.glob("master_*")) == ["master_全場_タイムM.csv.gz"] and (out / PP.HISTORY_FILE).exists()
     # 結果指数のフォルダが空・無い: 作らない
     out2 = tmp_path / "m2"
     assert R.main(["--master-dir", str(out2), "--result-dir", str(tmp_path / "nope")]) == 0

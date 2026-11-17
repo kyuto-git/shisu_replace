@@ -60,6 +60,8 @@ def _race_rows(rng: random.Random, date: str, venue: str, race_no: int, cond, he
 
 
 PREV_PLACES = ("東京", "中山", "京都", "新潟", "阪神", "小倉", "大井")
+# 前走のレースID(新) の場所コード（出馬表の「前走開催」から作る ID と同じレースを指すように、実際のコード。大井は地方）
+PREV_CODE = {"東京": "05", "中山": "06", "京都": "08", "新潟": "04", "阪神": "09", "小倉": "10", "大井": "44"}
 PLACE_CHAR = {"東京": "東", "中山": "中", "京都": "京", "新潟": "新", "阪神": "阪", "小倉": "小"}
 STYLES = (("逃げ", "逃"), ("先行", "先"), ("中団", "中"), ("後方", "後"), ("ﾏｸﾘ", "マ"))
 R3 = ("HHH", "HH", "Ｈ", "Ｍ", "Ｓ", "SS", "SSS", "")
@@ -82,7 +84,7 @@ def prev_run(rng: random.Random, place: str, surface: str, dist: str, date: str)
     tataki = rng.randint(1, 6)
     mare = rng.random() < 0.15
     pdate = date                              # 前走の日付（形だけ。照合の内外は京都・新潟の芝で使う）
-    prid16 = f"{pdate}{VENUE_CODE.get(pplace, '05')}0103{rng.randint(1, 12):02d}"
+    prid16 = f"{pdate}{PREV_CODE[pplace]}0103{rng.randint(1, 12):02d}"
     fw = lambda n: str(n).translate(str.maketrans("0123456789", "０１２３４５６７８９"))
     hist = {} if first else {
         "前走場所": pplace, "前芝・ダ": psd, "前距離": str(pdist), "前走レースID(新)": prid16 + "05",

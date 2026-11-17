@@ -19,8 +19,8 @@ from . import families as fam_registry
 from .conditions import CONDITION_COLUMNS
 from .csvio import read_csv_any
 from .finish import parse_finish
-from .indicators import parse_source_name
-from .naming import file_stem
+from .indicators import CONDITION_ONLY, parse_source_name
+from .naming import base_masters, file_stem
 from .odds import ODDS_MODES, odds_mask
 
 MASTER_PREFIX = "master_"
@@ -67,6 +67,8 @@ def master_files(master_dir=None) -> list[Path]:
 def find_master(region: str, indicator: str, master_dir=None) -> Path | None:
     """(地域, 指数) の master。ファイル名は集計と同じ読み方（parse_source_name）で比べる（引数からパスを組み立てない）。"""
     want = (str(region or ""), str(indicator or ""))
+    if want[1] == CONDITION_ONLY:        # 条件のみの family: 集計と同じ基準の master（地域ごとに タイムM → 対戦M → 先頭）
+        return base_masters(master_files(master_dir)).get(want[0])
     for p in master_files(master_dir):
         if parse_source_name(file_stem(p)[len(MASTER_PREFIX):]) == want:
             return p
@@ -85,7 +87,8 @@ def check_args(fam, scheme: str, mode: str) -> None:
 
 
 def extract(path, fam, scheme: str, mode: str, key: str) -> pd.DataFrame:
-    """master から、family・スキームのキーが key と同じで、オッズ帯 mode に入る馬の行（指数有効=1）。
+    """master から、family・スキームのキーが key と同じで、オッズ帯 mode に入る馬の行（指数有効=1。
+    指数を使わない family（条件のみ）は集計と同じく全部の行）。
     重複は集計と同じく レースID × 馬番（無ければ馬名）で除く。FINISH・DENOM・GOOD・RESULT の列を足す。新しい日付が上。"""
     fam = fam_registry.get(fam) if isinstance(fam, str) else fam
     check_args(fam, scheme, mode)
@@ -98,7 +101,7 @@ def extract(path, fam, scheme: str, mode: str, key: str) -> pd.DataFrame:
             columns = list(chunk.columns) if columns is None else columns
             if RID not in chunk.columns or "着順" not in chunk.columns:
                 raise DrillError(f"{path.name}: 列 {RID}・着順 がありません（master ではない可能性）")
-            if "指数有効" in chunk.columns:
+            if "指数有効" in chunk.columns and not fam.no_index:
                 chunk = chunk[chunk["指数有効"].astype(str) == "1"]
             if chunk.empty:
                 continue

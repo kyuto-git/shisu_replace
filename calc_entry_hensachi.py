@@ -239,7 +239,7 @@ def past_perf_lookups(raws: dict, baba_turf: str = "auto", baba_dirt: str = "aut
     if not names or not raws:
         return {}
     history = PP.get_history(csv_dir, result_dir, master_dir, log=log)
-    if history is None:
+    if history is None or not history.has_results:        # 結果指数のある走が無ければ、8指数は作れない
         return {}
     for path, raw in raws.items():
         for note in PP.column_notes(raw.columns, getattr(path, "name", str(path))):

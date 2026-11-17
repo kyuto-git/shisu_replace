@@ -5,6 +5,8 @@ family = 部品（parts）の並び ＋ 末尾の指数の部品（tail）
         場所・距離・芝(内・外)（コースの要素を1つずつ。COURSE とは同時に使わない）、
         shisu/conditions.py の条件（時期・輸送距離・間隔帯・叩き・R値帯・…・前走R印3）
   tail: RANK（指数順位そのもの）/ RBAND（指数順位帯。スキーム s1=細5帯・s2=広3帯）/ HBAND（偏差値帯6種）
+        / NONE（条件のみ。末尾に指数の部品を付けず、部品の値だけをつなぐ。指数に依らないので、成績表は地域ごとに
+          基準の master 1本だけで集計し、指数の名前は「条件のみ」（indicators.CONDITION_ONLY）で1回だけ出す）
   キー = 部品の値を「×」でつないだもの。部品が1つでも空なら作らない
   前走着順・前走人気・前走上り3F順 は帯にしてから使う。帯のスキームは family のスキーム（s1/s2）と同じ。
   これらを含む family は、末尾が偏差値帯でも s1・s2 の2つの集計表になる（uses_schemes）。
@@ -30,6 +32,7 @@ import pandas as pd
 
 from .conditions import BANDED_CONDITIONS, CONDITION_COLUMNS
 from .hensachi import band_labels
+from .indicators import CONDITION_ONLY
 
 SEP = "×"
 COURSE = "COURSE"
@@ -39,8 +42,9 @@ BASE_PARTS = ("重量種別", "クラス名", "枠番グループ", "騎手", "�
 # コースの要素を COURSE とは別に1つずつ使う部品（場所×芝・ダ・芝・ダ×距離 などの骨格。COURSE とは同時に使えない）
 COURSE_PARTS = ("場所", "距離", INNER_FIELD)
 PART_TOKENS = (COURSE,) + BASE_PARTS + COURSE_PARTS + tuple(CONDITION_COLUMNS)
-TAILS = ("RANK", "RBAND", "HBAND")
-TAIL_LABELS = {"RANK": "指数順位", "RBAND": "指数順位帯", "HBAND": "偏差値帯"}
+NONE = "NONE"                    # tail: 指数を使わない（条件のみ）
+TAILS = ("RANK", "RBAND", "HBAND", NONE)
+TAIL_LABELS = {"RANK": "指数順位", "RBAND": "指数順位帯", "HBAND": "偏差値帯", NONE: CONDITION_ONLY}
 PART_LABELS = {COURSE: "コース", "間隔帯": "レース間隔", "叩き": "叩き良化", "左右遷移": "左右回り遷移",
                "斤量帯": "当日斤量", "前走上り3F順": "前走上がり3F順"}
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,60}$")
@@ -72,6 +76,11 @@ class Family:
     def is_band(self) -> bool:
         """末尾が指数順位帯か。"""
         return self.tail == "RBAND"
+
+    @property
+    def no_index(self) -> bool:
+        """指数を使わない family（条件のみ）か。キーは部品の値だけ。成績表・照合の指数の名前は CONDITION_ONLY。"""
+        return self.tail == NONE
 
     def display(self) -> str:
         return self.label or (SEP.join(PART_LABELS.get(p, p) for p in self.parts) + SEP + TAIL_LABELS[self.tail])
@@ -108,7 +117,8 @@ class Family:
         cols: list[str] = []
         for p in self.parts:
             cols += list(COURSE_FIELDS) + [INNER_FIELD] if p == COURSE else [p]
-        cols.append({"RANK": "順位", "RBAND": "順位", "HBAND": "偏差値帯"}[self.tail])
+        if not self.no_index:
+            cols.append({"RANK": "順位", "RBAND": "順位", "HBAND": "偏差値帯"}[self.tail])
         return tuple(dict.fromkeys(cols))
 
 
@@ -131,6 +141,8 @@ def validate(f: Family) -> None:
         raise ValueError(f"family {f.name}: schemes は s1・s2 のどれか: {list(f.only)}")
     if f.only and not f.uses_schemes:
         raise ValueError(f"family {f.name}: schemes は指数順位帯（RBAND）か、前走着順・前走人気・前走上り3F順を含む family だけに書けます")
+    if f.name == CONDITION_ONLY:
+        raise ValueError(f"family の名前に {CONDITION_ONLY} は使えません")
     if _RESERVED_RE.match(f.name):
         raise ValueError(f"family {f.name}: 名前をオッズ帯の接頭辞（odds10u_・odds10_50_・odds50p_・odds5p_）や "
                          "rankband_ で始めることはできません（成績表のファイル名と区別できなくなる）")
@@ -241,6 +253,26 @@ def active_source() -> str:
 
 def get(name: str) -> Family | None:
     return _KNOWN.get(name)
+
+
+def is_no_index(name: str) -> bool:
+    """指数を使わない family（tail="NONE"）か。台帳に無い名前は False。"""
+    f = _KNOWN.get(name)
+    return f is not None and f.no_index
+
+
+def split_no_index(names: Iterable[str]) -> tuple[list[str], list[str]]:
+    """family の名前を (指数を使う family, 指数を使わない family) に分ける（並びはそのまま）。"""
+    indexed, plain = [], []
+    for n in names:
+        (plain if is_no_index(n) else indexed).append(n)
+    return indexed, plain
+
+
+def family_indicator(fam: "Family | str", indicator: str) -> str:
+    """その family の成績表・照合の「指数」の名前: 指数を使わない family は CONDITION_ONLY、ほかは indicator。"""
+    f = _KNOWN.get(fam) if isinstance(fam, str) else fam
+    return CONDITION_ONLY if f is not None and f.no_index else indicator
 
 
 def known_names() -> tuple[str, ...]:
@@ -369,7 +401,10 @@ def build_keys(df: pd.DataFrame, fam: Family | str, scheme: str = "") -> pd.Seri
         raise ValueError(f"{fam.name} は順位帯の family なので scheme（s1/s2）が要ります")
     pos = np.arange(len(df))
     key = None
-    for vals, multi in [_part_values(df, fam, p, scheme) for p in fam.parts] + [_tail_values(df, fam, scheme)]:
+    pieces = [_part_values(df, fam, p, scheme) for p in fam.parts]
+    if not fam.no_index:                 # 条件のみの family は、末尾に指数の部品を付けない
+        pieces.append(_tail_values(df, fam, scheme))
+    for vals, multi in pieces:
         if multi:
             lens = np.fromiter((len(vals[i]) for i in pos), dtype=np.int64, count=len(pos))
             take = np.repeat(np.arange(len(pos)), lens)
@@ -394,7 +429,8 @@ def inner_variants(inner: str) -> list[str]:
 
 
 def entry_keys(fields: Mapping, fam: Family | str, scheme: str = "") -> list[str]:
-    """出馬表側の1頭×1指数 → キーの候補（重複なし）。fields は master と同じ列名の値。"""
+    """出馬表側の1頭×1指数 → キーの候補（重複なし）。fields は master と同じ列名の値。
+    指数を使わない family（tail="NONE"）は、順位・偏差値帯を見ない（部品の値だけ）。"""
     fam = _KNOWN[fam] if isinstance(fam, str) else fam
     choices: list[list[str]] = []
     for p in fam.parts:
@@ -424,6 +460,8 @@ def entry_keys(fields: Mapping, fam: Family | str, scheme: str = "") -> list[str
         if not vs:
             return []
         choices.append(list(dict.fromkeys(vs)))
+    if fam.no_index:                     # 条件のみ: 部品の値だけ
+        return list(dict.fromkeys(SEP.join(c) for c in itertools.product(*choices)))
     if fam.tail == "RANK":
         t = str(fields.get("順位") or "")
         tails = [t] if t else []

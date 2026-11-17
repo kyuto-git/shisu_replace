@@ -150,18 +150,26 @@ def test_candidates_space():
     names = [f.name for f in cands]
     assert len(names) == len(set(names))
     assert {f.name for f in init} <= set(names)                 # 初期セットは名前のまま入る
-    assert len(S.POOL) == 28                                    # 重量種別・クラス名・枠番グループ・騎手 ＋ 22条件の24列
+    assert len(S.POOL) == 34          # 重量種別・クラス名・枠番グループ・騎手 ＋ 条件の30列（22条件の24列・レース印4・近5走2）
+    assert set(S.POOL) <= set(S.PART_CODES) and len(set(S.PART_CODES.values())) == len(S.PART_CODES)
     kinds = {}
     for _parts, kind in S.templates("default"):
         kinds[kind] = kinds.get(kind, 0) + 1
-    assert kinds == {"s0:single": 28, "s0:pair": 377, "s0:trio": 87, "s2:single": 26, "s3:single": 27,
-                     "s4:single": 27, "s5:single": 25, "s6:single": 19, "s6n:single": 17}
+    assert kinds == {"s0:single": 34, "s0:pair": 560, "s0:trio": 87, "s2:single": 32, "s3:single": 33,
+                     "s4:single": 33, "s5:single": 31, "s6:single": 25, "s6n:single": 23}
+    assert sum(kinds.values()) == 858 and (len(cands), sum(len(f.schemes) for f in cands)) == (1739, 2791)
     n_all = len(S.templates("all"))
-    assert 2000 <= n_all <= 3000                                 # 約2,000〜3,000 のテンプレート
+    assert n_all == 3433                                         # 条件が6つ増えた分（2026-11-17。それまで 2,371）
     allk = {}
     for _parts, kind in S.templates("all"):
         allk[kind] = allk.get(kind, 0) + 1
-    assert allk["s6:pair"] == 171 and allk["s2:pair"] == 325 and allk["s1:trio"] == 87
+    assert allk["s6:pair"] == 300 and allk["s2:pair"] == 496 and allk["s1:trio"] == 87
+    # 末尾の種類に NONE（条件のみ）を入れると、その分の候補が増える（名前は X_…_none。指数の候補はそのまま）
+    with_none = S.make_candidates("default", ("RBAND", "HBAND", "NONE"))
+    plain = [f for f in with_none if f.no_index]
+    assert len(plain) == 858 and all(f.name.startswith("X_") and f.name.endswith("_none") for f in plain)
+    assert [f.name for f in with_none if not f.no_index] == names
+    assert S.candidate_name(("騎手", "近5走同条件"), "NONE") == "X_jk_r5cond_none"
     assert any(f.parts == (F.COURSE, "前走着順") for f in cands)          # 初期セット D_prevfin
     assert any(f.parts == ("場所", "芝・ダ", "騎手") for f in cands)
     assert any(f.parts == (F.COURSE, "重量種別", "クラス名", "前走脚質") for f in cands)   # normal × 1条件

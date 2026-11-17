@@ -129,6 +129,26 @@ def table_name_for_foragg(path_or_stem: str) -> str:
     return t if t.startswith(FORAGG_PREFIX) else FORAGG_PREFIX + t
 
 
+MASTER_PREFIX = "master_"
+BASE_INDICATORS = ("タイムM", "対戦M")     # 条件のみの family を集計・逆引きする基準の master の優先順（無ければその地域の先頭）
+
+
+def base_masters(files) -> dict:
+    """地域 → 条件のみの family（tail="NONE"）を集計・逆引きする基準の master
+    （タイムM を優先、無ければ 対戦M、それも無ければ名前順の先頭）。files は master_{地域}_{指数名}.csv(.gz) のパス。"""
+    from pathlib import Path
+    best: dict[str, tuple[int, Path]] = {}
+    for p in sorted(Path(x) for x in files):
+        stem = file_stem(p)
+        if not stem.startswith(MASTER_PREFIX):
+            continue
+        region, indicator = parse_source_name(stem[len(MASTER_PREFIX):])
+        prio = BASE_INDICATORS.index(indicator) if indicator in BASE_INDICATORS else len(BASE_INDICATORS)
+        if region not in best or prio < best[region][0]:
+            best[region] = (prio, p)
+    return {r: p for r, (_prio, p) in sorted(best.items())}
+
+
 ENTRIES_PREFIX = "entries_"
 XJOIN_PREFIX = "entries_xjoin_"
 ENTRIES_ALL = "entries_all"

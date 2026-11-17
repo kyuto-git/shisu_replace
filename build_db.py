@@ -48,6 +48,7 @@ from shisu import families as fam_registry
 from shisu.conditions import CONDITION_COLUMNS, derive, load_inner_lookup, standardize_entries
 from shisu.csvio import norm_series, norm_text, read_csv_any
 from shisu.matching import (HIT_COLUMNS, HORSE_COLUMNS, PART_FIELDS, STAT_COLUMNS, UNIFIED, HitCache, indicator_bases,
+                            match_bases,
                             iter_hit_rows, rank_text, unified_status)
 from shisu.aggstore import (FLOAT_COLUMNS, INT_COLUMNS, RATE_NAMES, ROW_META, agg_master_files,  # noqa: F401
                             IDENTITY_KEYS, STAMP_SUFFIX, estimate_percent, iter_agg_chunks, legacy_files,
@@ -457,13 +458,21 @@ def _first_nonempty(df: pd.DataFrame, names: tuple[str, ...]) -> pd.Series:
     return out
 
 
-def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None) -> pd.DataFrame:
+def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None, marks=None, history=None) -> pd.DataFrame:
     """出馬表（calc_entry_hensachi の出力）を、キーの部品が過去側と同じ表記になるよう正規化する。
-    22条件（shisu/conditions.py）の列も足す。inner_lookup は前走の内外を引く表（replace が master_csv/ に書く）。"""
+    条件（shisu/conditions.py）の列も足す。inner_lookup は前走の内外を引く表（replace が master_csv/ に書く）。
+    marks は外部レース印（race_marks.RaceMarks。前走メンバーLv など）、history は馬ごとの過去走の履歴
+    （past_perf_indices.History。近5走同条件・近5走同場）。どちらも過去側（replace）と同じ関数を通す。無ければその列は空。"""
     df = raw.copy()
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()]
     raw = df
+    targets = None
+    if history is not None:
+        # 近5走の要約条件に使う列（馬・日付・場所・芝ダ・距離）は、元の列から先に取る
+        # （下で 距離 をレンジ統合後の値（16-18 など）に、芝・ダ を障害の印に書き換えるため）
+        from shisu import past_perf_indices as PP
+        targets = PP.target_frame(df)
     rid = norm_series(df["レースID(新)"]) if "レースID(新)" in df.columns else pd.Series("", index=df.index)
     given = df["レースID(新/馬番無)"] if "レースID(新/馬番無)" in df.columns else None
     df["レースID(新)"] = rid
@@ -516,10 +525,31 @@ def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None) ->
     for c in ENTRIES_REQUIRED:
         if c not in df.columns:
             df[c] = ""
-    cond = derive(standardize_entries(raw, df), inner_lookup)
+    recent = PP.recent_form(targets, history) if targets is not None else None
+    cond = derive(standardize_entries(raw, df), inner_lookup, marks, recent)
     for c in CONDITION_COLUMNS:
         df[c] = cond[c]
     return df
+
+
+def entries_side_sources(log=print):
+    """出馬表の条件に使う (外部レース印, 馬ごとの過去走の履歴)。
+    レース印は race_marks/ にファイルがあればそれ、無ければ master_csv/__race_marks__.csv.gz。
+    履歴は master_csv/__horse_perf_history__.csv.gz（基本CSV・結果指数が変わっていれば作り直す。calc_entry_hensachi と同じ）。
+    読めなければ、その条件を空にして続ける（WARN）。"""
+    from shisu import past_perf_indices as PP
+    from shisu import race_marks
+    try:
+        marks = race_marks.load(log=log)
+    except Exception as e:
+        log(f"[WARN] 外部レース印を読めません（{type(e).__name__}: {e}）。前走メンバーLv などは空にします")
+        marks = None
+    try:
+        history = PP.get_history(log=log)
+    except Exception as e:
+        log(f"[WARN] 過去走の履歴を用意できません（{type(e).__name__}: {e}）。近5走の条件は空にします")
+        history = None
+    return marks, history
 
 
 def load_entries_tables(con: sqlite3.Connection, entries_dir: Path) -> list[dict]:
@@ -529,8 +559,9 @@ def load_entries_tables(con: sqlite3.Connection, entries_dir: Path) -> list[dict
         return []
     loaded = []
     inner = load_inner_lookup()
+    marks, history = entries_side_sources()
     for p in files:
-        df = normalize_entries_df(read_csv_any(p), inner)
+        df = normalize_entries_df(read_csv_any(p), inner, marks, history)
         tname = table_name_for_entries(p.name)
         df.to_sql(tname, con, if_exists="replace", index=False)
         con.execute(f'CREATE INDEX IF NOT EXISTS {q("idx_" + tname + "_race")} ON {q(tname)}("レースID(新/馬番無)")')
@@ -592,7 +623,7 @@ def build_xjoin(con: sqlite3.Connection, entries_table: str, families=None) -> d
     cur = con.execute(f"SELECT * FROM {q(entries_table)}")
     names = [d[0] for d in cur.description]
     rows = [dict(zip(names, r)) for r in cur.fetchall()]
-    bases = indicator_bases(names)
+    bases = match_bases(names, families)       # 条件のみの family があれば、指数の名前「条件のみ」でも1回照合する
     total = insert_hits(con, xname, rows, bases, entries_table, families, progress=True)
     con.execute(f'CREATE INDEX {q("idx_" + xname + "_race")} ON {q(xname)}("レースID(新/馬番無)")')
     return {"table_name": xname, "source_file": entries_table, "kind": "xjoin", "n_rows": total,

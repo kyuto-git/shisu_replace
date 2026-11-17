@@ -86,13 +86,17 @@ _BABA3 = {"良": "良", "稍": "稍・重", "稍重": "稍・重", "重": "稍�
 
 HISTORY_FILE = "__horse_perf_history__.csv.gz"
 HISTORY_META = "__horse_perf_history__.json"
-HISTORY_VERSION = 2         # 2: 履歴のファイルを UTF-8 に（cp932 で書けない馬名を落とさない）・印に中身の指紋
-HISTORY_COLUMNS = ["馬ID", "馬名", "日付", RID, "芝・ダ", "距離", "馬場", "SP", "ST"]
+HISTORY_VERSION = 3         # 3: 結果指数の無い走も入れ、場所・着順を持つ（近5走の要約条件用）。2: UTF-8・印に中身の指紋
+HISTORY_COLUMNS = ["馬ID", "馬名", "日付", RID, "場所", "芝・ダ", "距離", "馬場", "着順", "SP", "ST"]
+# 近5走の要約条件（conditions.RECENT_CONDITIONS）: 600日以内の直近 RECENT_RUNS 走のうち、条件の合う走の最高着順
+RECENT_RUNS = 5
+RECENT_DIST_TOL = 200       # 「同条件」の距離差の許容（メートル）
+RECENT_COLUMNS = ("近5走同条件", "近5走同場")
 BASE_INDICATORS = ("タイムM", "対戦M")
 ALL_REGION = "全場"
 # 基本CSVから読む列（これ以外は読まない。10年分の基本CSVを丸ごと読むとメモリを使うため）
 BASE_USECOLS = ("レースID(新)", "馬番", "日付S", "血統登録番号", "馬名", "馬名S", "馬名1", "芝・ダ", "芝ダ", "距離",
-                "馬場状態", "馬場", "着順", "トラックコード(JV)")
+                "馬場状態", "馬場", "着順", "トラックコード(JV)", "場所", "頭数", "頭")
 
 
 # ---------------------------------------------------------------------------
@@ -389,12 +393,13 @@ def age_limited(age, cls="", race_name="") -> bool:
 
 def target_frame(raw: pd.DataFrame) -> pd.DataFrame:
     """基本CSV・出馬表・ベースCSVの列 → 計算に使う列（index は raw のまま）:
-    レースID(新)（18桁。読めなければ ""）・日付・馬ID・馬名・芝・ダ・距離（数。無ければ NaN）・馬場（3区分。列が無ければ ""）・限定。"""
+    レースID(新)（18桁。読めなければ ""）・日付・馬ID・馬名・場所・芝・ダ・距離（数。無ければ NaN）・馬場（3区分。列が無ければ ""）・限定。"""
     out = pd.DataFrame(index=raw.index)
     out[RID] = _rid18(raw)
     out["日付"] = _dates(raw, out[RID])
     out["馬ID"] = _col(raw, "血統登録番号").map(norm_horse_id)
     out["馬名"] = _col(raw, "馬名", "馬名S", "馬名1").map(norm_horse_name)
+    out["場所"] = _col(raw, "場所").map(lambda v: re.sub(r"\s+", "", _nfkc(v)))
     surface, dist_raw = split_surface_distance(_col(raw, "芝・ダ", "芝ダ"), _col(raw, "距離"))
     out["芝・ダ"] = surface
     out["距離"] = pd.to_numeric(distance_series(dist_raw), errors="coerce")
@@ -424,18 +429,25 @@ def column_notes(columns: Iterable[str], side: str = "") -> list[str]:
 
 
 def history_rows(raw: pd.DataFrame, results: dict[str, dict[str, Decimal]]) -> pd.DataFrame:
-    """基本CSV（過去レース）の行 → 履歴の行（HISTORY_COLUMNS）。SP・ST のどちらの値も無い走、取消・除外で走っていない走、
-    障害、レースID(新)・日付が読めない行、馬を見分けられない行（血統登録番号も馬名も無い）は入れない。"""
+    """基本CSV（過去レース）の行 → 履歴の行（HISTORY_COLUMNS）。取消・除外で走っていない走、障害、
+    レースID(新)・日付が読めない行、馬を見分けられない行（血統登録番号も馬名も無い）は入れない。
+    結果指数（SP・ST）の無い走も入れる（SP・ST は空。近5走の要約条件が使う）。
+    着順: 確定着順（数）。失格・中止は 頭数（分からなければ18。走ったが着は無い = 4着以下に数える）。空・読めない着順は ""。"""
     t = target_frame(raw)
-    ran = parse_finish(_col(raw, "着順"))["denom"] if "着順" in raw.columns else pd.Series(True, index=raw.index)
+    if "着順" in raw.columns:
+        heads = _col(raw, "頭数", "頭")
+        fl = parse_finish(_col(raw, "着順"), heads if (heads.map(_nfkc) != "").any() else None)
+        ran, num = fl["denom"], fl["finish_num"]
+    else:
+        ran, num = pd.Series(True, index=raw.index), pd.Series(float("nan"), index=raw.index)
     track = pd.to_numeric(norm_series(_col(raw, "トラックコード(JV)")), errors="coerce")
     jump = (t["芝・ダ"] == "障") | (track >= 51).fillna(False)
     sp, st = results.get("SP", {}), results.get("ST", {})
     rids = t[RID].tolist()
     t["SP"] = [fmt_raw(sp.get(r)) for r in rids]
     t["ST"] = [fmt_raw(st.get(r)) for r in rids]
-    keep = (ran & ~jump & (t[RID] != "") & (t["日付"] != "") & ((t["馬ID"] != "") | (t["馬名"] != ""))
-            & ((t["SP"] != "") | (t["ST"] != "")))
+    t["着順"] = [("" if v != v or v < 1 else str(int(v))) for v in num.tolist()]
+    keep = ran & ~jump & (t[RID] != "") & (t["日付"] != "") & ((t["馬ID"] != "") | (t["馬名"] != ""))
     h = t[keep].copy()
     h["距離"] = h["距離"].map(lambda v: "" if pd.isna(v) else str(int(v)))
     return h[HISTORY_COLUMNS].reset_index(drop=True)
@@ -453,59 +465,141 @@ def fmt_raw(d: Decimal | None) -> str:
 # 履歴（馬ごとの走）
 # ---------------------------------------------------------------------------
 Run = tuple  # (日の通し番号, レースID(新), 芝・ダ, 距離 or None, 馬場, 値)
+# 履歴の1走: (日の通し番号, レースID(新), 芝・ダ, 距離 or None, 馬場, SP or None, ST or None, 場所, 着順 or None)
+FullRun = tuple
+_F_SP, _F_ST, _F_PLACE, _F_FINISH = 5, 6, 7, 8
 
 
-def _RUN_ORDER(r: Run) -> tuple:
+def _RUN_ORDER(r: tuple) -> tuple:
     return (r[0], r[1])
 
 
 class History:
-    """馬ごとの走（新しい順）。SP・ST は別々に持つ（その指数の値がある走だけが母集団）。"""
+    """馬ごとの走（新しい順）。1走を1つのタプル（FullRun）で持ち、結果指数（SP・ST）と着順は同じ走に載せる。
+    runs(kind, …) は、その指数の値がある走だけ（SP・ST は別々の母集団）。form_runs(…) は着順のある走。"""
 
     def __init__(self, frame: pd.DataFrame):
         self.rows = len(frame)
-        self.by_id: dict[str, dict[str, list[Run]]] = {k: {} for k in KINDS}
-        self.by_name: dict[str, dict[str, list[Run]]] = {k: {} for k in KINDS}        # その馬名の全部の走
-        self.by_name_noid: dict[str, dict[str, list[Run]]] = {k: {} for k in KINDS}   # 血統登録番号の無い行だけ
-        cols = [frame[c].tolist() for c in HISTORY_COLUMNS]
-        for hid, name, date, rid, surface, dist, baba, sp, st in zip(*cols):
+        self.by_id: dict[str, list[FullRun]] = {}
+        self.by_name: dict[str, list[FullRun]] = {}          # その馬名の全部の走
+        self.by_name_noid: dict[str, list[FullRun]] = {}     # 血統登録番号の無い行だけ
+        self.result_rows = {k: 0 for k in KINDS}             # 結果指数のある走の数
+        n = len(frame)
+        cols = [frame[c].tolist() if c in frame.columns else [""] * n for c in HISTORY_COLUMNS]
+        words: dict[str, str] = {}                           # 同じ文字列（芝・良・東京 …）は1つを使い回す
+        nums: dict[int, int] = {}
+
+        def word(v) -> str:
+            t = "" if v is None or v != v else str(v)
+            return words.setdefault(t, t)
+
+        def number(v) -> int | None:
+            try:
+                k = int(float(v)) if str(v) != "" else None
+            except (TypeError, ValueError):
+                return None
+            return None if k is None else nums.setdefault(k, k)
+
+        for hid, name, date, rid, place, surface, dist, baba, fin, sp, st in zip(*cols):
             o = date_ordinal(str(date))
             if o is None:
                 continue
-            try:
-                d = int(float(dist)) if str(dist) != "" else None
-            except ValueError:
-                d = None
-            for kind, raw in (("SP", sp), ("ST", st)):
-                v = parse_value(raw)
-                if v is None:
-                    continue
-                run = (o, str(rid), str(surface), d, str(baba), v)
-                if hid:
-                    self.by_id[kind].setdefault(str(hid), []).append(run)
-                elif name:
-                    self.by_name_noid[kind].setdefault(str(name), []).append(run)
-                if name:
-                    self.by_name[kind].setdefault(str(name), []).append(run)
-        for kind in KINDS:
-            for table in (self.by_id[kind], self.by_name[kind], self.by_name_noid[kind]):
-                for runs in table.values():
-                    runs.sort(key=_RUN_ORDER, reverse=True)
+            vs, vt = parse_value(sp), parse_value(st)
+            f = number(fin)
+            run = (o, str(rid), word(surface), number(dist), word(baba), vs, vt, word(place), f if f and f >= 1 else None)
+            if vs is not None:
+                self.result_rows["SP"] += 1
+            if vt is not None:
+                self.result_rows["ST"] += 1
+            hid, name = word(hid), word(name)
+            if hid:
+                self.by_id.setdefault(hid, []).append(run)
+            elif name:
+                self.by_name_noid.setdefault(name, []).append(run)
+            if name:
+                self.by_name.setdefault(name, []).append(run)
+        for table in (self.by_id, self.by_name, self.by_name_noid):
+            for runs in table.values():
+                runs.sort(key=_RUN_ORDER, reverse=True)
 
-    def runs(self, kind: str, horse_id: str, name: str) -> list[Run]:
+    @property
+    def has_results(self) -> bool:
+        """結果指数（SP・ST）のある走が1つでもあるか（無ければ 過去SP・ST の8指数は作れない）。"""
+        return any(self.result_rows.values())
+
+    def all_runs(self, horse_id: str, name: str) -> list[FullRun]:
         """この馬の走（新しい順）。
         - 今走に血統登録番号があれば、その番号の走 ＋ 同じ馬名で番号の無い行の走（番号の列が無い期間の基本CSVの分）。
           同じ馬名でも別の番号の行（別の馬）は入れない
         - 今走に番号が無ければ（番号の列の無い出馬表など）、その馬名の全部の走"""
         if not horse_id:
-            return self.by_name[kind].get(name, []) if name else []
-        own = self.by_id[kind].get(horse_id, [])
-        extra = self.by_name_noid[kind].get(name, []) if name else []
+            return self.by_name.get(name, []) if name else []
+        own = self.by_id.get(horse_id, [])
+        extra = self.by_name_noid.get(name, []) if name else []
         if not extra:
             return own
         if not own:
             return extra
         return sorted(own + extra, key=_RUN_ORDER, reverse=True)
+
+    def runs(self, kind: str, horse_id: str, name: str) -> list[Run]:
+        """この馬の、結果指数 kind（SP / ST）の値がある走（新しい順）。値は r[5]。"""
+        i = _F_SP if kind == "SP" else _F_ST
+        return [(r[0], r[1], r[2], r[3], r[4], r[i]) for r in self.all_runs(horse_id, name) if r[i] is not None]
+
+    def form_runs(self, horse_id: str, name: str) -> list[FullRun]:
+        """この馬の、着順のある走（新しい順）。近5走の要約条件の母集団（結果指数の有無は問わない）。"""
+        return [r for r in self.all_runs(horse_id, name) if r[_F_FINISH] is not None]
+
+
+def _form_label(best: int | None, word: str) -> str:
+    if best is None:
+        return ""
+    if best <= 2:
+        return f"{word}連対あり"
+    return f"{word}3着あり" if best == 3 else f"{word}4着以下"
+
+
+def recent_form(targets: pd.DataFrame, history: History | None) -> pd.DataFrame:
+    """近5走の要約条件（RECENT_COLUMNS。index は targets と同じ。値は文字列、分からなければ ""）。
+    今走の日 D に対して D − 600日 ≦ 走った日 ＜ D の、着順のある走を新しい順に RECENT_RUNS（5）走まで取り、
+      近5走同条件: その中で「同じ芝・ダ かつ 距離差 RECENT_DIST_TOL（200）以内」の走の最高着順
+      近5走同場  : その中で「同じ場所 かつ 同じ芝・ダ」の走の最高着順
+    を 連対あり（1〜2着）/ 3着あり / 4着以下 にする（合う走が無ければ ""）。過去側（replace）と出馬表側（build_db）で共通。"""
+    out = {c: [""] * len(targets) for c in RECENT_COLUMNS}
+    if history is None or not len(targets):
+        return pd.DataFrame(out, index=targets.index, dtype=object)
+    days = [date_ordinal(str(d)) for d in targets["日付"].tolist()]
+    ids, names = targets["馬ID"].tolist(), targets["馬名"].tolist()
+    surfaces = targets["芝・ダ"].tolist()
+    places = targets["場所"].tolist() if "場所" in targets.columns else [""] * len(targets)
+    dists = [None if pd.isna(v) else float(v) for v in targets["距離"].tolist()]
+    cond, place_col = out[RECENT_COLUMNS[0]], out[RECENT_COLUMNS[1]]
+    for i in range(len(targets)):
+        day, surface = days[i], surfaces[i]
+        if day is None or not surface:
+            continue
+        lo, dist, place = day - WINDOW_DAYS, dists[i], places[i]
+        best_c = best_p = None
+        taken = 0
+        for r in history.all_runs(ids[i], names[i]):
+            if r[0] >= day:
+                continue
+            if r[0] < lo or taken >= RECENT_RUNS:
+                break
+            f = r[_F_FINISH]
+            if f is None:                        # 着順の分からない走は数えない
+                continue
+            taken += 1
+            if r[2] != surface:
+                continue
+            if dist is not None and r[3] is not None and abs(r[3] - dist) <= RECENT_DIST_TOL:
+                best_c = f if best_c is None or f < best_c else best_c
+            if place and r[_F_PLACE] == place:
+                best_p = f if best_p is None or f < best_p else best_p
+        cond[i] = _form_label(best_c, "同条件")
+        place_col[i] = _form_label(best_p, "同場")
+    return pd.DataFrame(out, index=targets.index, dtype=object)
 
 
 def select_runs(runs: list[Run], day: int, surface: str, dist: float | None, baba: str, limited: bool
@@ -686,7 +780,8 @@ def build_history_frame(bases: list[Path], files: list[ResultFile], log: Logger 
         if "血統登録番号" not in raw.columns:
             log(f"[INFO] 過去走の履歴: {p.name} に 血統登録番号 の列が無いので、馬は馬名で見分けます")
         h = history_rows(raw, results)
-        log(f"[INFO] 過去走の履歴: {p.name} {len(raw)} 行 → 結果指数のある走 {len(h)} 行")
+        with_result = int(((h["SP"] != "") | (h["ST"] != "")).sum())
+        log(f"[INFO] 過去走の履歴: {p.name} {len(raw)} 行 → {len(h)} 走（うち結果指数のある走 {with_result}）")
         frames.append(h)
     if not frames:
         return pd.DataFrame(columns=HISTORY_COLUMNS, dtype=object)
@@ -742,26 +837,37 @@ def has_result_files(result_dir: Path | str | None = None) -> bool:
     return bool(find_result_files(result_dir))
 
 
+def _frame_has_results(frame: pd.DataFrame) -> bool:
+    return bool(((frame["SP"] != "") | (frame["ST"] != "")).any())
+
+
 def get_history(csv_dir: Path | str | None = None, result_dir: Path | str | None = None,
                 master_dir: Path | str | None = None, log: Logger | None = None, rebuild: bool = False,
                 save: bool = True) -> History | None:
-    """履歴を用意する。戻り値が None なら、結果指数が無い（この8指数は作れない）。
+    """履歴を用意する。戻り値が None なら、履歴を作る元（基本CSV）も前に作った履歴も無い。
+    過去SP・ST の8指数に使えるかは History.has_results（結果指数のある走があるか）で見る。近5走の要約条件は結果指数が無くても使える。
 
-    - 元（基本CSV・結果指数のファイル）があり、master_csv/ の履歴の印がそれと同じなら、履歴のファイルを読む
+    - 基本CSVがあり、master_csv/ の履歴の印が元（基本CSV・結果指数のファイル）と同じなら、履歴のファイルを読む
     - 印が違う・履歴が無い・rebuild=True なら、元から作り直して master_csv/ に書く（save=False なら書かない）
-    - 元が無く（別の場所に master_csv だけ持ってきた など）履歴のファイルだけあれば、それを使う"""
+    - 結果指数のファイルが無いとき: 前に作った履歴に結果指数の値があれば、それを使う（別の場所に master_csv と csv_files だけ
+      持ってきたときに、8指数を落とさない）。rebuild=True（replace）のときは、今ある元から作り直す（結果指数なしの履歴になる）
+    - 基本CSVが無く履歴のファイルだけあれば、それを使う"""
     log = log or (lambda m: None)
     master_dir = Path(master_dir) if master_dir is not None else config.master_dir()
     files = find_result_files(result_dir, log)
-    bases = base_csv_paths(csv_dir) if files else []
+    bases = base_csv_paths(csv_dir)
     cached = load_history_cache(master_dir)
-    if files and bases:
+    keep_cached = (not files and cached is not None and not rebuild and _frame_has_results(cached[0]))
+    if bases and not keep_cached:
         sig = source_signature(bases, files)
         if cached is not None and cached[1] == sig and not rebuild:
             log(f"[INFO] 過去走の履歴: {HISTORY_FILE}（{len(cached[0])} 走）を使います")
             return History(cached[0])
         if cached is not None and not rebuild:
             log("[INFO] 過去走の履歴: 基本CSV・結果指数のファイルが変わったので作り直します")
+        if not files:
+            log("[INFO] 過去走の履歴: 結果指数（result_indices）のファイルが無いので、着順だけの履歴を作ります"
+                "（近5走の条件には使えます。過去SP・ST の8指数は付きません）")
         frame = build_history_frame(bases, files, log)
         if save:
             try:
@@ -771,12 +877,12 @@ def get_history(csv_dir: Path | str | None = None, result_dir: Path | str | None
                 log(f"[WARN] 過去走の履歴を {master_dir} に書けませんでした（{type(e).__name__}: {e}）。計算は続けます")
         return History(frame)
     if cached is not None:
-        why = "結果指数のファイルが無い" if not files else "基本CSV（csv_files の タイムM・対戦M）が無い"
+        why = "結果指数のファイルが無い" if bases else "基本CSV（csv_files の タイムM・対戦M）が無い"
         log(f"[INFO] 過去走の履歴: {why}ので、前に作った {HISTORY_FILE}（{len(cached[0])} 走）を使います")
         return History(cached[0])
     if (master_dir / HISTORY_FILE).exists():
         log(f"[WARN] 過去走の履歴 {master_dir.name}/{HISTORY_FILE} を読めません（壊れている・前の版のファイル）。作り直す元"
-            "（result_indices の結果指数と csv_files の基本CSV）も無いので、過去SP・ST の8指数は付けません。"
+            "（csv_files の基本CSV）も無いので、過去SP・ST の8指数と近5走の条件は付けません。"
             "replace_csv_ver3.py を回して作り直してください")
     if files and not bases:
         log("[WARN] 結果指数（result_indices）はありますが、過去走の履歴を作る基本CSV（csv_files の {地域}_タイムM.csv / "
@@ -826,5 +932,6 @@ __all__ = [
     "find_result_files", "load_results", "parse_result_text", "target_frame", "history_rows", "select_runs", "aggregate",
     "compute", "resolve_baba", "age_limited", "baba3", "norm_baba_choice", "base_csv_paths", "source_signature",
     "build_history_frame", "save_history", "load_history_cache", "get_history", "has_result_files",
-    "load_settings", "save_settings", "baba_text", "stage_text", "column_notes",
+    "load_settings", "save_settings", "baba_text", "stage_text", "column_notes", "recent_form", "RECENT_COLUMNS",
+    "RECENT_RUNS", "RECENT_DIST_TOL",
 ]

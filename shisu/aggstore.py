@@ -69,9 +69,10 @@ def prepare_agg_frame(df: pd.DataFrame) -> pd.DataFrame:
 # コンパクト化
 # ---------------------------------------------------------------------------
 def compact_mask(out: pd.DataFrame, mode: str, layer: str = "", min_count: int = COMPACT_MIN_COUNT,
-                 min_wedge: float = COMPACT_MIN_WEDGE) -> np.ndarray:
+                 min_wedge: float = COMPACT_MIN_WEDGE, indicator: str = "") -> np.ndarray:
     """成績表 out（aggregate_frame の出力。1つの family・スキーム・オッズ帯 mode）のうち残す行。
-    min_count・min_wedge が 0 以下ならその条件は使わない（区分と layer A だけで残す行を決められるように）。"""
+    min_count・min_wedge が 0 以下ならその条件は使わない（区分と layer A だけで残す行を決められるように）。
+    indicator はその成績表の指数の名前（条件のみの family は CONDITION_ONLY。区分の判定で指数の上限ゲートを見ない）。"""
     n = len(out)
     if n == 0 or layer in FULL_LAYERS:
         return np.ones(n, dtype=bool)
@@ -92,6 +93,8 @@ def compact_mask(out: pd.DataFrame, mode: str, layer: str = "", min_count: int =
                             index=sub.index)
         if "結合データ" in sub.columns:               # 希少条件（G1・重賞・長距離など）は最低件数が下がる
             vals["結合データ"] = sub["結合データ"]
+        if indicator:
+            vals["indicator"] = indicator
         for r in ("複勝率", "連対率"):
             vals[f"{r}_val"] = estimate_percent(sub[r]) if r in sub.columns else np.nan
         cats = classify_frame(vals, mode)

@@ -380,4 +380,4 @@ def test_summarize_counts_only_the_rows_in_the_denominator(master_dir):
     assert "距離" in s and s["距離"]["core_text"] == "1600" and "年" in s
     assert "輸送距離" not in s                                                                          # 値が1つも無い項目は出さない
     names = [n for n, _ in drill.SUMMARY_ITEMS]
-    assert names[:4] == ["単勝オッズ", "枠番", "馬番", "頭数"] and len(names) == 13 + 24
+    assert names[:4] == ["単勝オッズ", "枠番", "馬番", "頭数"] and len(names) == 13 + 30      # 条件は 24 + レース印4 + 近5走2

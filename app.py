@@ -44,7 +44,8 @@ from shisu.indicators import INDICATOR_ORDER, TRADEOFF_GROUPS, tradeoff_opponent
 from shisu.ingest.web import make_blueprint as make_ingest_blueprint
 from shisu.ingest.web import allowed_host, same_origin
 from shisu import families as fam_registry
-from shisu.matching import HIT_COLUMNS, UNIFIED, HitCache, indicator_bases, match_entry_row, unified_status
+from shisu.matching import (HIT_COLUMNS, UNIFIED, HitCache, indicator_bases, match_bases, match_entry_row,
+                            unified_status)
 from shisu.naming import ENTRIES_ALL, XJOIN_PREFIX, xjoin_table_for
 from shisu.odds import ODDS_BREAKS, ODDS_LABELS, ODDS_MODES, ODDS_RANK
 from shisu.wedge import DEFAULT_MAX_YEARS, DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WEDGE_FLOAT_COLUMNS
@@ -548,7 +549,7 @@ def index():
                 w += cw
                 p += cp
                 if q_preset != "none":
-                    w.append(sql_condition(q_preset, m["odds_mode"]))
+                    w.append(sql_condition(q_preset, m["odds_mode"], indicator_col="indicator"))
                 w += mw
                 p += mp
                 # 並べ替えに WEDGE などの索引を使わせない（テーブル名の索引で絞ってから並べる）
@@ -599,7 +600,7 @@ def _rank_query(con, families, inds, odds_mode, region, course, preset, mins, so
         where.append("region = ?")
         params.append(region)
     if preset != "none":   # 判定はオッズ帯で変わる（消し候補の2〜10倍未満ルール）ので帯ごとに条件を付ける
-        where.append("(" + " OR ".join(f"(odds_mode = '{m}' AND {sql_condition(preset, m)})" for m in ODDS_MODES) + ")")
+        where.append("(" + " OR ".join(f"(odds_mode = '{m}' AND {sql_condition(preset, m, indicator_col='indicator')})" for m in ODDS_MODES) + ")")
     only_sort_bound = not where and all(col == sort for name, col in MIN_FILTERS if mins.get(name) is not None)
     mw, mp, _ = _min_filters(mins)
     where += mw
@@ -897,7 +898,7 @@ def collect_hits(con, table: str, race_rows: list[dict]) -> tuple[list[dict], st
             hits = [dict(r) for r in con.execute(f'SELECT * FROM {q(xname)} WHERE "レースID(新/馬番無)" = ?', (rid,))]
             return hits, "xjoin"
         note = "on-the-fly（照合結果 xjoin が古い形式のため。build_db.py --mode entries で作り直してください）"
-    bases = indicator_bases(race_rows[0].keys())
+    bases = match_bases(race_rows[0].keys())          # 条件のみの family があれば「条件のみ」も
     # 上限つき（同じレースの馬どうしの引き直しを省く）。family が数千あると1頭で上限を超えて何度も空になり、馬どうしの再利用が
     # 減る（合成のストレス DB で照合の回数 +18%・時間 +12%。代わりにメモリは約3割減）。ふつうの規模（初期セット）では変わらない。
     # その場照合は xjoin が無い・古い形式のときだけの経路なので、メモリを優先して build_db と同じ上限にしている
@@ -911,7 +912,8 @@ def collect_hits(con, table: str, race_rows: list[dict]) -> tuple[list[dict], st
 def _hit_rec(h: dict) -> dict:
     return {"cnt": h.get("件数"), "fv": h.get("複勝率_val"), "rv": h.get("連対率_val"),
             "top5": h.get("掲示板率_val"), "frc": h.get("複勝回収値"),
-            "tra": h.get("単勝適正回収値"), "key": h.get("key")}
+            "tra": h.get("単勝適正回収値"), "key": h.get("key"),
+            "indicator": h.get("indicator") or h.get("base")}       # 条件のみの family の行は指数の上限ゲートを見ない
 
 
 def hit_category(h: dict) -> str | None:
@@ -1322,7 +1324,7 @@ def entries_hits():
         race = _race_rows(con, table, rid, legacy, request.args.get("date", "").strip())
         hits, path = collect_hits(con, table, race)
         stale = xjoin_note(con, table, path)
-        bases = order_bases(indicator_bases(table_columns(con, table)))
+        bases = order_bases(match_bases(table_columns(con, table)))
     if not race:
         return render("条件ヒット馬", '<div class="card">該当レースがありません。</div>')
     cut_low = cut_low_request()
@@ -1533,7 +1535,7 @@ def _wedge_data(p: dict):
         race = _race_rows(con, p["table"], p["rid"], p["legacy"], p["date"])
         hits, path = collect_hits(con, p["table"], race)
         p["xjoin_note"] = xjoin_note(con, p["table"], path)
-        bases = indicator_bases(table_columns(con, p["table"]))
+        bases = match_bases(table_columns(con, p["table"]))
     # connect() が DB の __families__ を台帳に反映したあとで、family の絞り込みを確かめる
     p["fams"] = [v for v in p["fams"] if v in fam_registry.active_names()]
     bases = order_bases(bases)

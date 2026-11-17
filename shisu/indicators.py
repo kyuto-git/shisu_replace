@@ -119,6 +119,11 @@ def spec_for(name) -> IndicatorSpec:
     return spec if spec is not None else IndicatorSpec(canonical_indicator(name))
 
 
+# 指数を使わない family（tail="NONE"。条件のみ）の成績表・照合結果の「指数」の名前（指数の台帳には入れない。
+# 地域ごとに基準の master 1本だけで集計して、この名前で1回だけ出す。shisu/families.py・aggregate_stats_ver2.py）
+CONDITION_ONLY = "条件のみ"
+
+
 def parse_source_name(stem: str) -> tuple[str, str]:
     """過去側ファイル名（拡張子なし）→ (地域, 正式指数名)。
 
@@ -126,15 +131,29 @@ def parse_source_name(stem: str) -> tuple[str, str]:
         '札幌_カツラキ' → ('札幌', 'カツラキ')
     '_' で区切った末尾側から、台帳にある最長の指数名を探す。見つからなければ最初の '_' で分ける。
     """
+    region, indicator = split_source_name(stem)
+    if indicator == CONDITION_ONLY:
+        return unicodedata.normalize("NFKC", region), CONDITION_ONLY
+    return unicodedata.normalize("NFKC", region), canonical_indicator(indicator)
+
+
+def split_source_name(stem: str) -> tuple[str, str]:
+    """過去側ファイル名（拡張子なし）→ (地域, 指数名) の、ファイル名に書いてあるままの文字（parse_source_name と同じ切り方）。"""
     parts = str(stem).split("_")
+    if len(parts) >= 2 and parts[-1] == CONDITION_ONLY:       # {地域}_条件のみ（指数を使わない family の成績表）
+        return "_".join(parts[:-1]), CONDITION_ONLY
     for i in range(len(parts)):
         cand = "_".join(parts[i:])
         if is_known_indicator(cand):
-            region = "_".join(parts[:i])
-            return unicodedata.normalize("NFKC", region), canonical_indicator(cand)
+            return "_".join(parts[:i]), cand
     if len(parts) >= 2:
-        return unicodedata.normalize("NFKC", parts[0]), canonical_indicator("_".join(parts[1:]))
-    return "", canonical_indicator(stem)
+        return parts[0], "_".join(parts[1:])
+    return "", str(stem)
+
+
+def condition_only_source(stem: str) -> str:
+    """master の元ファイル名（{地域}_{指数名}）→ 条件のみの成績表の元ファイル名（{地域}_条件のみ）。"""
+    return f"{split_source_name(stem)[0]}_{CONDITION_ONLY}"
 
 
 # ---------------------------------------------------------------------------

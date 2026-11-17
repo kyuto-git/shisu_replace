@@ -11,6 +11,7 @@ ingest_out/
 ext_indices/
 raw_csv/
 result_indices/
+race_marks/
 past_perf_settings.json
 selected_families.json
 *.xlsx

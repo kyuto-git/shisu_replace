@@ -125,10 +125,13 @@ docker_shisu_replace/
 ├─ csv_files/          [過去入力] 過去レースの基本CSV（全場_タイムM.csv / 全場_対戦M.csv）
 ├─ result_indices/     [結果入力] レース後に確定する結果指数（SP指数 SP*.csv・speed*.zip ／ ST指数 st_se*.csv・st_se*.zip）。
 │                                 「過去3走/5走の平均・最高」の8指数（過去SP_3走平均 など）の元 → 2章G
+├─ race_marks/         [印の入力] TARGET の外部レース印CSV 5種（member*.csv・time*.csv・pace_decision*.csv・cushion*.csv・
+│                                 moistureG*.csv）。前走条件（前走メンバーLv など）の元 → 2章H
 ├─ raw_csv/            [追加用]   半年〜1年ごとの追加分の基本CSV・前走の列パッチCSV（replace 実行時に自動統合。
 │                                 済んだファイルは raw_csv/merged_done/ へ移動）→ 1章D・2章F
 ├─ master_csv/         [過去中間] 1頭1行の正規化済みマスター（*.csv.gz：キーの部品・22条件・偏差値・順位・成績）
-│                                 ＋ __horse_perf_history__.csv.gz（馬ごとの過去走と結果指数。過去SP・ST指数の計算用）
+│                                 ＋ __horse_perf_history__.csv.gz（馬ごとの過去走・着順・結果指数。過去SP・ST指数と近5走の条件の計算用）
+│                                 ＋ __race_marks__.csv.gz（外部レース印の表。出馬表側が前走のレースIDで引く）
 ├─ agg_csv/            [過去成果] ベイズ集計＋WEDGE算出済みの成績表。master 1本につき1ファイル
 │                                 agg_master_{地域}_{指数名}.csv.gz ＋ families.json ＋ agg_settings.json
 ├─ selected_families.json  [設定] screen_families.py で選抜した family（初期セット49種の代わりに使われる）
@@ -178,10 +181,13 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m pytest
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python replace_csv_ver3.py --clean --workers 2
   ・raw_csv/ に未統合のファイルがあれば、最初に csv_files/全場_*.csv へ統合・前走の列パッチを反映します。
   ・result_indices/ に結果指数（SP指数・ST指数）があれば、過去SP・ST の8指数の master も作ります（→ 2章G）。
+  ・race_marks/ に外部レース印CSVがあれば、前走条件（前走メンバーLv・前走タイムLv・前走クッション帯・前走含水率帯）を付け、
+    前走R印3 の空欄をペース判定で補います（→ 2章H）。近5走の条件（近5走同条件・近5走同場）は、基本CSVから自動で付きます（→ 2章I）。
 
 # Step 1.5（年1回の条件見直し時のみ）: 全掛け合わせ候補を採点して、使う family を選ぶ（→ 5章）
 #   (a) 採点（重い。代表の指数で、all なら約5時間/master）
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --space all --indicators タイムM,対戦M --workers 2 --export-selected
+#       「指数なし（条件のみ）」のパターンも候補に入れるときは --tails RBAND,HBAND,NONE を付ける（→ 5章）
 #   (b) 選抜基準だけやり直す（0.5秒。採点済みの screening_report.csv から再選抜）
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --from-report --min-axis 1 --top-a 30 --export-selected
 
@@ -306,6 +312,59 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
        ・結果指数のファイルを直した・足したときは、calc_entry_hensachi.py が自動で履歴を作り直します（中身が変わったかを毎回確かめます）。
 
 
+＜H. 外部レース印5種（race_marks/ に置くファイル）→ 前走条件（2026-11-17〜）＞
+  TARGET の外部レース印（メンバーレベル・タイムレベル・ペース判定・クッション値・ゴール前含水率）を、
+  各馬の「前走のレース」で引いて、前走条件（集計キーの部品）として使います。
+  （1）置き場所とファイル名
+       ・race_marks/ の下（サブフォルダ・ZIP の中も探します。大文字小文字は問いません）
+           member*.csv          メンバーレベル（レースレベル）   例 member2026.csv
+           time*.csv            タイムレベル                     例 time2026.csv
+           pace_decision*.csv   ペース判定（pace*.csv でも可）   例 pace_decision2026.csv
+           cushion*.csv         クッション値                     例 cushion2026.csv
+           moistureG*.csv       ゴール前含水率（moisture*.csv でも可。moistureC*.csv（4コーナー）は使いません）
+       ・中身は TARGET の出力のまま（見出しなしの3列）:
+           "2026年3回福島2日目12R",RX03263212,"0E Ｂ "      ← 開催名, RX+旧8桁のレースID, 2桁のカラーコード+値
+         文字コードは cp932・UTF-8 のどちらでも読めます。同じレースが複数のファイルにあれば、名前順で後のファイルの値。
+       ・含水率のファイルは、同じレースが2行続きます（1行目 = 芝の含水率、2行目 = ダートの含水率）。
+  （2）できる前走条件（値が無い・印が「－」「----」の馬は空 → その条件を含むキーは作りません）
+       ・前走メンバーLv    : A / B / C / D / E
+       ・前走タイムLv      : S / A / B / C / D / E
+       ・前走クッション帯  : 前走が芝のときだけ  軟(8.9以下) / 標準(9.0~9.9) / 硬(10.0以上)
+       ・前走含水率帯      : 前走が芝 → 芝乾(9.9以下) / 芝標準(10.0~14.9) / 芝湿(15.0以上)
+                             前走がダ → ダ乾(4.9以下) / ダ標準(5.0~9.9) / ダ湿(10.0以上)
+       ・前走R印3 の補完   : 基本CSV・出馬表の「前走レース印３」が空の馬だけ、ペース判定（HHH/HH → HHH~HH、H、M、S、SS/SSS → SS~SSS）で埋めます。
+                             値が入っている馬は、基本CSV・出馬表の値のまま（そちらが優先）。
+  （3）使い方
+       ・過去側: race_marks/ に置いて replace_csv_ver3.py（1章A の Step 1）を回すと、master にこの列が入り、
+         印の表が master_csv/__race_marks__.csv.gz にも保存されます。読まないときは --no-race-marks。
+       ・出馬表側（毎週）: build_db.py が、出馬表の各馬の前走（「前走開催」の欄から作るレースID）で同じ値を引きます。
+         race_marks/ にファイルがあればそれを読みます（無ければ master_csv/__race_marks__.csv.gz）。
+         → 先週のレースが前走の馬にも付くように、race_marks/ のファイルは毎週 TARGET から出し直して上書きしておいてください
+           （過去側の作り直しは要りません。Step 4 の build_db.py --entries-only だけで反映されます）。
+       ・この条件を使ったパターン（family）は、screen_families.py（Step 1.5）の候補に入ります。集計に使うには
+         Step 1 → Step 1.5（選抜）→ Step 2 → Step 4 の作り直しが要ります。
+  （4）注意
+       ・照合は「年の下2桁・場所・回・日・R」で行います（RX… には月日が入っていないため）。基本CSVの 前走レースID(新) が
+         無い馬（前走が地方・海外など）は空です。
+       ・値の先頭2文字が16進（0〜9・A〜F）なら、必ずカラーコードとして取り除きます（TARGET の出力は必ず付いています）。
+       ・クッション値・含水率が 0 以下・数でないときは「値なし」として扱います。
+
+＜I. 近5走の同条件・同場での好走実績（近5走同条件・近5走同場。2026-11-17〜）＞
+  各馬の「そのレースの日より前・600日以内」の走を新しい順に最大5走取り、その中の好走実績を1つの条件にまとめます
+  （条件を細かく掛け合わせずに、適性の有無を1つの部品として使うためのもの）。
+       ・近5走同条件 : 5走のうち「今走と同じ芝・ダ かつ 距離差200m以内」の走の最高着順
+                       同条件連対あり（1〜2着）/ 同条件3着あり / 同条件4着以下 /（該当する走が無ければ空）
+       ・近5走同場   : 5走のうち「今走と同じ場所 かつ 同じ芝・ダ」の走の最高着順
+                       同場連対あり / 同場3着あり / 同場4着以下 /（該当する走が無ければ空）
+  ・元は G と同じ「馬ごとの過去走の履歴」（csv_files/ の基本CSVから作る master_csv/__horse_perf_history__.csv.gz）です。
+    結果指数（result_indices/）が無くても作られます。ファイルを置く作業はありません。
+  ・過去側は replace_csv_ver3.py、出馬表側は build_db.py が同じ関数で付けます。
+  ・失格・中止は「走ったが着なし」として4着以下に数えます。取消・除外・障害の走は数えません。
+  ・注意は G と同じです: 過去走に数えられるのは「基本CSVにある走」だけです。基本CSVを半年前までしか足していないと、
+    直近半年の走は無いものとして「近5走」を数えます（出馬表側も同じ履歴を使うので、両側の数え方は揃います）。
+    基本CSVに 血統登録番号 の列が無いと、馬は馬名で見分けます。
+
+
 --------------------------------------------------------------------------------
 3. システム全体像（内部で何をしているか）
 --------------------------------------------------------------------------------
@@ -368,6 +427,21 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
   ・採点済みレポート（screening_report.csv）から選抜基準を変えて selected_families.json を作り直す場合（0.5秒）：
     docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --from-report --min-axis 1 --top-a 30 --export-selected
   ・既定（--min-axis 25 --top-a 100）では約1,655通り（1,243 family）、--min-axis 1 --top-a 30 では4,868通り（3,531 family）が選ばれます。
+  ・2026-11-17 から、候補を作る条件に6つ（前走メンバーLv・前走タイムLv・前走クッション帯・前走含水率帯・近5走同条件・近5走同場）が
+    増えました。候補の数は --space default で 2,098 → 2,791通り、--space all で 7,557 → 10,815通り になり、採点の時間もその分かかります
+    （上の「選ばれる数」は前の候補での数字です。採点し直すと変わります）。
+  ・【指数なし（条件のみ）のパターン】（2026-11-17〜）
+    指数の順位・偏差値帯を使わず、コース・騎手・枠・条件だけの掛け合わせで絶対軸・軸候補・消し候補になるパターンも作れます。
+      docker run --rm -v "$(pwd)":/app csv_processor_shisu python screen_families.py --space all --tails RBAND,HBAND,NONE --indicators タイムM,対戦M --workers 2 --export-selected
+    ・--tails は候補の末尾の種類です（RBAND = 指数順位帯・HBAND = 偏差値帯・RANK = 指数順位・NONE = 条件のみ。既定は RBAND,HBAND）。
+    ・条件のみのパターンは指数に依らないので、採点も本集計（Step 2）も「地域ごとに基準の master 1本」（タイムM、無ければ 対戦M、
+      それも無ければその地域の先頭）だけで行い、その master の全部の馬（指数の欠けた馬も）を数えます。
+      成績表は agg_csv/agg_master_{地域}_条件のみ.csv.gz の1本にまとまり、画面では指数の欄が「条件のみ」になります
+      （指数の数だけ同じ成績表ができることはありません）。
+    ・条件のみのパターンには指数の帯が無いので、選抜の基準A（識別力）では選ばれず、基準B（絶対軸・軸候補のキーの数）で選ばれます。
+      数えるのが基準の master 1本ぶんなので、--min-axis の基準は指数つきのパターンより厳しめに効きます。
+    ・条件ヒット馬・WEDGE一覧・逆引きでは、ほかの行と同じに出ます。「指数が下位の条件を軸・相手にしない」の制限は掛かりません
+      （末尾が指数ではないため）。逆引きは基準の master から取り出します。
 
 
 --------------------------------------------------------------------------------
@@ -572,6 +646,20 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
   Q. 想定馬場状態を変えて計算し直したい
   A. calc_entry_hensachi.py --merge-only --clean --baba-turf 稍・重 --baba-dirt 不 → build_db.py --entries-only（過去の成績表は作り直しません）。
      過去SP・ST の指数だけ差し替えるなら --indicators 過去SP_3走平均,過去SP_5走平均,…（指数名をカンマで並べる）でも構いません。
+
+  Q. 前走メンバーLv・前走タイムLv・前走クッション帯・前走含水率帯が空の馬が多い
+  A. (1) race_marks/ にその種類のファイルがあるか（replace・build_db のログに「レース印: メンバーレベル 1 本・… → n レース」と出ます）、
+     (2) その馬の前走のレースがファイルに入っているか（前走が地方・海外・ファイルの期間より前なら空）、
+     (3) 前走クッション帯は前走が芝の馬だけ、を確認してください。出馬表側は race_marks/ を毎週出し直しておくと、先週のレースが前走の馬にも付きます（2章H）。
+
+  Q. 近5走同条件・近5走同場が空の馬が多い
+  A. 600日以内の直近5走の中に、条件の合う走（同じ芝ダ・距離差200m以内／同じ場所・同じ芝ダ）が無い馬は空です（新馬・転向初戦など）。
+     全部の馬が空なら、csv_files/ に基本CSV（全場_タイムM.csv など）があるか、master_csv/__horse_perf_history__.csv.gz ができているかを確認してください（2章I）。
+
+  Q. 指数なし（条件のみ）のパターンを使いたい
+  A. screen_families.py に --tails RBAND,HBAND,NONE を付けて選抜し（5章）、Step 2 → Step 4 を回してください。
+     selected_families.json に手で {"name": "N_jk_r5", "parts": ["騎手", "近5走同条件"], "tail": "NONE"} のように書いても使えます。
+     画面では指数の欄が「条件のみ」になり、成績表は agg_csv/agg_master_{地域}_条件のみ.csv.gz に入ります。
 
   Q. 危険条件メモはどこに保存される？ DB を作り直したら消える？
   A. プロジェクト直下の condition_notes.json です。racing.db の外なので、build_db.py --fresh でも消えません（6章(3)）。

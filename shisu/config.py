@@ -71,6 +71,13 @@ def result_indices_dir() -> Path:
     return Path(env) if env else base_dir() / "result_indices"
 
 
+def race_marks_dir() -> Path:
+    """TARGET の外部レース印（メンバーレベル・タイムレベル・ペース判定・クッション値・含水率）の置き場。前走条件の元
+    （shisu/race_marks.py）。"""
+    env = os.environ.get("RACE_MARKS_DIR")
+    return Path(env) if env else base_dir() / "race_marks"
+
+
 def past_perf_settings_path() -> Path:
     """過去SP・ST指数の想定馬場状態（/ingest の画面で選んだ値）。calc_entry_hensachi が --baba-* の既定として読む。"""
     env = os.environ.get("PAST_PERF_SETTINGS")
