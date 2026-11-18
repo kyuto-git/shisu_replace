@@ -519,8 +519,13 @@ def main(argv=None) -> int:
         return 2
     if args.mining_only:
         targets += [t for t in MINING_INDICATORS if t not in targets]
+    # 一部の指数だけの差し替えでは、省いた想定の馬場は「前の計算で使った想定」（entries_out/ の記録）にする
+    # （差し替えない 過去SP・ST の指数は前の想定の値のままなので、設定ファイル・auto に戻すと想定が混ざる）
+    used_before = PP.load_used_baba(args.out_dir) if targets else None
     try:
-        baba_turf, baba_dirt, baba_from = resolve_baba(args.baba_turf, args.baba_dirt)
+        baba_turf, baba_dirt, baba_from = resolve_baba(
+            args.baba_turf if args.baba_turf is not None or not used_before else used_before["baba_turf"],
+            args.baba_dirt if args.baba_dirt is not None or not used_before else used_before["baba_dirt"])
     except ValueError as e:
         print(f"[ERROR] --baba-turf / --baba-dirt: {e}", file=sys.stderr)
         return 2
@@ -558,7 +563,14 @@ def main(argv=None) -> int:
             lookups = {} if args.no_ext else load_ext(Path(args.ext_dir), only=targets)
             computed = perf(only=targets)
             if computed:                               # 過去SP・ST を計算し直した: 使った想定を残す（build_db が読む）
-                PP.save_used_baba(out_dir, baba_turf, baba_dirt)
+                now = {"baba_turf": PP.norm_baba_choice(baba_turf), "baba_dirt": PP.norm_baba_choice(baba_dirt)}
+                if used_before is None or used_before == now or set(PP.INDICATORS) <= set(targets):
+                    PP.save_used_baba(out_dir, baba_turf, baba_dirt)
+                else:                                  # 8指数の一部だけを、前と違う想定で計算し直した: 記録は前のまま
+                    print(f"[WARN] 過去SP・ST: {'・'.join(t for t in targets if t in PP.INDICATORS)} だけを、前と違う想定の馬場状態"
+                          f"（{PP.baba_text(baba_turf, baba_dirt)}）で計算し直しました。ほかの 過去SP・ST の指数は前の想定"
+                          f"（{PP.baba_text(used_before['baba_turf'], used_before['baba_dirt'])}）の値のままで、build_db もその想定で"
+                          "基準値を引きます。想定をそろえるには --merge-only --clean で全部計算し直してください")
             lookups.update(computed)                   # 計算した値を優先（ext_indices/past_sp_st のファイルより）
             if refresh_indicators(raws, merged_path, targets, lookups):
                 return 0

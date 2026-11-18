@@ -605,7 +605,8 @@ def test_rank_bands_of_past_sp_st_make_the_same_keys_on_both_sides():
     f = F.Family("X_stb_st3", ("過去ST今走基準比", "過去ST3走順"), "RBAND")
     h = F.Family("X_spb_sp3_hen", ("過去SP今走基準比", "過去SP3走順"), "HBAND")
     nidx = F.Family("X_stb_st3_none", ("過去ST今走基準比", "過去ST3走順"), "NONE")
-    for fam in (f, h, nidx):
+    rk = F.Family("X_sp3_rank", ("過去SP3走順",), "RANK")
+    for fam in (f, h, nidx, rk):
         F.validate(fam)
         assert fam.uses_schemes and fam.schemes == ("s1", "s2")          # 帯にする条件なので、どの末尾でも s1・s2
     df = pd.DataFrame({"過去ST今走基準比": ["ST平均基準超", "ST今走基準未達", "ST平均基準超", ""], "過去ST3走順": ["2", "7", "", "1"],
@@ -616,15 +617,27 @@ def test_rank_bands_of_past_sp_st_make_the_same_keys_on_both_sides():
     assert F.build_keys(df, h, "s1").tolist() == ["SP3走最高基準超×SP3走1位×61~65", "SP3走最高基準超×SP3走10位~×71以上",
                                                   "SP3走最高基準超×SP3走4~5位×51~60"]
     assert F.build_keys(df, nidx, "s2")[lambda s: s.index == 1].tolist() == ["ST今走基準未達×ST3走6位~"]
-    for fam in (f, h, nidx):
+    assert F.build_keys(df, rk, "s1").tolist() == ["SP3走1位×4", "SP3走10位~×1", "SP3走4~5位×2"]      # 末尾が指数順位でも帯はスキームどおり
+    assert sorted(F.build_keys(df, rk, "s2")[lambda s: s.index == 0]) == ["SP3走1~3位×4", "SP3走1~5位×4"]
+    from shisu import matching
+    from shisu.indicators import CONDITION_ONLY
+    for fam in (f, h, nidx, rk):
         for sc in ("s1", "s2"):
             past = F.build_keys(df, fam, sc)
             for i, row in df.iterrows():
                 assert sorted(F.entry_keys(row.to_dict(), fam, sc)) == sorted(past[past.index == i].tolist()), (fam.name, sc, i)
+    # 照合の窓口（matching.entry_fields）を通しても同じ: 条件のみ（順位・偏差値帯を見ない）でも 3走順の部品は残る
+    for i, row in df.iterrows():
+        entry = {**row.to_dict(), "オメガ指数_順位": row["順位"], "オメガ指数_偏差値帯": row["偏差値帯"]}
+        for fam, base in ((nidx, CONDITION_ONLY), (f, "オメガ指数"), (rk, "オメガ指数")):
+            got = {k for sc in ("s1", "s2") for k in F.entry_keys(matching.entry_fields(entry, base), fam, sc)}
+            want = {k for sc in ("s1", "s2") for k in F.build_keys(df, fam, sc)[lambda s: s.index == i].tolist()}
+            assert got == want, (fam.name, i)
     # その指数自身の順位を部品にした family は、その指数の master では作らない
     assert F.is_self_redundant(h, "過去SP_3走平均") and not F.is_self_redundant(h, "過去ST_3走平均")
     assert F.is_self_redundant(f, "過去ST_3走平均") and not F.is_self_redundant(f, "過去ST_5走平均") and not F.is_self_redundant(f, "オメガ指数")
     assert not F.is_self_redundant(nidx, "過去ST_3走平均")                # 条件のみは基準の master で1回だけ（対象外）
+    assert F.is_self_redundant(rk, "過去SP_3走平均") and not F.is_self_redundant(rk, "過去SP_3走最高")     # 末尾が指数順位でも
     assert not F.is_self_redundant(F.Family("X_spb", ("過去SP今走基準比",), "RBAND"), "過去SP_3走平均")
 
 
@@ -658,6 +671,8 @@ FAMILIES = [
     {"name": "X_pspb", "parts": ["前走SP基準比"], "tail": "RBAND"},
     {"name": "X_sp3", "parts": ["過去SP3走順"], "tail": "RBAND"},
     {"name": "N_stb_pstb", "parts": ["過去ST今走基準比", "前走ST基準比"], "tail": "NONE"},
+    {"name": "N_stb_st3", "parts": ["過去ST今走基準比", "過去ST3走順"], "tail": "NONE"},
+    {"name": "X_sp3_rank", "parts": ["過去SP3走順"], "tail": "RANK"},
 ]
 AGG_ARGS = ["--wedge-min-year-count", "2", "--no-compact"]
 MIN_ARGS = ["--baseline-min-samples", "30"]
@@ -863,14 +878,25 @@ def test_tables_and_hits_use_the_new_parts_and_skip_self_synonyms(site):
     assert ("X_sp3", "過去SP_5走平均") in by and ("X_sp3", "過去ST_3走平均") in by and ("X_spb_sp3_hen", "タイムM") in by
     assert ("X_pspb", "過去SP_3走平均") in by                             # 順位の部品が無い family は作る
     assert {i for f, i in by if f == "N_stb_pstb"} == {"条件のみ"}
+    # 条件のみで帯の部品を持つ family・末尾が指数順位の family
+    none_re = re.compile(r"^ST(平均基準超|3走最高基準超|5走最高基準超|今走基準未達)×ST3走(\d+位|\d+~\d+位|\d+位~)$")
+    got = by[("N_stb_st3", "条件のみ")]
+    assert {i for f, i in by if f == "N_stb_st3"} == {"条件のみ"} and len(got) > 10
+    assert all(none_re.match(r["key"]) for r in got) and {r["rank_scheme"] for r in got} == {"s1", "s2"}
+    assert ("X_sp3_rank", "過去SP_3走平均") not in by and ("X_sp3_rank", "過去SP_5走平均") in by
+    rank_re = re.compile(r"^SP3走(\d+位|\d+~\d+位|\d+位~)×\d+$")
+    assert all(rank_re.match(r["key"]) for r in by[("X_sp3_rank", "タイムM")]) and {r["rank_scheme"] for r in by[("X_sp3_rank", "タイムM")]} == {"s1", "s2"}
     assert any(r["key"].startswith("ST平均基準超×前走ST基準") for r in by[("N_stb_pstb", "条件のみ")])
     # 照合結果: 出馬表の馬の部品から作ったキーで当たっている
-    hits = [dict(r) for r in con.execute("SELECT * FROM entries_xjoin_merged_hensachi WHERE family IN ('X_stb_st3', 'X_spb_sp3_hen', 'X_pspb')")]
-    assert len(hits) > 20 and {h["family"] for h in hits} == {"X_stb_st3", "X_spb_sp3_hen", "X_pspb"}
+    hits = [dict(r) for r in con.execute("SELECT * FROM entries_xjoin_merged_hensachi WHERE family IN "
+                                         "('X_stb_st3', 'X_spb_sp3_hen', 'X_pspb', 'N_stb_st3', 'X_sp3_rank') ORDER BY family, base")]
+    assert len(hits) > 20 and {h["family"] for h in hits} == {"X_stb_st3", "X_spb_sp3_hen", "X_pspb", "N_stb_st3", "X_sp3_rank"}
+    assert {h["base"] for h in hits if h["family"] == "N_stb_st3"} == {"条件のみ"}       # 条件のみは base = 条件のみ で1回だけ
     ents = {r[RID]: dict(r) for r in con.execute("SELECT * FROM entries_merged_hensachi")}
     from shisu import matching
     F.configure(root / "selected_families.json", log=lambda m: None)
-    for h in hits[:200]:
+    step = max(1, len(hits) // 400)
+    for h in [*hits[::step], *(x for x in hits if x["family"] in ("N_stb_st3", "X_sp3_rank"))]:
         fields = matching.entry_fields(ents[h[RID]], h["base"])
         assert h["key"] in F.entry_keys(fields, F.get(h["family"]), h["rank_scheme"] or ""), h["key"]
     assert not any(h["family"] == "X_sp3" and h["base"] == "過去SP_3走平均" for h in
@@ -1082,6 +1108,27 @@ def test_assumed_going_from_calc_and_partial_rebuild(site, capsys):
         record.write_text("こわれた", encoding="utf-8")                        # 記録が読めなければ設定ファイル
         _rc, fallback = entries_table(root)
         assert fallback["過去SP今走基準比"].tolist() == want("良", "良", fallback)
+        # 一部の指数だけの差し替え（--indicators）: 省いた想定は前の計算の記録から（設定ファイル・auto に戻して想定を混ぜない）
+        record.unlink()
+        PP.config.past_perf_settings_path().unlink()
+        assert calc_entry_hensachi.main(["--merge-only", "--clean", "--baba-turf", "稍・重", "--baba-dirt", "稍・重"]) == 0
+        mid = {"baba_turf": "稍・重", "baba_dirt": "稍・重"}
+        merged = root / "entries_out" / "entries_merged_hensachi.csv"
+        before_bytes = merged.read_bytes()
+        assert json.loads(record.read_text(encoding="utf-8")) == mid
+        assert calc_entry_hensachi.main(["--indicators", "過去SP_5走最高"]) == 0
+        assert json.loads(record.read_text(encoding="utf-8")) == mid and merged.read_bytes() == before_bytes   # 同じ想定で計算 → 同じ値
+        capsys.readouterr()
+        assert calc_entry_hensachi.main(["--indicators", "過去SP_5走最高", "--baba-turf", "不", "--baba-dirt", "不"]) == 0
+        assert "だけを、前と違う想定の馬場状態" in capsys.readouterr().out               # 一部だけ違う想定: 記録は前のまま（WARN）
+        assert json.loads(record.read_text(encoding="utf-8")) == mid and merged.read_bytes() != before_bytes
+        assert calc_entry_hensachi.main(["--indicators", ",".join(PP.INDICATORS), "--baba-turf", "不", "--baba-dirt", "不"]) == 0
+        assert json.loads(record.read_text(encoding="utf-8")) == {"baba_turf": "不", "baba_dirt": "不"}     # 8指数とも計算し直した → 記録も
+        record.unlink()                                                             # 記録が無ければ、差し替えでも残す
+        assert calc_entry_hensachi.main(["--indicators", "過去ST_3走平均", "--baba-dirt", "良"]) == 0
+        assert json.loads(record.read_text(encoding="utf-8")) == {"baba_turf": "auto", "baba_dirt": "良"}
+        assert calc_entry_hensachi.main(["--mining-only"]) == 0                     # 過去SP・ST を計算し直さない差し替えは記録に触らない
+        assert json.loads(record.read_text(encoding="utf-8")) == {"baba_turf": "auto", "baba_dirt": "良"}
     finally:
         PP.config.past_perf_settings_path().unlink(missing_ok=True)
         assert calc_entry_hensachi.main(["--merge-only", "--clean"]) == 0
