@@ -391,6 +391,9 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
          ログ: [INFO] 基準値（SP）: 3着馬 n 件（最新年 2026・decay 0.65・全体平均 62）→ 467 セル を … に書きました
        ・3着馬の標本が 2,000 件に満たないときは作り直しません（数か月ぶんのデータで10年ぶんの基準値を置き換えないため）。
          そのときは今のファイルをそのまま使います。下げるなら --baseline-min-samples N、作り直させないなら --no-baseline-update。
+       ・--csv-dir・--result-dir・--master-dir を別の場所にした「試しの実行」では、いつもの基準値マスタを書き換えません
+         （そのデータで作りたいときは --baseline-dir DIR で置き場所を指定します）。
+       ・片方のファイルが読めない・無いときは [WARN] を出して、その種類（SP か ST）の基準比だけ空にします。
        ・基準値だけ作り直すコマンド（中身を見るだけなら --update を外す）:
            docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m shisu.baselines --update
          ※ これだけでは master・出馬表には効きません。Step 1（replace）→ Step 2 → Step 4 を回してください。

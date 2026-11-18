@@ -7,6 +7,7 @@ import re
 import shutil
 import sqlite3
 import statistics
+from fractions import Fraction
 from pathlib import Path
 
 import pandas as pd
@@ -72,8 +73,9 @@ def o_now_label(kind, a3, a5, m3, m5, b):
 def o_build(samples, decay):
     """(芝ダ, クラス, 馬場区分, 場所区分, 距離帯, 年, 値) → {key: 行}。依頼の手順をそのまま書いたもの。"""
     ymax = max(s[5] for s in samples)
-    items = [(s[:5], s[6], decay ** (ymax - s[5])) for s in samples]
-    wmean = lambda xs: sum(v * w for v, w in xs) / sum(w for _v, w in xs)
+    d = Fraction(str(float(decay)))
+    items = [(s[:5], s[6], d ** (ymax - s[5])) for s in samples]
+    wmean = lambda xs: sum(Fraction(str(v)) * w for v, w in xs) / sum(w for _v, w in xs)   # 分数で（誤差なし）
     root = round(wmean([(v, w) for _k, v, w in items]))
     levels = {"L3": lambda k: (k[0], k[1], k[2]), "L2": lambda k: (k[0], k[1], k[2], k[4]), "L1": lambda k: k}
     parents = {"L3": lambda key: None, "L2": lambda key: key[:3], "L1": lambda key: key[:3] + key[4:]}
@@ -90,7 +92,7 @@ def o_build(samples, decay):
             m = round(wmean(kept))
             pkey = parents[level](key)
             base = root if pkey is None else final[pkey]
-            mean = round((n * m + 30 * base) / (n + 30))
+            mean = round(Fraction(n * m + 30 * base, n + 30))
             final[key] = mean
             out[" × ".join(key)] = {
                 "level": level, "n": n, "index_mean": mean, "reliability": "高" if n >= 100 else ("中" if n >= 30 else "低"),
@@ -142,7 +144,7 @@ def test_lookup_falls_back_level_by_level():
     assert t.lookup("ダ", "2勝", "良稍", "主場", "ダマイル") == 50
     assert t.lookup("ダ", "2勝", "重不良", "主場", "ダマイル") is None          # L3 も無ければ None
     assert t.lookup("芝", "3勝", "良", "主場", "芝マイル") is None
-    text = "level,key,index_mean\nL3,芝×2勝×良,60\nL3, ダ × 2勝 × 良稍 ,51.0\nL3,bad,x\n"
+    text = "level,key,index_mean\nL3,芝×2勝×良,60\nL3, ダ × 2勝 × 良稍 ,51.0\nL3,bad,x\nL3,芝×3勝×良,1e999\nL3,芝×3勝×良以外,nan\n"
     got = B.parse_csv(text)                                                       # × の前後の空白はそろえる・読めない行は飛ばす
     assert got.cells == {"芝 × 2勝 × 良": 60, "ダ × 2勝 × 良稍": 51}
     for bad in ("", "a,b\n1,2\n", "level,key,index_mean\n"):
@@ -166,6 +168,7 @@ def test_generation_and_race_class():
                                   ("GIII", "4上"))] == \
         ["2歳未勝利", "3歳未勝利", "2歳1勝", "3歳1勝", "古馬1勝", "2勝", "2勝", "3勝", "3勝", "2歳OP", "3歳OP", "古馬OP", "古馬OP",
          "2歳重賞", "3歳重賞", "古馬重賞", "古馬重賞"]
+    assert [rc(c, "3上") for c in ("(L)", "リステッド", "OP", "ＯＰ（Ｌ）", "オープン")] == ["古馬OP"] * 5
     assert set(rc(c, a) for c in ("未勝利", "1勝", "2勝", "3勝", "オープン", "G3") for a in ("2歳", "3歳", "3上")) - {""} \
         == set(B.CLASSES) | {"2勝", "3勝"} and len(B.CLASSES) == 13
     assert rc("新馬", "2歳") == "新馬" and rc("Ｇ１", "3上") == "古馬G1" and rc("GI", "3歳") == "3歳G1" and rc("G1", "2歳") == "2歳G1"
@@ -271,6 +274,36 @@ def test_year_decay_weights_recent_seasons():
         B.build_rows([], 0.65)
 
 
+def test_exact_half_ties_and_the_weighted_root():
+    mk = lambda year, v, cls="2勝": ("芝", cls, "良", "主場", "芝マイル", year, v)
+    other = [("ダ", "3勝", "良稍", "ローカル", "ダ短距離", 2026, 70)]
+    # 残した値の平均がちょうど .5 のセルは、重みが全部同じ（同じ年）なら重みに依らず偶数丸め。
+    # （float で重みを掛けると 43.49999999999999 のようにずれて、別のセルに新しい年の標本があるだけで丸めが変わる）
+    for year in (2026, 2025, 2022, 2020, 2017):
+        for a in range(20, 60):
+            for decay in (1.0, 0.65, 0.9):
+                rows, _ = B.build_rows([mk(year, a), mk(year, a + 1), *other], decay)
+                assert rows_by_key(rows)["芝 × 2勝 × 良"]["index_raw"] == (a if a % 2 == 0 else a + 1), (year, a, decay)
+    # 2つの年に同じ組（a・a+1）があっても、平均は a + 0.5 ちょうど
+    for a in range(20, 60):
+        rows, _ = B.build_rows([mk(2026, a), mk(2026, a + 1), mk(2023, a), mk(2023, a + 1), *other], 0.65)
+        assert rows_by_key(rows)["芝 × 2勝 × 良"]["index_mean_全体"] == (a if a % 2 == 0 else a + 1), a
+    # 全体平均（L3 の縮約の親）: カットなし・年度の重みつき・偶数丸め
+    assert B.build_rows([mk(2026, 52), mk(2026, 53)], 0.65)[1]["root"] == 52            # 52.5 → 52
+    assert B.build_rows([mk(2026, 53), mk(2026, 54)], 0.65)[1]["root"] == 54            # 53.5 → 54
+    old_high = [mk(2026, 40)] * 3 + [("ダ", "3勝", "良稍", "ローカル", "ダ短距離", 2020, 90)] * 3
+    rows, info = B.build_rows(old_high, 0.5)                                            # 2020年の重み = 0.5 ** 6 = 1/64
+    assert info["root"] == round(Fraction(120 * 64 + 270, 3 * 64 + 3)) == 41            # 重みなしなら 65
+    assert rows_by_key(rows)["芝 × 2勝 × 良"]["index_mean"] == round(Fraction(3 * 40 + 30 * 41, 33)) == 41   # 重みなしの親なら 63
+    assert B.build_rows(old_high, 1.0)[1]["root"] == 65
+    # 縮約もちょうど .5 は偶数丸め: (30 × 51 + 30 × 50) / 60 = 50.5 → 50
+    assert B._shrink(30, 51, 50) == 50 and B._shrink(30, 52, 51) == 52 and B._shrink(10, 60, 62) == 62
+    # 信頼度の境目
+    assert [B._reliability(n) for n in (1, 29, 30, 99, 100, 5000)] == ["低", "低", "中", "中", "高", "高"]
+    for n, want in ((29, "低"), (30, "中"), (99, "中"), (100, "高")):
+        assert B.build_rows([mk(2026, 50)] * n, 1.0)[0][0]["reliability"] == want
+
+
 @pytest.mark.parametrize("seed,decay,integer", [(1, 1.0, True), (2, 0.65, True), (3, 0.9, False), (4, 0.65, True), (5, 1.0, False)])
 def test_build_rows_equals_an_independent_calculation(seed, decay, integer):
     samples = random_samples(seed, integer=integer)
@@ -310,6 +343,8 @@ def test_samples_are_third_place_finishers_of_the_13_classes():
             ("3", "70", "55", "芝", 1600, "東京", "20260105", "古馬1勝", ""),         # 馬場不明
             ("3", "70", "55", "芝", 1600, "大井", "20260105", "古馬1勝", "良"),       # JRA の10場でない
             ("3", "70", "55", "芝", "", "東京", "20260105", "古馬1勝", "良"),         # 距離不明
+            ("3", "inf", "nan", "芝", 1600, "東京", "20260105", "古馬1勝", "良"),     # 数として使えない値
+            ("3", "70", "55", "芝", 1600, "東京", "", "古馬1勝", "良"),               # 年が分からない
             ("3", "-5", "0.5", "ダ", 1200, "小倉", "20250105", "2勝", "不")]         # 負の値・小数も値
     f = history_frame(rows)
     assert B.samples_from_history(f, "SP") == [("芝", "古馬1勝", "良", "主場", "芝マイル", 2026, 70.0),
@@ -345,6 +380,25 @@ def test_update_writes_the_masters_only_with_enough_samples(tmp_path):
             {k: {c: (v if c in ("level", "reliability", "parent") else float(v)) for c, v in r.items()} for k, r in want.items()}
         assert B.load(kind, out).cells == {k: r["index_mean"] for k, r in want.items()}
     assert not list(out.glob("*.part"))
+    # 最低件数はちょうどなら更新する（1件でも足りなければしない）
+    n_sp = len(B.samples_from_history(frame, "SP"))
+    edge = tmp_path / "edge"
+    assert B.update_from_history(frame, edge, min_samples=n_sp + 1, kinds=["SP"])["SP"]["status"] == "skipped" and not edge.exists()
+    assert B.update_from_history(frame, edge, min_samples=n_sp, kinds=["SP"])["SP"]["status"] == "updated"
+    # 書き込みは一時ファイルからの置き換え: 置き換えに失敗しても、前のファイルがそのまま読める
+    held = (out / B.FILES["SP"]).read_bytes()
+    real = B.os.replace
+    def failing(src, dst):
+        raise OSError("disk full (test)")
+    B.os.replace = failing
+    try:
+        with pytest.raises(OSError):
+            B.update_from_history(frame, out, decay=1.0, min_samples=50, kinds=["SP"])
+    finally:
+        B.os.replace = real
+    assert (out / B.FILES["SP"]).read_bytes() == held and B.load("SP", out) is not None
+    for part in out.glob("*.part"):
+        part.unlink()
     before = {k: (out / B.FILES[k]).stat().st_mtime_ns for k in B.KINDS}
     res = B.update_from_history(frame, out, decay=0.65, min_samples=50)           # 同じ中身なら書き直さない
     assert {k: v["status"] for k, v in res.items()} == {"SP": "same", "ST": "same"}
@@ -446,6 +500,71 @@ def test_conditions_from_history_values_and_ranks():
     assert C.derive(std, perf=got)[list(C.BASELINE_CONDITIONS)].equals(got.astype(object))
     assert (C.derive(std)[list(C.BASELINE_CONDITIONS)] == "").all().all()
     assert hist.run_at("2020100001", "アルファ", "2026030106010101")[PP._F_BABA4] == "重" and hist.run_at("", "ベータ", "") is None
+
+
+def test_previous_run_is_this_horse_at_that_race_and_cells_use_each_races_own_place():
+    # 主場とローカルで基準値の違う表（L1）: 芝・2勝・良・芝マイル は 主場 50／ローカル 70（L2・L3 は 60）
+    table = B.Baseline("SP", {"芝 × 2勝 × 良": 60, "芝 × 2勝 × 良 × 芝マイル": 60, "芝 × 2勝 × 良 × 主場 × 芝マイル": 50,
+                              "芝 × 2勝 × 良 × ローカル × 芝マイル": 70})
+    run = lambda hid, name, date, rid, place, sp, baba="良": {
+        "馬ID": hid, "馬名": name, "日付": date, RID: rid, "場所": place, "芝・ダ": "芝", "距離": "1600", "馬場": baba, "着順": "4",
+        "SP": sp, "ST": "", "クラス": "2勝", "馬場4": baba}
+    hist = PP.History(pd.DataFrame([
+        run("2020200001", "ドウメイ", "20260501", "202605011001010103", "小倉", "65"),     # 同じレースに同じ馬名の2頭（番号が違う）
+        run("2020200002", "ドウメイ", "20260501", "202605011001010107", "小倉", "75"),
+        run("2020200003", "フルイ", "20260101", "202601010501010102", "東京", "80"),       # 履歴にあるのは古い走だけ
+        run("2020200004", "フメイ", "20260501", "202605010501010105", "東京", "49", ""),   # 前走の馬場が分からない → 良 として引く
+    ], columns=PP.HISTORY_COLUMNS))
+    raw = pd.DataFrame({"血統登録番号": ["2020200001", "2020200002", "2020200003", "2020200004"],
+                        "馬名": ["ドウメイ", "ドウメイ", "フルイ", "フメイ"], "場所": ["東京", "小倉", "東京", "東京"],
+                        "芝ダ": ["芝"] * 4, "距離": ["1600"] * 4, "クラス": ["2勝"] * 4, "年限定": ["3上"] * 4, "馬場状態": ["良"] * 4})
+    # フルイの前走は履歴に無いレース（地方・取消だった走など）。履歴の古い走で代用しない
+    prev = pd.Series(["2026050110010101", "2026050110010101", "2026040144010101", "2026050105010101"])
+    values = {"過去SP_3走平均": pd.Series(["60", "60", "-3", "49.5"]), "過去SP_5走平均": pd.Series(["55", "58", "-3", ""]),
+              "過去SP_3走最高": pd.Series(["65", "65", "-1", ""]), "過去SP_5走最高": pd.Series(["65", "69.9", "-1", ""])}
+    got = B.conditions(B.today_parts(raw), prev, hist, {"SP": table}, values, {})
+    # 前走は小倉（ローカル 70）: 番号 …01 は 65 − 70 = −5 → 未達、…02 は 75 − 70 = +5 → 突破（今走の場所・馬名だけでは決めない）
+    assert got["前走SP基準比"].tolist() == ["前走SP基準未達", "前走SP基準突破", "", "前走SP基準未達"]      # フメイ: 49 − 50（主場・良）
+    # 今走: 東京（主場 50）に 60 → 平均基準超／小倉（ローカル 70）に 60・最高 69.9 → 未達／負の値も値（未達）／49.5 < 50 → 未達
+    assert got["過去SP今走基準比"].tolist() == ["SP平均基準超", "SP今走基準未達", "SP今走基準未達", "SP今走基準未達"]
+    assert hist.run_at("2020200003", "フルイ", "2026040144010101") is None
+    assert hist.run_at("2020200003", "フルイ", "2026010105010101")[PP._F_SP] == 80
+    assert hist.run_at("2020200002", "ドウメイ", "2026050110010101")[PP._F_SP] == 75
+
+
+def test_results_of_a_previous_version_history_are_carried_over(tmp_path):
+    """版3の履歴（結果指数つき）が残っていて結果指数のファイルが無い場所（csv_files と master_csv だけ持ってきた）では、
+    履歴を捨てずに、結果指数の値を引き継いで版4にする。"""
+    base, _marks, _ent, _names = synth2.site_data(days=20)
+    csv_dir, res, master = tmp_path / "csv_files", tmp_path / "result_indices", tmp_path / "master_csv"
+    csv_dir.mkdir()
+    res.mkdir()
+    base.to_csv(csv_dir / "全場_タイムM.csv", index=False, encoding="cp932")
+    sp, _st = result_values(base)
+    (res / "SP_all.csv").write_text("".join(f"{r},{v}\n" for r, v in sp.items()), encoding="utf-8")
+    h4 = PP.get_history(csv_dir, res, master)
+    assert h4.has_results
+    frame, _sig = PP.load_history_cache(master)
+    # 前の版の形にする（クラス・馬場4 の列が無い・版3）
+    import gzip
+    old_cols = [c for c in PP.HISTORY_COLUMNS if c not in ("クラス", "馬場4")]
+    (master / PP.HISTORY_FILE).write_bytes(gzip.compress(frame[old_cols].to_csv(index=False).encode("utf-8")))
+    meta = json.loads((master / PP.HISTORY_META).read_text(encoding="utf-8"))
+    (master / PP.HISTORY_META).write_text(json.dumps({**meta, "version": 3}), encoding="utf-8")
+    assert PP.load_history_cache(master) is None
+    (res / "SP_all.csv").unlink()
+    logs = []
+    h = PP.get_history(csv_dir, res, master, logs.append)
+    assert h is not None and h.has_results and any("前の版の履歴（結果指数つき）" in m for m in logs)
+    again, _sig = PP.load_history_cache(master)                       # 版4で書き直されている（結果指数の値・クラス・馬場4 つき）
+    assert again.equals(frame) and json.loads((master / PP.HISTORY_META).read_text(encoding="utf-8"))["version"] == 4
+    logs.clear()
+    assert PP.get_history(csv_dir, res, master, logs.append).has_results and not any("前の版" in m for m in logs)
+    # replace（rebuild=True）は今ある元から作り直す（結果指数なし）。結果指数の無い版3の履歴からは引き継がない
+    assert not PP.get_history(csv_dir, res, master, rebuild=True, save=False).has_results
+    (master / PP.HISTORY_FILE).write_bytes(gzip.compress(frame[old_cols].assign(SP="", ST="").to_csv(index=False).encode("utf-8")))
+    (master / PP.HISTORY_META).write_text(json.dumps({**meta, "version": 3}), encoding="utf-8")
+    assert not PP.get_history(csv_dir, res, master).has_results
 
 
 def test_rank_bands_of_past_sp_st_make_the_same_keys_on_both_sides():
@@ -557,6 +676,11 @@ def site(tmp_path_factory, monkeypatch_module):
     (root / "result_indices" / "sub").mkdir(parents=True)
     (root / "result_indices" / "SP_all.csv").write_text("".join(f"{r},{v}\n" for r, v in sp.items()), encoding="utf-8")
     (root / "result_indices" / "sub" / "st_se_all.csv").write_text("".join(f"{r},{v}\n" for r, v in st.items()), encoding="utf-8")
+    # ext_indices の指数（形式A）: 「基準比 × ST3走順 × ほかの指数の順位帯」の道を通す
+    (root / "ext_indices" / "OMEGA").mkdir(parents=True)
+    rng = random.Random(9)
+    (root / "ext_indices" / "OMEGA" / "all_omega.csv").write_text(
+        "".join(f"{r},{rng.randint(30, 99)}\n" for r in [*base[RID], *ent[RID]]), encoding="utf-8")
     (root / "selected_families.json").write_text(json.dumps({"families": FAMILIES}, ensure_ascii=False), encoding="utf-8")
     import aggregate_stats_ver2, build_db, calc_entry_hensachi, replace_csv_ver3
     assert replace_csv_ver3.main(["--clean", *MIN_ARGS]) == 0
@@ -626,7 +750,7 @@ def test_replace_rebuilds_the_masters_from_third_place_finishers(site):
     assert json.loads((root / "master_csv" / B.MASTER_META).read_text(encoding="utf-8")) == {"version": 1, "past_perf": True}
 
 
-@pytest.mark.parametrize("indicator", ["タイムM", "対戦M", "過去ST_5走最高"])
+@pytest.mark.parametrize("indicator", ["タイムM", "対戦M", "オメガ指数", "過去ST_5走最高"])     # file・ext・perf の3つの道
 def test_masters_carry_the_six_columns(site, indicator):
     root, base, _ent, sp, st = site
     m = read_master(root, indicator)
@@ -697,12 +821,13 @@ def test_tables_and_hits_use_the_new_parts_and_skip_self_synonyms(site):
     for r in rows:
         by.setdefault((r["family"], r["indicator"]), []).append(r)
     inds = {i for _f, i in by}
-    assert {"タイムM", "対戦M", "過去SP_3走平均", "過去ST_3走平均", "条件のみ"} <= inds and len(inds) == 11
+    assert {"タイムM", "対戦M", "オメガ指数", "過去SP_3走平均", "過去ST_3走平均", "条件のみ"} <= inds and len(inds) == 12
     key_re = re.compile(r"^ST(平均基準超|3走最高基準超|5走最高基準超|今走基準未達)×ST3走(\d+位|\d+~\d+位|\d+位~)×(\d+位|\d+~\d+位|\d+位~)$")
-    for ind in ("タイムM", "過去SP_5走最高", "過去ST_5走平均"):
+    for ind in ("タイムM", "オメガ指数", "過去SP_5走最高", "過去ST_5走平均"):
         got = by[("X_stb_st3", ind)]
         assert len(got) > 20 and all(key_re.match(r["key"]) for r in got) and {r["rank_scheme"] for r in got} == {"s1", "s2"}
-    assert any(r["key"] == "ST平均基準超×ST3走1~5位×1~5位" for r in by[("X_stb_st3", "タイムM")])
+    for ind in ("タイムM", "オメガ指数"):                                  # 依頼の例: ST平均基準超 × ST3走1~5位 × 1~5位（オメガ指数）
+        assert any(r["key"] == "ST平均基準超×ST3走1~5位×1~5位" for r in by[("X_stb_st3", ind)])
     # その指数自身の順位を部品にした family は、その指数の master では作らない
     assert ("X_sp3", "過去SP_3走平均") not in by and ("X_spb_sp3_hen", "過去SP_3走平均") not in by
     assert ("X_stb_st3", "過去ST_3走平均") not in by
@@ -732,7 +857,7 @@ def test_screening_skips_self_synonyms_too(site, monkeypatch, capsys):
     report = root / "report.csv"
     assert SF.main(["--space", "default", "--tails", "RBAND", "--report", str(report), "--wedge-min-year-count", "2"]) == 0
     rep = pd.read_csv(report, dtype=str, keep_default_na=False, encoding="cp932").drop_duplicates("name").set_index("name")
-    assert rep.loc["X_sp3", "masters"] == "9" and rep.loc["X_stb_st3", "masters"] == "9" and rep.loc["X_pspb", "masters"] == "10"
+    assert rep.loc["X_sp3", "masters"] == "10" and rep.loc["X_stb_st3", "masters"] == "10" and rep.loc["X_pspb", "masters"] == "11"
     assert int(rep.loc["X_stb_st3", "groups"]) > 50
     F.configure(root / "selected_families.json", log=lambda m: None)
 
@@ -833,6 +958,32 @@ def test_replace_options_for_the_baseline(site, capsys):
     assert not (root / "master_csv" / B.MASTER_FILES["SP"]).exists()
     assert json.loads((root / "master_csv" / B.MASTER_META).read_text(encoding="utf-8")) == {"version": 1, "past_perf": False, "error": True}
     assert B.load_for_master(root / "master_csv") == {}                           # 出馬表側も付けない（master と同じ）
+    # SP の基準値マスタが読めない（別の形で保存した など）・無い: WARN を出して SP の2列だけ空に。前の実行の写しは残さない
+    assert replace_csv_ver3.main(MIN_ARGS) == 0 and (root / "master_csv" / B.MASTER_FILES["SP"]).exists()
+    for breaker in (lambda: data.write_text("レベル,キー,値\nL3,芝 × 2勝 × 良,60\n", encoding="utf-8"), data.unlink):
+        breaker()
+        capsys.readouterr()
+        assert replace_csv_ver3.main(["--no-baseline-update"]) == 0
+        out = capsys.readouterr().out
+        assert "[WARN] 基準値（SP）: index_baseline_SP.csv が" in out and "前走SP基準比・過去SP今走基準比 は空になります" in out
+        assert not (root / "master_csv" / B.MASTER_FILES["SP"]).exists() and (root / "master_csv" / B.MASTER_FILES["ST"]).exists()
+        m = read_master(root)
+        assert (m[["前走SP基準比", "過去SP今走基準比"]] == "").all().all()
+        assert m[["前走ST基準比", "過去ST今走基準比", "過去SP3走順"]].equals(full[["前走ST基準比", "過去ST今走基準比", "過去SP3走順"]])
+    # 試しの実行（--result-dir などを別の場所に）は、いつもの基準値マスタを書き換えない。--baseline-dir を指定すればそこに作る
+    data.write_bytes((REPO_DATA / B.FILES["SP"]).read_bytes())
+    trial = root / "trial_results"
+    shutil.copytree(root / "result_indices", trial)
+    capsys.readouterr()
+    assert replace_csv_ver3.main(["--result-dir", str(trial), *MIN_ARGS]) == 0
+    out = capsys.readouterr().out
+    assert "--result-dir が既定の場所と違うので、基準値マスタ" in out and "更新しません" in out
+    assert data.read_bytes() == (REPO_DATA / B.FILES["SP"]).read_bytes()
+    elsewhere = root / "trial_baseline"
+    assert replace_csv_ver3.main(["--result-dir", str(trial), "--baseline-dir", str(elsewhere), *MIN_ARGS]) == 0
+    assert (elsewhere / B.FILES["SP"]).read_bytes() == built and data.read_bytes() == (REPO_DATA / B.FILES["SP"]).read_bytes()
+    assert (root / "master_csv" / B.MASTER_FILES["SP"]).read_bytes() == built      # その実行の master は、指定した場所の基準値で引く
+    assert read_master(root).equals(full)
     # --no-past-perf: 8指数を作らない実行では、今走の基準比・3走順は空。前走の基準比は付く
     assert replace_csv_ver3.main(["--clean", "--no-past-perf", *MIN_ARGS]) == 0
     m = read_master(root)
@@ -868,4 +1019,28 @@ def test_update_command(site, capsys, monkeypatch):
         want, _root = o_build(base_samples(base, results), 0.65)
         assert o_cells(out_dir / B.FILES[kind]) == {k: r["index_mean"] for k, r in want.items()}
     assert B.main(["--update", "--csv-dir", str(root / "nope"), "--master-dir", str(root / "nope2")]) == 1
+    # 片方だけ最低件数に届く: 届いたほうだけ更新して終了コード 0
+    n_sp, n_st = len(base_samples(base, sp)), len(base_samples(base, st))
+    assert n_sp < n_st
+    part_dir = root / "partial"
+    capsys.readouterr()
+    assert B.main(["--update", "--min-samples", str(n_st), "--out-dir", str(part_dir)]) == 0
+    assert "基準値（SP）: 3着馬のサンプルが" in capsys.readouterr().out
+    assert (part_dir / B.FILES["ST"]).exists() and not (part_dir / B.FILES["SP"]).exists()
+    # --result-dir: 別のフォルダの結果指数で作る（master_csv の履歴はこの場所のものを使わない）
+    other = root / "other_results"
+    other.mkdir()
+    (other / "SP_all.csv").write_text("".join(f"{r},{v + 100}\n" for r, v in sp.items() if v), encoding="utf-8")
+    assert B.main(["--update", "--min-samples", "30", "--kinds", "SP", "--result-dir", str(other), "--master-dir", str(root / "m2"),
+                   "--out-dir", str(root / "out2")]) == 0
+    shifted = {k: v + 100 for k, v in sp.items() if v}
+    want, _root = o_build(base_samples(base, shifted), 0.65)
+    assert o_cells(root / "out2" / B.FILES["SP"]) == {k: r["index_mean"] for k, r in want.items()}
+    # 履歴を作れない（0バイトの基本CSV）: 終了コード 1
+    broken = root / "broken_csv"
+    broken.mkdir()
+    (broken / "全場_タイムM.csv").write_bytes(b"")
+    capsys.readouterr()
+    assert B.main(["--update", "--csv-dir", str(broken), "--master-dir", str(root / "m3"), "--out-dir", str(root / "out3")]) == 1
+    assert "[ERROR] 過去走の履歴を作れません" in capsys.readouterr().err and not (root / "out3").exists()
     assert B.main(["--update", "--min-samples", "30"]) == 0                       # 既定の decay に戻す

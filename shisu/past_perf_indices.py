@@ -870,6 +870,30 @@ def _cached_base_signature(master_dir: Path | str) -> str:
         return ""
 
 
+def _legacy_results(master_dir: Path | str) -> pd.DataFrame | None:
+    """前の版（版3）の履歴にある結果指数の値（レースID(新)・SP・ST）。無い・読めない・結果指数の値が1つも無ければ None。
+    版4で列（クラス・馬場4）が増えたが、その2列は基本CSVから作れるので、結果指数の値だけは引き継げる。"""
+    d = Path(master_dir)
+    try:
+        m = json.loads((d / HISTORY_META).read_text(encoding="utf-8"))
+        if m.get("version") != HISTORY_VERSION - 1:
+            return None
+        frame = pd.read_csv(d / HISTORY_FILE, encoding="utf-8", dtype=str, keep_default_na=False)
+    except Exception:
+        return None
+    if any(c not in frame.columns for c in (RID, "SP", "ST")) or not _frame_has_results(frame):
+        return None
+    return frame[[RID, "SP", "ST"]]
+
+
+def _carry_results(frame: pd.DataFrame, old: pd.DataFrame) -> pd.DataFrame:
+    """基本CSVから作った履歴 frame に、前の履歴 old の結果指数の値を レースID(新) で入れる。"""
+    old = old.drop_duplicates(subset=[RID], keep="last").set_index(RID)
+    for c in ("SP", "ST"):
+        frame[c] = frame[RID].map(old[c]).fillna("")
+    return frame
+
+
 def has_result_files(result_dir: Path | str | None = None) -> bool:
     return bool(find_result_files(result_dir))
 
@@ -903,10 +927,23 @@ def get_history(csv_dir: Path | str | None = None, result_dir: Path | str | None
             # 基本CSVが変わった（か、行数の合わない履歴）: 走は基本CSVから作り直し、結果指数の値は前の履歴から引き継ぐ
             log("[INFO] 過去走の履歴: 結果指数のファイルが無く、基本CSVが前と違うので、走は基本CSVから作り直します"
                 "（結果指数の値は、前に作った履歴から引き継ぎます）")
-            frame = build_history_frame(bases, [], log)
-            old = cached[0].drop_duplicates(subset=[RID], keep="last").set_index(RID)
-            for c in ("SP", "ST"):
-                frame[c] = frame[RID].map(old[c]).fillna("")
+            frame = _carry_results(build_history_frame(bases, [], log), cached[0])
+            log(f"[INFO] 過去走の履歴: {len(frame)} 走（うち結果指数を引き継いだ走 "
+                f"{int(((frame['SP'] != '') | (frame['ST'] != '')).sum())}）")
+            if save:
+                try:
+                    save_history(frame, master_dir, base_sig, base_sig)
+                except OSError as e:
+                    log(f"[WARN] 過去走の履歴を {master_dir} に書けませんでした（{type(e).__name__}: {e}）。計算は続けます")
+            return History(frame)
+    if bases and cached is None and not files and not rebuild:
+        legacy = _legacy_results(master_dir)
+        if legacy is not None:
+            # 前の版の履歴（結果指数つき）しか無く、結果指数のファイルも無い: 捨てずに、結果指数の値を引き継ぐ
+            base_sig = _signatures(bases, [])[1]
+            log("[INFO] 過去走の履歴: 前の版の履歴（結果指数つき）があり、結果指数のファイルが無いので、走は基本CSVから作り直して、"
+                "結果指数の値を前の履歴から引き継ぎます")
+            frame = _carry_results(build_history_frame(bases, [], log), legacy)
             log(f"[INFO] 過去走の履歴: {len(frame)} 走（うち結果指数を引き継いだ走 "
                 f"{int(((frame['SP'] != '') | (frame['ST'] != '')).sum())}）")
             if save:

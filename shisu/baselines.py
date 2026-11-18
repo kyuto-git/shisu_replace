@@ -38,6 +38,7 @@ import re
 import statistics
 import sys
 import unicodedata
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
@@ -263,7 +264,7 @@ def parse_csv(text: str, kind: str = "", source: str = "") -> Baseline:
         key = KEY_SEP.join(p.strip() for p in str(r["key"]).split("×"))
         try:
             cells[key] = int(round(float(r["index_mean"])))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):      # 数でない・inf の行は飛ばす
             continue
     if not cells:
         raise ValueError("基準値の表に読める行がありません")
@@ -301,7 +302,8 @@ def load_tables(directory: Path | str | None = None, log: Logger | None = None) 
     return {k: b for k in KINDS if (b := load(k, directory, log)) is not None}
 
 
-def snapshot(master_dir: Path | str, directory: Path | str | None = None, meta: Mapping | None = None) -> dict[str, Baseline]:
+def snapshot(master_dir: Path | str, directory: Path | str | None = None, meta: Mapping | None = None,
+             log: Logger | None = None) -> dict[str, Baseline]:
     """今の基準値マスタを master_csv/ に写す（replace が呼ぶ）。master を作ったときの基準値を、出馬表側（build_db）も
     使うため（あとから基準値だけ更新しても、master と出馬表で違う基準値を見ない）。戻り値は写した表。"""
     d = Path(master_dir)
@@ -310,9 +312,13 @@ def snapshot(master_dir: Path | str, directory: Path | str | None = None, meta: 
     out: dict[str, Baseline] = {}
     for kind in KINDS:
         dst = d / MASTER_FILES[kind]
-        b = load(kind, src)
+        b = load(kind, src, log)
         if b is None:
             dst.unlink(missing_ok=True)
+            if log:
+                why = "読めない" if (src / FILES[kind]).exists() else "無い"
+                log(f"[WARN] 基準値（{kind}）: {FILES[kind]} が{why}ので、{PREV_COLUMNS[kind]}・{NOW_COLUMNS[kind]} は空になります"
+                    f"（{src}）")
             continue
         tmp = d / (MASTER_FILES[kind] + ".part")
         tmp.write_bytes((src / FILES[kind]).read_bytes())
@@ -375,25 +381,43 @@ def _reliability(n: int) -> str:
     return "高" if n >= 100 else ("中" if n >= 30 else "低")
 
 
-def _wmean(items: list[tuple[float, float]]) -> float:
-    return math.fsum(v * w for v, w in items) / math.fsum(w for _v, w in items)
+def _exact(v: float):
+    """値を誤差なしの数に（整数はそのまま、小数は書かれたとおりの10進の値）。"""
+    return int(v) if float(v).is_integer() else Fraction(repr(float(v)))
 
 
-def _cell_stat(items: list[tuple[float, float]]) -> dict:
-    """items = (値, 重み) のリスト → 上位1/3カットの重みつき平均など。
-    同じ値が切れ目にまたがるときは、重みの小さい（古い）ほうから除く（並びに依らない。decay = 1.0 なら重みは同じ）。"""
-    items = sorted(items, key=lambda t: (t[0], -t[1]))
+def _weights(decay: float, ages: Iterable[int]) -> dict[int, Fraction]:
+    """最新年からの年数 → 重み decay ** 年数（誤差なし。decay は書かれたとおりの10進の値）。"""
+    d = Fraction(repr(float(decay)))
+    return {a: d ** a for a in set(ages)}
+
+
+def _wmean(items: list[tuple[float, int]], weights: Mapping[int, Fraction]) -> Fraction:
+    """(値, 最新年からの年数) の重みつき平均。分数で計算する: float だと、ちょうど .5 の平均が 43.49999999999999 の
+    ようにずれて、丸め（偶数丸め）が重みの掛け方で変わる。"""
+    sums: dict[int, object] = {}
+    counts: dict[int, int] = {}
+    for v, age in items:
+        sums[age] = sums.get(age, 0) + _exact(v)
+        counts[age] = counts.get(age, 0) + 1
+    return Fraction(sum(weights[a] * x for a, x in sums.items())) / sum(weights[a] * c for a, c in counts.items())
+
+
+def _cell_stat(items: list[tuple[float, int]], weights: Mapping[int, Fraction]) -> dict:
+    """items = (値, 最新年からの年数) のリスト → 上位1/3カットの重みつき平均など。
+    同じ値が切れ目にまたがるときは、古い（重みの小さい）ほうから除く（並びに依らない）。"""
+    items = sorted(items)
     n = len(items)
     cut = n // 3
     kept = items[: n - cut]
     q = lambda p: float(items[min(n - 1, int(n * p))][0])
-    return {"n": n, "index_raw": round(_wmean(kept)), "index_mean_全体": round(_wmean(items)), "n_kept": len(kept),
-            "n_cut": cut, "index_std": round(statistics.pstdev([v for v, _w in kept]), 2),
+    return {"n": n, "index_raw": round(_wmean(kept, weights)), "index_mean_全体": round(_wmean(items, weights)),
+            "n_kept": len(kept), "n_cut": cut, "index_std": round(statistics.pstdev([v for v, _a in kept]), 2),
             "p25": q(0.25), "median": q(0.5), "p75": q(0.75)}
 
 
 def _shrink(n: int, m: int, base: int) -> int:
-    return round((n * m + K_SHRINK * base) / (n + K_SHRINK))
+    return round(Fraction(n * m + K_SHRINK * base, n + K_SHRINK))
 
 
 def _order(level: str, key: str) -> tuple:
@@ -415,14 +439,15 @@ def build_rows(samples: Iterable[tuple], decay: float = DEFAULT_DECAY) -> tuple[
     if not samples:
         raise ValueError("基準値を作るサンプルがありません")
     year_max = max(int(s[5]) for s in samples)
-    groups: dict[str, dict[str, list[tuple[float, float]]]] = {lv: {} for lv in LEVELS}
-    everything: list[tuple[float, float]] = []
+    groups: dict[str, dict[str, list[tuple[float, int]]]] = {lv: {} for lv in LEVELS}
+    everything: list[tuple[float, int]] = []
     for surface, cls, track, pgroup, band, year, value in samples:
-        item = (float(value), float(decay) ** (year_max - int(year)))
+        item = (float(value), year_max - int(year))
         everything.append(item)
         for level, key in cell_keys(surface, cls, track, pgroup, band).items():
             groups[level].setdefault(key, []).append(item)
-    root = round(_wmean(everything))
+    weights = _weights(decay, (age for _v, age in everything))
+    root = round(_wmean(everything, weights))
     final: dict[str, int] = {}
     rows: list[dict] = []
     for level in LEVELS:                          # 粗い階層から確定する
@@ -430,7 +455,7 @@ def build_rows(samples: Iterable[tuple], decay: float = DEFAULT_DECAY) -> tuple[
             parent = ROOT_LABEL if level == "L3" else KEY_SEP.join(
                 key.split(KEY_SEP)[:3] if level == "L2" else key.split(KEY_SEP)[:3] + key.split(KEY_SEP)[4:])
             base = root if level == "L3" else final[parent]
-            st = _cell_stat(groups[level][key])
+            st = _cell_stat(groups[level][key], weights)
             mean = _shrink(st["n"], st["index_raw"], base)
             final[key] = mean
             rows.append({"level": level, "key": key, "n": st["n"], "index_mean": mean,

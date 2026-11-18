@@ -504,6 +504,9 @@ def main(argv=None) -> int:
     ap.add_argument("--no-baseline-update", action="store_true",
                     help="SP指数・ST指数の3着内基準値（shisu/data/index_baseline_SP.csv・_ST.csv）を作り直さない"
                          "（今ある基準値をそのまま使う）")
+    ap.add_argument("--baseline-dir", default=None,
+                    help="3着内基準値マスタの置き場所（既定 shisu/data。環境変数 SHISU_BASELINE_DIR）。--csv-dir・--result-dir・"
+                         "--master-dir を既定と違う場所にした実行では、これを指定しない限り基準値マスタを書き換えない")
     ap.add_argument("--baseline-decay", type=float, default=None,
                     help="基準値の年度の減衰（最新年から1年古いごとに掛ける重み。既定 0.65。1.0 で等重み）")
     ap.add_argument("--baseline-min-samples", type=int, default=None,
@@ -600,17 +603,25 @@ def main(argv=None) -> int:
     try:
         if args.baseline_decay is not None and not (0 < args.baseline_decay <= 1):
             raise ValueError(f"--baseline-decay は 0 より大きく 1 以下: {args.baseline_decay!r}")
+        # 試しの実行（--csv-dir などを別の場所にした）で、いつもの基準値マスタを別のデータの基準値に置き換えない
+        moved = [name for name, given, default in (("--csv-dir", args.csv_dir, config.csv_dir()),
+                                                   ("--result-dir", args.result_dir, config.result_indices_dir()),
+                                                   ("--master-dir", args.master_dir, config.master_dir()))
+                 if Path(given).resolve() != Path(default).resolve()]
         if history is not None and history.has_results and not args.no_baseline_update:
-            cached = PP.load_history_cache(args.master_dir)
-            if cached is not None:
-                baselines.update_from_history(
-                    cached[0], decay=baselines.DEFAULT_DECAY if args.baseline_decay is None else args.baseline_decay,
-                    min_samples=baselines.MIN_SAMPLES if args.baseline_min_samples is None else args.baseline_min_samples,
-                    log=print)
-            del cached
-        tables = baselines.snapshot(args.master_dir, meta={"past_perf": use_perf})
-        if not tables:
-            print("[INFO] 基準値: index_baseline_SP.csv・index_baseline_ST.csv が無いので、基準比の条件（前走SP基準比 など）は空になります")
+            if moved and args.baseline_dir is None:
+                print(f"[INFO] 基準値: {'・'.join(moved)} が既定の場所と違うので、基準値マスタ（{baselines.data_dir()}）は"
+                      "更新しません（今の基準値を使います。このデータで作り直すなら --baseline-dir DIR を指定）")
+            else:
+                cached = PP.load_history_cache(args.master_dir)
+                if cached is not None:
+                    baselines.update_from_history(
+                        cached[0], args.baseline_dir,
+                        decay=baselines.DEFAULT_DECAY if args.baseline_decay is None else args.baseline_decay,
+                        min_samples=baselines.MIN_SAMPLES if args.baseline_min_samples is None else args.baseline_min_samples,
+                        log=print)
+                del cached
+        tables = baselines.snapshot(args.master_dir, args.baseline_dir, meta={"past_perf": use_perf}, log=print)
         del tables
     except Exception as e:              # 基準値を用意できなくても、master は作る（基準比の条件が空になる）
         base_error = f"[ERROR] 3着内基準値: {type(e).__name__}: {e}（基準比の条件は付きません）"
