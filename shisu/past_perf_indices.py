@@ -870,9 +870,11 @@ def _cached_base_signature(master_dir: Path | str) -> str:
         return ""
 
 
-def _legacy_results(master_dir: Path | str) -> pd.DataFrame | None:
-    """前の版（版3）の履歴にある結果指数の値（レースID(新)・SP・ST）。無い・読めない・結果指数の値が1つも無ければ None。
-    版4で列（クラス・馬場4）が増えたが、その2列は基本CSVから作れるので、結果指数の値だけは引き継げる。"""
+LEGACY_NEW_COLUMNS = ("クラス", "馬場4")          # 版4で増えた列（基本CSVから作る。前の版の履歴には無い）
+
+
+def _legacy_frame(master_dir: Path | str) -> pd.DataFrame | None:
+    """前の版（版3）の履歴の表（増えた列 クラス・馬場4 は空にして HISTORY_COLUMNS の形に）。無い・読めない・形が違えば None。"""
     d = Path(master_dir)
     try:
         m = json.loads((d / HISTORY_META).read_text(encoding="utf-8"))
@@ -881,7 +883,18 @@ def _legacy_results(master_dir: Path | str) -> pd.DataFrame | None:
         frame = pd.read_csv(d / HISTORY_FILE, encoding="utf-8", dtype=str, keep_default_na=False)
     except Exception:
         return None
-    if any(c not in frame.columns for c in (RID, "SP", "ST")) or not _frame_has_results(frame):
+    if any(c not in frame.columns for c in HISTORY_COLUMNS if c not in LEGACY_NEW_COLUMNS):
+        return None
+    for c in LEGACY_NEW_COLUMNS:
+        frame[c] = ""
+    return frame[HISTORY_COLUMNS]
+
+
+def _legacy_results(master_dir: Path | str) -> pd.DataFrame | None:
+    """前の版（版3）の履歴にある結果指数の値（レースID(新)・SP・ST）。無い・読めない・結果指数の値が1つも無ければ None。
+    版4で列（クラス・馬場4）が増えたが、その2列は基本CSVから作れるので、結果指数の値だけは引き継げる。"""
+    frame = _legacy_frame(master_dir)
+    if frame is None or not _frame_has_results(frame):
         return None
     return frame[[RID, "SP", "ST"]]
 
@@ -974,6 +987,14 @@ def get_history(csv_dir: Path | str | None = None, result_dir: Path | str | None
         why = "結果指数のファイルが無い" if bases else "基本CSV（csv_files の タイムM・対戦M）が無い"
         log(f"[INFO] 過去走の履歴: {why}ので、前に作った {HISTORY_FILE}（{len(cached[0])} 走）を使います")
         return History(cached[0])
+    if not bases:
+        legacy = _legacy_frame(master_dir)
+        if legacy is not None:
+            # 前の版の履歴だけがある（基本CSVも無い）: 過去SP・ST の8指数と近5走の条件には使える（前の版と同じ）
+            log(f"[INFO] 過去走の履歴: 基本CSV（csv_files の タイムM・対戦M）が無いので、前の版で作った {HISTORY_FILE}"
+                f"（{len(legacy)} 走）を使います（クラス・馬場状態の列が無いので、前走SP基準比・前走ST基準比は付きません。"
+                "csv_files に基本CSVを置けば作り直します）")
+            return History(legacy)
     if (master_dir / HISTORY_FILE).exists():
         log(f"[WARN] 過去走の履歴 {master_dir.name}/{HISTORY_FILE} を読めません（壊れている・前の版のファイル）。作り直す元"
             "（csv_files の基本CSV）も無いので、過去SP・ST の8指数と近5走の条件は付けません。"

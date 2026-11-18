@@ -112,7 +112,7 @@ def rows_by_key(rows):
 # 受け取った基準値マスタ（shisu/data/）
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("kind,root", [("SP", 62), ("ST", 48)])
-def test_shipped_masters_follow_the_shrinkage_formula(kind, root):
+def test_shipped_masters_follow_the_shrinkage_formula(kind, root, tmp_path):
     path = REPO_DATA / B.FILES[kind]
     data = path.read_bytes()
     assert data.startswith(b"level,key,n,index_mean,reliability,index_raw,") and data.count(b"\r\n") == 468
@@ -127,6 +127,10 @@ def test_shipped_masters_follow_the_shrinkage_formula(kind, root):
         assert (r["parent"] == B.ROOT_LABEL) == (r["level"] == "L3")
     table = B.load(kind, REPO_DATA)
     assert len(table) == 467 and table.cells == {r["key"]: int(r["index_mean"]) for r in rows}
+    resaved = tmp_path / B.FILES[kind]                     # Excel などで cp932・BOM つき UTF-8 に保存し直したものも読める
+    for enc in ("cp932", "utf-8-sig"):
+        resaved.write_bytes(data.decode("utf-8").encode(enc))
+        assert B.load(kind, tmp_path).cells == table.cells, enc
     # 引き方: L1 → L2 → L3
     assert table.lookup("芝", "古馬1勝", "良", "主場", "芝マイル") == int(by["芝 × 古馬1勝 × 良 × 主場 × 芝マイル"]["index_mean"])
     assert table.lookup("芝", "古馬1勝", "良", "", "芝マイル") == int(by["芝 × 古馬1勝 × 良 × 芝マイル"]["index_mean"])
@@ -148,7 +152,7 @@ def test_lookup_falls_back_level_by_level():
     text = "level,key,index_mean\nL3,芝×2勝×良,60\nL3, ダ × 2勝 × 良稍 ,51.0\nL3,bad,x\nL3,芝×3勝×良,1e999\nL3,芝×3勝×良以外,nan\n"
     got = B.parse_csv(text)                                                       # × の前後の空白はそろえる・読めない行は飛ばす
     assert got.cells == {"芝 × 2勝 × 良": 60, "ダ × 2勝 × 良稍": 51}
-    for bad in ("", "a,b\n1,2\n", "level,key,index_mean\n"):
+    for bad in ("", "a,b\n1,2\n", "level,key,index_mean\n", "level,key,index_mean\nL3,芝×2勝×良," + "9" * 140000 + "\n"):
         with pytest.raises(ValueError):
             B.parse_csv(bad)
 
@@ -314,8 +318,17 @@ def test_build_rows_equals_an_independent_calculation(seed, decay, integer):
     assert info["root"] == root and info["n"] == len(samples) and set(got) == set(want)
     for key in want:
         assert got[key] == want[key], key
-    # 並び: L3 → L2 → L1、その中は 芝 → ダ・クラスの順。入力の並びを変えても同じ表
+    # 並び: L3 → L2 → L1、その中は 芝 → ダ・クラス（CLASSES の順）・馬場区分・場所区分・距離帯。入力の並びを変えても同じ表
     assert [r["level"] for r in rows] == sorted((r["level"] for r in rows), key=["L3", "L2", "L1"].index)
+    def order(r):
+        parts = r["key"].split(" × ")
+        sd = parts[0]
+        pg = parts[3] if r["level"] == "L1" else ""
+        band = parts[-1] if r["level"] != "L3" else ""
+        bands = ["", *(b for _hi, b in B.BANDS[sd])]
+        return (["L3", "L2", "L1"].index(r["level"]), ["芝", "ダ"].index(sd), B.CLASSES.index(parts[1]), B.TRACKS[sd].index(parts[2]),
+                ["", "主場", "ローカル"].index(pg), bands.index(band))
+    assert rows == sorted(rows, key=order)
     shuffled = samples[:]
     random.Random(seed + 100).shuffle(shuffled)
     assert B.build_rows(shuffled, decay)[0] == rows
@@ -366,6 +379,8 @@ def test_update_writes_the_masters_only_with_enough_samples(tmp_path):
     frame = history_frame(rows)
     out = tmp_path / "data"
     logs = []
+    none = B.update_from_history(frame.iloc[0:0], out, min_samples=0)             # 標本が1つも無ければ、最低件数 0 でも書かない
+    assert {k: v for k, v in none.items()} == {"SP": {"status": "skipped", "n": 0}, "ST": {"status": "skipped", "n": 0}}
     res = B.update_from_history(frame, out, log=logs.append)                      # 既定は 2000 件に満たなければ書かない
     assert {k: v["status"] for k, v in res.items()} == {"SP": "skipped", "ST": "skipped"} and not out.exists()
     assert sum("満たないので更新しません" in m for m in logs) == 2
@@ -566,6 +581,19 @@ def test_results_of_a_previous_version_history_are_carried_over(tmp_path):
     (master / PP.HISTORY_FILE).write_bytes(gzip.compress(frame[old_cols].assign(SP="", ST="").to_csv(index=False).encode("utf-8")))
     (master / PP.HISTORY_META).write_text(json.dumps({**meta, "version": 3}), encoding="utf-8")
     assert not PP.get_history(csv_dir, res, master).has_results
+    # 基本CSVも無い場所（master_csv だけ持ってきた）: 前の版の履歴をそのまま使う（8指数・近5走には足りる。前走の基準比は付かない）
+    (master / PP.HISTORY_FILE).write_bytes(gzip.compress(frame[old_cols].to_csv(index=False).encode("utf-8")))
+    (master / PP.HISTORY_META).write_text(json.dumps({**meta, "version": 3}), encoding="utf-8")
+    logs.clear()
+    h = PP.get_history(tmp_path / "no_csv", res, master, logs.append)
+    assert h is not None and h.has_results and h.rows == len(frame) and any("前の版で作った" in m for m in logs)
+    row = frame[frame["SP"] != ""].iloc[0]
+    run = h.run_at(row["馬ID"], row["馬名"], row[RID][:16])
+    assert run[PP._F_SP] == float(row["SP"]) and run[PP._F_CLASS] == "" and run[PP._F_BABA4] == ""
+    assert json.loads((master / PP.HISTORY_META).read_text(encoding="utf-8"))["version"] == 3      # 書き換えない
+    (master / PP.HISTORY_META).write_text(json.dumps({**meta, "version": 2}), encoding="utf-8")    # もっと前の版は使えない
+    logs.clear()
+    assert PP.get_history(tmp_path / "no_csv", res, master, logs.append) is None and any("[WARN]" in m for m in logs)
 
 
 def test_rank_bands_of_past_sp_st_make_the_same_keys_on_both_sides():
@@ -1063,7 +1091,7 @@ def test_assumed_going_from_calc_and_partial_rebuild(site, capsys):
     assert digest() != "" and xjoin_rows(root / "racing.db") != xjoin_rows(a)
 
 
-def test_replace_options_for_the_baseline(site, capsys):
+def test_replace_options_for_the_baseline(site, capsys, monkeypatch):
     root, base, _ent, sp, _st = site
     import replace_csv_ver3
     full = read_master(root)
@@ -1114,6 +1142,17 @@ def test_replace_options_for_the_baseline(site, capsys):
     out = capsys.readouterr().out
     assert "--result-dir が既定の場所と違うので、基準値マスタ" in out and "更新しません" in out
     assert data.read_bytes() == (REPO_DATA / B.FILES["SP"]).read_bytes()
+    # 根ごと別の場所（SHISU_BASE_DIR）に向けて、基準値の置き場所（SHISU_BASELINE_DIR・--baseline-dir）を指定しない実行も同じ
+    calls = []
+    with monkeypatch.context() as mp:
+        mp.delenv("SHISU_BASELINE_DIR")
+        mp.setattr(B, "update_from_history", lambda *a, **k: calls.append(a) or {})
+        capsys.readouterr()
+        assert replace_csv_ver3.main(["--no-past-perf", *MIN_ARGS]) == 0
+        assert "SHISU_BASE_DIR が既定の場所と違うので、基準値マスタ" in capsys.readouterr().out and calls == []
+        assert (root / "master_csv" / B.MASTER_FILES["SP"]).read_bytes() == (REPO_DATA / B.FILES["SP"]).read_bytes()
+    assert replace_csv_ver3.main(["--clean", *MIN_ARGS]) == 0 and read_master(root).equals(full)
+    data.write_bytes((REPO_DATA / B.FILES["SP"]).read_bytes())
     elsewhere = root / "trial_baseline"
     assert replace_csv_ver3.main(["--result-dir", str(trial), "--baseline-dir", str(elsewhere), *MIN_ARGS]) == 0
     assert (elsewhere / B.FILES["SP"]).read_bytes() == built and data.read_bytes() == (REPO_DATA / B.FILES["SP"]).read_bytes()

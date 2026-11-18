@@ -256,7 +256,10 @@ class Baseline:
 
 def parse_csv(text: str, kind: str = "", source: str = "") -> Baseline:
     """index_baseline_*.csv の中身 → Baseline。level・key・index_mean の列が要る。形が違えば ValueError。"""
-    rows = list(csv.DictReader(io.StringIO(text.lstrip("﻿"))))
+    try:
+        rows = list(csv.DictReader(io.StringIO(text.lstrip("﻿"))))
+    except csv.Error as e:                      # CSV として読めない（大きすぎる欄など）
+        raise ValueError(f"基準値の表を CSV として読めません（{e}）") from e
     if not rows or any(c not in rows[0] for c in ("level", "key", "index_mean")):
         raise ValueError("基準値の表に level・key・index_mean の列がありません")
     cells: dict[str, int] = {}

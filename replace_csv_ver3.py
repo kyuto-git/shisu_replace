@@ -608,10 +608,14 @@ def main(argv=None) -> int:
                                                    ("--result-dir", args.result_dir, config.result_indices_dir()),
                                                    ("--master-dir", args.master_dir, config.master_dir()))
                  if Path(given).resolve() != Path(default).resolve()]
+        import os
+        if (os.environ.get("SHISU_BASE_DIR") and not os.environ.get("SHISU_BASELINE_DIR")
+                and config.base_dir().resolve() != Path(config.__file__).resolve().parent.parent):
+            moved.append("SHISU_BASE_DIR")             # 根ごと別の場所に向けた実行も同じ（基準値マスタはパッケージの中にある）
         if history is not None and history.has_results and not args.no_baseline_update:
             if moved and args.baseline_dir is None:
                 print(f"[INFO] 基準値: {'・'.join(moved)} が既定の場所と違うので、基準値マスタ（{baselines.data_dir()}）は"
-                      "更新しません（今の基準値を使います。このデータで作り直すなら --baseline-dir DIR を指定）")
+                      "更新しません（今の基準値を使います。このデータで作り直すなら --baseline-dir DIR か SHISU_BASELINE_DIR を指定）")
             else:
                 cached = PP.load_history_cache(args.master_dir)
                 if cached is not None:
