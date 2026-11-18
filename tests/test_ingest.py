@@ -1186,26 +1186,26 @@ def test_sources_run_in_parallel_and_match_sequential(tmp_path):
 def test_parallel_keeps_per_site_interval(tmp_path):
     """同時に動かしても、1つのサイトへのアクセスは取得元ごとの間隔（Ω 3秒・吉馬 2秒）をあける。"""
     base = write_base(tmp_path / "base.csv")
-    slept: dict[str, float] = {}
-    order: dict[str, list[str]] = {}
+    pending: dict[str, float] = {}                 # スレッド → 次のアクセスの前に待つはずだった秒数
+    by_site: dict[str, tuple[int, float]] = {}     # サイト → (アクセスの数, アクセスの前に待った秒数の合計)
     lock = threading.Lock()
 
     class Recorder(FakeSession):
         def get(self, url, headers=None, timeout=None):
             with lock:
-                order.setdefault(threading.current_thread().name, []).append(_site(url))
+                n, sec = by_site.get(_site(url), (0, 0.0))
+                by_site[_site(url)] = (n + 1, sec + pending.pop(threading.current_thread().name, 0.0))
             return super().get(url, headers, timeout)
 
-    def sleep(sec):                                # 実際には待たず、スレッドごとに待つはずだった秒数を足す
-        with lock:
+    def sleep(sec):                                # 実際には待たず、そのスレッドの次のアクセスの前の待ちとして足す
+        with lock:                                 # （速く終わった取得元のスレッドが次の取得元に使い回されても、サイトごとに数えられる）
             name = threading.current_thread().name
-            slept[name] = slept.get(name, 0.0) + sec
+            pending[name] = pending.get(name, 0.0) + sec
 
     session = Recorder(_three_site_pages())
     req = IngestRequest(sources=["omega", "kichiuma"], base_paths=[base])
     run_ingest(req, tmp_path / "o", lambda m: None, session=session, sleep=sleep)
-    by_site = {sites[0]: (len(sites), slept.get(t, 0.0)) for t, sites in order.items()}
-    assert all(len(set(s)) == 1 for s in order.values()) and len(order) == 2      # 1スレッド = 1サイト
+    assert set(by_site) == {"www.keibalab.jp", "kichiuma.net"}
     n_omega, s_omega = by_site["www.keibalab.jp"]
     n_kichi, s_kichi = by_site["kichiuma.net"]
     assert n_omega == 4 and n_kichi == 4                                          # ベースCSVの4レース
