@@ -606,7 +606,9 @@ def test_rank_bands_of_past_sp_st_make_the_same_keys_on_both_sides():
     h = F.Family("X_spb_sp3_hen", ("過去SP今走基準比", "過去SP3走順"), "HBAND")
     nidx = F.Family("X_stb_st3_none", ("過去ST今走基準比", "過去ST3走順"), "NONE")
     rk = F.Family("X_sp3_rank", ("過去SP3走順",), "RANK")
-    for fam in (f, h, nidx, rk):
+    rk_st = F.Family("X_st3_rank", ("過去ST3走順",), "RANK")             # SP・ST のもう片方でも同じ
+    nidx_sp = F.Family("X_sp3_none", ("過去SP3走順",), "NONE")
+    for fam in (f, h, nidx, rk, rk_st, nidx_sp):
         F.validate(fam)
         assert fam.uses_schemes and fam.schemes == ("s1", "s2")          # 帯にする条件なので、どの末尾でも s1・s2
     df = pd.DataFrame({"過去ST今走基準比": ["ST平均基準超", "ST今走基準未達", "ST平均基準超", ""], "過去ST3走順": ["2", "7", "", "1"],
@@ -621,7 +623,7 @@ def test_rank_bands_of_past_sp_st_make_the_same_keys_on_both_sides():
     assert sorted(F.build_keys(df, rk, "s2")[lambda s: s.index == 0]) == ["SP3走1~3位×4", "SP3走1~5位×4"]
     from shisu import matching
     from shisu.indicators import CONDITION_ONLY
-    for fam in (f, h, nidx, rk):
+    for fam in (f, h, nidx, rk, rk_st, nidx_sp):
         for sc in ("s1", "s2"):
             past = F.build_keys(df, fam, sc)
             for i, row in df.iterrows():
@@ -629,7 +631,7 @@ def test_rank_bands_of_past_sp_st_make_the_same_keys_on_both_sides():
     # 照合の窓口（matching.entry_fields）を通しても同じ: 条件のみ（順位・偏差値帯を見ない）でも 3走順の部品は残る
     for i, row in df.iterrows():
         entry = {**row.to_dict(), "オメガ指数_順位": row["順位"], "オメガ指数_偏差値帯": row["偏差値帯"]}
-        for fam, base in ((nidx, CONDITION_ONLY), (f, "オメガ指数"), (rk, "オメガ指数")):
+        for fam, base in ((nidx, CONDITION_ONLY), (nidx_sp, CONDITION_ONLY), (f, "オメガ指数"), (rk, "オメガ指数"), (rk_st, "オメガ指数")):
             got = {k for sc in ("s1", "s2") for k in F.entry_keys(matching.entry_fields(entry, base), fam, sc)}
             want = {k for sc in ("s1", "s2") for k in F.build_keys(df, fam, sc)[lambda s: s.index == i].tolist()}
             assert got == want, (fam.name, i)
@@ -638,6 +640,9 @@ def test_rank_bands_of_past_sp_st_make_the_same_keys_on_both_sides():
     assert F.is_self_redundant(f, "過去ST_3走平均") and not F.is_self_redundant(f, "過去ST_5走平均") and not F.is_self_redundant(f, "オメガ指数")
     assert not F.is_self_redundant(nidx, "過去ST_3走平均")                # 条件のみは基準の master で1回だけ（対象外）
     assert F.is_self_redundant(rk, "過去SP_3走平均") and not F.is_self_redundant(rk, "過去SP_3走最高")     # 末尾が指数順位でも
+    assert F.is_self_redundant(rk_st, "過去ST_3走平均") and not F.is_self_redundant(rk_st, "過去SP_3走平均")
+    assert not F.is_self_redundant(nidx_sp, "過去SP_3走平均")
+    assert F.build_keys(df, nidx_sp, "s1").tolist() == ["SP3走1位", "SP3走10位~", "SP3走4~5位"]
     assert not F.is_self_redundant(F.Family("X_spb", ("過去SP今走基準比",), "RBAND"), "過去SP_3走平均")
 
 
