@@ -63,7 +63,7 @@ shisu_replace/
 ├─ condition_notes.json  危険条件メモ（/entries/drill で書く。DB の外。`NOTES_PATH` で場所を変えられる。§4.8）
 ├─ result_indices/  入力: 結果指数（SP指数 SP*.csv・speed*.zip／ST指数 st_se*.csv・st_se*.zip。`RESULT_INDICES_DIR`。§4.9）
 ├─ race_marks/  入力: TARGET の外部レース印CSV 5種（member*.csv・time*.csv・pace*.csv・cushion*.csv・moistureG*.csv。`RACE_MARKS_DIR`。§4.10）
-├─ past_perf_settings.json  過去SP・ST指数の想定馬場状態（/ingest で選んだ値。`PAST_PERF_SETTINGS`。§4.9）
+├─ past_perf_settings.json  過去SP・ST指数の想定馬場状態（/ingest で選んだ値。`PAST_PERF_SETTINGS`。§4.9。calc が実際に使った想定は entries_out/past_perf_baba.json）
 ├─ replace_csv/ processed_*（normal family のキーの確認用。--processed のときだけ）
 ├─ ingest_in/ ingest_out/  指数の取得の入力・出力（§3.6）
 └─ foragg_csv/  旧版の集計素材（2026-11-06 から作らない。残っていても使わない。消してよい）
@@ -163,7 +163,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 # SP・ST の3着内基準値: 今の中身を見る／結果指数から作り直す（replace も自動で作り直す。作り直したら replace → aggregate → build_db）
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m shisu.baselines
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python -m shisu.baselines --update --decay 0.65
-# 出馬表の「今走の基準値」を引く馬場の想定を指定（省くと /ingest で選んだ値。無ければ出馬表の 馬場状態 の列・良）
+# 出馬表の「今走の基準値」を引く馬場の想定を指定（省くと calc が使った想定 → /ingest で選んだ値。無ければ出馬表の 馬場状態 の列・良）
 docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entries-only --baba-turf 良 --baba-dirt 重
 ```
 
@@ -183,7 +183,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 | 基本CSV（近5走の条件・過去SP・ST の元の履歴） | 過去側: replace → aggregate → build_db --mode both。出馬表側だけ: build_db --entries-only（履歴は build_db・calc が自動で作り直す） |
 | 条件のみの family（tail=NONE）を足した・やめた | family を入れ替えたときと同じ（aggregate --clean → build_db --fresh）。`--resume` でも設定のハッシュが変わるので全部作り直す。やめたときの `agg_master_*_条件のみ.csv.gz` は aggregate が消す |
 | 3着内基準値（`shisu/data/index_baseline_*.csv` を作り直した・手で替えた・`--baseline-decay` を変えた） | replace（基準値を master_csv/ に写し、master の基準比の4列を引き直す）→ aggregate → build_db --mode both。`python -m shisu.baselines --update` だけでは master・出馬表には効かない（出馬表側は master_csv/ の写しを読む） |
-| 出馬表の今走の馬場の想定（build_db の `--baba-turf`／`--baba-dirt`・/ingest のプルダウン） | build_db --entries-only（`過去SP今走基準比`・`過去ST今走基準比` を引き直す。過去SP・ST の値そのものも想定で変えるなら、先に calc_entry_hensachi --merge-only --clean） |
+| 出馬表の今走の馬場の想定（`--baba-turf`／`--baba-dirt`・/ingest のプルダウン） | calc_entry_hensachi --merge-only --clean（想定を付ける・/ingest で選ぶ）→ build_db --entries-only（引数なしなら calc が使った想定で `過去SP今走基準比`・`過去ST今走基準比` を引く）。基準値の馬場区分だけ変えるなら build_db --entries-only --baba-turf … だけでもよい |
 | 区分の閾値（`shisu/classify.py`） | コンパクト化（既定）しているなら aggregate（`--resume` で、閾値が変わった成績表を作り直す。閾値は設定のハッシュに入る）→ build_db --fresh → app の再起動。`--no-compact` なら app の再起動だけ |
 
 - `build_db --mode foragg` だけ回すと xjoin（照合結果）が古いまま残るので、警告が出る。続けて `--mode entries` を回す（回すまで、条件ヒット馬・WEDGE 一覧の画面に「照合結果が今の成績表より前のもの」の注意書きが出る。§3.5）。
@@ -311,6 +311,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
   - **想定の馬場状態**: `--baba-turf`・`--baba-dirt`（`auto`／`良`／`稍・重`／`不`。`稍重`・`不良`・`自動` も受ける。知らない値は終了コード2）。`auto` は出馬表の `馬場状態`（`馬場`）の列（無ければ指定なし＝段階②から）。値を指定すると、その芝・ダのレースは列より指定を優先する。省いたほうは設定ファイル `past_perf_settings.json`（/ingest の画面で選んだ値）、それも無ければ `auto`（`resolve_baba`。ログに「想定の馬場状態は 引数／設定ファイル／既定 から」）
   - `--result-dir`・`--csv-dir`・`--master-dir`（履歴の元と置き場所）、`--no-past-perf`（結果指数から計算しない。`ext_indices/past_sp_st/` にファイルがあれば、ほかの外部指数と同じにそこから付く。それも付けないなら `--no-ext` か、そのフォルダを消す）。`--indicators 過去SP_3走平均,…` の差し替えでも計算する。`--mining-only`（タイムM・対戦M だけ）は履歴も結果指数も読まない
   - 計算に失敗しても（読めない基本CSV など）ほかの指数の処理は続け、終了コード1
+  - **使った想定の記録（2026-11-18〜）**: 過去SP・ST を計算したら、その想定（芝・ダ）を `entries_out/past_perf_baba.json`（`PP.save_used_baba`。`{"baba_turf": …, "baba_dirt": …}`）に残す。build_db が今走の基準値を引くときの既定になる（§3.4）。過去SP・ST を計算しなかった全部の計算（`--no-past-perf`・履歴なし）では消す。`--mining-only` など 過去SP・ST を計算し直さない差し替えでは触らない
 - 指数列は台帳で検出し正式名にする（`GoldAirplane→Gold`、`マイニング値→タイムM`、`対戦型マイニング値→対戦M`、`先行力→先行` など）
 - 各指数列の直後に `X_偏差値, X_偏差値帯, X_順位, X_順位帯_s1, X_順位帯_s2` を挿入。計算は過去側と同じ `compute_indicator`。`X_順位帯_s2` は重なる帯を「・」でつないだ表示用（例 `1~3位・1~5位`。キーは帯ごとに作る）
 - 順位は元ファイルの順位列を優先する。対応の付け方: ①明示列（`マイニング順位`・`対戦型マイニング順位`・`{列}順位`）→ ②指数列の**すぐ右**にある `指数順位N`（TARGET の並び）→ ③N 番目の枠（指数を読み込んでいない枠の見出し `指数N` も1枠と数える）→ ④指数が1種類なら無印 `指数順位`。どれも無ければ同値同順位で計算し `[INFO]` を出す
@@ -352,7 +353,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
   - 読める成績表が0本なら DB に触らず終了コード2（空にしたいときだけ `--allow-empty`）。WEDGE 列の無い旧形式の成績表は取り込まず終了コード1
   - families.json に無い family・スキームの行・ファイル（前の実行の残り）は取り込まず、行数・本数を警告する
 - entries: `normalize_entries_df`（キー部品の正規化と条件。前走の内外は `master_csv/__inner_outer__.csv.gz` で引く。外部レース印の前走条件と近5走の要約条件は `entries_side_sources()` が用意する (レース印, 履歴) から、過去側と同じ `derive`・`recent_form` で付ける: レース印は `race_marks.load`（race_marks/ にファイルがあればそれ、無ければ `__race_marks__.csv.gz`。replace が `--no-race-marks`・`--marks-dir` で作った master なら、記録 `__race_marks__.json` に合わせて、読まない・そのフォルダを読む。build_db の `--marks-dir DIR`・`--no-race-marks` で指定もできる）、履歴は `past_perf_indices.get_history`（基本CSV・結果指数が変わっていれば作り直す）。読めなければ WARN を出してその条件を空にする。近5走に使う列（馬・日付・場所・芝ダ・距離）は、距離をレンジ統合後の値に書き換える前の元の列から取る。**障害レース**（今芝ダ=障・レース名が 障害…・トラックコード51以上。TARGET の出馬表は 芝ダ に「ダ」「芝」と入る）は 芝・ダ を「障」にし、照合しない）→ テーブル → entries_all → xjoin（各馬 × 指数 × family × キー候補を unified_all と完全一致照合）。`--mode entries` では DB の `__families__` の family で照合する（DB を作ったときの family）
-  - **基準比・過去SP/ST 3走順（2026-11-18〜。§3.16）**: `entries_baselines()` が (基準値の表, 芝の想定, ダの想定) を用意し、`normalize_entries_df(raw, inner, marks, history, tables, baba_turf, baba_dirt)` が過去側と同じ `baselines.conditions` で6列を付ける。基準値は `baselines.load_for_master`（replace の記録 `__index_baseline__.json` があれば master_csv/ の写しだけ、無ければ基準値マスタ）。過去SP・ST の値と順位は、出馬表の列（calc_entry_hensachi が付けた `過去SP_3走平均`・`過去SP_5走平均`・`過去SP_3走最高`・`過去SP_5走最高`・`過去SP_3走平均_順位` と ST の同じ列。`entry_perf_values`。空・0 は値なし）から取る。今走の部品（芝ダ・距離・クラス・年限定・馬場状態・場所・馬）は、列を正規化で書き換える前の元の列から（`baselines.today_parts`）。想定の馬場は 引数 → `past_perf_settings.json` → `auto` の順（ログに `[INFO] 3着内基準値: SP n セル・ST n セル／今走の馬場の想定 …`）
+  - **基準比・過去SP/ST 3走順（2026-11-18〜。§3.16）**: `entries_baselines()` が (基準値の表, 芝の想定, ダの想定) を用意し、`normalize_entries_df(raw, inner, marks, history, tables, baba_turf, baba_dirt)` が過去側と同じ `baselines.conditions` で6列を付ける。基準値は `baselines.load_for_master`（replace の記録 `__index_baseline__.json` があれば master_csv/ の写しだけ、無ければ基準値マスタ）。過去SP・ST の値と順位は、出馬表の列（calc_entry_hensachi が付けた `過去SP_3走平均`・`過去SP_5走平均`・`過去SP_3走最高`・`過去SP_5走最高`・`過去SP_3走平均_順位` と ST の同じ列。`entry_perf_values`。空・0 は値なし）から取る。今走の部品（芝ダ・距離・クラス・年限定・馬場状態・場所・馬）は、列を正規化で書き換える前の元の列から（`baselines.today_parts`）。想定の馬場は 引数 → calc_entry_hensachi が 過去SP・ST の計算に使った想定（`entries_out/past_perf_baba.json`。§3.3）→ `past_perf_settings.json` → `auto` の順（ログに `[INFO] 3着内基準値: SP n セル・ST n セル／今走の馬場の想定 …`。calc と同じ想定で引くので、calc にだけ `--baba-turf` を付けても、過去SP・ST の値の選び方と基準値の馬場区分が食い違わない）。replace を `--no-past-perf` で回した master（記録の `past_perf` が false）のときは、出馬表の 過去SP・ST の列があっても 今走基準比・3走順 を付けない（master と同じ。`[INFO] …出馬表にも 今走基準比・過去SP/ST 3走順 は付けません`）
   - 照合する指数の名前は `match_bases`（出馬表の指数 ＋ 条件のみの family があれば「条件のみ」）。条件のみの family は base = 「条件のみ」で1頭につき1回だけ照合する（指数の数だけ同じ行を作らない）。`--mining-only`／`--indicators` の一部の作り直しは指定した指数の行だけを入れ替えるので、条件のみの行はそのまま残る（キーの部品・条件が変わっていれば `plain` の違いで全部の照合になる）
   - unified_all が無い・旧形式なら xjoin を作らず終了コード1
   - **照合（xjoin）のメモリ（2026-11-14〜）**: 全部の照合（`build_xjoin`）も一部の作り直し（`refresh_xjoin`）も `insert_hits` を通る。メモリに持つのは、INSERT 待ちの行（`XJOIN_BATCH` 5,000行まで）と照合のキャッシュ（`HitCache`: `XJOIN_CACHE_LIMIT` 20,000件・`XJOIN_CACHE_ROWS` 50,000行まで）だけで、family・指数・馬の数に依らない
@@ -668,7 +669,7 @@ TARGET の外部レース印（レース単位の印。5種）を、各馬の前
 - **`過去SP今走基準比`・`過去ST今走基準比`**: B = 今走の条件の基準値。過去SP・ST の8指数（§3.11）の値で
   - `過去SP_3走平均 ≥ B` または `過去SP_5走平均 ≥ B` → `SP平均基準超`／そうでなく `過去SP_3走最高 ≥ B` → `SP3走最高基準超`／そうでなく `過去SP_5走最高 ≥ B` → `SP5走最高基準超`／値が1つでもあってどれも B 未満 → `SP今走基準未達`（ST も同じ形。`now_label`）
   - 空になるとき: 4つの値が全部無い（対象の走なし。値 0・空）、今走が新馬戦・クラスや世代の分からないレース・基準値のセルが無い
-  - 今走の馬場区分: 過去側は基本CSVの `馬場状態`（実際の馬場）。出馬表側は想定（`--baba-turf`／`--baba-dirt` → `past_perf_settings.json` → `auto`）。`auto` は出馬表の `馬場状態`（`馬場`）の列、無ければ 良（芝 = `良`・ダ = `良稍`）
+  - 今走の馬場区分: 過去側は基本CSVの `馬場状態`（実際の馬場）。出馬表側は想定（build_db の `--baba-turf`／`--baba-dirt` → calc が使った想定 `entries_out/past_perf_baba.json` → `past_perf_settings.json` → `auto`）。`auto` は出馬表の `馬場状態`（`馬場`）の列、無ければ 良（芝 = `良`・ダ = `良稍`）
 - **`過去SP3走順`・`過去ST3走順`**: 指数 `過去SP_3走平均`・`過去ST_3走平均` のレース内順位（1以上の整数の文字。その指数の master の `順位`・出馬表の `過去SP_3走平均_順位` と同じ値）。値の無い馬・その指数を使わないレース（欠損2頭以上 など。§5.5）は空
   - `BANDED_CONDITIONS` に登録（単位 `sp3`・`st3`）: キーでは帯の名前になる。s1 = `SP3走1位`／`SP3走2~3位`／`SP3走4~5位`／`SP3走6~9位`／`SP3走10位~`、s2 = `SP3走1~3位`／`SP3走1~5位`／`SP3走6位~`（ST は `ST3走…`）。これらを含む family は、末尾が偏差値帯・指数順位・条件のみでも s1・s2 の2つの成績表になる（§5.1）
   - 3走最高・5走平均・5走最高の順位は条件にしていない（部品の数を増やさないため。末尾の指数として使えば帯になる）
@@ -1178,7 +1179,7 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 62. **基準値マスタは replace が書き換える追跡ファイル**: `shisu/data/index_baseline_*.csv` はリポジトリに入っている。実データで replace を回すと git の差分に出る（コミットするかは運用しだい。別の PC に持っていくなら、このファイルか master_csv/ の写しが要る）。標本が 2,000 件に満たない場所・`--csv-dir` などを既定と違う場所にした実行（`--baseline-dir` なし）では書き換えない
 63. **基準値は全期間のデータから作る（過去側は少し先読みになる）**: 過去のレースの基準比も、今の基準値マスタ（そのレースより後の年の3着馬も入り、直近の年ほど重い）で引く。セルの水準は年で大きくは動かない前提の割り切り。年ごとの基準値は持っていない
 64. **前走基準比は「基本CSVにある前走」だけ**（43・54 と同じ）: 前走が基本CSVの期間の外・地方・海外・障害なら空。前走の結果指数が result_indices/ に無い馬も空。出馬表側は `前走開催` から作る 前走RID16 で引くので、先週のレースが前走の馬は、基本CSV（raw_csv への追加）と結果指数が先週ぶんまで入っていなければ空になる
-65. **今走基準比の馬場は、過去側は実際・出馬表側は想定**（45 と同じ）: 出馬表側は `--baba-turf`／`--baba-dirt`（無ければ /ingest で選んだ値・出馬表の 馬場状態 の列・良）。芝の 良／良以外、ダの 良稍／重不良 の2区分なので、想定が区分をまたいで外れたときだけ基準値が変わる。calc_entry_hensachi の想定（過去SP・ST の値の選び方）と build_db の想定は別々に渡す（同じ設定ファイルを既定にしている）
+65. **今走基準比の馬場は、過去側は実際・出馬表側は想定**（45 と同じ）: 出馬表側は build_db の `--baba-turf`／`--baba-dirt`（無ければ calc が使った想定・/ingest で選んだ値・出馬表の 馬場状態 の列・良）。芝の 良／良以外、ダの 良稍／重不良 の2区分なので、想定が区分をまたいで外れたときだけ基準値が変わる。build_db の引数を省けば calc_entry_hensachi の想定（過去SP・ST の値の選び方）と同じになる。build_db にだけ引数を付けると、値の選び方と基準値の馬場区分が別の想定になる（calc の3区分 良／稍・重／不 に対し、build_db は 稍 と 重 を分けて指定できる: ダの 稍 = 良稍・重 = 重不良）
 66. **世代の分からないレースは基準値なし**: 基本CSVに `年齢限定` の列が無い・空だと、1勝クラス・オープン・重賞の世代をクラス名・レース名からしか決められない（「3歳以上」「2歳」などの文字が無ければ空 → そのレースの今走基準比・そのレースが前走の馬の前走基準比が空。2勝・3勝は世代を見ないので付く）。46 と同じく `年齢限定` を入れて出す
 67. **`過去SP3走順`・`過去ST3走順` は 3走平均の順位だけ**: 出馬表側は calc_entry_hensachi の出力の `過去SP_3走平均_順位` の列が要る（calc を `--no-past-perf`・`--no-ext` で回して列が無ければ空）。replace を `--no-past-perf` で回した master では、今走基準比と3走順が空（その条件を含む family の成績表は0行）。その指数自身の順位の family は、その指数の成績表に無い（§3.16）ので、画面で指数を `過去SP_3走平均` に絞ると `過去SP3走順` を含む family は出ない
 68. **最初の実行で作り直されるもの**（2026-11-18 の版に上げたあと）: 履歴（版3 → 版4。calc・build_db・replace の最初の1回で自動）。master は replace を回すまで6列が無い（その条件を含む family のキーができないだけ）。出馬表の表は `build_db --entries-only` で6列が入り、条件の列が増えたので `--mining-only` の最初の1回は全部の照合になる。family の定義は変えていないので、aggregate の設定のハッシュは変わらない（ただし replace を回すと master の中身が変わるので、`aggregate --resume` はその master の成績表を作り直す）

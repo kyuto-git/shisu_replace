@@ -468,13 +468,15 @@ def entry_perf_values(raw: pd.DataFrame) -> tuple[dict, dict]:
 
 
 def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None, marks=None, history=None,
-                         tables=None, baba_turf: str = "auto", baba_dirt: str = "auto") -> pd.DataFrame:
+                         tables=None, baba_turf: str = "auto", baba_dirt: str = "auto",
+                         use_perf: bool = True) -> pd.DataFrame:
     """出馬表（calc_entry_hensachi の出力）を、キーの部品が過去側と同じ表記になるよう正規化する。
     条件（shisu/conditions.py）の列も足す。inner_lookup は前走の内外を引く表（replace が master_csv/ に書く）。
     marks は外部レース印（race_marks.RaceMarks。前走メンバーLv など）、history は馬ごとの過去走の履歴
     （past_perf_indices.History。近5走同条件・近5走同場・前走の基準比）。どちらも過去側（replace）と同じ関数を通す。
     tables は3着内基準値（baselines.Baseline の {SP, ST}）。baba_turf・baba_dirt は今走の馬場の想定（基準値を引くときに使う。
-    auto なら出馬表の 馬場状態 の列、無ければ 良）。無ければその列は空。"""
+    auto なら出馬表の 馬場状態 の列、無ければ 良）。無ければその列は空。use_perf=False なら、出馬表の 過去SP・ST の列を
+    使わない（今走基準比・3走順が空。replace --no-past-perf の master と同じ）。"""
     df = raw.copy()
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()]
@@ -485,7 +487,7 @@ def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None, ma
         # 基準値を引く部品（芝ダ・距離・クラス・馬場・場所）も、下で書き換える前の元の列から取る
         from shisu import baselines
         parts = baselines.today_parts(df)
-        perf_values, perf_ranks = entry_perf_values(df)
+        perf_values, perf_ranks = entry_perf_values(df) if use_perf else ({}, {})
     if history is not None:
         # 近5走の要約条件に使う列（馬・日付・場所・芝ダ・距離）は、元の列から先に取る
         # （下で 距離 をレンジ統合後の値（16-18 など）に、芝・ダ を障害の印に書き換えるため）
@@ -581,11 +583,12 @@ def entries_side_sources(log=print, marks_dir=None, no_marks: bool = False):
     return marks, history
 
 
-def entries_baselines(baba_turf=None, baba_dirt=None, log=print) -> tuple[dict, str, str]:
-    """出馬表の基準比の条件に使う (3着内基準値の表, 芝の想定馬場, ダの想定馬場)。
-    基準値は master と同じもの（replace が master_csv/ に写したもの。無ければ基準値マスタ shisu/data/）。
-    想定の馬場は、引数（auto / 良 / 稍 / 重 / 不 / 稍・重）→ 省いたほうは設定ファイル past_perf_settings.json
-    （/ingest の画面で選んだ値。calc_entry_hensachi と同じ）→ 無ければ auto。"""
+def entries_baselines(baba_turf=None, baba_dirt=None, log=print, entries_dir=None) -> tuple[dict, str, str, bool]:
+    """出馬表の基準比の条件に使う (3着内基準値の表, 芝の想定馬場, ダの想定馬場, 過去SP・ST の値を使うか)。
+    基準値は master と同じもの（replace が master_csv/ に写したもの。記録が無ければ基準値マスタ shisu/data/）。
+    想定の馬場は、引数（auto / 良 / 稍 / 重 / 不 / 稍・重）→ 省いたほうは calc_entry_hensachi が 過去SP・ST の計算に
+    使った想定（entries_out/past_perf_baba.json）→ 設定ファイル past_perf_settings.json（/ingest の画面で選んだ値）→ auto。
+    replace を --no-past-perf で回した master（記録の past_perf が false）なら、今走基準比・3走順は付けない（master と同じ）。"""
     from shisu import baselines
     from shisu import past_perf_indices as PP
     try:
@@ -593,14 +596,22 @@ def entries_baselines(baba_turf=None, baba_dirt=None, log=print) -> tuple[dict, 
     except Exception as e:
         log(f"[WARN] 3着内基準値を読めません（{type(e).__name__}: {e}）。基準比の条件は空にします")
         tables = {}
-    saved = PP.load_settings()
+    meta = baselines.load_meta()
+    use_perf = bool(meta.get("past_perf", True)) if meta else True
+    used = PP.load_used_baba(entries_dir) if entries_dir is not None else None
+    saved = used or PP.load_settings()
     turf = baselines.norm_baba_choice(saved["baba_turf"] if baba_turf is None else baba_turf)
     dirt = baselines.norm_baba_choice(saved["baba_dirt"] if baba_dirt is None else baba_dirt)
     if tables:
         show = lambda v: "自動（出馬表の 馬場状態 の列。無ければ 良）" if v == baselines.BABA_AUTO else v
+        src = "" if (baba_turf is not None and baba_dirt is not None) else (
+            "（指定の無いほうは calc_entry_hensachi が使った想定）" if used else "")
         log(f"[INFO] 3着内基準値: {'・'.join(f'{k} {len(t)} セル' for k, t in tables.items())}"
-            f"／今走の馬場の想定 芝 {show(turf)}・ダ {show(dirt)}")
-    return tables, turf, dirt
+            f"／今走の馬場の想定 芝 {show(turf)}・ダ {show(dirt)}{src}")
+    if not use_perf:
+        log("[INFO] 3着内基準値: master は 過去SP・ST の8指数なし（replace --no-past-perf）で作られているので、"
+            "出馬表にも 今走基準比・過去SP/ST 3走順 は付けません")
+    return tables, turf, dirt, use_perf
 
 
 def load_entries_tables(con: sqlite3.Connection, entries_dir: Path, marks_dir=None, no_marks: bool = False,
@@ -612,9 +623,9 @@ def load_entries_tables(con: sqlite3.Connection, entries_dir: Path, marks_dir=No
     loaded = []
     inner = load_inner_lookup()
     marks, history = entries_side_sources(marks_dir=marks_dir, no_marks=no_marks)
-    tables, turf, dirt = entries_baselines(baba_turf, baba_dirt)
+    tables, turf, dirt, use_perf = entries_baselines(baba_turf, baba_dirt, entries_dir=entries_dir)
     for p in files:
-        df = normalize_entries_df(read_csv_any(p), inner, marks, history, tables, turf, dirt)
+        df = normalize_entries_df(read_csv_any(p), inner, marks, history, tables, turf, dirt, use_perf)
         tname = table_name_for_entries(p.name)
         df.to_sql(tname, con, if_exists="replace", index=False)
         con.execute(f'CREATE INDEX IF NOT EXISTS {q("idx_" + tname + "_race")} ON {q(tname)}("レースID(新/馬番無)")')

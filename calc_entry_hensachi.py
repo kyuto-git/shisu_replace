@@ -42,6 +42,7 @@ from typing import Iterable
 import pandas as pd
 
 from shisu import config
+from shisu import past_perf_indices as PP
 from shisu.csvio import norm_series, read_csv_any, write_csv
 from shisu.hensachi import RANK_SCHEMES, compute_indicator, int_text_series
 from shisu.indicators import canonical_indicator, is_known_indicator, spec_for
@@ -555,7 +556,10 @@ def main(argv=None) -> int:
             return 1
         try:
             lookups = {} if args.no_ext else load_ext(Path(args.ext_dir), only=targets)
-            lookups.update(perf(only=targets))         # 計算した値を優先（ext_indices/past_sp_st のファイルより）
+            computed = perf(only=targets)
+            if computed:                               # 過去SP・ST を計算し直した: 使った想定を残す（build_db が読む）
+                PP.save_used_baba(out_dir, baba_turf, baba_dirt)
+            lookups.update(computed)                   # 計算した値を優先（ext_indices/past_sp_st のファイルより）
             if refresh_indicators(raws, merged_path, targets, lookups):
                 return 0
         except Exception as e:
@@ -571,6 +575,9 @@ def main(argv=None) -> int:
     if computed:
         print(f"[INFO] 過去SP・ST: 想定の馬場状態は {baba_from} から")
         lookups.update(computed)                       # 計算した値を優先（ext_indices/past_sp_st のファイルより）
+        PP.save_used_baba(out_dir, baba_turf, baba_dirt)   # build_db が同じ想定で今走の基準値を引く
+    else:
+        (out_dir / PP.USED_BABA_FILE).unlink(missing_ok=True)   # 過去SP・ST を計算していない出力に、前の想定を残さない
     for p, raw in raws.items():
         try:
             raw, masks, added = attach_ext(raw, lookups, p.name)

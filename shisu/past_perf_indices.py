@@ -1028,6 +1028,30 @@ def save_settings(baba_turf: str, baba_dirt: str, path: Path | str | None = None
     return p
 
 
+USED_BABA_FILE = "past_perf_baba.json"
+
+
+def save_used_baba(out_dir: Path | str, baba_turf: str, baba_dirt: str) -> Path:
+    """calc_entry_hensachi が 過去SP・ST の計算に使った想定の馬場状態を、出力のフォルダ（entries_out/）に残す。
+    build_db が同じ想定で今走の基準値を引くため（同じ引数を2つのコマンドに付け忘れても食い違わない）。"""
+    p = Path(out_dir) / USED_BABA_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".part")
+    tmp.write_text(json.dumps({"baba_turf": norm_baba_choice(baba_turf), "baba_dirt": norm_baba_choice(baba_dirt)},
+                              ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, p)
+    return p
+
+
+def load_used_baba(entries_dir: Path | str) -> dict[str, str] | None:
+    """save_used_baba の記録。無い・読めない・知らない値なら None。"""
+    try:
+        data = json.loads((Path(entries_dir) / USED_BABA_FILE).read_text(encoding="utf-8"))
+        return {"baba_turf": norm_baba_choice(data["baba_turf"]), "baba_dirt": norm_baba_choice(data["baba_dirt"])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def baba_text(baba_turf: str, baba_dirt: str) -> str:
     def one(v: str) -> str:
         return "自動" if v == BABA_AUTO else v

@@ -423,7 +423,8 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
        ・出馬表側（build_db.py）: 過去SP・ST の値と順位は calc_entry_hensachi.py が付けた列から、基準値は master を作ったときの写し
          （master_csv/__index_baseline_*__.csv）から引きます。今走の馬場は想定です:
            docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entries-only --baba-turf 良 --baba-dirt 重
-         （auto／良／稍／重／不／稍・重。省くと /ingest の「想定馬場状態」で選んだ値、それも無ければ出馬表の 馬場状態 の列・無ければ 良）
+         （auto／良／稍／重／不／稍・重。省くと calc_entry_hensachi.py が使った想定（--baba-turf／--baba-dirt・/ingest の「想定馬場状態」）と
+           同じになります。それも無ければ出馬表の 馬場状態 の列・無ければ 良。ふつうは calc にだけ想定を付ければ足ります）
        ・基本CSVには クラス名・年齢限定・馬場状態・血統登録番号・前走レースID(新) の列を入れて出してください（G・I と同じ）。
          年齢限定 が無いと、3歳限定の1勝クラス・オープン・重賞の世代が分からず、そのレースの基準値が引けません。
 

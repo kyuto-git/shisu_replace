@@ -1,5 +1,6 @@
 """SP指数・ST指数の3着内基準値（shisu/baselines.py）と、基準比・過去SP/ST 3走順の条件。"""
 import csv
+import hashlib
 import io
 import json
 import random
@@ -887,18 +888,24 @@ def test_assumed_going_for_the_entries_and_the_snapshot_in_master_csv(site, caps
         return out
 
     assert plain["過去SP今走基準比"].tolist() == want("", "", plain)
-    # 想定の馬場: 引数 → 省いたほうは設定ファイル（/ingest で選んだ値）→ auto
+    # 想定の馬場: 引数 → 省いたほうは calc が使った想定（entries_out/ の記録）→ 設定ファイル（/ingest で選んだ値）→ auto
     capsys.readouterr()
     _rc, wet = entries_table(root, "--baba-turf", "不", "--baba-dirt", "重")
     assert "今走の馬場の想定 芝 不・ダ 重" in capsys.readouterr().out
     assert wet["過去SP今走基準比"].tolist() == want("不", "重", wet)
     assert wet["前走SP基準比"].tolist() == plain["前走SP基準比"].tolist()          # 前走は実際の馬場で引く
     PP.save_settings("不", "auto")
+    _rc, recorded = entries_table(root)            # calc の記録（auto）があるあいだは、設定ファイルより先
+    assert recorded["過去SP今走基準比"].tolist() == plain["過去SP今走基準比"].tolist()
+    record = root / "entries_out" / PP.USED_BABA_FILE
+    held_record = record.read_bytes()
+    record.unlink()                                # 記録が無ければ設定ファイル
     _rc, saved = entries_table(root)
-    assert saved["過去SP今走基準比"].tolist() == want("不", "", saved)
+    assert saved["過去SP今走基準比"].tolist() == want("不", "", saved) != plain["過去SP今走基準比"].tolist()
     _rc, over = entries_table(root, "--baba-turf", "auto")
     assert over["過去SP今走基準比"].tolist() == plain["過去SP今走基準比"].tolist()
     PP.config.past_perf_settings_path().unlink()
+    record.write_bytes(held_record)
     import build_db
     assert build_db.main(["--entries-only", "--baba-turf", "晴"]) == 2
     # 基準値マスタだけをあとから変えても、出馬表側は master を作ったときの写しで引く（master と違う基準値を見ない）
@@ -917,6 +924,13 @@ def test_assumed_going_for_the_entries_and_the_snapshot_in_master_csv(site, caps
         _rc, no_sp = entries_table(root)
         assert (no_sp[["前走SP基準比", "過去SP今走基準比"]] == "").all().all()
         assert no_sp[["前走ST基準比", "過去ST今走基準比", "過去SP3走順"]].equals(plain[["前走ST基準比", "過去ST今走基準比", "過去SP3走順"]])
+        copy.write_bytes(b"\xff\xfe\x00garbage")    # 記録があって写しが読めない → 基準値マスタで代用しない（WARN）
+        capsys.readouterr()
+        _rc, unreadable = entries_table(root)
+        assert "[WARN] 基準値: __index_baseline_SP__.csv を読めません" in capsys.readouterr().out
+        assert (unreadable[["前走SP基準比", "過去SP今走基準比"]] == "").all().all()
+        assert unreadable["過去ST今走基準比"].tolist() == plain["過去ST今走基準比"].tolist()
+        copy.unlink()
         meta.unlink()                              # 記録も無い（前の版の master）→ 基準値マスタ
         _rc, raised = entries_table(root)
         assert set(raised["過去SP今走基準比"]) == {"SP今走基準未達"} and set(raised["前走SP基準比"]) <= {"", "前走SP基準大幅未達"}
@@ -926,6 +940,127 @@ def test_assumed_going_for_the_entries_and_the_snapshot_in_master_csv(site, caps
         data.write_bytes(kept)
     _rc, back = entries_table(root)
     assert back[list(C.BASELINE_CONDITIONS)].equals(plain[list(C.BASELINE_CONDITIONS)])
+
+
+def past_entries(base, dates):
+    """過去の開催日を出馬表の形に（馬場状態の列つき。取消・除外の馬は出馬表に出ないので除く）。"""
+    day = base[base[RID].str[:8].isin(dates)]
+    def kaisai(rid18):
+        if not rid18:
+            return ""
+        place = {"05": "東京", "06": "中山"}[rid18[8:10]]
+        return f"{rid18[2:8]} {int(rid18[10:12])}{synth2.PLACE_CHAR[place]}{int(rid18[12:14])} {int(rid18[14:16]):>2}R"
+    ent = pd.DataFrame({
+        RID: day[RID], "場 R": day["場所"].str[0] + day[RID].str[14:16].astype(int).astype(str), "Ｒ": day[RID].str[14:16],
+        "場所": day["場所"], "芝ダ": day["距離"].str[0], "距離": day["距離"].str[1:], "外回り": "", "クラス": day["クラス名"],
+        "レース名": "", "年限定": day["年齢限定"], "頭": "12", "枠番": day["枠番"], "馬番": day["馬番"], "馬名S": day["馬名"],
+        "騎手": day["騎手"], "血統登録番号": day["血統登録番号"], "所属": "美浦", "間隔": day["間隔"], "休明戦目": "2", "斤量": "56",
+        "性": "牡", "前場所": day["前走場所"], "前芝ダ": day["前芝・ダ"], "前距離": day["前距離"],
+        "前走開催": [kaisai(v) for v in day["前走レースID(新)"]], "前着順": [f"{v}着" if v else "" for v in day["前走着順"]],
+        "前人気": day["前走人気"], "前3F順": day["前走上り3F順"], "前脚質": day["前走脚質"].str[0], "前レース印3": day["前走レース印３"],
+        "前斤量": "56", "マイニング値": day["指数"], "マイニング順位": day["指数順位"], "馬場状態": day["馬場状態"]})
+    return ent[~day["着順"].isin(["取消", "除外"]).to_numpy()].reset_index(drop=True)
+
+
+def test_a_past_race_day_as_entries_gets_the_same_six_columns_as_the_master(site, capsys):
+    """同じ馬・同じレースなら、過去側（master）と出馬表側（DB）で6列が同じ（出馬表に実際の 馬場状態 の列があるとき）。"""
+    root, base, _ent, _sp, _st = site
+    import build_db, calc_entry_hensachi
+    dates = sorted(set(base[RID].str[:8]))[-6:]
+    ent = past_entries(base, dates)
+    assert len(ent) > 150 and set(ent["馬場状態"]) == {"良", "稍", "重"}
+    (root / "past_in").mkdir(exist_ok=True)
+    ent.to_csv(root / "past_in" / "shisu_past_1.csv", index=False, encoding="cp932")
+    db = root / "past.db"
+    shutil.copy(root / "racing.db", db)
+    assert calc_entry_hensachi.main(["--merge-only", "--clean", "--in-dir", str(root / "past_in"), "--out-dir", str(root / "past_out")]) == 0
+    assert build_db.main(["--entries-only", "--no-xjoin", "--entries-dir", str(root / "past_out"), "--db-path", str(db)]) == 0
+    con = sqlite3.connect(db)
+    e = pd.read_sql("SELECT * FROM entries_merged_hensachi", con).fillna("").set_index(RID)
+    con.close()
+    m = read_master(root).set_index(RID).loc[e.index]
+    for c in C.BASELINE_CONDITIONS:
+        assert e[c].tolist() == m[c].tolist(), c
+        assert (e[c] != "").mean() > 0.5, c
+    assert len(set(e["過去SP今走基準比"])) == 5 and len(set(e["前走ST基準比"])) == 5      # どの区分も出ている（空を含めて5通り）
+
+
+def xjoin_rows(db):
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute("SELECT * FROM entries_xjoin_merged_hensachi").fetchall()
+    finally:
+        con.close()
+    return sorted(map(repr, rows))
+
+
+def test_assumed_going_from_calc_and_partial_rebuild(site, capsys):
+    root, _base, ent, _sp, _st = site
+    import build_db, calc_entry_hensachi
+    ent = ent.sort_values(RID).reset_index(drop=True)
+    cells = o_cells(root / "baseline" / B.FILES["SP"])
+
+    def want(baba_turf, baba_dirt, e):
+        out = []
+        for i, r in ent.iterrows():
+            baba = baba_turf if r["芝ダ"] == "芝" else baba_dirt
+            b = o_lookup(cells, r["芝ダ"], "古馬1勝", O_TRACK[r["芝ダ"]][baba], O_PG[r["場所"]], O_BAND[(r["芝ダ"], int(r["距離"]))])
+            out.append(o_now_label("SP", *[o_num(e.loc[i, n]) for n in B.NOW_INDICATORS["SP"]], b))
+        return out
+
+    # 不正な想定は、どのオプションと一緒でも DB に触らずに終了コード 2
+    assert build_db.main(["--entries-only"]) == 0
+    digest = lambda: hashlib.md5((root / "racing.db").read_bytes()).hexdigest()
+    before = digest()
+    for argv in (["--fresh", "--baba-turf", "晴"], ["--entries-only", "--mining-only", "--baba-dirt", "bad"],
+                 ["--mode", "foragg", "--baba-turf", "x"]):
+        assert build_db.main(argv) == 2 and digest() == before, argv
+    # 想定の馬場だけを変えた --mining-only: 6列が変わるので全部の照合に切り替わり、全部作り直した DB と同じ照合結果になる
+    a, b = root / "a.db", root / "b.db"
+    shutil.copy(root / "racing.db", a)
+    shutil.copy(root / "racing.db", b)
+    capsys.readouterr()
+    assert build_db.main(["--entries-only", "--mining-only", "--baba-turf", "不", "--baba-dirt", "重", "--db-path", str(a)]) == 0
+    assert "全部の指数を照合し直します" in capsys.readouterr().out
+    assert build_db.main(["--entries-only", "--baba-turf", "不", "--baba-dirt", "重", "--db-path", str(b)]) == 0
+    assert xjoin_rows(a) == xjoin_rows(b) != xjoin_rows(root / "racing.db") and len(xjoin_rows(a)) > 1000
+    # 同じ想定のままの --mining-only は一部の作り直しで済む
+    capsys.readouterr()
+    assert build_db.main(["--entries-only", "--mining-only", "--baba-turf", "不", "--baba-dirt", "重", "--db-path", str(a)]) == 0
+    assert "の行だけ作り直しました" in capsys.readouterr().out and xjoin_rows(a) == xjoin_rows(b)
+    # calc_entry_hensachi に付けた想定は出力のフォルダに残り、引数なしの build_db が同じ想定で今走の基準値を引く
+    record = root / "entries_out" / PP.USED_BABA_FILE
+    assert json.loads(record.read_text(encoding="utf-8")) == {"baba_turf": "auto", "baba_dirt": "auto"}
+    # calc の記録が無いとき、ダの想定は設定ファイル（/ingest で選んだ値）から
+    held_record = record.read_bytes()
+    record.unlink()
+    PP.save_settings("auto", "不")
+    _rc, saved = entries_table(root)
+    assert saved["過去SP今走基準比"].tolist() == want("", "不", saved) != want("", "", saved)
+    PP.config.past_perf_settings_path().unlink()
+    record.write_bytes(held_record)
+    try:
+        assert calc_entry_hensachi.main(["--merge-only", "--clean", "--baba-turf", "不", "--baba-dirt", "不"]) == 0
+        assert json.loads(record.read_text(encoding="utf-8")) == {"baba_turf": "不", "baba_dirt": "不"} and PP.load_used_baba(record.parent)
+        capsys.readouterr()
+        _rc, used = entries_table(root)
+        assert "今走の馬場の想定 芝 不・ダ 不（指定の無いほうは calc_entry_hensachi が使った想定）" in capsys.readouterr().out
+        assert used["過去SP今走基準比"].tolist() == want("不", "不", used) != want("", "", used)
+        _rc, mixed = entries_table(root, "--baba-dirt", "良")                 # 引数が先。省いた芝は calc の想定
+        assert mixed["過去SP今走基準比"].tolist() == want("不", "良", mixed)
+        PP.save_settings("良", "良")                                          # 設定ファイルより calc の記録が先
+        _rc, still = entries_table(root)
+        assert still["過去SP今走基準比"].tolist() == used["過去SP今走基準比"].tolist()
+        record.write_text("こわれた", encoding="utf-8")                        # 記録が読めなければ設定ファイル
+        _rc, fallback = entries_table(root)
+        assert fallback["過去SP今走基準比"].tolist() == want("良", "良", fallback)
+    finally:
+        PP.config.past_perf_settings_path().unlink(missing_ok=True)
+        assert calc_entry_hensachi.main(["--merge-only", "--clean"]) == 0
+    assert json.loads(record.read_text(encoding="utf-8")) == {"baba_turf": "auto", "baba_dirt": "auto"}
+    assert calc_entry_hensachi.main(["--merge-only", "--clean", "--no-past-perf"]) == 0 and not record.exists()   # 計算していない出力には残さない
+    assert calc_entry_hensachi.main(["--merge-only", "--clean"]) == 0 and build_db.main(["--entries-only"]) == 0
+    assert digest() != "" and xjoin_rows(root / "racing.db") != xjoin_rows(a)
 
 
 def test_replace_options_for_the_baseline(site, capsys):
@@ -990,6 +1125,11 @@ def test_replace_options_for_the_baseline(site, capsys):
     assert (m[["過去SP今走基準比", "過去ST今走基準比", "過去SP3走順", "過去ST3走順"]] == "").all().all()
     assert m["前走SP基準比"].tolist() == full["前走SP基準比"].tolist() and data.read_bytes() == built
     assert json.loads((root / "master_csv" / B.MASTER_META).read_text(encoding="utf-8"))["past_perf"] is False
+    capsys.readouterr()
+    _rc, e = entries_table(root)                   # 出馬表側も同じ（calc が付けた 過去SP・ST の列があっても使わない）
+    assert "出馬表にも 今走基準比・過去SP/ST 3走順 は付けません" in capsys.readouterr().out
+    assert (e[["過去SP今走基準比", "過去ST今走基準比", "過去SP3走順", "過去ST3走順"]] == "").all().all()
+    assert (e["前走SP基準比"] != "").sum() > 10 and (e["過去SP_3走平均_順位"].astype(str) != "").any()
     assert not (root / "master_csv" / "master_全場_過去SP_3走平均.csv.gz").exists()
     # 元に戻す（--workers 2 でも同じ master）
     assert replace_csv_ver3.main(["--clean", "--workers", "2", *MIN_ARGS]) == 0
