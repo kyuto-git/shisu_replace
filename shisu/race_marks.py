@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import json
 import io
 import os
 import re
@@ -44,6 +45,7 @@ FIELDS = ("member", "time", "pace", "cushion", "moist_turf", "moist_dirt")      
 KEY = "RX"
 COLUMNS = [KEY] + list(FIELDS)
 FILE = "__race_marks__.csv.gz"
+META = "__race_marks__.json"
 _RX_RE = re.compile(r"^RX(\d{2})(\d{2})(\d)([0-9A-Z])(\d{2})$")
 _COLOR_RE = re.compile(r"^[0-9A-Fa-f]{2}")
 _DASH_RE = re.compile(r"^[-‐-―ー−]+$")
@@ -106,11 +108,12 @@ class MarkFile:
 
 
 def _walk(root: Path) -> Iterator[Path]:
+    """root の下のファイルを、相対パス（/ 区切り）の名前順で。「.」で始まるもの・__MACOSX・__pycache__ は見ない。"""
+    found: list[Path] = []
     for dirpath, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d.casefold() not in ("__macosx", "__pycache__"))
-        for f in sorted(files):
-            if not f.startswith("."):
-                yield Path(dirpath) / f
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d.casefold() not in ("__macosx", "__pycache__")]
+        found.extend(Path(dirpath) / f for f in files if not f.startswith("."))
+    yield from sorted(found, key=lambda p: p.relative_to(root).as_posix())
 
 
 def find_files(root: Path | str | None = None, log: Logger | None = None) -> list[MarkFile]:
@@ -130,7 +133,7 @@ def find_files(root: Path | str | None = None, log: Logger | None = None) -> lis
         try:
             with zipfile.ZipFile(p) as z:
                 names = sorted(n for n in z.namelist() if not n.endswith("/"))
-        except (zipfile.BadZipFile, OSError) as e:
+        except Exception as e:                               # 壊れた ZIP 1本で全体を止めない
             log(f"[WARN] レース印: {p.name} を ZIP として読めません（{type(e).__name__}: {e}）")
             continue
         for n in names:
@@ -225,7 +228,7 @@ def read_files(files: Iterable[MarkFile], log: Logger | None = None) -> RaceMark
     for mf in files:
         try:
             rows, bad, examples = parse_text(_decode(_read_bytes(mf)))
-        except (OSError, zipfile.BadZipFile, KeyError, csv.Error) as e:
+        except Exception as e:      # 読めないファイル（パスワードつきの ZIP・途中で切れた ZIP など）は、その1本だけ飛ばす
             log(f"[WARN] レース印（{KIND_LABELS[mf.kind]}）: {mf.label} を読めません（{type(e).__name__}: {e}）")
             continue
         if bad:
@@ -284,6 +287,39 @@ def save(marks: RaceMarks, master_dir: Path | str | None = None) -> Path:
     return path
 
 
+def save_meta(master_dir: Path | str | None, enabled: bool, race_dir: Path | str | None = None) -> Path:
+    """replace が外部レース印をどう読んだか（読まない・既定でないフォルダ）を master_csv/__race_marks__.json に残す。
+    出馬表側（build_db）が同じ読み方をして、master と出馬表で違う印を見ないようにするため。
+    フォルダは、既定（config.race_marks_dir()）と同じなら空（出馬表側もその場所の既定を使う）。"""
+    d = Path(master_dir) if master_dir is not None else config.master_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    where = ""
+    if race_dir is not None:
+        try:
+            if Path(race_dir).resolve() != config.race_marks_dir().resolve():
+                where = str(Path(race_dir).resolve())
+        except OSError:
+            where = str(race_dir)
+    path = d / META
+    tmp = d / (META + ".part")
+    tmp.write_text(json.dumps({"version": 1, "enabled": bool(enabled), "dir": where}, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def load_meta(master_dir: Path | str | None = None) -> dict | None:
+    """master_csv/__race_marks__.json（{"enabled": bool, "dir": str}）。無い・読めない・形が違えば None。"""
+    p = (Path(master_dir) if master_dir is not None else config.master_dir()) / META
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or not isinstance(d.get("enabled"), bool):
+        return None
+    where = d.get("dir")
+    return {"enabled": d["enabled"], "dir": where if isinstance(where, str) else ""}
+
+
 def load_cache(master_dir: Path | str | None = None) -> RaceMarks | None:
     """master_csv/__race_marks__.csv.gz。無い・読めない・形が違えば None。"""
     p = (Path(master_dir) if master_dir is not None else config.master_dir()) / FILE
@@ -298,10 +334,25 @@ def load_cache(master_dir: Path | str | None = None) -> RaceMarks | None:
     return RaceMarks.from_frame(df)
 
 
-def load(race_dir: Path | str | None = None, master_dir: Path | str | None = None, log: Logger | None = None) -> RaceMarks:
+def load(race_dir: Path | str | None = None, master_dir: Path | str | None = None, log: Logger | None = None,
+         enabled: bool | None = None) -> RaceMarks:
     """出馬表側（build_db）用: race_marks/ にファイルがあればそれを読み（前走が先週のレースでも引けるように、新しいほう）、
-    無ければ master_csv/__race_marks__.csv.gz（replace が書いたもの）。どちらも無ければ空。"""
+    無ければ master_csv/__race_marks__.csv.gz（replace が書いたもの）。どちらも無ければ空。
+    race_dir・enabled を指定しなければ、replace の読み方（__race_marks__.json）に合わせる: replace が印を読まなかった
+    （--no-race-marks）なら出馬表側も読まず、別のフォルダ（--marks-dir）を読んだならそのフォルダを読む。
+    race_dir を指定すれば、そのフォルダを読む（enabled=False なら読まない）。"""
     log = log or (lambda m: None)
+    meta = load_meta(master_dir) if (race_dir is None and enabled is None) else None
+    if enabled is None:
+        enabled = meta["enabled"] if meta else True
+        if not enabled:
+            log("[INFO] レース印: replace が外部レース印を読まずに master を作っているので（--no-race-marks）、出馬表側も"
+                "使いません（使うなら replace をやり直すか、build_db に --marks-dir を付ける）")
+    if not enabled:
+        return RaceMarks()
+    if race_dir is None and meta and meta["dir"]:
+        race_dir = meta["dir"]
+        log(f"[INFO] レース印: replace と同じフォルダ {race_dir} を読みます")
     files = find_files(race_dir, log)
     if files:
         return read_files(files, log)
@@ -313,4 +364,4 @@ def load(race_dir: Path | str | None = None, master_dir: Path | str | None = Non
 
 
 __all__ = ["KINDS", "FIELDS", "FILE", "RaceMarks", "MarkFile", "rx_of", "day_char", "clean_value", "kind_of", "find_files",
-           "parse_text", "read_files", "load_dir", "save", "load_cache", "load"]
+           "parse_text", "read_files", "load_dir", "save", "load_cache", "load", "META", "save_meta", "load_meta"]

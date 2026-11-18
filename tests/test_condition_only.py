@@ -309,8 +309,12 @@ def test_entries_side_gets_the_same_conditions_from_marks_and_history(site, monk
     monkeypatch.setenv("RACE_MARKS_DIR", str(root / "nope"))
     marks_cached, _h = build_db.entries_side_sources(log=lambda m: None)
     b = build_db.normalize_entries_df(raw, None, marks_cached, history)
+    order = raw[RID].argsort(kind="stable").to_numpy()               # DB の表（e）は レースID(新) の順
+    assert raw[RID].to_numpy()[order].tolist() == e[RID].tolist()
     for c in ("前走メンバーLv", "前走タイムLv", "前走クッション帯", "前走含水率帯", "前走R印3", "近5走同条件", "近5走同場"):
-        assert a[c].tolist() == b[c].tolist() == e.sort_values(RID)[c].fillna("").tolist() or a[c].tolist() == b[c].tolist(), c
+        in_db = e[c].fillna("").tolist()
+        assert a[c].to_numpy()[order].tolist() == in_db, c            # race_marks/ から
+        assert b[c].to_numpy()[order].tolist() == in_db, c            # master_csv の表から
     plain = build_db.normalize_entries_df(raw)                       # 印・履歴を渡さなければ空
     assert all((plain[c] == "").all() for c in ("前走メンバーLv", "近5走同条件", "近5走同場"))
 
@@ -389,8 +393,10 @@ def db(root):
     return con
 
 
-def test_db_and_xjoin_hold_condition_only_rows_once(site):
+def test_db_and_xjoin_hold_condition_only_rows_once(site, monkeypatch):
     root, _base, _marks, _ent = site
+    import app as am
+    monkeypatch.setattr(am, "DB_PATH", str(root / "racing.db"))      # app は import したときの DB を覚えている
     con = db(root)
     rows = [dict(r) for r in con.execute('SELECT family, indicator, COUNT(*) n FROM unified_all GROUP BY family, indicator')]
     by = {(r["family"], r["indicator"]): r["n"] for r in rows}
@@ -416,7 +422,6 @@ def test_db_and_xjoin_hold_condition_only_rows_once(site):
     sd = [h for h in plain if h["family"] == "N_sd_dist" and h["odds_mode"] == "normal"]
     assert len(sd) == n_horses == 24 and {h["key"] for h in sd} == {"芝×16-18", "ダ×1600"}
     # その場照合（xjoin なし）と同じ中身
-    import app as am
     with am.connect() as c2:
         race = [dict(r) for r in c2.execute("SELECT * FROM entries_merged_hensachi")]
         bases = matching.match_bases(race[0].keys())
@@ -426,9 +431,10 @@ def test_db_and_xjoin_hold_condition_only_rows_once(site):
     assert sorted(map(key, fly)) == sorted(map(key, x))
 
 
-def test_pages_presets_and_drill_for_condition_only_rows(site):
+def test_pages_presets_and_drill_for_condition_only_rows(site, monkeypatch):
     root, _base, _marks, ent = site
     import app as am
+    monkeypatch.setattr(am, "DB_PATH", str(root / "racing.db"))
     from shisu import drill
     c = am.app.test_client()
     rid = ent[RID].iloc[0][:16]

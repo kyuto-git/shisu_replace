@@ -56,7 +56,7 @@ shisu_replace/
 ├─ csv_files/   入力: 過去レース（TARGET）       ├─ entries_in/   入力: 出馬表（TARGET）
 ├─ raw_csv/     入力: 追加分の過去基本CSV（replace が csv_files/全場_*.csv に統合。済んだものは raw_csv/merged_done/ へ。§3.9）
 ├─ ext_indices/ 入力: 外部指数CSV群（§4.2）       ├─ entries_out/  偏差値付き出馬表
-├─ master_csv/  1頭1行（.csv.gz。集計・選抜の入力）＋ __inner_outer__.csv.gz（前走の内外を引く表）＋ __horse_perf_history__.csv.gz・.json（馬ごとの過去走・着順・結果指数。§4.9）＋ __race_marks__.csv.gz（外部レース印の表。§4.10）
+├─ master_csv/  1頭1行（.csv.gz。集計・選抜の入力）＋ __inner_outer__.csv.gz（前走の内外を引く表）＋ __horse_perf_history__.csv.gz・.json（馬ごとの過去走・着順・結果指数。§4.9）＋ __race_marks__.csv.gz・.json（外部レース印の表と、replace の読み方の記録。§4.10）
 ├─ agg_csv/     成績表 agg_master_{地域}_{指数名}.csv.gz（master 1本につき1ファイル。1行=1結合データ。条件のみの family は agg_master_{地域}_条件のみ.csv.gz）＋ families.json（集計に使った family）・agg_settings.json（集計の設定。--resume 用）
 ├─ racing.db    SQLite                            ├─ selected_families.json / screening_report.csv（screen_families の出力）
 ├─ condition_notes.json  危険条件メモ（/entries/drill で書く。DB の外。`NOTES_PATH` で場所を変えられる。§4.8）
@@ -206,7 +206,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 | `matching.py` | 出馬表1頭 × unified_all の完全一致照合（xjoin 構築と画面のその場照合で共通）。`match_bases`（照合する指数の名前。条件のみの family があれば `CONDITION_ONLY` を足す）・`iter_hit_rows`（ヒット行を1行ずつ返す。xjoin 構築はこれを使う。指数を使う family は指数ごと、条件のみの family は1回）・`match_entry_row`（同じ中身の dict のリスト）・`HitCache`（照合のキャッシュ。入れるたびに件数と行数の上限を見る。§3.4） |
 | `drill.py` | 逆引き: (地域, 指数) の master を探し（`find_master`。指数が「条件のみ」なら基準の master）、family・スキームのキーとオッズ帯が同じ馬の行を取り出す（`extract`。集計と同じ `build_keys`・`odds_mask`・重複の除き方・分母）。TARGET 用のレースID（`id_lists`）・項目ごとの分布のまとめ（`summarize`）（§3.10） |
 | `notes.py` | 危険条件メモの保存（JSON 1本。ロック・一時ファイルからの置き換え・地域ごと／全地域共通の引き方。§4.8） |
-| `race_marks.py` | TARGET の外部レース印（5種）の探索（`find_files`。名前で種類を決める `kind_of`）・読み込み（`parse_text`・`read_files`）・レースID(新)16桁 → `RX`+旧8桁（`rx_of`）・値の前処理（`clean_value`）・表（`RaceMarks.get(前走RID16)`）・`master_csv/__race_marks__.csv.gz` の保存と読み込み（`save`・`load_cache`）・出馬表側の読み方（`load`: race_marks/ → 無ければ表）（§3.12・§4.10） |
+| `race_marks.py` | TARGET の外部レース印（5種）の探索（`find_files`。名前で種類を決める `kind_of`）・読み込み（`parse_text`・`read_files`）・レースID(新)16桁 → `RX`+旧8桁（`rx_of`）・値の前処理（`clean_value`）・表（`RaceMarks.get(前走RID16)`）・`master_csv/__race_marks__.csv.gz` の保存と読み込み（`save`・`load_cache`）・replace の読み方の記録（`save_meta`・`load_meta`。`__race_marks__.json`）・出馬表側の読み方（`load`: 記録に合わせて、race_marks/ → 無ければ表）（§3.12・§4.10） |
 | `past_perf_indices.py` | 結果指数（SP指数・ST指数）→ 過去3走／5走の平均・最高の8指数。結果ファイルの探索と読み込み（`find_result_files`・`load_results`）・計算に使う列（`target_frame`）・履歴（`history_rows`・`History`）・対象の走の決め方（`select_runs`）・値（`aggregate`）・`compute`・履歴のキャッシュ（`get_history`）・想定馬場状態の設定（`load_settings`・`save_settings`）・近5走の要約条件（`recent_form`。`History.all_runs`・`form_runs`）（§3.11・§3.13・§4.9） |
 | `wedge.py` | WIN・EDGE・WEDGE・年度加重 adjusted_WEDGE |
 | `ingest/`・`yasui_extractor.py` | 外部指数の取得（§3.6・§3.7） |
@@ -230,7 +230,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
    - 優先: 同じ地域×指数のファイルが csv_files にあればそちら（ext と同じ決まり）。計算した値は `ext_indices/past_sp_st/` のファイル（/ingest の出力）より優先（INFO を出して ext のジョブを外す）。結果指数が無く ext のファイルだけがあれば、ほかの外部指数と同じに ext から付ける
    - 1つのプロセスでの計算は基本CSV 1本につき1回（`_perf_values` の lru_cache。8指数ぶんの値を持つ）。`--workers` でも同じ master になる。`--no-past-perf` で計算しない（`ext_indices/past_sp_st/` にファイルがあれば、ほかの外部指数と同じにそこから付く）
    - main の最初に `_read_base`・`_perf_values` のキャッシュを空にする（同じプロセスで続けて呼ばれても前の実行の値を使わない）
-7. **外部レース印の前走条件（2026-11-17〜。§3.12）**: main が `race_marks/`（`--marks-dir`）を読んで `master_csv/__race_marks__.csv.gz` に書く（印が1つも無ければ、前の実行の表を消す）。各ジョブ（`process_frame`）は、その表を1つのプロセスで1回だけ読み（`_marks`）、`derive(…, marks)` に渡す。`--no-race-marks` で読まない
+7. **外部レース印の前走条件（2026-11-17〜。§3.12）**: main が `race_marks/`（`--marks-dir`）を読んで `master_csv/__race_marks__.csv.gz` に書く（印が1つも無ければ、前の実行の表を消す）。各ジョブ（`process_frame`）は、その表を1つのプロセスで1回だけ読み（`_marks`）、`derive(…, marks)` に渡す。`--no-race-marks` で読まない。どう読んだか（読まない・既定でないフォルダ）は `master_csv/__race_marks__.json` に残し、出馬表側（build_db）が同じ読み方をする（§3.12）。読めないファイル（パスワードつきの ZIP・途中で切れた ZIP など）は、その1本だけ WARN を出して飛ばす。フォルダごと読めなければ `[ERROR] 外部レース印: …` を出して印なしで master を作る（終了コード1）
 8. **近5走の要約条件（2026-11-17〜。§3.13）**: main は、結果指数の有無に関係なく（`--no-past-perf` でも）馬ごとの過去走の履歴を作り直して `master_csv/__horse_perf_history__.csv.gz` に書く（`get_history(rebuild=True)`）。過去SP・ST の8指数の「perf」ジョブを足すのは、履歴に結果指数のある走があり（`History.has_results`）`--no-past-perf` でないときだけ。各ジョブは履歴を1つのプロセスで1回だけ読み（`_history`）、入力の各馬の `recent_form` を `derive(…, recent=)` に渡す（基本CSVを何十回も使う ext・perf のジョブは、基本CSV 1本につき1回だけ計算する `recent_of_base`）
    - 履歴を作れなかったとき（読めない基本CSV など）: `[ERROR] 過去SP・ST の履歴: …` を出し、前の実行の履歴のファイルを消して（各ジョブが古い履歴を読まないように）、8指数は作らず・近5走の条件は空のまま、ほかの master は作る（終了コード1）
 - **family ごとの素材ファイルは作らない**（旧版は 20本×入力。今は aggregate が master からその場でキーを作る）
@@ -306,7 +306,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
 ### 3.4 build_db.py（CSV → racing.db）
 
 - family の定義ファイル（`SHISU_FAMILIES_FILE` など）が無い・読めないときは、DB に触る前に終了コード2
-- `--mode both|foragg|entries`, `--entries-only`（＝ `--mode entries`。出馬表だけ取り込み直す。馬体重発表後のマイニング確定値の差し替えなど。`--mode foragg`・`--fresh` とは一緒に使えない）, `--fresh`, `--prune`, `--no-xjoin`, `--agg-dir`, `--allow-empty`, `--entries-dir`, `--db-path`
+- `--mode both|foragg|entries`, `--entries-only`（＝ `--mode entries`。出馬表だけ取り込み直す。馬体重発表後のマイニング確定値の差し替えなど。`--mode foragg`・`--fresh` とは一緒に使えない）, `--fresh`, `--prune`, `--no-xjoin`, `--agg-dir`, `--allow-empty`, `--entries-dir`, `--db-path`, `--marks-dir DIR`・`--no-race-marks`（出馬表の外部レース印。省くと replace と同じ読み方。§3.12）
 - **`--indicators タイムM,対戦M`／`--mining-only`（2026-11-12〜。`--entries-only` と一緒に使う。付ければ出馬表だけのモードになる）**: 出馬表のテーブル（`entries_*`・`entries_all`）は今までどおり入れ替え、照合結果は `refresh_xjoin` で**指定した指数の行だけ**作り直す: `DELETE FROM entries_xjoin_* WHERE base IN (…)` → その指数だけを `match_entry_row` で照合して INSERT（1つのトランザクション。ほかの指数の行は触らない。__tables_meta__ の n_rows は全体の行数に直す）。時間は全部の照合のおよそ（指定した指数の数 / 全指数の数）
   - **一部の作り直しで済ませるのは、ほかの指数の照合結果が変わらないと分かるときだけ**（`partial_blocker`）。照合結果（xjoin）を書くたびに、それが何から作られたかの記録（`xjoin_record`）を `__build_info__` の `xjoin_of:{xjoin のテーブル名}` に JSON で残す: `unified`（成績表の印 `unified_stamp`。unified_all を入れ替えるたびに変わる）・`plain`（出馬表の馬の列 `HORSE_COLUMNS`・キーの部品と22条件 `PART_FIELDS` の全馬ぶんのハッシュ）・`bases`（指数ごとの `X_順位`／`X_偏差値帯` のハッシュ。`match_signatures`）。今の成績表・今の出馬表から作った記録と比べて、次のどれかなら `[INFO]`（理由つき）を出して全部の照合（`build_xjoin`）に切り替える
     - 記録が無い（前の版の build_db で作った照合結果・前の実行が途中で止まった）
@@ -330,7 +330,7 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --entrie
   - **オッズ帯の境目の記録（2026-11-14〜）**: 読んだ agg_master の印の `odds_breaks`（その成績表を集計したときの `ODDS_BREAKS`）が全部同じならその値を、違うものが混ざる・印に無い（前の版の aggregate）・旧来の foragg_*.csv を使った なら `null` を、unified_all の入れ替えと同じトランザクションで `__build_info__` の `odds_breaks` に書く（作っている間は `odds_breaks:build`）。今の `ODDS_BREAKS` と違えば `[INFO]` を出す。画面はこれを見て注意書きを出す（§3.5）
   - 読める成績表が0本なら DB に触らず終了コード2（空にしたいときだけ `--allow-empty`）。WEDGE 列の無い旧形式の成績表は取り込まず終了コード1
   - families.json に無い family・スキームの行・ファイル（前の実行の残り）は取り込まず、行数・本数を警告する
-- entries: `normalize_entries_df`（キー部品の正規化と条件。前走の内外は `master_csv/__inner_outer__.csv.gz` で引く。外部レース印の前走条件と近5走の要約条件は `entries_side_sources()` が用意する (レース印, 履歴) から、過去側と同じ `derive`・`recent_form` で付ける: レース印は `race_marks.load`（race_marks/ にファイルがあればそれ、無ければ `__race_marks__.csv.gz`）、履歴は `past_perf_indices.get_history`（基本CSV・結果指数が変わっていれば作り直す）。読めなければ WARN を出してその条件を空にする。近5走に使う列（馬・日付・場所・芝ダ・距離）は、距離をレンジ統合後の値に書き換える前の元の列から取る。**障害レース**（今芝ダ=障・レース名が 障害…・トラックコード51以上。TARGET の出馬表は 芝ダ に「ダ」「芝」と入る）は 芝・ダ を「障」にし、照合しない）→ テーブル → entries_all → xjoin（各馬 × 指数 × family × キー候補を unified_all と完全一致照合）。`--mode entries` では DB の `__families__` の family で照合する（DB を作ったときの family）
+- entries: `normalize_entries_df`（キー部品の正規化と条件。前走の内外は `master_csv/__inner_outer__.csv.gz` で引く。外部レース印の前走条件と近5走の要約条件は `entries_side_sources()` が用意する (レース印, 履歴) から、過去側と同じ `derive`・`recent_form` で付ける: レース印は `race_marks.load`（race_marks/ にファイルがあればそれ、無ければ `__race_marks__.csv.gz`。replace が `--no-race-marks`・`--marks-dir` で作った master なら、記録 `__race_marks__.json` に合わせて、読まない・そのフォルダを読む。build_db の `--marks-dir DIR`・`--no-race-marks` で指定もできる）、履歴は `past_perf_indices.get_history`（基本CSV・結果指数が変わっていれば作り直す）。読めなければ WARN を出してその条件を空にする。近5走に使う列（馬・日付・場所・芝ダ・距離）は、距離をレンジ統合後の値に書き換える前の元の列から取る。**障害レース**（今芝ダ=障・レース名が 障害…・トラックコード51以上。TARGET の出馬表は 芝ダ に「ダ」「芝」と入る）は 芝・ダ を「障」にし、照合しない）→ テーブル → entries_all → xjoin（各馬 × 指数 × family × キー候補を unified_all と完全一致照合）。`--mode entries` では DB の `__families__` の family で照合する（DB を作ったときの family）
   - 照合する指数の名前は `match_bases`（出馬表の指数 ＋ 条件のみの family があれば「条件のみ」）。条件のみの family は base = 「条件のみ」で1頭につき1回だけ照合する（指数の数だけ同じ行を作らない）。`--mining-only`／`--indicators` の一部の作り直しは指定した指数の行だけを入れ替えるので、条件のみの行はそのまま残る（キーの部品・条件が変わっていれば `plain` の違いで全部の照合になる）
   - unified_all が無い・旧形式なら xjoin を作らず終了コード1
   - **照合（xjoin）のメモリ（2026-11-14〜）**: 全部の照合（`build_xjoin`）も一部の作り直し（`refresh_xjoin`）も `insert_hits` を通る。メモリに持つのは、INSERT 待ちの行（`XJOIN_BATCH` 5,000行まで）と照合のキャッシュ（`HitCache`: `XJOIN_CACHE_LIMIT` 20,000件・`XJOIN_CACHE_ROWS` 50,000行まで）だけで、family・指数・馬の数に依らない
@@ -571,6 +571,8 @@ TARGET の外部レース印（レース単位の印。5種）を、各馬の前
   - `前走R印3` の補完（pace）: 基本CSV・出馬表の `前走レース印３` から作った区分が空（空欄・`----`・区分に無い値）の馬だけ、ペース判定（`HHH`/`HH` → `HHH~HH`、`H`、`M`、`S`、`SS`/`SSS` → `SS~SSS`）で埋める。値のある馬は基本CSV・出馬表の値のまま
 - **過去側**: replace の main が race_marks/ を読んで `master_csv/__race_marks__.csv.gz` に書き、各ジョブがその表を読む（§3.1 の7）
 - **出馬表側**: build_db の `entries_side_sources` → `race_marks.load`: race_marks/ にファイルがあればそれ（先週のレースの印が足されていれば、前走が先週の馬にも付く）、無ければ `__race_marks__.csv.gz`、どちらも無ければ空
+  - **replace と同じ読み方をする**（`master_csv/__race_marks__.json`。§4.10）: replace を `--no-race-marks` で回した master なら、race_marks/ にファイルがあっても出馬表側は読まない（`[INFO]`）。`--marks-dir DIR`（既定と違うフォルダ）で回した master なら、出馬表側もそのフォルダを読む（そこにファイルが無ければ表）。記録が無い（前の版の master）なら既定のフォルダ
+  - build_db の `--marks-dir DIR`（そのフォルダを読む。記録より優先）・`--no-race-marks`（付けない）で、出馬表側だけ変えることもできる（master と違う印を見ることになるので、試すとき用）
 - 同じレースの値が複数のファイルにあれば、相対パスの名前順で後のファイル（値なしでは上書きしない。含水率は芝・ダの組ごと）
 
 ### 3.13 近5走の要約条件（2026-11-17〜。`past_perf_indices.recent_form`）
@@ -747,6 +749,8 @@ ext_indices/ の下（階層は自由）のファイルを、フォルダ名・�
   - 含水率: 1つのファイルの中で同じ RX の1行目 = 芝・2行目 = ダート（続いていなくてもよい）。3行目からは使わない（WARN）。1行だけなら芝だけ
   - 同じレースが複数のファイルにあれば、相対パスの名前順で後のファイルの値（値なしでは上書きしない。含水率は芝・ダの組ごと入れ替え、2行とも値なしなら前の値を残す）
 - **`master_csv/__race_marks__.csv.gz`**（UTF-8・gzip・時刻なし・一時ファイルから置き換え）: `RX, member, time, pace, cushion, moist_turf, moist_dirt`（1行 = 印が1つでもあるレース。値は前処理のあとの文字。区分にはしていない）。replace が race_marks/ から書く（印が無い・`--no-race-marks` なら消す）。出馬表側は race_marks/ にファイルが無いときに読む
+- **`master_csv/__race_marks__.json`**（replace の読み方の記録。一時ファイルから置き換え）: `{"version": 1, "enabled": true|false, "dir": ""|フォルダ}`。`enabled` は `--no-race-marks` で false。`dir` は、読んだフォルダが既定（`config.race_marks_dir()`）と同じなら空（出馬表側も、その場所の既定のフォルダを読む）、違えば絶対パス。replace が毎回書く。無い・読めない・形が違うときは、記録なし（既定のフォルダを読む）として扱う
+- 読む順は相対パス（`/` 区切り）の名前順（`a/member.csv` → `member.csv`。大文字は小文字より前）。結果指数（§4.9）も同じ（2026-11-17 の2件目から。それまでは「上のフォルダのファイル → サブフォルダ」の順だった）。読めないファイル・ZIP の中身は、その1本だけ WARN を出して飛ばす
 
 ### 4.6 DB（racing.db）
 
@@ -1050,7 +1054,7 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 49. **履歴の印は中身の CRC32**: calc・/ingest は実行のたびに基本CSV・結果指数のファイルを読んで CRC32 を取る（10年分の基本CSVで1秒前後）。違えば履歴を作り直す（基本CSVの必要な列だけを読む。数秒〜十数秒）
 50. **/ingest の取得元 past のベースCSV**: 馬名（または血統登録番号）・芝ダ・距離・年限定 のある出馬表の形が要る（スクレイピング用の ★5タブのベースCSV（レースID(新)・日付S・枠番・馬番・ワーク1）だけでは計算できない → この取得元だけ失敗）。ext_indices/past_sp_st へのコピーは、今回のファイルにある馬を今回の値に置き換える（空欄も。24 の「前の値を残す」とは違う。今回のファイルに無い馬の行は残る）。calc は計算した値を優先するので、ext のファイルは TARGET への取り込み用
 51. **外部レース印の照合は「年の下2桁・場所・回・日・R」**（2026-11-17〜）: RX… には月日が入っていないので、前走RID16 の月日は見ない（同じ年・場所・回・日・R は1レースなので、ふつうは取り違えない）。前走が地方・海外の馬、印のファイルの期間より前のレースが前走の馬は空。値の先頭2文字が16進なら必ずカラーコードとして除くので、カラーコードの付いていない2文字だけの値（`12` など）は空になる（TARGET の出力には必ず付いている前提）
-52. **過去側の印は replace を回した時点・出馬表側は build_db を回した時点**: 出馬表側は race_marks/ を先に読む（先週のレースの印を使うため）。race_marks/ のファイルの値をあとから直すと、同じ前走でも過去側（master）と出馬表側で区分が変わりうる（過去側も合わせるには replace → aggregate）。replace は、印が1つも無ければ `__race_marks__.csv.gz` を消す
+52. **過去側の印は replace を回した時点・出馬表側は build_db を回した時点**: 出馬表側は race_marks/ を先に読む（先週のレースの印を使うため）。race_marks/ のファイルの値をあとから直すと、同じ前走でも過去側（master）と出馬表側で区分が変わりうる（過去側も合わせるには replace → aggregate）。replace は、印が1つも無ければ `__race_marks__.csv.gz` を消す。replace を `--no-race-marks`・`--marks-dir` で回したときは、出馬表側も同じ読み方をする（`__race_marks__.json`）。build_db の `--marks-dir`・`--no-race-marks` を使うと、その実行だけ master と違う印を見る
 53. **前走R印3 の補完で、既存の family の成績表も変わる**: ペース判定のファイルを置いて replace → aggregate を回すと、基本CSVの `前走レース印３` が空だった馬にも 前走R印3 が付くので、前走R印3 を使う family（初期セットの D_r3・C_sd_r3_style など）の件数が増える。基本CSV・出馬表に値があれば、印と違っていてもそちらを使う
 54. **近5走の要約は「基本CSVにある平地の走」だけ**（43 と同じ）: 基本CSVが半年前までなら、直近半年の走は無いものとして数える（出馬表側も同じ履歴なので両側はそろう）。着順が空の走は数えない。失格・中止は4着以下。障害の走・取消・除外は入らない。馬の見分けは 47 と同じ
 55. **履歴は全部の走を持つ**（版3）: 10年分（約48万走）で、履歴のファイルは数MB、読み込んだ History は1プロセスあたり約210MB・作るのに約4秒（合成データでの実測。2026-11-17）。replace の `--workers` の子プロセスは、それぞれ1回読む。近5走の計算は30万行で約2秒

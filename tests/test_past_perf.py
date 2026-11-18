@@ -105,7 +105,9 @@ def test_result_files_are_found_in_subfolders_and_zips(tmp_path):
     (root / "2026" / "deep").mkdir(parents=True)
     a, b, c, d = "202601050501010101", "202601050501010102", "202601050501010103", "202601050501010104"
     (root / "SP01260105.csv").write_text(f"{a},80\n{b},70\n", encoding="cp932")
-    (root / "2026" / "sp_lower.CSV").write_text(f"{b},71\n", encoding="utf-8-sig")              # 後のファイルが優先
+    (root / "zz").mkdir()
+    (root / "zz" / "sp_lower.CSV").write_text(f"{b},71\n", encoding="utf-8-sig")                # 相対パスの名前順で後のファイルが優先
+    (root / "2026" / "sp_early.csv").write_text(f"{a},1\n", encoding="utf-8")                   # 2026/… は SP0126… より前
     (root / "2026" / "deep" / "st_se_20260105.csv").write_text(f"{a},-10\n", encoding="utf-8")
     (root / "ST_SE_upper.csv").write_text(f"{b},33\n", encoding="cp932")
     with zipfile.ZipFile(root / "2026" / "Speed_2026.zip", "w") as z:
@@ -122,7 +124,8 @@ def test_result_files_are_found_in_subfolders_and_zips(tmp_path):
     logs = []
     files = PP.find_result_files(root, logs.append)
     got = sorted((f.kind, f.path.name, f.member) for f in files)
-    assert got == [("SP", "SP01260105.csv", ""), ("SP", "Speed_2026.zip", "inner/SP02260105.csv"), ("SP", "sp_lower.CSV", ""),
+    assert got == [("SP", "SP01260105.csv", ""), ("SP", "Speed_2026.zip", "inner/SP02260105.csv"), ("SP", "sp_early.csv", ""),
+                   ("SP", "sp_lower.CSV", ""),
                    ("ST", "ST_SE_upper.csv", ""), ("ST", "st_se_2026.zip", "anything.csv"), ("ST", "st_se_20260105.csv", "")]
     assert any("speed_broken.zip" in m and "[WARN]" in m for m in logs)
     res = PP.load_results(files, logs.append)

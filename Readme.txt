@@ -337,8 +337,11 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
   （3）使い方
        ・過去側: race_marks/ に置いて replace_csv_ver3.py（1章A の Step 1）を回すと、master にこの列が入り、
          印の表が master_csv/__race_marks__.csv.gz にも保存されます。読まないときは --no-race-marks。
+         別のフォルダを読むときは --marks-dir フォルダ。パスワードつきなど読めない ZIP は、その1本だけ飛ばします（[WARN] が出ます）。
        ・出馬表側（毎週）: build_db.py が、出馬表の各馬の前走（「前走開催」の欄から作るレースID）で同じ値を引きます。
          race_marks/ にファイルがあればそれを読みます（無ければ master_csv/__race_marks__.csv.gz）。
+         ※ replace を --no-race-marks や --marks-dir で回したときは、build_db.py も自動で同じ読み方になります
+           （master と出馬表で違う印を見ないように、読み方を master_csv/__race_marks__.json に残しています）。
          → 先週のレースが前走の馬にも付くように、race_marks/ のファイルは毎週 TARGET から出し直して上書きしておいてください
            （過去側の作り直しは要りません。Step 4 の build_db.py --entries-only だけで反映されます）。
        ・この条件を使ったパターン（family）は、screen_families.py（Step 1.5）の候補に入ります。集計に使うには

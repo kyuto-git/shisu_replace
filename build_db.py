@@ -532,15 +532,22 @@ def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None, ma
     return df
 
 
-def entries_side_sources(log=print):
+def entries_side_sources(log=print, marks_dir=None, no_marks: bool = False):
     """出馬表の条件に使う (外部レース印, 馬ごとの過去走の履歴)。
     レース印は race_marks/ にファイルがあればそれ、無ければ master_csv/__race_marks__.csv.gz。
+    marks_dir・no_marks を指定しなければ、replace の読み方（master_csv/__race_marks__.json）に合わせる
+    （replace が --no-race-marks なら読まない・--marks-dir ならそのフォルダ）。
     履歴は master_csv/__horse_perf_history__.csv.gz（基本CSV・結果指数が変わっていれば作り直す。calc_entry_hensachi と同じ）。
     読めなければ、その条件を空にして続ける（WARN）。"""
     from shisu import past_perf_indices as PP
     from shisu import race_marks
     try:
-        marks = race_marks.load(log=log)
+        if no_marks:
+            marks = None
+        elif marks_dir is not None:
+            marks = race_marks.load(marks_dir, log=log, enabled=True)
+        else:
+            marks = race_marks.load(log=log)
     except Exception as e:
         log(f"[WARN] 外部レース印を読めません（{type(e).__name__}: {e}）。前走メンバーLv などは空にします")
         marks = None
@@ -552,14 +559,14 @@ def entries_side_sources(log=print):
     return marks, history
 
 
-def load_entries_tables(con: sqlite3.Connection, entries_dir: Path) -> list[dict]:
+def load_entries_tables(con: sqlite3.Connection, entries_dir: Path, marks_dir=None, no_marks: bool = False) -> list[dict]:
     files = sorted(Path(entries_dir).glob("*.csv"))
     if not files:
         print(f"[entries] 出馬表CSVがありません: {entries_dir}")
         return []
     loaded = []
     inner = load_inner_lookup()
-    marks, history = entries_side_sources()
+    marks, history = entries_side_sources(marks_dir=marks_dir, no_marks=no_marks)
     for p in files:
         df = normalize_entries_df(read_csv_any(p), inner, marks, history)
         tname = table_name_for_entries(p.name)
@@ -762,6 +769,11 @@ def parse_cli(argv=None):
                    help="成績表（aggregate_stats_ver2.py の出力）のディレクトリ（既定 agg_csv/）")
     p.add_argument("--allow-empty", action="store_true", help="成績表が0本でも unified_all を空で作り直す")
     p.add_argument("--entries-dir", default=str(config.entries_out_dir()))
+    p.add_argument("--marks-dir", default=None,
+                   help="出馬表の前走条件に使う外部レース印のフォルダ。省くと replace と同じ読み方（既定は race_marks。"
+                        "ファイルが無ければ master_csv/__race_marks__.csv.gz）")
+    p.add_argument("--no-race-marks", action="store_true",
+                   help="出馬表に外部レース印の前走条件（前走メンバーLv など）を付けない")
     p.add_argument("--db-path", default=str(config.db_path()), help="既定は環境変数 DB_PATH か racing.db")
     args = p.parse_args(argv)
     targets: list[str] = []
@@ -846,7 +858,7 @@ def main(argv=None) -> int:
             db_fams = families_from_db(con)
             if db_fams:
                 fam_registry.set_active(db_fams, f"DB の {FAMILIES_TABLE}（{len(db_fams)} family）")
-        entries = load_entries_tables(con, Path(args.entries_dir))
+        entries = load_entries_tables(con, Path(args.entries_dir), marks_dir=args.marks_dir, no_marks=args.no_race_marks)
         build_entries_all(con, entries)
         con.commit()                         # 出馬表はここまでで確定（照合結果は下で、テーブルごとに1つのトランザクション）
         gc.collect()                         # 正規化に使った DataFrame を手放してから照合に入る（照合がいちばんメモリを使う）

@@ -230,11 +230,12 @@ def _zip_kind(name: str) -> str | None:
 
 
 def _walk(root: Path) -> Iterator[Path]:
+    """root の下のファイルを、相対パス（/ 区切り）の名前順で。「.」で始まるもの・__MACOSX・__pycache__ は見ない。"""
+    found: list[Path] = []
     for dirpath, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d.casefold() not in ("__macosx", "__pycache__"))
-        for f in sorted(files):
-            if not f.startswith("."):
-                yield Path(dirpath) / f
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d.casefold() not in ("__macosx", "__pycache__")]
+        found.extend(Path(dirpath) / f for f in files if not f.startswith("."))
+    yield from sorted(found, key=lambda p: p.relative_to(root).as_posix())
 
 
 def find_result_files(root: Path | str | None = None, log: Logger | None = None) -> list[ResultFile]:
@@ -255,7 +256,7 @@ def find_result_files(root: Path | str | None = None, log: Logger | None = None)
         try:
             with zipfile.ZipFile(p) as z:
                 names = sorted(n for n in z.namelist() if not n.endswith("/"))
-        except (zipfile.BadZipFile, OSError) as e:
+        except Exception as e:                               # 壊れた ZIP 1本で全体を止めない
             log(f"[WARN] 結果指数: {p.name} を ZIP として読めません（{type(e).__name__}: {e}）")
             continue
         for n in names:
@@ -323,7 +324,7 @@ def load_results(files: Iterable[ResultFile], log: Logger | None = None) -> dict
     for rf in files:
         try:
             values, bad, examples = parse_result_text(_decode(_read_bytes(rf)))
-        except (OSError, zipfile.BadZipFile, KeyError, csv.Error) as e:
+        except Exception as e:      # 読めないファイル（パスワードつきの ZIP・途中で切れた ZIP など）は、その1本だけ飛ばす
             log(f"[WARN] 結果指数（{rf.kind}）: {rf.label} を読めません（{type(e).__name__}: {e}）")
             continue
         if bad:

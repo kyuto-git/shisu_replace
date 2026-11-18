@@ -102,6 +102,90 @@ def test_bad_rows_headers_later_files_and_moisture_pairs(tmp_path):
     assert any("[WARN]" in m and "3行目以降が 1 行" in m for m in logs)
     assert (t["RX06261102"]["moist_turf"], t["RX06261102"]["moist_dirt"]) == ("11.1", "3.3")     # 後のファイルの組
     assert (t["RX06261103"]["moist_turf"], t["RX06261103"]["moist_dirt"]) == ("8.8", "")         # 2行とも値なしなら前の値を残す
+    # 後のファイルに芝の1行しか無いレースは、組ごと入れ替える（前のファイルのダートの値を残さない）
+    (d / "moistureG_c.csv").write_text('"a",RX06261101,"0013.3"\n', encoding="utf-8")
+    t = RM.load_dir(d).table
+    assert (t["RX06261101"]["moist_turf"], t["RX06261101"]["moist_dirt"]) == ("13.3", "")
+    # 値が1つも無いレース（「－」だけ）は表に入れない
+    (d / "member_c.csv").write_text('"z",RX06261112,"09 － "\n', encoding="utf-8")
+    (d / "moistureG_d.csv").write_text('"y",RX06261113,"09----"\n"y",RX06261113,"09----"\n', encoding="utf-8")
+    marks = RM.load_dir(d)
+    assert not {"RX06261112", "RX06261113"} & set(marks.table) and len(marks) == 3 and len(marks.to_frame()) == 3
+
+
+def _encrypt_flag(path):
+    """ZIP の中の全部のファイルに「暗号化」の印を付ける（読むと RuntimeError: password required）。"""
+    data = bytearray(path.read_bytes())
+    for sig, off in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        i = data.find(sig)
+        while i >= 0:
+            data[i + off] |= 1
+            i = data.find(sig, i + 4)
+    path.write_bytes(bytes(data))
+
+
+def test_search_order_hidden_folders_and_unreadable_files(tmp_path, monkeypatch):
+    d = tmp_path / "m"
+    for sub in ("a", ".old", "__MACOSX", "__pycache__"):
+        (d / sub).mkdir(parents=True)
+    line = lambda rx, v: f'"x",{rx},"03 {v} "\n'
+    # 優先は相対パスの名前順で後のファイル: a/member.csv < member.csv（サブフォルダのほうが前）
+    (d / "member.csv").write_text(line("RX06261101", "Ａ"), encoding="utf-8")
+    (d / "a" / "member.csv").write_text(line("RX06261101", "Ｂ") + line("RX06261102", "Ｃ"), encoding="utf-8")
+    for sub in (".old", "__MACOSX", "__pycache__"):                    # 隠しフォルダなどの中は読まない
+        (d / sub / "member_zz.csv").write_text(line("RX06261101", "Ｅ"), encoding="utf-8")
+    files = RM.find_files(d)
+    assert [f.path.relative_to(d).as_posix() for f in files] == ["a/member.csv", "member.csv"]
+    t = RM.read_files(files).table
+    assert t["RX06261101"]["member"] == "A" and t["RX06261102"]["member"] == "C"
+    # ZIP の中: 「.」で始まるフォルダは読まない。名前の順に読み、後の名前の値が残る
+    with zipfile.ZipFile(d / "z.zip", "w") as z:
+        z.writestr("time_b.csv", line("RX06261101", "Ｂ"))
+        z.writestr("time_a.csv", line("RX06261101", "Ａ"))
+        z.writestr(".x/time_c.csv", line("RX06261101", "Ｃ"))
+        z.writestr("sub/.y/time_d.csv", line("RX06261101", "Ｄ"))
+    files = RM.find_files(d)
+    assert [f.member for f in files if f.member] == ["time_a.csv", "time_b.csv"]
+    assert RM.read_files(files).table["RX06261101"]["time"] == "B"
+    # 読めない ZIP の中身（パスワードつき）は、その1本だけ飛ばして残りを読む
+    with zipfile.ZipFile(d / "locked.zip", "w") as z:
+        z.writestr("pace_x.csv", '"x",RX06261101,"05HHH "\n')
+    _encrypt_flag(d / "locked.zip")
+    logs = []
+    marks = RM.load_dir(d, logs.append)
+    assert marks.table["RX06261101"] == {"member": "A", "time": "B", "pace": "", "cushion": "", "moist_turf": "", "moist_dirt": ""}
+    assert sum("[WARN]" in m and "locked.zip:pace_x.csv を読めません" in m for m in logs) == 1
+    assert RM.load(d, tmp_path / "nomaster").table == marks.table                      # 出馬表側の読み方も止まらない
+    # どんな読み込みの失敗でも（途中で切れた圧縮データ など）同じ
+    real = RM._read_bytes
+    def flaky(mf):
+        if mf.path == d / "member.csv":
+            raise EOFError("compressed file ended")
+        return real(mf)
+    monkeypatch.setattr(RM, "_read_bytes", flaky)
+    logs = []
+    assert RM.load_dir(d, logs.append).table["RX06261101"]["member"] == "B"            # a/member.csv の値
+    assert any("[WARN]" in m and "member.csv を読めません（EOFError" in m for m in logs)
+
+
+def test_result_files_follow_the_same_order_and_skip_unreadable_members(tmp_path):
+    """結果指数（過去SP・ST）のファイルも、相対パスの名前順・読めない ZIP の中身は1本だけ飛ばす。"""
+    from shisu import past_perf_indices as PP
+    d = tmp_path / "r"
+    (d / "a").mkdir(parents=True)
+    rid = "202601050601010101"
+    (d / "sp_x.csv").write_text(f"{rid},50\n", encoding="utf-8")
+    (d / "a" / "sp_x.csv").write_text(f"{rid},60\n", encoding="utf-8")
+    files = PP.find_result_files(d)
+    assert [f.path.relative_to(d).as_posix() for f in files] == ["a/sp_x.csv", "sp_x.csv"]
+    assert str(PP.load_results(files)["SP"][rid]) == "50"
+    with zipfile.ZipFile(d / "st_se_locked.zip", "w") as z:
+        z.writestr("st_se_1.csv", f"{rid},70\n")
+    _encrypt_flag(d / "st_se_locked.zip")
+    logs = []
+    got = PP.load_results(PP.find_result_files(d), logs.append)
+    assert str(got["SP"][rid]) == "50" and got["ST"] == {}
+    assert sum("[WARN]" in m and "st_se_1.csv を読めません" in m for m in logs) == 1
 
 
 def test_band_rules_and_boundaries():
@@ -192,7 +276,156 @@ def test_cache_file_round_trip_and_entries_side_source(tmp_path, monkeypatch):
     assert config.race_marks_dir() == tmp_path / "race_marks"
 
 
+def test_entries_side_follows_how_replace_read_the_marks(tmp_path, monkeypatch):
+    """replace の読み方（__race_marks__.json）: 読まなかったなら出馬表側も読まない。別のフォルダならそのフォルダ。"""
+    monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path))
+    monkeypatch.delenv("RACE_MARKS_DIR", raising=False)
+    d, other, master = tmp_path / "race_marks", tmp_path / "other", tmp_path / "master_csv"
+    d.mkdir(), other.mkdir()
+    (d / "member.csv").write_text('"x",RX06261101,"03 Ａ "\n', encoding="utf-8")
+    (other / "member.csv").write_text('"x",RX06261101,"03 Ｂ "\n', encoding="utf-8")
+    rid = "2026010506010101"
+    assert RM.load_meta(master) is None and RM.load().get(rid)["member"] == "A"       # 記録が無ければ既定のフォルダ
+    # 既定のフォルダで読んだ: フォルダは記録しない（出馬表側も、その場所の既定のフォルダ）
+    path = RM.save_meta(master, True, d)
+    assert path == master / RM.META and RM.load_meta(master) == {"enabled": True, "dir": ""} and not list(master.glob("*.part"))
+    assert RM.load().get(rid)["member"] == "A"
+    # --no-race-marks: 既定のフォルダにファイルがあっても読まない
+    RM.save_meta(master, False, d)
+    logs = []
+    assert len(RM.load(log=logs.append)) == 0 and any("[INFO]" in m and "--no-race-marks" in m for m in logs)
+    assert RM.load(d).get(rid)["member"] == "A"                    # フォルダを指定すれば読む（build_db --marks-dir）
+    assert RM.load(enabled=True).get(rid)["member"] == "A"
+    # --marks-dir: 同じフォルダを読む。そこにファイルが無ければ master_csv の表
+    RM.save_meta(master, True, other)
+    assert RM.load_meta(master) == {"enabled": True, "dir": str(other.resolve())}
+    logs = []
+    assert RM.load(log=logs.append).get(rid)["member"] == "B" and any("replace と同じフォルダ" in m for m in logs)
+    assert RM.load(d).get(rid)["member"] == "A" and len(RM.load(enabled=False)) == 0
+    RM.save(RM.load(), master)
+    (other / "member.csv").unlink()
+    assert RM.load().get(rid)["member"] == "B"
+    # 読めない記録は無いものとして扱う
+    for text in ("{broken", "[]", '{"enabled": "yes"}'):
+        (master / RM.META).write_text(text, encoding="utf-8")
+        assert RM.load_meta(master) is None
+    assert RM.load().get(rid)["member"] == "A"
+
+
+MARK_COLS = ["前走メンバーLv", "前走タイムLv", "前走クッション帯", "前走含水率帯"]
+
+
+def test_replace_options_reach_every_master_and_the_entries_side(tmp_path, monkeypatch, capsys):
+    """replace の --no-race-marks・--marks-dir が、全部の種類の master（基本CSV・ext・過去SP）と出馬表側（build_db）に同じに効く。"""
+    import sqlite3
+
+    from tests import synth2
+    root = tmp_path
+    monkeypatch.setenv("SHISU_BASE_DIR", str(root))
+    for k in ("RESULT_INDICES_DIR", "RACE_MARKS_DIR", "SHISU_EXT_DIR", "DB_PATH", "SHISU_FAMILIES_FILE", "NOTES_PATH"):
+        monkeypatch.delenv(k, raising=False)
+    base, marks, ent, _names = synth2.write_site(root, days=26)
+    rid = "レースID(新)"
+    (root / "ext_indices" / "OMEGA").mkdir(parents=True)
+    (root / "ext_indices" / "OMEGA" / "20260101_omega.csv").write_text(
+        "".join(f"{r},{50 + i % 37}\n" for i, r in enumerate(base[rid])), encoding="utf-8")
+    (root / "result_indices").mkdir()
+    (root / "result_indices" / "sp_all.csv").write_text(
+        "".join(f"{r},{40 + i % 41}\n" for i, r in enumerate(base[rid])), encoding="utf-8")
+    import build_db, calc_entry_hensachi, replace_csv_ver3
+    master = root / "master_csv"
+    read = lambda ind: pd.read_csv(master / f"master_全場_{ind}.csv.gz", encoding="cp932", dtype=str,
+                                   keep_default_na=False).sort_values(rid).reset_index(drop=True)
+
+    def entries_table(*args):
+        build_db.main(["--entries-only", "--no-xjoin", *args])      # 成績表の無い DB なので警告つき（出馬表の表は入る）
+        con = sqlite3.connect(root / "racing.db")
+        try:
+            return pd.read_sql('SELECT * FROM entries_merged_hensachi ORDER BY "レースID(新)"', con).fillna("")
+        finally:
+            con.close()
+
+    # 1) ふつうに読む: 3種類の master（基本CSV・ext の指数・過去SP）が同じ前走条件を持つ
+    assert replace_csv_ver3.main(["--clean"]) == 0
+    assert calc_entry_hensachi.main(["--merge-only", "--clean"]) == 0
+    full = read("タイムM")
+    assert all(len(set(full[c]) - {""}) >= 3 for c in MARK_COLS) and (master / RM.FILE).exists()
+    assert RM.load_meta(master) == {"enabled": True, "dir": ""}
+    for ind in ("オメガ指数", "過去SP_3走平均"):
+        other = read(ind)
+        assert other[rid].tolist() == full[rid].tolist()
+        for c in MARK_COLS + ["前走R印3"]:
+            assert other[c].tolist() == full[c].tolist(), (ind, c)
+    e_full = entries_table()
+    assert all((e_full[c] != "").sum() >= 5 for c in MARK_COLS)
+    # 出馬表側は race_marks/ を先に読む: 表（__race_marks__.csv.gz）に無い新しい値が効く
+    prev_of = base[base["着順"] != "取消"].groupby("血統登録番号").tail(1).set_index("血統登録番号")[rid]
+    horse = next(h for h in ent["血統登録番号"] if h in prev_of.index)
+    rx = RM.rx_of(prev_of[horse][:16])
+    old = RM.load_cache(master).table[rx]["member"]
+    new = "E" if old != "E" else "A"
+    (root / "race_marks" / "member_zz.csv").write_text(f'"x",{rx},"03 {new} "\n', encoding="utf-8")
+    e_new = entries_table()
+    row = (e_new["血統登録番号"] == horse) if "血統登録番号" in e_new.columns else (e_new[rid] == ent.set_index("血統登録番号")[rid][horse])
+    assert set(e_new.loc[row, "前走メンバーLv"]) == {new} and RM.load_cache(master).table[rx]["member"] == old
+    (root / "race_marks" / "member_zz.csv").unlink()
+    # build_db の --no-race-marks・--marks-dir
+    e_none = entries_table("--no-race-marks")
+    assert all((e_none[c] == "").all() for c in MARK_COLS) and (e_none["近5走同場"] != "").any()
+    only = root / "only_one"
+    only.mkdir()
+    (only / "member.csv").write_text(f'"x",{rx},"03 {new} "\n', encoding="utf-8")
+    e_dir = entries_table("--marks-dir", str(only))
+    assert set(e_dir["前走メンバーLv"]) == {"", new} and all((e_dir[c] == "").all() for c in MARK_COLS[1:])
+    assert set(e_dir.loc[row, "前走メンバーLv"]) == {new}
+
+    # 2) replace --no-race-marks: 前の実行の表を残さず、どの master も空。出馬表側も race_marks/ があっても読まない
+    capsys.readouterr()
+    assert replace_csv_ver3.main(["--no-race-marks"]) == 0
+    assert not (master / RM.FILE).exists() and RM.load_meta(master) == {"enabled": False, "dir": ""}
+    base_r3 = full["前走R印3"].tolist()
+    for ind in ("タイムM", "オメガ指数", "過去SP_3走平均"):
+        m = read(ind)
+        assert all((m[c] == "").all() for c in MARK_COLS), ind
+        assert (m["前走R印3"] != "").sum() < sum(1 for v in base_r3 if v)            # ペース判定での補完もしない
+        assert (m["近5走同場"] != "").any()                                          # 近5走の条件はそのまま
+    e_off = entries_table()
+    assert all((e_off[c] == "").all() for c in MARK_COLS) and "--no-race-marks" in capsys.readouterr().out
+    assert e_off["前走R印3"].tolist() == e_none["前走R印3"].tolist()
+    e_forced = entries_table("--marks-dir", str(root / "race_marks"))                 # 指定すれば読む
+    assert e_forced[MARK_COLS].equals(e_full[MARK_COLS])
+
+    # 3) replace --marks-dir: そのフォルダの印だけ（既定の race_marks/ は読まない）。出馬表側も同じフォルダ
+    assert replace_csv_ver3.main(["--marks-dir", str(only)]) == 0
+    assert RM.load_meta(master) == {"enabled": True, "dir": str(only.resolve())} and len(RM.load_cache(master)) == 1
+    for ind in ("タイムM", "オメガ指数", "過去SP_3走平均"):
+        m = read(ind)
+        assert set(m["前走メンバーLv"]) == {"", new} and all((m[c] == "").all() for c in MARK_COLS[1:]), ind
+    e_only = entries_table()
+    assert e_only[MARK_COLS].equals(e_dir[MARK_COLS])
+
+    # 4) 印のフォルダが空になった: 前の実行の表を残さない
+    (only / "member.csv").unlink()
+    assert replace_csv_ver3.main(["--marks-dir", str(only)]) == 0
+    assert not (master / RM.FILE).exists() and (read("タイムM")["前走メンバーLv"] == "").all()
+    assert (entries_table()["前走メンバーLv"] == "").all()
+
+    # 5) 読めない ZIP があっても止まらず、残りの印で master を作る
+    assert replace_csv_ver3.main([]) == 0
+    with zipfile.ZipFile(root / "race_marks" / "locked.zip", "w") as z:
+        z.writestr("member_x.csv", f'"x",{rx},"03 {new} "\n')
+    _encrypt_flag(root / "race_marks" / "locked.zip")
+    capsys.readouterr()
+    assert replace_csv_ver3.main(["--clean"]) == 0
+    assert "locked.zip:member_x.csv を読めません" in capsys.readouterr().out
+    again = read("タイムM")
+    assert all(again[c].tolist() == full[c].tolist() for c in MARK_COLS)
+    assert entries_table()[MARK_COLS].equals(e_full[MARK_COLS])
+
+
 def test_two_hex_characters_at_the_head_are_always_taken_as_the_colour_code():
     """先頭2文字が16進なら、カラーコードとして除く（依頼どおり。カラーコードの無い2文字だけの値は空になる）。"""
     assert [RM.clean_value(v) for v in ("12", "ab", "0f")] == ["", "", ""]
     assert [RM.clean_value(v) for v in ("0012", "00ab", "0E 0f")] == ["12", "ab", "0f"]
+    # カラーコードを除くのは、空白を除く・NFKC の前（先頭が空白の値から数字を落とさない）
+    assert RM.clean_value("  10.2") == "10.2" and RM.clean_value("　１２") == "12" and RM.clean_value("00 １０.２ ") == "10.2"

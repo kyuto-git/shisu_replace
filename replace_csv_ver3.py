@@ -481,11 +481,20 @@ def main(argv=None) -> int:
     # 外部レース印（race_marks/）: 読んで master_csv/__race_marks__.csv.gz に書く（各ジョブと出馬表側が前走RID16 で引く）
     from shisu import race_marks
     marks_path = Path(args.master_dir) / race_marks.FILE
-    marks = None if args.no_race_marks else race_marks.load_dir(args.marks_dir, log=print)
+    marks = None
+    marks_error = ""
+    if not args.no_race_marks:
+        try:
+            marks = race_marks.load_dir(args.marks_dir, log=print)
+        except Exception as e:          # 印を読めなくても（フォルダを開けない など）、master は作る
+            marks_error = f"[ERROR] 外部レース印: {type(e).__name__}: {e}（前走メンバーLv などは付きません）"
+            print(marks_error)
     if marks is not None and len(marks):
         race_marks.save(marks, args.master_dir)
     else:                               # 今回使わない印の表を残さない（master と出馬表側で違う印を見ないように）
         marks_path.unlink(missing_ok=True)
+    # どう読んだか（読まない・既定でないフォルダ）を残す: 出馬表側（build_db）が同じ読み方をする
+    race_marks.save_meta(args.master_dir, enabled=not args.no_race_marks, race_dir=args.marks_dir)
     del marks
 
     # 馬ごとの過去走の履歴: 基本CSV（と、あれば結果指数 result_indices）から作って master_csv に書く。
@@ -523,7 +532,7 @@ def main(argv=None) -> int:
         results = [_run(j) for j in jobs]
     for r in results:
         print(r)
-    return 1 if perf_error or any(r.startswith("[ERROR]") for r in results) else 0
+    return 1 if perf_error or marks_error or any(r.startswith("[ERROR]") for r in results) else 0
 
 
 MAX_TASKS_PER_CHILD = 4
