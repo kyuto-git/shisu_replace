@@ -712,7 +712,7 @@ def refresh_xjoin(con: sqlite3.Connection, entries_table: str, targets: list[str
     print(f"[xjoin] {xname}: {'・'.join(targets)} の行だけ作り直しました（{len(rows)} 頭, その指数の hits {total}, 全体 {n} 行）"
           + (f" ／ 出馬表に無い指数: {'・'.join(missing)}" if missing else ""), flush=True)
     return {"table_name": xname, "source_file": entries_table, "kind": "xjoin", "n_rows": int(n),
-            "indicator": ",".join(all_bases)}
+            "indicator": ",".join(match_bases(names, families))}
 
 
 # ---------------------------------------------------------------------------

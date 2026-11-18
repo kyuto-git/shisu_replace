@@ -489,6 +489,82 @@ def test_pages_presets_and_drill_for_condition_only_rows(site, monkeypatch):
     assert "件数が違います" not in text and "合いません" not in text
 
 
+def _card(page: str, cat: str) -> str:
+    """条件ヒット馬のページの、区分 cat のカード（次のカードの手前まで）。"""
+    start = page.index(f'<div class="card cat-{cat}">')
+    end = page.find('<div class="card', start + 10)
+    return page[start:end if end > 0 else len(page)]
+
+
+@pytest.mark.parametrize("with_xjoin", [True, False])
+def test_pages_classify_condition_only_rows_without_the_gate(site, monkeypatch, tmp_path, with_xjoin):
+    """数字で終わる条件のみのキー（ダ×1600・東京×ダ×1600）が、画面のどの経路でも指数の上限ゲートに掛からない。
+    照合結果（xjoin）を読む経路と、その場照合（xjoin なし）の両方で。"""
+    import shutil
+
+    root, _base, _marks, _ent = site
+    import app as am
+    dbp = tmp_path / "pages.db"
+    shutil.copy(root / "racing.db", dbp)
+    monkeypatch.setattr(am, "DB_PATH", str(dbp))
+    monkeypatch.setenv("NOTES_PATH", str(tmp_path / "notes.json"))
+    xt = "entries_xjoin_merged_hensachi"
+    con = sqlite3.connect(dbp)
+    con.row_factory = sqlite3.Row
+    abs_num = {"件数": 40, "連対率_val": 85.0, "複勝率_val": 90.0, "掲示板率_val": 95.0, "複勝回収値": 120.0, "単勝適正回収値": 110.0}
+    opp_num = {"件数": 40, "連対率_val": 10.0, "複勝率_val": 65.0, "掲示板率_val": 75.0, "複勝回収値": 50.0, "単勝適正回収値": 50.0}
+    for fam, key, num in (("N_sd_dist", "ダ×1600", abs_num), ("N_crs", "東京×ダ×1600", opp_num)):
+        sets = ", ".join(f'"{k}" = ?' for k in num)
+        for tbl, col in (("unified_all", "結合データ"), (xt, "key")):
+            n = con.execute(f'UPDATE {tbl} SET {sets} WHERE family = ? AND odds_mode = \'normal\' AND "{col}" = ?',
+                            (*num.values(), fam, key)).rowcount
+            assert n >= 1, (tbl, key)
+    rid = con.execute(f'SELECT "レースID(新/馬番無)" FROM {xt} WHERE key = ? LIMIT 1', ("ダ×1600",)).fetchone()[0]
+    want_rows = con.execute(f'SELECT COUNT(*) FROM {xt} WHERE "レースID(新/馬番無)" = ? AND base = ?', (rid, CONDITION_ONLY)).fetchone()[0]
+    if not with_xjoin:
+        con.execute(f"DROP TABLE {xt}")
+        con.execute("DELETE FROM __tables_meta__ WHERE table_name = ?", (xt,))
+    con.commit()
+    con.close()
+    c = am.app.test_client()
+    q = {"table": "entries_merged_hensachi", "rid": rid}
+    # 条件ヒット馬: 絶対軸・相手候補のカードに出る。条件特化ヒット（ゲートで外れた行の表）には出ない
+    page = c.get("/entries/hits", query_string=q).get_data(as_text=True)
+    assert ("on-the-fly" in page) == (not with_xjoin)
+    assert "ダ×1600" in _card(page, "abs") and CONDITION_ONLY in _card(page, "abs")
+    assert "東京×ダ×1600" in _card(page, "opp") and "東京×ダ×1600" not in _card(page, "abs")
+    assert CONDITION_ONLY not in _card(page, "special")
+    assert f'<option value="{CONDITION_ONLY}"' in page                       # 指数クロスの指数A・B の選択肢
+    # WEDGE 一覧: 指数の絞り込み・「馬 × 指数」の列・全該当キーの行。CSV の「区分」
+    wedge = c.get("/entries/wedge", query_string={**q, "odds_mode": "all"}).get_data(as_text=True)
+    assert f'name="ind" value="{CONDITION_ONLY}"' in wedge and f"<th>{CONDITION_ONLY}</th>" in wedge
+    import io
+    csv = pd.read_csv(io.StringIO(c.get("/entries/wedge.csv", query_string={**q, "odds_mode": "all"}).get_data(as_text=True)),
+                      dtype=str, keep_default_na=False)
+    plain = csv[csv["base"] == CONDITION_ONLY]
+    assert len(plain) == want_rows > 0                                       # 条件のみの行が落ちていない
+    cat_of = lambda fam, key: set(plain[(plain["family"] == fam) & (plain["odds_mode"] == "normal") & (plain["key"] == key)]["区分"])
+    assert cat_of("N_sd_dist", "ダ×1600") == {"絶対軸"} and cat_of("N_crs", "東京×ダ×1600") == {"相手候補"}
+    only = c.get("/entries/wedge", query_string={**q, "odds_mode": "normal", "ind": CONDITION_ONLY}).get_data(as_text=True)
+    assert "東京×ダ×1600" in only and "N_crs" in only
+    # 横断検索: 指数「条件のみ」・プリセットで、まとめて表示にも集計表ごとにも出る
+    for view in ("rank", "tables"):
+        for preset, key, other in (("abs", "ダ×1600", "東京×ダ×1600"), ("opp", "東京×ダ×1600", "芝×16-18")):
+            top = c.get("/", query_string={"submitted": "1", "view": view, "preset": preset, "ind": CONDITION_ONLY,
+                                           "odds_mode": "normal"}).get_data(as_text=True)
+            assert f">{key}<" in top, (view, preset)
+            assert f">{other}<" not in top, (view, preset)
+    none = c.get("/", query_string={"submitted": "1", "view": "rank", "ind": CONDITION_ONLY, "odds_mode": "normal"}).get_data(as_text=True)
+    assert ">芝×16-18<" in none and ">ダ×1600<" in none                      # プリセットなしなら全部の行
+    # 逆引きページの DB の成績表の区分
+    drill_page = c.get("/entries/drill", query_string={"region": "全場", "indicator": CONDITION_ONLY, "family": "N_sd_dist",
+                                                       "rank_scheme": "", "odds_mode": "normal", "key": "ダ×1600"}).get_data(as_text=True)
+    assert "区分 <b>絶対軸</b>" in drill_page
+    drill_page = c.get("/entries/drill", query_string={"region": "全場", "base": CONDITION_ONLY, "family": "N_crs",
+                                                       "rank_scheme": "", "odds_mode": "normal", "key": "東京×ダ×1600"}).get_data(as_text=True)
+    assert "区分 <b>相手候補</b>" in drill_page
+
+
 def test_mining_only_refresh_keeps_condition_only_rows_and_matches_a_full_rebuild(site, capsys):
     root, _base, _marks, ent = site
     import build_db, calc_entry_hensachi
@@ -508,8 +584,12 @@ def test_mining_only_refresh_keeps_condition_only_rows_and_matches_a_full_rebuil
     partial = snap()
     assert partial != before
     assert [r for r in partial if r[2] == CONDITION_ONLY] == [r for r in before if r[2] == CONDITION_ONLY]
+    meta = lambda: tuple(sqlite3.connect(root / "racing.db").execute(
+        "SELECT indicator, n_rows FROM __tables_meta__ WHERE table_name = ?", (table,)).fetchone())
+    partial_meta = meta()
+    assert partial_meta == (f"タイムM,{CONDITION_ONLY}", len(partial))       # 照合結果の一覧の行も、全部の照合と同じ
     assert build_db.main(["--entries-only"]) == 0
-    assert snap() == partial
+    assert snap() == partial and meta() == partial_meta
 
 
 def test_screening_scores_condition_only_candidates_on_the_base_master_only(site, monkeypatch, capsys):
