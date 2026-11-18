@@ -375,15 +375,23 @@ def test_resume_covers_the_condition_only_job_and_stale_files_are_removed(site, 
     assert (alt / path.name).exists()
     fams = root / "no_none.json"
     fams.write_text(json.dumps({"families": [d for d in FAMILIES if d["tail"] != "NONE"]}, ensure_ascii=False), encoding="utf-8")
+    lone = alt / "agg_master_東京_条件のみ.csv.gz.done"                # 0行で終わって印だけが残っていた成績表
+    lone.write_text("{}", encoding="utf-8")
     assert aggregate_stats_ver2.main(["--out-dir", str(alt), "--families", str(fams), *AGG_ARGS]) == 0
-    assert not (alt / path.name).exists() and not (alt / (path.name + ".done")).exists()
+    assert not (alt / path.name).exists() and not (alt / (path.name + ".done")).exists() and not lone.exists()
     assert sorted(p.name for p in alt.glob("agg_master_*.csv.gz")) == ["agg_master_全場_タイムM.csv.gz", "agg_master_全場_対戦M.csv.gz"]
     # 条件のみの family だけにしたら、指数ごとの集計はしない
     only = root / "only_none.json"
     only.write_text(json.dumps({"families": [d for d in FAMILIES if d["tail"] == "NONE"]}, ensure_ascii=False), encoding="utf-8")
     alt2 = root / "agg_alt2"
     assert aggregate_stats_ver2.main(["--out-dir", str(alt2), "--families", str(only), *AGG_ARGS]) == 0
-    assert sorted(p.name for p in alt2.glob("agg_master_*.csv.gz")) == [path.name]
+    assert sorted(p.name for p in alt2.glob("agg_master_*")) == [path.name, path.name + ".done"]         # 指数ごとの印も作らない
+    # 指数を使う family の成績表がある場所で、条件のみだけにした: 前の family の成績表（指数ごとのファイル）と印を残さない
+    for resume in ([], ["--resume"]):
+        assert aggregate_stats_ver2.main(["--out-dir", str(alt2), *AGG_ARGS]) == 0
+        assert len(list(alt2.glob("agg_master_*"))) == 6
+        assert aggregate_stats_ver2.main(["--out-dir", str(alt2), "--families", str(only), *resume, *AGG_ARGS]) == 0
+        assert sorted(p.name for p in alt2.glob("agg_master_*")) == [path.name, path.name + ".done"], resume
     F.configure(root / "selected_families.json", log=lambda m: None)
 
 
@@ -542,3 +550,67 @@ def test_screening_scores_condition_only_candidates_on_the_base_master_only(site
     assert SF.main(["--from-report", str(report), "--min-axis", "0", "--export-selected", str(root / "picked2.json")]) == 0
     assert sorted(f.name for f in F.load_families(root / "picked2.json")) == sorted(f.name for f in picked)
     F.configure(root / "selected_families.json", log=lambda m: None)
+
+
+def test_condition_only_keys_ending_in_digits_survive_compaction_and_screening(tmp_path, monkeypatch, capsys):
+    """数字で終わる条件のみのキー（騎手×距離）: コンパクト化・採点が指数の上限ゲートを掛けず、master の全部の行で数える。"""
+    root = tmp_path
+    monkeypatch.setenv("SHISU_BASE_DIR", str(root))
+    for k in ("RESULT_INDICES_DIR", "RACE_MARKS_DIR", "SHISU_EXT_DIR", "DB_PATH", "SHISU_FAMILIES_FILE", "NOTES_PATH"):
+        monkeypatch.delenv(k, raising=False)
+    base, _marks, _ent, _names = synth2.write_site(root, days=80, marks_as="none")
+    rid16 = base[RID].str[:16]
+    # 強井: ダ1200 の勝ち馬に必ず乗る → 「強井×1200」は絶対軸の水準。相手井: ダ1600 の4レースに3つで3着・残りは6着 → 相手候補の水準
+    win = base.index[(base["距離"] == "ダ1200") & (base["着順"] == "1")]
+    base.loc[win, "騎手"] = "強井"
+    for i, r in enumerate(sorted(set(rid16[base["距離"] == "ダ1600"]))):
+        idx = base.index[(rid16 == r) & (base["着順"] == ("6" if i % 4 == 3 else "3"))]
+        base.loc[idx[:1], "騎手"] = "相手井"
+    for r in sorted(set(rid16))[::3]:                                 # 3レースに1つは指数が欠けて 指数有効=0
+        idx = base.index[(rid16 == r) & ~base["騎手"].isin(["強井", "相手井"])][:2]
+        base.loc[idx, "指数"] = ""
+    base.to_csv(root / "csv_files" / "全場_タイムM.csv", index=False, encoding="cp932")
+    rng = random.Random(3)
+    base.assign(指数=[str(rng.randint(40, 110)) for _ in range(len(base))]).drop(columns=["指数順位"]).to_csv(
+        root / "csv_files" / "全場_対戦M.csv", index=False, encoding="cp932")
+    fams = [{"name": "N_jk_dist", "parts": ["騎手", "距離"], "tail": "NONE"}, {"name": "X_jk_hen", "parts": ["騎手"], "tail": "HBAND"}]
+    (root / "selected_families.json").write_text(json.dumps({"families": fams}, ensure_ascii=False), encoding="utf-8")
+    import aggregate_stats_ver2, replace_csv_ver3
+    import screen_families as SF
+    try:
+        assert replace_csv_ver3.main(["--clean"]) == 0
+        m = read_master(root)
+        assert (m["指数有効"] == "0").sum() > 500 and len(m) == len(base)
+        # コンパクト化（区分の行だけを残す設定）: 数字で終わるキーでも、相手候補・絶対軸の行が残る
+        assert aggregate_stats_ver2.main(["--clean", "--wedge-min-year-count", "2", "--compact-min-count", "none",
+                                          "--compact-min-wedge", "none"]) == 0
+        t = pd.read_csv(root / "agg_csv" / "agg_master_全場_条件のみ.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
+        normal = t[t["odds_mode"] == "normal"].set_index("結合データ")
+        assert {"強井×1200", "相手井×1600"} <= set(normal.index) and len(normal) < 10      # 平凡な行は落ちている
+        ran = m[~m["着順"].isin(["取消", "除外"])]
+        for key, jk, dist in (("強井×1200", "強井", "1200"), ("相手井×1600", "相手井", "1600")):
+            rows = ran[(ran["騎手"] == jk) & (ran["距離"] == dist)]
+            assert int(normal.loc[key, "件数"]) == len(rows) > (rows["指数有効"] == "1").sum() >= 10, key   # 指数有効=0 の馬も数える
+        from shisu.aggstore import prepare_agg_frame
+        vals = prepare_agg_frame(t[t["odds_mode"] == "normal"].copy()).set_index("結合データ")
+        rec = lambda key, **kw: {"cnt": vals.loc[key, "件数"], "fv": vals.loc[key, "複勝率_val"], "rv": vals.loc[key, "連対率_val"],
+                                 "top5": vals.loc[key, "掲示板率_val"], "frc": vals.loc[key, "複勝回収値"],
+                                 "tra": vals.loc[key, "単勝適正回収値"], "key": key, **kw}
+        assert C.classify(rec("相手井×1600", indicator=CONDITION_ONLY), "normal") == "opp"
+        assert C.classify(rec("相手井×1600"), "normal") is None and C.low_tail_axis_category(rec("相手井×1600"), "normal") is None
+        assert C.classify(rec("強井×1200", indicator=CONDITION_ONLY), "normal") == "abs"
+        # 採点（screen_families）: 同じ見方（ゲートなし・全部の行）。--indicators で絞ったら、基準の master は絞ったあとの中から
+        monkeypatch.setattr(SF, "templates", lambda space="default", pool=SF.POOL: [(("騎手", "距離"), "s0:pair")])
+        report = root / "report.csv"
+        capsys.readouterr()
+        assert SF.main(["--tails", "NONE", "--report", str(report), "--wedge-min-year-count", "2"]) == 0
+        assert "全場 = master_全場_タイムM.csv.gz" in capsys.readouterr().out
+        r = pd.read_csv(report, dtype=str, keep_default_na=False, encoding="cp932").set_index("name").loc["X_jk_dist_none"]
+        assert int(r["abs_normal"]) >= 1 and int(r["opp_normal"]) >= 1 and r["masters"] == "1"
+        groups_all = ran.groupby(["騎手", "距離"]).size()
+        assert int(r["groups_ge10"]) == int((groups_all >= 10).sum())
+        assert int(r["covered"]) == len(m) > (m["指数有効"] == "1").sum()          # 全部の行が母数（指数有効=0 の馬も）
+        assert SF.main(["--tails", "NONE", "--indicators", "対戦M", "--report", str(report), "--wedge-min-year-count", "2"]) == 0
+        assert "全場 = master_全場_対戦M.csv.gz" in capsys.readouterr().out
+    finally:
+        F.reset()

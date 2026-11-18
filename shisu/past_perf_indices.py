@@ -729,16 +729,19 @@ def base_csv_paths(csv_dir: Path | str | None = None) -> list[Path]:
     return [p for _prio, p in (best[r] for r in sorted(best))]
 
 
-def read_base_columns(path: Path | str) -> pd.DataFrame:
-    """基本CSVから、履歴に要る列だけを文字列で読む（cp932 → utf-8-sig → utf-8）。"""
-    last: Exception | None = None
+def read_base_columns(path: Path | str, log: Logger | None = None) -> pd.DataFrame:
+    """基本CSVから、履歴に要る列だけを文字列で読む（cp932 → utf-8-sig → utf-8）。どれでも読めない文字があれば、
+    その文字だけを置き換えて読む（master を作る読み方 csvio.read_csv_any と同じ。1文字のために履歴ごと落とさない）。"""
+    usecols = lambda c: str(c).strip() in BASE_USECOLS
     for enc in ("cp932", "utf-8-sig", "utf-8"):
         try:
-            return pd.read_csv(path, encoding=enc, dtype=str, keep_default_na=False,
-                               usecols=lambda c: str(c).strip() in BASE_USECOLS)
-        except UnicodeDecodeError as e:
-            last = e
-    raise last  # type: ignore[misc]
+            return pd.read_csv(path, encoding=enc, dtype=str, keep_default_na=False, usecols=usecols)
+        except UnicodeDecodeError:
+            continue
+    if log is not None:
+        log(f"[WARN] 過去走の履歴: {Path(path).name} に cp932・UTF-8 のどちらでも読めない文字があります（その文字だけ置き換えて読みます）")
+    with open(path, encoding="cp932", errors="replace", newline="") as f:
+        return pd.read_csv(f, dtype=str, keep_default_na=False, usecols=usecols)
 
 
 def file_crc(path: Path) -> int:
@@ -754,17 +757,23 @@ def source_signature(bases: list[Path], files: list[ResultFile]) -> str:
     """履歴の元（基本CSV・結果指数のファイル）の名前・大きさ・中身の CRC32 から作る印。元が変わったら履歴を作り直すために比べる。
     大きさが同じまま値だけ直したファイル（訂正版の結果指数・馬場状態の直し）も見分ける。更新時刻は、コピー・Docker の
     マウントで変わるので使わない。"""
+    return _signatures(bases, files)[0]
+
+
+def _signatures(bases: list[Path], files: list[ResultFile]) -> tuple[str, str]:
+    """(元の全部の印, 基本CSVだけの印)。結果指数のファイルが無ければ2つは同じ。"""
     h = hashlib.sha1()
     h.update(f"v{HISTORY_VERSION}|{WINDOW_DAYS}\n".encode())
     for p in bases:
         h.update(f"B|{p.name}|{p.stat().st_size}|{file_crc(p)}\n".encode())
+    base_sig = h.hexdigest()
     seen: set[Path] = set()
     for rf in files:
         if rf.path in seen:
             continue
         seen.add(rf.path)
         h.update(f"R|{rf.kind}|{rf.path.name}|{rf.path.stat().st_size}|{file_crc(rf.path)}\n".encode())
-    return h.hexdigest()
+    return h.hexdigest(), base_sig
 
 
 def build_history_frame(bases: list[Path], files: list[ResultFile], log: Logger | None = None) -> pd.DataFrame:
@@ -773,7 +782,7 @@ def build_history_frame(bases: list[Path], files: list[ResultFile], log: Logger 
     results = load_results(files, log)
     frames = []
     for p in bases:
-        raw = read_base_columns(p)
+        raw = read_base_columns(p, log)
         raw.columns = [str(c).strip() for c in raw.columns]
         if not {"馬場状態", "馬場"} & set(raw.columns):
             log(f"[WARN] 過去走の履歴: {p.name} に 馬場状態 の列が無いので、過去走の馬場状態が分かりません"
@@ -790,8 +799,9 @@ def build_history_frame(bases: list[Path], files: list[ResultFile], log: Logger 
     return out.drop_duplicates(subset=[RID], keep="last").reset_index(drop=True)
 
 
-def save_history(frame: pd.DataFrame, master_dir: Path | str, signature: str) -> Path:
-    """履歴の表と印を master_csv/ に書く（一時ファイルから置き換える）。"""
+def save_history(frame: pd.DataFrame, master_dir: Path | str, signature: str, base_signature: str = "") -> Path:
+    """履歴の表と印を master_csv/ に書く（一時ファイルから置き換える）。base_signature は基本CSVだけの印
+    （結果指数のファイルが無くなったあとに、基本CSVが変わったかを見分けるため）。"""
     d = Path(master_dir)
     d.mkdir(parents=True, exist_ok=True)
     path = d / HISTORY_FILE
@@ -802,8 +812,8 @@ def save_history(frame: pd.DataFrame, master_dir: Path | str, signature: str) ->
     os.replace(tmp, path)
     meta = d / HISTORY_META
     mtmp = d / (HISTORY_META + ".part")
-    mtmp.write_text(json.dumps({"version": HISTORY_VERSION, "signature": signature, "rows": int(len(frame))},
-                               ensure_ascii=False), encoding="utf-8")
+    mtmp.write_text(json.dumps({"version": HISTORY_VERSION, "signature": signature, "bases": base_signature,
+                                "rows": int(len(frame))}, ensure_ascii=False), encoding="utf-8")
     os.replace(mtmp, meta)
     return path
 
@@ -834,6 +844,15 @@ def load_history_cache(master_dir: Path | str) -> tuple[pd.DataFrame, str] | Non
     return frame[HISTORY_COLUMNS], sig
 
 
+def _cached_base_signature(master_dir: Path | str) -> str:
+    """前に作った履歴の、基本CSVだけの印（無い・読めない・前の版の記録なら空）。"""
+    try:
+        m = json.loads((Path(master_dir) / HISTORY_META).read_text(encoding="utf-8"))
+        return str(m.get("bases") or "") if m.get("version") == HISTORY_VERSION else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
 def has_result_files(result_dir: Path | str | None = None) -> bool:
     return bool(find_result_files(result_dir))
 
@@ -851,7 +870,9 @@ def get_history(csv_dir: Path | str | None = None, result_dir: Path | str | None
     - 基本CSVがあり、master_csv/ の履歴の印が元（基本CSV・結果指数のファイル）と同じなら、履歴のファイルを読む
     - 印が違う・履歴が無い・rebuild=True なら、元から作り直して master_csv/ に書く（save=False なら書かない）
     - 結果指数のファイルが無いとき: 前に作った履歴に結果指数の値があれば、それを使う（別の場所に master_csv と csv_files だけ
-      持ってきたときに、8指数を落とさない）。rebuild=True（replace）のときは、今ある元から作り直す（結果指数なしの履歴になる）
+      持ってきたときに、8指数を落とさない）。そのあと基本CSVが変わっていれば（行数の合わない履歴も）、走は基本CSVから作り直して、
+      結果指数の値だけを前の履歴から引き継ぐ（近5走の条件を古い走のままにしない）。
+      rebuild=True（replace）のときは、今ある元から作り直す（結果指数なしの履歴になる）
     - 基本CSVが無く履歴のファイルだけあれば、それを使う"""
     log = log or (lambda m: None)
     master_dir = Path(master_dir) if master_dir is not None else config.master_dir()
@@ -859,8 +880,26 @@ def get_history(csv_dir: Path | str | None = None, result_dir: Path | str | None
     bases = base_csv_paths(csv_dir)
     cached = load_history_cache(master_dir)
     keep_cached = (not files and cached is not None and not rebuild and _frame_has_results(cached[0]))
+    if bases and keep_cached:
+        base_sig = _signatures(bases, [])[1]
+        if not cached[1] or _cached_base_signature(master_dir) != base_sig:
+            # 基本CSVが変わった（か、行数の合わない履歴）: 走は基本CSVから作り直し、結果指数の値は前の履歴から引き継ぐ
+            log("[INFO] 過去走の履歴: 結果指数のファイルが無く、基本CSVが前と違うので、走は基本CSVから作り直します"
+                "（結果指数の値は、前に作った履歴から引き継ぎます）")
+            frame = build_history_frame(bases, [], log)
+            old = cached[0].drop_duplicates(subset=[RID], keep="last").set_index(RID)
+            for c in ("SP", "ST"):
+                frame[c] = frame[RID].map(old[c]).fillna("")
+            log(f"[INFO] 過去走の履歴: {len(frame)} 走（うち結果指数を引き継いだ走 "
+                f"{int(((frame['SP'] != '') | (frame['ST'] != '')).sum())}）")
+            if save:
+                try:
+                    save_history(frame, master_dir, base_sig, base_sig)
+                except OSError as e:
+                    log(f"[WARN] 過去走の履歴を {master_dir} に書けませんでした（{type(e).__name__}: {e}）。計算は続けます")
+            return History(frame)
     if bases and not keep_cached:
-        sig = source_signature(bases, files)
+        sig, base_sig = _signatures(bases, files)
         if cached is not None and cached[1] == sig and not rebuild:
             log(f"[INFO] 過去走の履歴: {HISTORY_FILE}（{len(cached[0])} 走）を使います")
             return History(cached[0])
@@ -872,7 +911,7 @@ def get_history(csv_dir: Path | str | None = None, result_dir: Path | str | None
         frame = build_history_frame(bases, files, log)
         if save:
             try:
-                save_history(frame, master_dir, sig)
+                save_history(frame, master_dir, sig, base_sig)
                 log(f"[INFO] 過去走の履歴 {len(frame)} 走を {master_dir.name}/{HISTORY_FILE} に書きました")
             except OSError as e:
                 log(f"[WARN] 過去走の履歴を {master_dir} に書けませんでした（{type(e).__name__}: {e}）。計算は続けます")

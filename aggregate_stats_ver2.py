@@ -60,7 +60,7 @@ import pandas as pd
 from shisu import config
 from shisu import classify as classify_rules
 from shisu.aggstore import (COMPACT_MIN_COUNT, COMPACT_MIN_WEDGE, PART_SUFFIX, AggMasterWriter, compact_mask,
-                            IDENTITY_KEYS, legacy_files, master_identity, settings_hash, stamp_matches, stamp_path,
+                            IDENTITY_KEYS, legacy_files, master_identity, settings_hash, stamp_matches, stamp_path, STAMP_SUFFIX,
                             write_stamp)
 from shisu.csvio import read_csv_any
 from shisu.estimates import beta_quantile, has_scipy, posterior_mean
@@ -532,9 +532,18 @@ def main(argv=None) -> int:
     # build_db・照合・画面はこの定義を使う（AGG_RANKBAND_SCHEMES で絞ったスキームもここに残る）
     fam_registry.save_families(out_dir / "families.json", fams, {"source": fam_registry.active_source()})
     # 今回作らない「条件のみ」の成績表（条件のみの family をやめた・基準の master が変わった）を残さない
+    # （0行で終わって印だけが残っているものも）
     wanted = {agg_output_name(p, True) for p in bases.values()}
-    for old in out_dir.glob(agg_master_filename(f"*_{CONDITION_ONLY}")):
-        if old.name not in wanted:
+    pattern = agg_master_filename(f"*_{CONDITION_ONLY}")
+    stale = {p.name for p in out_dir.glob(pattern)}
+    stale |= {p.name[:-len(STAMP_SUFFIX)] for p in out_dir.glob(pattern + STAMP_SUFFIX)}
+    for name in sorted(stale - wanted):
+        stamp_path(out_dir / name).unlink(missing_ok=True)
+        (out_dir / name).unlink(missing_ok=True)
+    # 指数を使う family が1つも無い（条件のみだけ）: 指数ごとの集計はしないので、前の family の成績表（指数ごとのファイル）を残さない
+    if n_plain == len(fams):
+        for p in files:
+            old = out_dir / agg_output_name(p)
             stamp_path(old).unlink(missing_ok=True)
             old.unlink(missing_ok=True)
     if bases:

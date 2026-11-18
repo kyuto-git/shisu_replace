@@ -68,6 +68,9 @@ def test_only_the_latest_five_runs_within_600_days_before_the_race_day():
     # 今走の芝・ダ・距離・場所・日付が分からないとき
     one = hist([("", "ウマ", "20260501", "東京", "芝", 1600, 1)])
     assert form(one, sd="") == ("", "") and form(one, dist=None) == ("", "同場連対あり")
+    # 今走の芝・ダが分からなければ、芝・ダの空の過去走があっても空（空どうしを「同じ」にしない）
+    blank = hist([("", "ウマ", "20260501", "東京", "", 1600, 1)])
+    assert form(blank, sd="") == ("", "") and form(blank) == ("", "")
     assert form(one, place="") == ("同条件連対あり", "") and form(one, date="") == ("", "")
     assert form(one, name="ベツ") == ("", "") and form(None) == ("", "")
     assert list(PP.recent_form(target().iloc[0:0], one).columns) == list(PP.RECENT_COLUMNS)
@@ -177,7 +180,16 @@ def test_history_is_built_without_result_files_and_keeps_results_when_they_vanis
     assert meta["version"] == PP.HISTORY_VERSION == 3 and meta["rows"] == h.rows
     logs.clear()
     assert PP.get_history(csv_dir, res, master, logs.append).rows == h.rows
-    assert any("を使います" in m for m in logs) and not any("作り直します" in m or "作ります" in m for m in logs)   # 2回目は読むだけ
+    assert any(f"（{h.rows} 走）を使います" in m for m in logs)                        # 2回目は読むだけ
+    assert not any("作り直します" in m or "作ります" in m or "前に作った" in m for m in logs)
+    # 結果指数が無いまま基本CSVが変わったら、作り直す（出馬表側の build_db・calc が新しい走を拾う）
+    last_race = base[RID].str[:16] == base[RID].str[:16].max()
+    base[~last_race].to_csv(csv_dir / "全場_タイムM.csv", index=False, encoding="cp932")
+    logs.clear()
+    short = PP.get_history(csv_dir, res, master, logs.append)
+    assert short.rows < h.rows and any("変わったので作り直します" in m for m in logs)
+    base.to_csv(csv_dir / "全場_タイムM.csv", index=False, encoding="cp932")
+    assert PP.get_history(csv_dir, res, master).rows == h.rows
     # 結果指数を足すと作り直す（結果指数のある走が入る）
     res.mkdir()
     rid = base[RID].iloc[5]
@@ -190,6 +202,24 @@ def test_history_is_built_without_result_files_and_keeps_results_when_they_vanis
     logs.clear()
     h3 = PP.get_history(csv_dir, res, master, logs.append)
     assert h3.has_results and any("結果指数のファイルが無いので、前に作った" in m for m in logs)
+    # その状態で基本CSVが変わったら: 走は基本CSVから作り直し、結果指数の値は前の履歴から引き継ぐ（古い走のままにしない）
+    base[~last_race].to_csv(csv_dir / "全場_タイムM.csv", index=False, encoding="cp932")
+    logs.clear()
+    h3b = PP.get_history(csv_dir, res, master, logs.append)
+    assert h3b.rows == short.rows and h3b.has_results and h3b.result_rows["SP"] == 1
+    assert any("前に作った履歴から引き継ぎます" in m for m in logs)
+    assert PP.load_history_cache(master)[0].set_index(RID).loc[rid, "SP"] == "61"
+    logs.clear()                                                    # 同じ基本CSVなら、次は読むだけ
+    assert PP.get_history(csv_dir, res, master, logs.append).rows == short.rows
+    assert any("前に作った" in m and "を使います" in m for m in logs) and not any("引き継ぎます" in m for m in logs)
+    # 行数が印と合わない（途中で切れた）履歴も、そのまま使わず作り直す
+    meta_path = master / PP.HISTORY_META
+    meta_path.write_text(json.dumps({**json.loads(meta_path.read_text(encoding="utf-8")), "rows": 3}), encoding="utf-8")
+    logs.clear()
+    assert PP.get_history(csv_dir, res, master, logs.append).has_results and any("引き継ぎます" in m for m in logs)
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["rows"] == short.rows
+    base.to_csv(csv_dir / "全場_タイムM.csv", index=False, encoding="cp932")
+    assert PP.get_history(csv_dir, res, master).rows == h.rows
     # replace（rebuild=True）は、今ある元から作り直す（結果指数なしの履歴になる）
     h4 = PP.get_history(csv_dir, res, master, rebuild=True)
     assert not h4.has_results and h4.rows == h.rows
@@ -201,7 +231,7 @@ def test_history_is_built_without_result_files_and_keeps_results_when_they_vanis
 
 
 @pytest.mark.parametrize("workers", [1])
-def test_replace_writes_the_recent_form_columns(tmp_path, monkeypatch, workers):
+def test_replace_writes_the_recent_form_columns(tmp_path, monkeypatch, capsys, workers):
     monkeypatch.setenv("SHISU_BASE_DIR", str(tmp_path))
     for k in ("RESULT_INDICES_DIR", "RACE_MARKS_DIR", "SHISU_EXT_DIR"):
         monkeypatch.delenv(k, raising=False)
@@ -215,6 +245,31 @@ def test_replace_writes_the_recent_form_columns(tmp_path, monkeypatch, workers):
         assert m[c].tolist() == want[c].tolist(), c
     assert (m["近5走同条件"] != "").mean() > 0.5
     assert (tmp_path / "master_csv" / PP.HISTORY_FILE).exists()
+    # cp932 でも UTF-8 でも読めないバイトが1つあるだけの基本CSV: master と同じに、その文字だけ置き換えて履歴を作る
+    good = (tmp_path / "csv_files" / "全場_タイムM.csv").read_bytes()
+    name = "ホース1,".encode("cp932")
+    assert good.count(name) > 3
+    (tmp_path / "csv_files" / "全場_タイムM.csv").write_bytes(good.replace(name, "ホース1".encode("cp932") + b"\x81\xff,", 1))
+    capsys.readouterr()
+    assert replace_csv_ver3.main([]) == 0
+    out = capsys.readouterr().out
+    assert "読めない文字があります" in out and "[ERROR]" not in out
+    m_bad = pd.read_csv(tmp_path / "master_csv" / "master_全場_タイムM.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
+    assert (m_bad["近5走同条件"] != "").mean() > 0.5 and (m_bad["近5走同条件"] != m["近5走同条件"]).sum() <= 12
+    (tmp_path / "csv_files" / "全場_タイムM.csv").write_bytes(good)
+    # replace は履歴を必ず作り直す: 結果指数のファイルが無くなったら、前の履歴の結果指数を引き継がない
+    res = tmp_path / "result_indices"
+    res.mkdir()
+    (res / "sp_a.csv").write_text("".join(f"{r},{50 + i % 30}\n" for i, r in enumerate(base[RID])), encoding="utf-8")
+    assert replace_csv_ver3.main([]) == 0
+    assert PP.History(PP.load_history_cache(tmp_path / "master_csv")[0]).has_results
+    assert (tmp_path / "master_csv" / "master_全場_過去SP_3走平均.csv.gz").exists()
+    (res / "sp_a.csv").unlink()
+    assert PP.get_history(log=lambda m: None).has_results                    # 出馬表側（作り直さない）は前の値を使う
+    capsys.readouterr()
+    assert replace_csv_ver3.main([]) == 0                                    # --clean なし（前の履歴が残っている）でも作り直す
+    assert not PP.History(PP.load_history_cache(tmp_path / "master_csv")[0]).has_results
+    assert "過去SP_3走平均" not in capsys.readouterr().out                   # 8指数の master は作らない
     # 履歴を作れないとき（読めない基本CSV）: エラーを出して近5走は空・前の履歴を残さない・ほかの master は作る
     (tmp_path / "csv_files" / "全場_対戦M.csv").write_bytes((tmp_path / "csv_files" / "全場_タイムM.csv").read_bytes())
     (tmp_path / "csv_files" / "全場_タイムM.csv").write_bytes(b"")
