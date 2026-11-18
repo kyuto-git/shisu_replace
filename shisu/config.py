@@ -89,3 +89,9 @@ def notes_path() -> Path:
     env = os.environ.get("NOTES_PATH")
     return Path(env) if env else base_dir() / "condition_notes.json"
 
+
+def baseline_dir() -> Path:
+    """SP指数・ST指数の3着内基準値（index_baseline_SP.csv・index_baseline_ST.csv）の置き場所（shisu/baselines.py）。
+    既定はパッケージの shisu/data/（リポジトリに入れてあるマスタ。replace・python -m shisu.baselines --update が書き換える）。"""
+    env = os.environ.get("SHISU_BASELINE_DIR")
+    return Path(env) if env else Path(__file__).resolve().parent / "data"

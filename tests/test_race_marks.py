@@ -206,7 +206,7 @@ def test_band_rules_and_boundaries():
         "ダ乾(4.9以下)", "ダ標準(5.0~9.9)", "ダ標準(5.0~9.9)", "ダ湿(10.0以上)", "ダ湿(10.0以上)"]
     assert mo("12.5", "7.1", "芝") == "芝標準(10.0~14.9)" and mo("12.5", "7.1", "ダ") == "ダ標準(5.0~9.9)"   # 1行目 = 芝・2行目 = ダ
     assert mo("12.5", "", "ダ") == "" and mo("", "7.1", "芝") == "" and mo("12.5", "7.1", "") == "" and mo("x", "y", "芝") == ""
-    assert set(C.MARK_CONDITIONS) <= set(C.CONDITION_COLUMNS) and len(C.CONDITION_COLUMNS) == 30
+    assert set(C.MARK_CONDITIONS) <= set(C.CONDITION_COLUMNS) and len(C.CONDITION_COLUMNS) == 36
 
 
 def _std(rows):

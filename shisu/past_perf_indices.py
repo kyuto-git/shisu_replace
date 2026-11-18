@@ -86,8 +86,10 @@ _BABA3 = {"良": "良", "稍": "稍・重", "稍重": "稍・重", "重": "稍�
 
 HISTORY_FILE = "__horse_perf_history__.csv.gz"
 HISTORY_META = "__horse_perf_history__.json"
-HISTORY_VERSION = 3         # 3: 結果指数の無い走も入れ、場所・着順を持つ（近5走の要約条件用）。2: UTF-8・印に中身の指紋
-HISTORY_COLUMNS = ["馬ID", "馬名", "日付", RID, "場所", "芝・ダ", "距離", "馬場", "着順", "SP", "ST"]
+# 4: クラス（基準値のクラス。baselines.race_class）と 馬場4（良/稍/重/不）を持つ（3着内基準値と前走の基準比用）。
+# 3: 結果指数の無い走も入れ、場所・着順を持つ（近5走の要約条件用）。2: UTF-8・印に中身の指紋
+HISTORY_VERSION = 4
+HISTORY_COLUMNS = ["馬ID", "馬名", "日付", RID, "場所", "芝・ダ", "距離", "馬場", "着順", "SP", "ST", "クラス", "馬場4"]
 # 近5走の要約条件（conditions.RECENT_CONDITIONS）: 600日以内の直近 RECENT_RUNS 走のうち、条件の合う走の最高着順
 RECENT_RUNS = 5
 RECENT_DIST_TOL = 200       # 「同条件」の距離差の許容（メートル）
@@ -96,7 +98,8 @@ BASE_INDICATORS = ("タイムM", "対戦M")
 ALL_REGION = "全場"
 # 基本CSVから読む列（これ以外は読まない。10年分の基本CSVを丸ごと読むとメモリを使うため）
 BASE_USECOLS = ("レースID(新)", "馬番", "日付S", "血統登録番号", "馬名", "馬名S", "馬名1", "芝・ダ", "芝ダ", "距離",
-                "馬場状態", "馬場", "着順", "トラックコード(JV)", "場所", "頭数", "頭")
+                "馬場状態", "馬場", "着順", "トラックコード(JV)", "場所", "頭数", "頭",
+                "クラス名", "クラス", "年齢限定", "年限定", "レース名")
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +451,10 @@ def history_rows(raw: pd.DataFrame, results: dict[str, dict[str, Decimal]]) -> p
     t["SP"] = [fmt_raw(sp.get(r)) for r in rids]
     t["ST"] = [fmt_raw(st.get(r)) for r in rids]
     t["着順"] = [("" if v != v or v < 1 else str(int(v))) for v in num.tolist()]
+    from . import baselines                      # 基準値のクラス（年齢限定で分けた区分）と馬場の4区分
+    t["クラス"] = [baselines.race_class(c, a, n) for c, a, n in zip(_col(raw, "クラス名", "クラス"),
+                                                                   _col(raw, "年齢限定", "年限定"), _col(raw, "レース名"))]
+    t["馬場4"] = _col(raw, "馬場状態", "馬場").map(baselines.baba4)
     keep = ran & ~jump & (t[RID] != "") & (t["日付"] != "") & ((t["馬ID"] != "") | (t["馬名"] != ""))
     h = t[keep].copy()
     h["距離"] = h["距離"].map(lambda v: "" if pd.isna(v) else str(int(v)))
@@ -466,9 +473,9 @@ def fmt_raw(d: Decimal | None) -> str:
 # 履歴（馬ごとの走）
 # ---------------------------------------------------------------------------
 Run = tuple  # (日の通し番号, レースID(新), 芝・ダ, 距離 or None, 馬場, 値)
-# 履歴の1走: (日の通し番号, レースID(新), 芝・ダ, 距離 or None, 馬場, SP or None, ST or None, 場所, 着順 or None)
+# 履歴の1走: (日の通し番号, レースID(新), 芝・ダ, 距離 or None, 馬場, SP or None, ST or None, 場所, 着順 or None, クラス, 馬場4)
 FullRun = tuple
-_F_SP, _F_ST, _F_PLACE, _F_FINISH = 5, 6, 7, 8
+_F_SP, _F_ST, _F_PLACE, _F_FINISH, _F_CLASS, _F_BABA4 = 5, 6, 7, 8, 9, 10
 
 
 def _RUN_ORDER(r: tuple) -> tuple:
@@ -501,13 +508,14 @@ class History:
                 return None
             return None if k is None else nums.setdefault(k, k)
 
-        for hid, name, date, rid, place, surface, dist, baba, fin, sp, st in zip(*cols):
+        for hid, name, date, rid, place, surface, dist, baba, fin, sp, st, cls, baba_raw in zip(*cols):
             o = date_ordinal(str(date))
             if o is None:
                 continue
             vs, vt = parse_value(sp), parse_value(st)
             f = number(fin)
-            run = (o, str(rid), word(surface), number(dist), word(baba), vs, vt, word(place), f if f and f >= 1 else None)
+            run = (o, str(rid), word(surface), number(dist), word(baba), vs, vt, word(place), f if f and f >= 1 else None,
+                   word(cls), word(baba_raw))
             if vs is not None:
                 self.result_rows["SP"] += 1
             if vt is not None:
@@ -542,6 +550,15 @@ class History:
         if not own:
             return extra
         return sorted(own + extra, key=_RUN_ORDER, reverse=True)
+
+    def run_at(self, horse_id: str, name: str, rid16: str) -> FullRun | None:
+        """この馬の、レースID(新)の先頭16桁が rid16 のレースの走（前走の指数・前走の条件を引く）。無ければ None。"""
+        if not rid16:
+            return None
+        for r in self.all_runs(horse_id, name):
+            if r[1][:16] == rid16:
+                return r
+        return None
 
     def runs(self, kind: str, horse_id: str, name: str) -> list[Run]:
         """この馬の、結果指数 kind（SP / ST）の値がある走（新しい順）。値は r[5]。"""
@@ -930,6 +947,20 @@ def get_history(csv_dir: Path | str | None = None, result_dir: Path | str | None
     return None
 
 
+def history_frame(csv_dir: Path | str | None = None, result_dir: Path | str | None = None,
+                  master_dir: Path | str | None = None, log: Logger | None = None) -> pd.DataFrame | None:
+    """過去走の履歴の表（HISTORY_COLUMNS）。get_history と同じ決まりで用意して（元が変わっていれば作り直す）、表のまま返す。
+    基本CSVも前に作った履歴も無ければ None。3着内基準値の更新（shisu/baselines.py）が使う。"""
+    master_dir = Path(master_dir) if master_dir is not None else config.master_dir()
+    if get_history(csv_dir, result_dir, master_dir, log=log) is None:
+        return None
+    cached = load_history_cache(master_dir)
+    if cached is not None:
+        return cached[0]
+    bases = base_csv_paths(csv_dir)              # 履歴を書けなかった（書けない場所）ときは、その場で作る
+    return build_history_frame(bases, find_result_files(result_dir), log) if bases else None
+
+
 # ---------------------------------------------------------------------------
 # 想定の馬場状態の設定（/ingest の画面で選んだ値を、calc_entry_hensachi が既定として読む）
 # ---------------------------------------------------------------------------
@@ -973,5 +1004,5 @@ __all__ = [
     "compute", "resolve_baba", "age_limited", "baba3", "norm_baba_choice", "base_csv_paths", "source_signature",
     "build_history_frame", "save_history", "load_history_cache", "get_history", "has_result_files",
     "load_settings", "save_settings", "baba_text", "stage_text", "column_notes", "recent_form", "RECENT_COLUMNS",
-    "RECENT_RUNS", "RECENT_DIST_TOL",
+    "RECENT_RUNS", "RECENT_DIST_TOL", "history_frame",
 ]

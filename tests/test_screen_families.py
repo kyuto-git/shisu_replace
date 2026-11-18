@@ -150,24 +150,24 @@ def test_candidates_space():
     names = [f.name for f in cands]
     assert len(names) == len(set(names))
     assert {f.name for f in init} <= set(names)                 # 初期セットは名前のまま入る
-    assert len(S.POOL) == 34          # 重量種別・クラス名・枠番グループ・騎手 ＋ 条件の30列（22条件の24列・レース印4・近5走2）
+    assert len(S.POOL) == 40          # 重量種別・クラス名・枠番グループ・騎手 ＋ 条件の36列（22条件の24列・レース印4・近5走2・基準比と3走順の6）
     assert set(S.POOL) <= set(S.PART_CODES) and len(set(S.PART_CODES.values())) == len(S.PART_CODES)
     kinds = {}
     for _parts, kind in S.templates("default"):
         kinds[kind] = kinds.get(kind, 0) + 1
-    assert kinds == {"s0:single": 34, "s0:pair": 560, "s0:trio": 87, "s2:single": 32, "s3:single": 33,
-                     "s4:single": 33, "s5:single": 31, "s6:single": 25, "s6n:single": 23}
-    assert sum(kinds.values()) == 858 and (len(cands), sum(len(f.schemes) for f in cands)) == (1739, 2791)
+    assert kinds == {"s0:single": 40, "s0:pair": 779, "s0:trio": 95, "s2:single": 38, "s3:single": 39,
+                     "s4:single": 39, "s5:single": 37, "s6:single": 31, "s6n:single": 29}
+    assert sum(kinds.values()) == 1127 and (len(cands), sum(len(f.schemes) for f in cands)) == (2277, 3709)
     n_all = len(S.templates("all"))
-    assert n_all == 3433                                         # 条件が6つ増えた分（2026-11-17。それまで 2,371）
+    assert n_all == 4727                                         # 条件が6つずつ増えた分（2026-11-17 に 2,371 → 3,433、2026-11-18 に → 4,727）
     allk = {}
     for _parts, kind in S.templates("all"):
         allk[kind] = allk.get(kind, 0) + 1
-    assert allk["s6:pair"] == 300 and allk["s2:pair"] == 496 and allk["s1:trio"] == 87
+    assert allk["s6:pair"] == 465 and allk["s2:pair"] == 703 and allk["s1:trio"] == 95
     # 末尾の種類に NONE（条件のみ）を入れると、その分の候補が増える（名前は X_…_none。指数の候補はそのまま）
     with_none = S.make_candidates("default", ("RBAND", "HBAND", "NONE"))
     plain = [f for f in with_none if f.no_index]
-    assert len(plain) == 858 and all(f.name.startswith("X_") and f.name.endswith("_none") for f in plain)
+    assert len(plain) == 1127 and all(f.name.startswith("X_") and f.name.endswith("_none") for f in plain)
     assert [f.name for f in with_none if not f.no_index] == names
     assert S.candidate_name(("騎手", "近5走同条件"), "NONE") == "X_jk_r5cond_none"
     assert any(f.parts == (F.COURSE, "前走着順") for f in cands)          # 初期セット D_prevfin

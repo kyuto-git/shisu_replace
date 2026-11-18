@@ -1,4 +1,4 @@
-"""集計キーに使う条件（22種 ＋ 外部レース印の前走条件4種 ＋ 近5走の要約2種）の導出。過去側（TARGET ★6タブの過去レースCSV）と出馬表側（TARGET 出馬表）で共通。
+"""集計キーに使う条件（22種 ＋ 外部レース印の前走条件4種 ＋ 近5走の要約2種 ＋ 3着内基準値との比較と過去SP・ST の順位6種）の導出。過去側（TARGET ★6タブの過去レースCSV）と出馬表側（TARGET 出馬表）で共通。
 
 両側の列名の違いは standardize_history / standardize_entries で吸収し、同じ derive() を通す
 （過去側と出馬表側でキーの部品が必ず同じ値になるようにするため）。
@@ -31,6 +31,15 @@
 近5走の要約（shisu/past_perf_indices.py の recent_form。馬ごとの過去走の履歴から。derive には recent で渡す）:
   近5走同条件      600日以内の直近5走のうち、同じ芝・ダ・距離差200以内の走の最高着順: 同条件連対あり / 同条件3着あり / 同条件4着以下
   近5走同場        同じく、同じ場所・同じ芝・ダの走の最高着順: 同場連対あり / 同場3着あり / 同場4着以下
+3着内基準値との比較（shisu/baselines.py の conditions。derive には perf で渡す）:
+  前走SP基準比     前走のSP指数 − 前走の条件のSP基準値: 前走SP基準突破（+3以上）/ 前走SP基準クリア（0〜+2）/
+                   前走SP基準未達（−5〜−1）/ 前走SP基準大幅未達（−6以下）
+  前走ST基準比     同じく ST指数: 前走ST基準突破（+2以上）/ クリア（0〜+1）/ 未達（−3〜−1）/ 大幅未達（−4以下）
+  過去SP今走基準比 今走の 過去SP_3走平均・5走平均・3走最高・5走最高 と今走の条件のSP基準値:
+                   SP平均基準超 / SP3走最高基準超 / SP5走最高基準超 / SP今走基準未達
+  過去ST今走基準比 同じく ST: ST平均基準超 / ST3走最高基準超 / ST5走最高基準超 / ST今走基準未達
+  過去SP3走順・過去ST3走順   過去SP_3走平均・過去ST_3走平均 のレース内順位（1以上の整数。帯はキーを作るときに s1/s2 で付ける:
+                   SP3走1~3位・ST3走6位~ など）
 """
 from __future__ import annotations
 
@@ -49,9 +58,12 @@ CONDITION_COLUMNS = ("時期", "輸送距離", "間隔帯", "叩き", "R値帯",
 # 外部レース印（race_marks/）から作る前走条件と、馬ごとの過去走の履歴から作る近5走の要約（2026-11-17〜）
 MARK_CONDITIONS = ("前走メンバーLv", "前走タイムLv", "前走クッション帯", "前走含水率帯")
 RECENT_CONDITIONS = ("近5走同条件", "近5走同場")
-CONDITION_COLUMNS = CONDITION_COLUMNS + MARK_CONDITIONS + RECENT_CONDITIONS
+# SP指数・ST指数の3着内基準値（shisu/baselines.py）との比較と、過去SP_3走平均・過去ST_3走平均 のレース内順位（2026-11-18〜）
+BASELINE_CONDITIONS = ("前走SP基準比", "前走ST基準比", "過去SP今走基準比", "過去ST今走基準比", "過去SP3走順", "過去ST3走順")
+CONDITION_COLUMNS = CONDITION_COLUMNS + MARK_CONDITIONS + RECENT_CONDITIONS + BASELINE_CONDITIONS
 # 帯をキーのときに付ける条件（値は整数）と、その帯の名前の種類（hensachi.BAND_UNITS）
-BANDED_CONDITIONS = {"前走着順": "finish", "前走人気": "pop", "前走上り3F順": "agari"}
+BANDED_CONDITIONS = {"前走着順": "finish", "前走人気": "pop", "前走上り3F順": "agari",
+                     "過去SP3走順": "sp3", "過去ST3走順": "st3"}
 STD_COLUMNS = ("日付", "場所", "芝・ダ", "距離_raw", "芝(内・外)", "所属", "間隔", "休明戦目", "斤量", "前走斤量",
                "牝馬限定", "前走場所", "前走芝ダ", "前走距離", "前走内外", "前走RID16", "前走着順", "前走人気",
                "前走上り3F順", "前走脚質", "前走R印3")
@@ -343,12 +355,13 @@ def moisture_band(turf, dirt, prev_surface) -> str:
 
 
 def derive(std: pd.DataFrame, inner_lookup: Mapping[str, str] | None = None, marks=None,
-           recent: pd.DataFrame | None = None) -> pd.DataFrame:
+           recent: pd.DataFrame | None = None, perf: pd.DataFrame | None = None) -> pd.DataFrame:
     """STD_COLUMNS の DataFrame → CONDITION_COLUMNS の DataFrame（index は同じ。値は文字列、分からなければ ''）。
 
     inner_lookup: 前走のレースID(新)先頭16桁 → 芝(内・外)。内外の分からない前走コースを引くときに使う。
     marks: 外部レース印（shisu.race_marks.RaceMarks）。前走RID16 で引いて 前走メンバーLv などにする。無ければ空。
     recent: 近5走の要約（RECENT_CONDITIONS の列。index は std と同じ。past_perf_indices.recent_form の結果）。無ければ空。
+    perf: 基準比と 過去SP3走順・過去ST3走順（BASELINE_CONDITIONS の列。baselines.conditions の結果）。無ければ空。
     """
     out = pd.DataFrame(index=std.index)
     out["時期"] = std["日付"].map(season)
@@ -394,11 +407,12 @@ def derive(std: pd.DataFrame, inner_lookup: Mapping[str, str] | None = None, mar
     out["前走タイムLv"] = [time_level(get(rec, "time")) for rec in recs]
     out["前走クッション帯"] = [cushion_band(get(rec, "cushion"), sd) for rec, sd in zip(recs, prev_sd)]
     out["前走含水率帯"] = [moisture_band(get(rec, "moist_turf"), get(rec, "moist_dirt"), sd) for rec, sd in zip(recs, prev_sd)]
-    for c in RECENT_CONDITIONS:
-        if recent is not None and c in recent.columns:
-            out[c] = recent[c].reindex(std.index).fillna("").astype(object)
-        else:
-            out[c] = ""
+    for cols, frame in ((RECENT_CONDITIONS, recent), (BASELINE_CONDITIONS, perf)):
+        for c in cols:
+            if frame is not None and c in frame.columns:
+                out[c] = frame[c].reindex(std.index).fillna("").astype(object)
+            else:
+                out[c] = ""
     return out[list(CONDITION_COLUMNS)].astype(object)
 
 

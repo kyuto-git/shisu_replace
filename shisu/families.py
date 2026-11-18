@@ -47,6 +47,9 @@ TAILS = ("RANK", "RBAND", "HBAND", NONE)
 TAIL_LABELS = {"RANK": "指数順位", "RBAND": "指数順位帯", "HBAND": "偏差値帯", NONE: CONDITION_ONLY}
 PART_LABELS = {COURSE: "コース", "間隔帯": "レース間隔", "叩き": "叩き良化", "左右遷移": "左右回り遷移",
                "斤量帯": "当日斤量", "前走上り3F順": "前走上がり3F順"}
+# その指数のレース内順位そのものを部品にした条件 → その指数。その指数の master では、この部品を含む family を集計しない
+# （過去SP3走順 × 指数順位帯 を 過去SP_3走平均 の master で作ると、同じ順位を2回掛けただけの表になる）
+SELF_RANK_PARTS = {"過去SP3走順": "過去SP_3走平均", "過去ST3走順": "過去ST_3走平均"}
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,60}$")
 _RESERVED_RE = re.compile(r"^(odds10u|odds10_50|odds50p|odds5p|rankband)_", re.IGNORECASE)
 
@@ -120,6 +123,12 @@ class Family:
         if not self.no_index:
             cols.append({"RANK": "順位", "RBAND": "順位", "HBAND": "偏差値帯"}[self.tail])
         return tuple(dict.fromkeys(cols))
+
+
+def is_self_redundant(fam: "Family", indicator: str) -> bool:
+    """family fam を指数 indicator の master で集計すると同義の重複になるか（部品が、その指数自身の順位）。
+    指数を使わない family（条件のみ）は対象外。集計（aggregate）と採点（screen_families）が同じ見方で飛ばす。"""
+    return (not fam.no_index) and any(SELF_RANK_PARTS.get(p) == indicator for p in fam.parts)
 
 
 def validate(f: Family) -> None:

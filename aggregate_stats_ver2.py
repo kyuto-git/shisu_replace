@@ -373,7 +373,9 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
     copts = compact_options() if compact is None else compact
     ref_year = ref_year_of(df)
     total = adj = kept = n_tables = 0
-    fams = [f for f in restrict_schemes(fam_registry.active(), schemes) if f.no_index == no_index]
+    # その指数自身の順位を部品にした family（過去SP3走順 を 過去SP_3走平均 の master で、など）は同義の重複なので作らない
+    fams = [f for f in restrict_schemes(fam_registry.active(), schemes)
+            if f.no_index == no_index and not fam_registry.is_self_redundant(f, indicator)]
     writer = AggMasterWriter(path)
     try:
         for fam, scheme, sub in family_frames(df, fams):

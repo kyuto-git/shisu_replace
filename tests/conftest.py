@@ -15,3 +15,21 @@ def _reset_family_registry():
     yield
     from shisu import families
     families.reset()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _baseline_copy(tmp_path_factory):
+    """SP・ST の3着内基準値のマスタ（shisu/data/index_baseline_*.csv）は replace が書き換える。
+    テストがリポジトリのファイルを書き換えないように、写しのフォルダ（SHISU_BASELINE_DIR）を使う。"""
+    import os
+    import shutil
+    d = tmp_path_factory.mktemp("baseline")
+    for src in (ROOT / "shisu" / "data").glob("index_baseline_*.csv"):
+        shutil.copy(src, d / src.name)
+    old = os.environ.get("SHISU_BASELINE_DIR")
+    os.environ["SHISU_BASELINE_DIR"] = str(d)
+    yield d
+    if old is None:
+        os.environ.pop("SHISU_BASELINE_DIR", None)
+    else:
+        os.environ["SHISU_BASELINE_DIR"] = old

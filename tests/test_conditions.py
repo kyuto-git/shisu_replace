@@ -235,12 +235,14 @@ def test_conditions_equal_between_history_and_entries(paired):
         assert h[c].tolist() == e[c].tolist(), c
     # 一致が空どうしの一致ばかりでないこと
     filled = {c: (h[c] != "").mean() for c in C.CONDITION_COLUMNS}
-    partly = ("前走クワドラント", "輸送距離", "左右遷移", "前走クッション帯") + C.RECENT_CONDITIONS
+    partly = ("前走クワドラント", "輸送距離", "左右遷移", "前走クッション帯") + C.RECENT_CONDITIONS + C.BASELINE_CONDITIONS
     assert all(v > 0.5 for k, v in filled.items() if k not in partly), filled
     assert filled["輸送距離"] > 0.3 and filled["前走クワドラント"] > 0.3
     assert filled["前走クッション帯"] > 0.2                      # 前走が芝の馬だけ
     # 近5走の要約は馬ごとの履歴から（ここでは渡していないので空。両側の一致は tests/test_condition_only.py）
     assert all(filled[c] == 0 for c in C.RECENT_CONDITIONS)
+    # 基準比・過去SP/ST 3走順は履歴と基準値から（ここでは渡していないので空。両側の一致は tests/test_baselines.py）
+    assert all(filled[c] == 0 for c in C.BASELINE_CONDITIONS)
     assert set(h["牝馬限定"]) == {"牝馬限定", "混合"}
     assert set(h["間隔帯"]) >= {"連闘", "中2-3"}
     assert set(h["前走脚質"]) >= {"逃げ", "先行", "中団", "後方"}

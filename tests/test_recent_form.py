@@ -177,7 +177,7 @@ def test_history_is_built_without_result_files_and_keeps_results_when_they_vanis
     assert h is not None and not h.has_results and h.rows > 600
     assert any("結果指数（result_indices）のファイルが無いので、着順だけの履歴を作ります" in m for m in logs)
     meta = json.loads((master / PP.HISTORY_META).read_text(encoding="utf-8"))
-    assert meta["version"] == PP.HISTORY_VERSION == 3 and meta["rows"] == h.rows
+    assert meta["version"] == PP.HISTORY_VERSION == 4 and meta["rows"] == h.rows
     logs.clear()
     assert PP.get_history(csv_dir, res, master, logs.append).rows == h.rows
     assert any(f"（{h.rows} 走）を使います" in m for m in logs)                        # 2回目は読むだけ

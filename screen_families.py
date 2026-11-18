@@ -54,7 +54,7 @@ import pandas as pd
 from shisu import config
 from shisu import families as F
 from shisu.classify import classify
-from shisu.indicators import CONDITION_ONLY
+from shisu.indicators import CONDITION_ONLY, parse_source_name
 from shisu.conditions import CONDITION_COLUMNS
 from shisu.csvio import read_csv_any, write_csv
 from shisu.hensachi import all_band_labels
@@ -62,8 +62,8 @@ from shisu.naming import file_stem
 from shisu.odds import ODDS_MODES
 
 HENSACHI_ORDER = ("71以上", "66~70", "61~65", "51~60", "41~50", "40以下")
-# 候補を作るときに組み合わせる条件（34種 = 重量種別・クラス名・枠番グループ・騎手 ＋ 条件の30列。
-# 条件の30列 = 22条件の24列 ＋ 外部レース印の前走条件4列 ＋ 近5走の要約2列）
+# 候補を作るときに組み合わせる条件（40種 = 重量種別・クラス名・枠番グループ・騎手 ＋ 条件の36列。
+# 条件の36列 = 22条件の24列 ＋ 外部レース印の前走条件4列 ＋ 近5走の要約2列 ＋ 3着内基準値との比較4列・過去SP/ST 3走平均の順位2列）
 POOL = ("重量種別", "クラス名", "枠番グループ", "騎手") + tuple(CONDITION_COLUMNS)
 PART_CODES = {"COURSE": "crs", "重量種別": "wt", "クラス名": "cls", "枠番グループ": "frm", "騎手": "jk", "芝・ダ": "sd",
               "場所": "plc", "距離": "dist", "芝(内・外)": "io",
@@ -73,7 +73,9 @@ PART_CODES = {"COURSE": "crs", "重量種別": "wt", "クラス名": "cls", "枠
               "斤量増減": "kinchg", "牝馬限定": "mare", "距離増減": "distchg", "前走着順": "pfin", "前走人気": "ppop",
               "前走上り3F順": "pagari", "前走脚質": "pstyle", "前走R印3": "pr3",
               "前走メンバーLv": "pmem", "前走タイムLv": "ptime", "前走クッション帯": "pcush", "前走含水率帯": "pmoist",
-              "近5走同条件": "r5cond", "近5走同場": "r5plc"}
+              "近5走同条件": "r5cond", "近5走同場": "r5plc",
+              "前走SP基準比": "pspb", "前走ST基準比": "pstb", "過去SP今走基準比": "spb", "過去ST今走基準比": "stb",
+              "過去SP3走順": "sp3", "過去ST3走順": "st3"}
 CLASSES = ("abs", "axis", "opp", "keshi")
 
 # コースだけで決まる物理属性（COURSE と掛け合わせても同じグループになる）
@@ -118,12 +120,17 @@ def redundant(parts: tuple[str, ...]) -> bool:
 def causal_trios(pool: tuple[str, ...] = POOL) -> list[tuple[str, ...]]:
     """因果関係の強い3条件:
     ① 騎手 × ローテ・馬の状態 × 前走の条件  ② コースの物理属性 × [前走R印3/前走脚質] × [前走着順/前走上り3F順]
-    ③ 前走人気 × 前走着順 × 今走の条件  ④ 枠番グループ × [初角帯/F係数帯] × 前走脚質"""
+    ③ 前走人気 × 前走着順 × 今走の条件  ④ 枠番グループ × [初角帯/F係数帯] × 前走脚質
+    ⑤ 過去SP今走基準比 × 過去SP3走順 × [前走SP基準比/前走着順/前走人気/近5走同条件]（ST も同じ）
+       ＝「ST平均基準超 × ST3走1~5位 × …」に、他指数の順位帯・偏差値帯（末尾）を掛ける形"""
     out = []
     out += [("騎手", r, p) for r in ROTATION for p in PREV]
     out += [(c, a, b) for c in PHYSICAL for a in ("前走R印3", "前走脚質") for b in ("前走着順", "前走上り3F順")]
     out += [("前走人気", "前走着順", n) for n in NOW]
     out += [("枠番グループ", c, "前走脚質") for c in ("初角帯", "F係数帯")]
+    for kind in ("SP", "ST"):
+        out += [(f"過去{kind}今走基準比", f"過去{kind}3走順", x)
+                for x in (f"前走{kind}基準比", "前走着順", "前走人気", "近5走同条件")]
     order = {p: i for i, p in enumerate(pool)}
     return [tuple(sorted(t, key=lambda p: order.get(p, 99))) for t in out if all(p in order for p in t)]
 
@@ -201,7 +208,9 @@ def score_master(path: str, fam_dicts: list[dict], wedge_opts: dict | None, mode
                     地域ごとの基準の master 1本でだけ呼ぶ）。"""
     import aggregate_stats_ver2 as agg
     import build_db
-    fams = [f for f in (F.Family.from_dict(d) for d in fam_dicts) if f.no_index == no_index]
+    own = "" if no_index else parse_source_name(file_stem(path)[len("master_"):])[1]      # この master の指数（同義の重複を飛ばす）
+    fams = [f for f in (F.Family.from_dict(d) for d in fam_dicts)
+            if f.no_index == no_index and not F.is_self_redundant(f, own)]
     df = read_csv_any(path)
     if not no_index:
         df = agg.master_frame(df)

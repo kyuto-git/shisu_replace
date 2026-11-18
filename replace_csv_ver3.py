@@ -170,12 +170,82 @@ def recent_of_base(base_path: str, master_dir: str) -> pd.DataFrame | None:
     return _recent_base(str(base_path), str(master_dir), _file_key(Path(master_dir) / PP.HISTORY_FILE))
 
 
+@functools.lru_cache(maxsize=1)
+def _baselines_cached(master_dir: str, key: tuple):
+    from shisu import baselines
+    return baselines.load_for_master(master_dir), bool(baselines.load_meta(master_dir).get("past_perf"))
+
+
+def _baselines(master_dir: str):
+    """(3着内基準値の表 {SP, ST}, 過去SP・ST の値を条件に使うか)。main が master_csv/ に写したもの。1つのプロセスで1回だけ読む。"""
+    from shisu import baselines
+    d = Path(master_dir)
+    key = tuple(_file_key(d / n) for n in (*baselines.MASTER_FILES.values(), baselines.MASTER_META))
+    return _baselines_cached(str(master_dir), key)
+
+
+def perf_rank(df: pd.DataFrame, values: pd.Series, indicator: str) -> pd.Series:
+    """指数 indicator（過去SP_3走平均 など）の値 values（"" = 値なし。index は df と同じ）のレース内順位（文字列。無ければ ""）。
+    df は normalize_history の結果。その指数の master（process_perf → process_frame）の 順位 と同じ計算:
+    障害と取消・除外の馬を外し、値の無い馬は 0（台帳で 0 = 欠損）にして compute_indicator に通す。"""
+    values = values.reindex(df.index).fillna("")
+    ran = parse_finish(df["着順"])["denom"] & ~df["障害"]
+    sub = df[ran]
+    absent = values == ""
+    ind = compute_indicator(values.where(~absent, "0").reindex(sub.index), _race_key(sub), spec_for(indicator),
+                            shinba_mask(sub["クラス名_raw"]), None, absent.reindex(sub.index))
+    return int_text_series(ind["順位"]).reindex(df.index).fillna("").astype(object)
+
+
+def perf_cond_of(raw: pd.DataFrame, master_dir: str, values: dict | None = None,
+                 df: pd.DataFrame | None = None) -> pd.DataFrame | None:
+    """入力（1行=1頭）の各馬の、3着内基準値との比較と 過去SP3走順・過去ST3走順（conditions.BASELINE_CONDITIONS）。
+    values: 過去SP・ST の8指数の値（省略すると履歴から計算する）。df: normalize_history(raw)（省略すると作る）。
+    基準値も履歴も無ければ None（空になる）。"""
+    from shisu import baselines
+    from shisu import past_perf_indices as PP
+    tables, use_perf = _baselines(master_dir)
+    history = _history(master_dir)
+    if history is None and not tables:
+        return None
+    if df is None:
+        df = normalize_history(raw)
+    ranks: dict[str, pd.Series] = {}
+    if use_perf and history is not None and history.has_results:
+        if values is None:
+            values = PP.compute(PP.target_frame(raw), history).values
+        for kind, name in baselines.RANK_INDICATOR.items():
+            if name in values:
+                ranks[kind] = perf_rank(df, values[name], name)
+    else:
+        values = None                    # 過去SP・ST の8指数を作らない実行では、今走の基準比・3走順も付けない
+    prev = standardize_history(raw, df)["前走RID16"]
+    return baselines.conditions(baselines.today_parts(raw), prev, history, tables, values, ranks)
+
+
+@functools.lru_cache(maxsize=2)
+def _perf_cond_base(base_path: str, master_dir: str, key: tuple):
+    got = _perf_values(base_path, master_dir) if _baselines(master_dir)[1] else None     # 8指数を作る実行のときだけ
+    return perf_cond_of(_read_base(base_path), master_dir, None if got is None else got[0])
+
+
+def perf_cond_of_base(base_path: str, master_dir: str) -> pd.DataFrame | None:
+    """基本CSV（ext・perf のジョブが何十回も使う）の基準比の条件。1つのプロセスで基本CSV 1本につき1回だけ計算する。"""
+    from shisu import baselines
+    from shisu import past_perf_indices as PP
+    d = Path(master_dir)
+    key = tuple(_file_key(d / n) for n in (PP.HISTORY_FILE, *baselines.MASTER_FILES.values(), baselines.MASTER_META))
+    return _perf_cond_base(str(base_path), str(master_dir), key)
+
+
 def process_frame(raw: pd.DataFrame, stem: str, region: str, indicator: str, master_dir: str,
                   processed_dir: str | None, inner_lookup: dict | None = None, given_rank: bool | None = None,
-                  label: str = "", absent: pd.Series | None = None, recent: pd.DataFrame | None = None) -> str:
+                  label: str = "", absent: pd.Series | None = None, recent: pd.DataFrame | None = None,
+                  perf: pd.DataFrame | None = None) -> str:
     """1地域×1指数の入力（1行=1頭）→ master_{stem}.csv.gz。戻り値はログの1行。
     absent: 外部指数のファイルに無く 0 で埋めた馬（値から順位を付けるとき最下位にする）。
     recent: 近5走の要約条件（index は raw と同じ）。省略すると raw と master_csv の履歴から計算する。
+    perf: 3着内基準値との比較と 過去SP3走順・過去ST3走順（index は raw と同じ）。省略すると raw から計算する。
     外部レース印の前走条件は master_csv/__race_marks__.csv.gz から（無ければ空）。"""
     label = label or f"{stem}.csv"
     spec = spec_for(indicator)
@@ -229,7 +299,9 @@ def process_frame(raw: pd.DataFrame, stem: str, region: str, indicator: str, mas
 
     if recent is None:
         recent = recent_of(raw, master_dir)
-    cond = derive(standardize_history(raw, df), inner_lookup, _marks(master_dir), recent)
+    if perf is None:
+        perf = perf_cond_of(raw, master_dir, df=df)
+    cond = derive(standardize_history(raw, df), inner_lookup, _marks(master_dir), recent, perf)
     for c in CONDITION_COLUMNS:
         df[c] = cond[c]
     m = df[heads_ok].copy()
@@ -294,7 +366,8 @@ def process_ext(base_path: str, indicator: str, master_dir: str, processed_dir: 
     stem = f"{region_raw}_{indicator}"
     msg = process_frame(raw, stem, region, indicator, master_dir, processed_dir, inner_lookup,
                         given_rank=ranks is not None, label=f"{base_path.name} + ext_indices/{indicator}",
-                        absent=att.absent, recent=recent_of_base(str(base_path), master_dir))
+                        absent=att.absent, recent=recent_of_base(str(base_path), master_dir),
+                        perf=perf_cond_of_base(str(base_path), master_dir))
     return msg + f" / 外部指数が付いた馬 {hit}/{len(raw)}"
 
 
@@ -334,7 +407,8 @@ def process_perf(base_path: str, indicator: str, master_dir: str, processed_dir:
         raw = raw.drop(columns=["指数順位"])
     msg = process_frame(raw, f"{region_raw}_{indicator}", region, indicator, master_dir, processed_dir, inner_lookup,
                         given_rank=False, label=f"{base_path.name} + 過去走の結果指数/{indicator}", absent=absent,
-                        recent=recent_of_base(str(base_path), master_dir))
+                        recent=recent_of_base(str(base_path), master_dir),
+                        perf=perf_cond_of_base(str(base_path), master_dir))
     kind = PP.INDICATORS[indicator][0]
     return msg + f" / 過去走の結果指数が付いた馬 {int((~absent).sum())}/{len(raw)}（{PP.stage_text(stages[kind])}）"
 
@@ -427,6 +501,13 @@ def main(argv=None) -> int:
                     help="TARGET の外部レース印（メンバーレベル・タイムレベル・ペース判定・クッション値・含水率）のフォルダ"
                          "（既定 race_marks）。あれば前走条件（前走メンバーLv など）にして、master_csv/__race_marks__.csv.gz にも書く")
     ap.add_argument("--no-race-marks", action="store_true", help="外部レース印を読まない（前走メンバーLv などは空になる）")
+    ap.add_argument("--no-baseline-update", action="store_true",
+                    help="SP指数・ST指数の3着内基準値（shisu/data/index_baseline_SP.csv・_ST.csv）を作り直さない"
+                         "（今ある基準値をそのまま使う）")
+    ap.add_argument("--baseline-decay", type=float, default=None,
+                    help="基準値の年度の減衰（最新年から1年古いごとに掛ける重み。既定 0.65。1.0 で等重み）")
+    ap.add_argument("--baseline-min-samples", type=int, default=None,
+                    help="3着馬のサンプルがこの件数に満たなければ基準値を更新しない（既定 2000）")
     ap.add_argument("--raw-dir", default=None,
                     help="未統合の過去基本CSVのフォルダ（既定は --csv-dir と同じ階層の raw_csv。ふつうは リポジトリ直下の raw_csv）。"
                          "あれば csv_files/全場_タイムM.csv・全場_対戦M.csv に統合してから進む")
@@ -440,7 +521,7 @@ def main(argv=None) -> int:
 
     _read_base.cache_clear()            # 同じプロセスで続けて呼ばれても（テストなど）、前の実行の基本CSV・計算を使い回さない
     _perf_values.cache_clear()
-    for c in (_marks_cached, _history_cached, _recent_base):
+    for c in (_marks_cached, _history_cached, _recent_base, _baselines_cached, _perf_cond_base):
         c.cache_clear()
     if args.raw_dir is None:            # --csv-dir を別の場所にしたとき、本物の raw_csv を取り込んで動かさない
         args.raw_dir = str(Path(args.csv_dir).parent / config.raw_dir().name)
@@ -511,6 +592,35 @@ def main(argv=None) -> int:
         print(perf_error)
         for name in (PP.HISTORY_FILE, PP.HISTORY_META):      # 前の実行の履歴を各ジョブが読まないように
             (Path(args.master_dir) / name).unlink(missing_ok=True)
+    # SP指数・ST指数の3着内基準値: 結果指数があれば作り直し（shisu/data/）、master を作るときの基準値を master_csv/ に写す
+    # （各ジョブと出馬表側が同じ基準値を引く）
+    from shisu import baselines
+    base_error = ""
+    use_perf = bool(history is not None and history.has_results and not args.no_past_perf)
+    try:
+        if args.baseline_decay is not None and not (0 < args.baseline_decay <= 1):
+            raise ValueError(f"--baseline-decay は 0 より大きく 1 以下: {args.baseline_decay!r}")
+        if history is not None and history.has_results and not args.no_baseline_update:
+            cached = PP.load_history_cache(args.master_dir)
+            if cached is not None:
+                baselines.update_from_history(
+                    cached[0], decay=baselines.DEFAULT_DECAY if args.baseline_decay is None else args.baseline_decay,
+                    min_samples=baselines.MIN_SAMPLES if args.baseline_min_samples is None else args.baseline_min_samples,
+                    log=print)
+            del cached
+        tables = baselines.snapshot(args.master_dir, meta={"past_perf": use_perf})
+        if not tables:
+            print("[INFO] 基準値: index_baseline_SP.csv・index_baseline_ST.csv が無いので、基準比の条件（前走SP基準比 など）は空になります")
+        del tables
+    except Exception as e:              # 基準値を用意できなくても、master は作る（基準比の条件が空になる）
+        base_error = f"[ERROR] 3着内基準値: {type(e).__name__}: {e}（基準比の条件は付きません）"
+        print(base_error)
+        for name in baselines.MASTER_FILES.values():
+            (Path(args.master_dir) / name).unlink(missing_ok=True)
+        try:                            # 「基準値なしで作った master」の記録（出馬表側も付けない）
+            baselines.save_meta(args.master_dir, {"past_perf": False, "error": True})
+        except OSError:
+            (Path(args.master_dir) / baselines.MASTER_META).unlink(missing_ok=True)
     if history is not None and history.has_results and not args.no_past_perf:
         perf_pairs, perf_notes = plan_perf_jobs(files, list(PP.INDICATORS))
         for n in perf_notes:
@@ -532,7 +642,7 @@ def main(argv=None) -> int:
         results = [_run(j) for j in jobs]
     for r in results:
         print(r)
-    return 1 if perf_error or marks_error or any(r.startswith("[ERROR]") for r in results) else 0
+    return 1 if perf_error or marks_error or base_error or any(r.startswith("[ERROR]") for r in results) else 0
 
 
 MAX_TASKS_PER_CHILD = 4
