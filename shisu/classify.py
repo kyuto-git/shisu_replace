@@ -36,6 +36,8 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from .indicators import CONDITION_ONLY
+
 CATEGORIES = ("keshi", "abs", "axis", "opp")
 CATEGORY_LABELS = {"abs": "絶対軸", "axis": "軸候補", "keshi": "消し候補", "opp": "相手候補"}
 
@@ -88,6 +90,7 @@ TAIL_OK_TOKENS = ("1位", "2~3位", "4~5位", "1~3位", "1~5位", "71以上", "6
 TAIL_LOW_TOKENS = ("6~9位", "10位~", "6位~", "41~50", "40以下")                                     # 下位の順位帯・偏差値帯
 TAIL_LOW_RANK_MIN = 6                    # 末尾が整数（指数順位そのもの）なら、この順位以上は下位（1〜5 は上位）
 TAIL_GATED = ("abs", "axis", "opp")      # 消し候補（keshi）は制限しない
+LOW_TAIL_AXIS_CATEGORIES = ("abs", "axis")   # 条件特化ヒット: 末尾が下位で区分なしだが、数の基準はこの区分を満たす行（low_tail_axis_category）
 _DIGITS = "0123456789"
 
 
@@ -103,9 +106,13 @@ def tail_token(key) -> str:
     return "" if key is None else str(key).rsplit(KEY_SEP, 1)[-1]
 
 
-def is_low_tail(key) -> bool:
+def is_low_tail(key, indicator=None) -> bool:
     """指数が下位の条件か: 末尾の部品が TAIL_LOW_TOKENS のどれか、または数字だけ（指数順位そのもの）で TAIL_LOW_RANK_MIN 以上。
-    結合データが無い・空・末尾がどの形でもない（上位の形も含む）ときは False。数字は ASCII の 0-9 だけを見る（SQL 版と同じ）。"""
+    結合データが無い・空・末尾がどの形でもない（上位の形も含む）ときは False。数字は ASCII の 0-9 だけを見る（SQL 版と同じ）。
+    indicator が CONDITION_ONLY（指数を使わない family の行）なら、末尾は指数の部品ではないので常に False
+    （末尾が 距離「1600」やコース「東京×芝×1600」でも、指数順位と取り違えない）。"""
+    if indicator == CONDITION_ONLY:
+        return False
     t = tail_token(key)
     if t in TAIL_LOW_TOKENS:
         return True
@@ -120,7 +127,9 @@ def rule_settings() -> dict:
     g = globals()
     nums = {k: g[k] for k in sorted(g) if k.isupper() and isinstance(g[k], (int, float)) and not isinstance(g[k], bool)}
     return {**nums, "HR_MODES": list(HR_MODES), "RARE_TOKENS": list(RARE_TOKENS),
-            "TAIL_LOW_TOKENS": list(TAIL_LOW_TOKENS), "TAIL_GATED": list(TAIL_GATED)}
+            "TAIL_LOW_TOKENS": list(TAIL_LOW_TOKENS), "TAIL_GATED": list(TAIL_GATED),
+            # 集計のコンパクト化は、条件特化ヒットの行（low_tail_axis_frame）も残す（2026-11-17〜。それより前の成績表には無い）
+            "LOW_TAIL_AXIS_CATEGORIES": list(LOW_TAIL_AXIS_CATEGORIES)}
 
 
 def _ge(v, t) -> bool:
@@ -143,7 +152,25 @@ def _num(v):
 
 def classify(rec: Mapping, mode: str) -> str | None:
     """rec: cnt, fv, rv, top5, frc, tra（欠損は None）と key（結合データ。無ければ希少条件ではない）。
+    rec["indicator"] が CONDITION_ONLY（条件のみの family の行）なら、指数の上限ゲートを見ない。
     mode: オッズ帯（normal/odds10u/...）。"""
+    return _classify(rec, mode, True)
+
+
+def low_tail_axis_category(rec: Mapping, mode: str) -> str | None:
+    """指数の上限ゲートで外された「条件特化」の行の、もとの区分: 'abs' / 'axis' / None。
+    結合データの末尾が下位（is_low_tail）のために classify() では区分なしになるが、数の基準（件数・連対率・複勝率・
+    掲示板率・回収値。希少条件の下限・高回収率の基準も classify と同じ）は 絶対軸・軸候補 を満たす行。
+    末尾が下位でない行・消し候補になる行（消しは末尾に関係なく先に決まる）・相手候補の基準までの行は None。"""
+    key = rec.get("key")
+    if not is_low_tail(key if key is not None else rec.get(KEY_COLUMN), rec.get("indicator")):
+        return None
+    cat = _classify(rec, mode, False)
+    return cat if cat in LOW_TAIL_AXIS_CATEGORIES else None
+
+
+def _classify(rec: Mapping, mode: str, gate: bool) -> str | None:
+    """classify の本体。gate=False なら、指数の上限ゲート（末尾が下位なら 絶対軸・軸候補・相手候補 にしない）を見ない。"""
     cnt = _num(rec.get("cnt"))
     fv = _num(rec.get("fv"))
     rv = _num(rec.get("rv"))
@@ -163,7 +190,7 @@ def classify(rec: Mapping, mode: str) -> str | None:
     )
     if keshi:
         return "keshi"
-    if is_low_tail(key):                 # 指数が下位の条件は、絶対軸・軸候補・相手候補にしない（消し候補は上で判定済み）
+    if gate and is_low_tail(key, rec.get("indicator")):   # 指数が下位の条件は、絶対軸・軸候補・相手候補にしない（消しは上で判定済み）
         return None
 
     if _ge(cnt, abs_cnt) and _ge(rv, ABS_REN) and (_ge(frc, ABS_FRC) or _ge(tra, ABS_TRA)):
@@ -212,11 +239,49 @@ FIELD_COLUMNS = {"cnt": "件数", "fv": "複勝率_val", "rv": "連対率_val", 
                  "frc": "複勝回収値", "tra": "単勝適正回収値"}
 
 
-def classify_frame(df, mode: str):
+def low_tail_axis_frame(df, mode: str):
+    """low_tail_axis_category() のベクトル版。戻り値は 'abs' / 'axis' か None の numpy 配列（object）。
+    集計のコンパクト化（shisu/aggstore.py）が、条件特化ヒットの行を残すために使う。"""
+    import numpy as np
+    cats = classify_frame(df, mode, gate=False)
+    low = _low_tail_mask(df)
+    out = np.full(len(df), None, dtype=object)
+    for name in LOW_TAIL_AXIS_CATEGORIES:
+        out[low & (cats == name)] = name
+    return out
+
+
+def _key_column(df):
+    return "key" if "key" in df.columns else KEY_COLUMN if KEY_COLUMN in df.columns else None   # classify() と同じ順
+
+
+def _low_tail_mask(df):
+    """結合データの末尾が下位か（is_low_tail と同じ見方）の bool 配列。結合データの列が無ければ全部 False。
+    indicator の列があれば、CONDITION_ONLY（条件のみの family）の行は False。"""
+    import numpy as np
+    key_col = _key_column(df)
+    if key_col is None:
+        return np.zeros(len(df), dtype=bool)
+    k = df[key_col].astype(object)
+    text = k.where(k.notna(), "").astype(str)
+    tail = text.str.rsplit(KEY_SEP, n=1).str[-1].astype(object)
+    tail = tail.where(tail.notna(), "").astype(str)
+    low = np.array(tail.isin(TAIL_LOW_TOKENS), dtype=bool)        # 書き換えるので写しを作る（pandas 3 は読み取り専用を返す）
+    digits = ((tail != "") & (tail.str.strip(_DIGITS) == "")).to_numpy(dtype=bool)
+    v, m = tail.str.lstrip("0"), str(TAIL_LOW_RANK_MIN)
+    n = v.str.len().to_numpy(dtype=float, na_value=0)
+    low |= digits & ((n > len(m)) | ((n == len(m)) & (v >= m).to_numpy(dtype=bool)))
+    if "indicator" in df.columns:
+        low &= (df["indicator"].astype(object) != CONDITION_ONLY).to_numpy(dtype=bool)
+    return low
+
+
+def classify_frame(df, mode: str, gate: bool = True):
     """classify() のベクトル版。df は FIELD_COLUMNS の列を持つ DataFrame（DB と同じ値。5つの率の *_val は推定値）。
     key（無ければ 結合データ = KEY_COLUMN）の列があれば希少条件の最低件数を使う（列が無ければ希少条件ではない。1行版と同じ順）。
     戻り値は区分の文字列（keshi/abs/axis/opp）か None の numpy 配列（object）。判定は classify() と同じ
-    （欠損・数にならない値はどの比較も満たさない。tests/test_aggstore.py で1行版と照合している）。"""
+    （欠損・数にならない値はどの比較も満たさない。tests/test_aggstore.py で1行版と照合している）。
+    gate=False は、指数の上限ゲート（末尾が下位なら 絶対軸・軸候補・相手候補 にしない）を見ない判定（low_tail_axis_frame 用）。"""
     import numpy as np
     import pandas as pd
 
@@ -227,9 +292,9 @@ def classify_frame(df, mode: str):
         return pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
 
     cnt, fv, rv, top5, frc, tra = (col(f) for f in ("cnt", "fv", "rv", "top5", "frc", "tra"))
-    key_col = "key" if "key" in df.columns else KEY_COLUMN if KEY_COLUMN in df.columns else None   # classify() と同じ順
+    key_col = _key_column(df)
     rare = np.zeros(len(df), dtype=bool)
-    low = np.zeros(len(df), dtype=bool)                # 指数が下位の条件（is_low_tail と同じ見方）
+    low = _low_tail_mask(df) if gate else np.zeros(len(df), dtype=bool)   # 指数が下位の条件（is_low_tail と同じ見方）
     if key_col is not None:
         # SQL 版（rare_sql）と同じ見方: 「×」+ 結合データ +「×」に「×」+ 部品 +「×」が入っているか（正規表現は使わない）
         k = df[key_col].astype(object)
@@ -237,13 +302,6 @@ def classify_frame(df, mode: str):
         wrapped = KEY_SEP + text + KEY_SEP
         for t in RARE_TOKENS:
             rare |= wrapped.str.contains(KEY_SEP + t + KEY_SEP, regex=False).to_numpy(dtype=bool)
-        tail = text.str.rsplit(KEY_SEP, n=1).str[-1].astype(object)
-        tail = tail.where(tail.notna(), "").astype(str)
-        low = np.array(tail.isin(TAIL_LOW_TOKENS), dtype=bool)        # 書き換えるので写しを作る（pandas 3 は読み取り専用を返す）
-        digits = ((tail != "") & (tail.str.strip(_DIGITS) == "")).to_numpy(dtype=bool)
-        v, m = tail.str.lstrip("0"), str(TAIL_LOW_RANK_MIN)
-        n = v.str.len().to_numpy(dtype=float, na_value=0)
-        low |= digits & ((n > len(m)) | ((n == len(m)) & (v >= m).to_numpy(dtype=bool)))
     ks_cnt = np.where(rare, RARE_KS_CNT, KS_CNT)
     abs_cnt = np.where(rare, RARE_ABS_CNT, ABS_CNT)
     ax_cnt = np.where(rare, RARE_AX_CNT, AX_CNT)
@@ -301,20 +359,24 @@ def rare_sql(key_col: str = KEY_COLUMN) -> str:
     return _or(*(f"instr({wrapped}, '{KEY_SEP}{t}{KEY_SEP}') > 0" for t in RARE_TOKENS))
 
 
-def low_tail_sql(key_col: str = KEY_COLUMN) -> str:
+def low_tail_sql(key_col: str = KEY_COLUMN, indicator_col: str | None = None) -> str:
     """指数が下位の条件かどうかの SQL（is_low_tail と同じ）。結合データの前に「×」を付けて、末尾が「×」+ 下位の部品か、
-    「×」+ 数字だけ（rtrim で数字を落とすと「×」で終わる）で TAIL_LOW_RANK_MIN 以上かを見る。NULL・空は下位ではない。"""
+    「×」+ 数字だけ（rtrim で数字を落とすと「×」で終わる）で TAIL_LOW_RANK_MIN 以上かを見る。NULL・空は下位ではない。
+    indicator_col（指数の列名）を渡すと、その列が CONDITION_ONLY の行（条件のみの family）は下位にしない。"""
     k = f"('{KEY_SEP}' || IFNULL({_q(key_col)}, ''))"
     toks = [f"substr({k}, -{len(t) + 1}) = '{KEY_SEP}{t}'" for t in TAIL_LOW_TOKENS]
     head = f"rtrim({k}, '{_DIGITS}')"
     rank = _and(f"substr({head}, -1) = '{KEY_SEP}'", f"length({k}) > length({head})",
                 f"CAST(substr({k}, length({head}) + 1) AS INTEGER) >= {int(TAIL_LOW_RANK_MIN)}")
-    return _or(*toks, rank)
+    low = _or(*toks, rank)
+    if indicator_col:
+        return _and(f"IFNULL({_q(indicator_col)}, '') <> '{CONDITION_ONLY}'", low)
+    return low
 
 
-def _gate(cond: str, key_col: str) -> str:
+def _gate(cond: str, key_col: str, indicator_col: str | None = None) -> str:
     """TAIL_GATED の区分の条件に、指数が下位でないことを足す（文字列の処理は、数の条件を満たした行でだけ評価される）。"""
-    return _and(cond, f"NOT {low_tail_sql(key_col)}")
+    return _and(cond, f"NOT {low_tail_sql(key_col, indicator_col)}")
 
 
 def _cnt(normal: int, rare: int, key_col: str) -> str:
@@ -323,7 +385,7 @@ def _cnt(normal: int, rare: int, key_col: str) -> str:
     return _or(_c("cnt", ">=", normal), _and(_c("cnt", ">=", rare), rare_sql(key_col)))
 
 
-def _sql_raw(category: str, mode: str, key_col: str = KEY_COLUMN) -> str:
+def _sql_raw(category: str, mode: str, key_col: str = KEY_COLUMN, indicator_col: str | None = None) -> str:
     if category == "keshi":
         cnt = _cnt(KS_CNT, RARE_KS_CNT, key_col)
         any_mode = _and(_c("fv", "<", KS_PLC_MAX_ANY), _c("top5", "<", KS_TOP5_MAX_ANY), cnt)
@@ -332,7 +394,7 @@ def _sql_raw(category: str, mode: str, key_col: str = KEY_COLUMN) -> str:
         return any_mode
     if category == "abs":
         return _gate(_and(_c("rv", ">=", ABS_REN), _or(_c("frc", ">=", ABS_FRC), _c("tra", ">=", ABS_TRA)),
-                          _cnt(ABS_CNT, RARE_ABS_CNT, key_col)), key_col)
+                          _cnt(ABS_CNT, RARE_ABS_CNT, key_col)), key_col, indicator_col)
     if category == "axis":
         base = _and(_or(
             _and(_c("fv", ">=", AX_FV_80), _c("top5", ">=", AX_TOP5_90)),
@@ -341,28 +403,31 @@ def _sql_raw(category: str, mode: str, key_col: str = KEY_COLUMN) -> str:
             _and(_c("rv", ">=", AX_RV_50), _c("top5", ">=", AX_TOP5_80), _c("frc", ">=", AX_FRC_100)),
         ), _cnt(AX_CNT, RARE_AX_CNT, key_col))
         if mode not in HR_MODES:
-            return _gate(base, key_col)
+            return _gate(base, key_col, indicator_col)
         high = _and(_or(
             _and(_c("fv", ">=", HR1_FV), _c("top5", ">=", HR1_TOP5),
                  _or(_c("frc", ">=", HR1_RET), _c("tra", ">=", HR1_RET))),
             _and(_c("fv", ">=", HR2_FV), _or(_c("frc", ">=", HR2_RET), _c("tra", ">=", HR2_RET))),
         ), _cnt(HR_CNT, RARE_HR_CNT, key_col))
-        return _gate(_or(base, high), key_col)
+        return _gate(_or(base, high), key_col, indicator_col)
     if category == "opp":
         return _gate(_and(_or(
             _and(_c("fv", ">=", OP_FV_60), _c("top5", ">=", OP_TOP5_70)),
             _and(_c("rv", ">=", OP_RV_50), _c("top5", ">=", OP_TOP5_70)),
             _and(_c("fv", ">=", OP_FV_33), _c("frc", ">=", OP_FRC_150), _c("top5", ">=", OP_TOP5_50)),
-        ), _cnt(OP_CNT, RARE_OP_CNT, key_col)), key_col)
+        ), _cnt(OP_CNT, RARE_OP_CNT, key_col)), key_col, indicator_col)
     raise ValueError(category)
 
 
-def sql_condition(category: str, mode: str, key_col: str = KEY_COLUMN) -> str:
+def sql_condition(category: str, mode: str, key_col: str = KEY_COLUMN, indicator_col: str | None = None) -> str:
     """classify(rec, mode) == category となる行の WHERE 句（判定順の排他も反映）。
-    key_col は結合データの列名（unified_all は 結合データ、照合結果 entries_xjoin_* は key）。"""
+    key_col は結合データの列名（unified_all は 結合データ、照合結果 entries_xjoin_* は key）。
+    indicator_col は指数の列名（unified_all・照合結果とも indicator）。渡すと、条件のみの family の行（CONDITION_ONLY）には
+    指数の上限ゲートを掛けない（classify の rec["indicator"] と同じ）。条件のみの行がある表では必ず渡す。"""
     order = list(CATEGORIES)
     before = order[:order.index(category)]
-    parts = [_sql_raw(category, mode, key_col)] + [f"NOT {_sql_raw(c, mode, key_col)}" for c in before]
+    parts = [_sql_raw(category, mode, key_col, indicator_col)] + [f"NOT {_sql_raw(c, mode, key_col, indicator_col)}"
+                                                                 for c in before]
     return _and(*parts)
 
 

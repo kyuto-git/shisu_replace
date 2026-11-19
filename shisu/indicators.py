@@ -30,6 +30,10 @@ _YOSHIUMA = ("吉馬_SP能力値", "吉馬_先行力", "吉馬_SP信頼", "吉�
 # 0 を欠損とみなすもの（4ファイルで値0は 0.1〜0.3%）と、0 が普通に出るもの（体力・やる気は約14%が0）
 _YASUI_ZERO_MISSING = ("安井_ランク", "安井_スピード", "安井_スタミナ", "安井_パワー", "安井_根性", "安井_賢さ")
 _YASUI_ZERO_VALUE = ("安井_体力", "安井_やる気")
+# 結果指数（SP指数・ST指数）から作る「過去3走/5走の平均・最高」（shisu/past_perf_indices.py）。
+# 対象の過去走が無い馬は 0（空）＝欠損。大きいほど良い
+PAST_PERF_INDICATORS = ("過去SP_3走平均", "過去SP_5走平均", "過去SP_3走最高", "過去SP_5走最高",
+                        "過去ST_3走平均", "過去ST_5走平均", "過去ST_3走最高", "過去ST_5走最高")
 
 INDICATORS: tuple[IndicatorSpec, ...] = (
     IndicatorSpec("Gold", ("GoldAirplane", "Gold指数", "Gold_Airplane")),
@@ -60,6 +64,7 @@ INDICATORS: tuple[IndicatorSpec, ...] = (
     # 安井サロン（月別 Excel。shisu/yasui_extractor.py）
     *(IndicatorSpec(n, zero_missing=True) for n in _YASUI_ZERO_MISSING),
     *(IndicatorSpec(n) for n in _YASUI_ZERO_VALUE),
+    *(IndicatorSpec(n, reverse=False, zero_missing=True) for n in PAST_PERF_INDICATORS),
 )
 
 # 画面での並び順（台帳の順）
@@ -114,6 +119,11 @@ def spec_for(name) -> IndicatorSpec:
     return spec if spec is not None else IndicatorSpec(canonical_indicator(name))
 
 
+# 指数を使わない family（tail="NONE"。条件のみ）の成績表・照合結果の「指数」の名前（指数の台帳には入れない。
+# 地域ごとに基準の master 1本だけで集計して、この名前で1回だけ出す。shisu/families.py・aggregate_stats_ver2.py）
+CONDITION_ONLY = "条件のみ"
+
+
 def parse_source_name(stem: str) -> tuple[str, str]:
     """過去側ファイル名（拡張子なし）→ (地域, 正式指数名)。
 
@@ -121,15 +131,29 @@ def parse_source_name(stem: str) -> tuple[str, str]:
         '札幌_カツラキ' → ('札幌', 'カツラキ')
     '_' で区切った末尾側から、台帳にある最長の指数名を探す。見つからなければ最初の '_' で分ける。
     """
+    region, indicator = split_source_name(stem)
+    if indicator == CONDITION_ONLY:
+        return unicodedata.normalize("NFKC", region), CONDITION_ONLY
+    return unicodedata.normalize("NFKC", region), canonical_indicator(indicator)
+
+
+def split_source_name(stem: str) -> tuple[str, str]:
+    """過去側ファイル名（拡張子なし）→ (地域, 指数名) の、ファイル名に書いてあるままの文字（parse_source_name と同じ切り方）。"""
     parts = str(stem).split("_")
+    if len(parts) >= 2 and parts[-1] == CONDITION_ONLY:       # {地域}_条件のみ（指数を使わない family の成績表）
+        return "_".join(parts[:-1]), CONDITION_ONLY
     for i in range(len(parts)):
         cand = "_".join(parts[i:])
         if is_known_indicator(cand):
-            region = "_".join(parts[:i])
-            return unicodedata.normalize("NFKC", region), canonical_indicator(cand)
+            return "_".join(parts[:i]), cand
     if len(parts) >= 2:
-        return unicodedata.normalize("NFKC", parts[0]), canonical_indicator("_".join(parts[1:]))
-    return "", canonical_indicator(stem)
+        return parts[0], "_".join(parts[1:])
+    return "", str(stem)
+
+
+def condition_only_source(stem: str) -> str:
+    """master の元ファイル名（{地域}_{指数名}）→ 条件のみの成績表の元ファイル名（{地域}_条件のみ）。"""
+    return f"{split_source_name(stem)[0]}_{CONDITION_ONLY}"
 
 
 # ---------------------------------------------------------------------------

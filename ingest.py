@@ -52,6 +52,10 @@ def main(argv=None) -> int:
     ap.add_argument("--keibaai-start", type=int)
     ap.add_argument("--keibaai-end", type=int)
     ap.add_argument("--interval", type=float, help="スクレイピングのアクセス間隔（秒。全取得元に同じ値。既定は取得元ごと）")
+    ap.add_argument("--baba-turf", default=None, metavar="{auto,良,稍・重,不}",
+                    help="過去SP・ST指数（--sources past）の想定の馬場状態（芝）。auto = ベースCSVの 馬場状態 の列（無ければ指定なし）。"
+                         "省くと前に保存した値（past_perf_settings.json。無ければ auto）")
+    ap.add_argument("--baba-dirt", default=None, metavar="{auto,良,稍・重,不}", help="同（ダ）")
     ap.add_argument("--sequential", action="store_true",
                     help="取得元を1つずつ実行する（既定は同時に実行。ログを取得元ごとにまとめて読みたいとき用）")
     ap.add_argument("--no-ext-copy", action="store_true",
@@ -62,6 +66,8 @@ def main(argv=None) -> int:
 
     names = list(ORDER) if args.sources.strip() == "all" else [s.strip() for s in args.sources.split(",") if s.strip()]
     inp = config.ingest_in_dir()
+    from shisu.past_perf_indices import load_settings
+    saved = load_settings()
     req = IngestRequest(
         sources=names,
         base_paths=_files(args.base, inp / "base", ("*.csv",)),
@@ -72,6 +78,8 @@ def main(argv=None) -> int:
         if args.interval is not None else {},
         ext_dir=None if args.no_ext_copy else config.ext_dir(),
         parallel=not args.sequential,
+        baba_turf=args.baba_turf if args.baba_turf is not None else saved["baba_turf"],
+        baba_dirt=args.baba_dirt if args.baba_dirt is not None else saved["baba_dirt"],
     )
     errors = validate(req)
     if errors:

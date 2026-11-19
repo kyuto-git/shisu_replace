@@ -6,6 +6,7 @@
   keibaai   ④ keibaAI指数（開始〜終了ID）  ベースCSV → keibaAI/{YYYYMMDD}_keibaAI.csv
   lap       ⑥ ラップ6指数（手元で計算）    ラップCSV → lap/{2F,1F,4F,33rap,rabbit_2F,rabbit_1F,pace}/...
   yasui     安井サロン Excel               Excel（＋ベースCSV）→ yasui/yasui_{key}/{YYYYMMDD}_yasui_{key}.csv
+  past      過去SP・ST指数（手元で計算）   ベースCSV（出馬表の形）→ past_sp_st/past_{sp,st}_{avg,max}{3,5}/{YYYYMMDD}_….csv
 （⑤ 一隊 ittai はサイト側の仕様変更で取得できなくなったため廃止。番号は旧来のまま ⑥ ラップを残す）
 
 画面（app.py の /ingest）と CLI（ingest.py）はどちらも run_ingest() を呼ぶ。
@@ -54,6 +55,7 @@ SOURCES: dict[str, SourceInfo] = {s.name: s for s in (
     SourceInfo("keibaai", "④ keibaAI指数（連番ID）", "keibaAI", True, 2.0),
     SourceInfo("lap", "⑥ ラップ6指数（計算のみ）", "lap", False, needs="lap"),
     SourceInfo("yasui", "安井サロン Excel", "yasui", False, needs="yasui"),
+    SourceInfo("past", "過去SP・ST指数（結果指数から過去3走/5走の平均・最高を計算）", "past_sp_st", False),
 )}
 ORDER = tuple(SOURCES)
 # 廃止した取得元（--sources に書かれたら理由を添えて断る）
@@ -61,7 +63,8 @@ DISCONTINUED = {"ittai": "⑤ 一隊（結果分析スピード指数）はサ�
 
 
 # ext_indices/ の置き場所（取得元 → ext_indices の下のフォルダ。shisu.ext_indices が指数を見分けられる名前）
-EXT_FOLDERS = {"omega": "OMEGA", "kichiuma": "kichiuma", "kayochin": "kayochin", "keibaai": "keibaAI", "yasui": "yasui"}
+EXT_FOLDERS = {"omega": "OMEGA", "kichiuma": "kichiuma", "kayochin": "kayochin", "keibaai": "keibaAI", "yasui": "yasui",
+               "past": "past_sp_st"}
 _TARGET_FILE = re.compile(r"^\d{8}_.+\.csv$", re.IGNORECASE)
 
 
@@ -85,14 +88,17 @@ def _read_target_csv(path: Path) -> pd.DataFrame | None:
     return pd.DataFrame({RID_HEADER: rids, WORK: vals}, dtype=object)
 
 
-def copy_to_ext(files: list[Path], src_root: Path, ext_root: Path, log: Logger | None = None) -> list[Path]:
+def copy_to_ext(files: list[Path], src_root: Path, ext_root: Path, log: Logger | None = None,
+                keep_old: bool = True) -> list[Path]:
     """TARGET 取込用の日付別CSV（{YYYYMMDD}_{名前}.csv。レースID(新), ワーク1 の2列）を ext_indices/ に置く。
     マージ完全版（*_merged.csv）・照合できなかった馬（*_noid.csv）・ベースCSVの無い日の 日付・場所… の形は置かない。
     フォルダの形は取得元の出力と同じ（kichiuma/kichiuma_{key}/、yasui/yasui_{key}/）。
 
     同じ名前のファイルがすでにあれば、丸ごと上書きせず レースID(新) ごとに足し合わせる: 今回値の取れた馬だけ
     新しい値にし、取れなかった馬（空欄）は前の値を残す（取得できなかった日・別の場所や範囲で取り直したときに、
-    前に取った値を消さない）。新しいファイルの値が全部空欄なら、新しく作らない。"""
+    前に取った値を消さない）。新しいファイルの値が全部空欄なら、新しく作らない。
+    keep_old=False（手元で計算する取得元 past）: 今回のファイルにある馬は、空欄でも今回の値にする（空欄は「取れなかった」
+    ではなく「対象の走が無い」なので、想定の馬場状態などを変えて計算し直したときに前の値を残さない）。"""
     log = log or (lambda m: None)
     out = []
     for f in files:
@@ -101,7 +107,7 @@ def copy_to_ext(files: list[Path], src_root: Path, ext_root: Path, log: Logger |
         if not _TARGET_FILE.match(f.name) or name.endswith("_merged.csv") or name.endswith("_noid.csv"):
             continue
         try:
-            placed = _place_one(f, src_root, ext_root, log)
+            placed = _place_one(f, src_root, ext_root, log, keep_old)
         except OSError as e:             # 1本置けなくても残りは続ける
             log(f"[WARN] {f.name} を ext_indices に置けませんでした（{type(e).__name__}: {e}）")
             continue
@@ -110,7 +116,7 @@ def copy_to_ext(files: list[Path], src_root: Path, ext_root: Path, log: Logger |
     return out
 
 
-def _place_one(f: Path, src_root: Path, ext_root: Path, log: Logger) -> Path | None:
+def _place_one(f: Path, src_root: Path, ext_root: Path, log: Logger, keep_old: bool = True) -> Path | None:
     """1本を ext_indices に置く（足し合わせ）。置いたら置き先、置かなければ None。"""
     new = _read_target_csv(f)
     if new is None:                  # 日付, 場所, … の形（ベースCSVの無い日）は TARGET に取り込めない
@@ -131,12 +137,18 @@ def _place_one(f: Path, src_root: Path, ext_root: Path, log: Logger) -> Path | N
             if rid not in vals or (not vals[rid] and v):
                 vals[rid] = v
         order = list(vals)
+        cleared = 0
         for rid, v, h in zip(new[RID_HEADER], new[WORK], has):
             if rid not in vals:
                 order.append(rid)
                 vals[rid] = v
             elif h:
                 vals[rid] = v
+            elif not keep_old and vals[rid] != "":
+                vals[rid] = ""
+                cleared += 1
+        if cleared:
+            log(f"[INFO] {dst.name}: 今回は値の無い {cleared} 頭の前の値を消しました")
         merged = pd.DataFrame({RID_HEADER: order, WORK: [vals[r] for r in order]})
         got, again = set(new.loc[has, RID_HEADER]), set(new[RID_HEADER])
         kept = sum(1 for r in order if vals[r] != "" and r not in got and r in again)
@@ -165,6 +177,8 @@ class IngestRequest:
     intervals: dict[str, float] = field(default_factory=dict)
     ext_dir: Path | None = None               # TARGET 取込用CSVを ext_indices/ にも置く（None なら置かない）
     parallel: bool = True                     # 選んだ取得元を同時に動かす（False なら1つずつ）
+    baba_turf: str = "auto"                   # 過去SP・ST指数の想定の馬場状態（芝）: auto / 良 / 稍・重 / 不
+    baba_dirt: str = "auto"                   # 同（ダ）
 
     def interval_for(self, name: str) -> float:
         v = self.intervals.get(name, SOURCES[name].default_interval)
@@ -195,6 +209,13 @@ def validate(req: IngestRequest) -> list[str]:
             errors.append(f"keibaAI の終了ID（{e}）が開始ID（{s}）より小さい")
         elif int(e) - int(s) + 1 > 20000:
             errors.append("keibaAI のIDの範囲が広すぎます（1回 20000 ページまで）")
+    if "past" in req.sources:
+        from ..past_perf_indices import norm_baba_choice
+        for label, v in (("芝", req.baba_turf), ("ダ", req.baba_dirt)):
+            try:
+                norm_baba_choice(v)
+            except ValueError:
+                errors.append(f"想定馬場状態（{label}）は 自動 / 良 / 稍・重 / 不 のどれかです: {v}")
     for name, v in req.intervals.items():
         try:
             float(v)
@@ -226,7 +247,7 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
     """選んだ取得元を実行する（既定は同時に。req.parallel=False なら1つずつ）。
     戻り値: 取得元 → Outputs（失敗は 'ERROR: …'、中止は 'CANCELLED'）。並びは ORDER の順。
     on_source(name, k, n) は取得元を始めたとき（k = 始めた順）、on_done(name, 済んだ数, n) は終わったときに呼ぶ。"""
-    from . import kayochin, keibaai, kichiuma, lap, omega
+    from . import kayochin, keibaai, kichiuma, lap, omega, past_perf
     from .. import yasui_extractor
 
     errors = validate(req)
@@ -248,7 +269,7 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
     if req.base_paths and any(SOURCES[s].needs == "base" or s == "yasui" for s in selected):
         base = read_base(req.base_paths, emit)
     shorts = {"omega": omega.LABEL, "kichiuma": kichiuma.LABEL, "kayochin": kayochin.LABEL, "keibaai": keibaai.LABEL,
-              "lap": lap.LABEL, "yasui": yasui_extractor.LABEL}
+              "lap": lap.LABEL, "yasui": yasui_extractor.LABEL, "past": past_perf.LABEL}
     count_lock = threading.Lock()
     counts = {"started": 0, "done": 0}
 
@@ -281,6 +302,8 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
                 res = keibaai.run(base, fetcher, dest, req.keibaai_start, req.keibaai_end, slog)
             elif name == "lap":
                 res = lap.run(req.lap_paths, dest, slog)
+            elif name == "past":
+                res = past_perf.run(base, dest, slog, req.baba_turf, req.baba_dirt)
             else:
                 # ベースCSVの指定が無い開催日は ingest_in/base/ と entries_in/ の CSV から探す
                 res = yasui_extractor.run(req.yasui_paths, base, dest, slog,
@@ -290,7 +313,7 @@ def run_ingest(req: IngestRequest, out_dir: Path, log: Logger = default_log, sto
             if req.ext_dir is not None and name in EXT_FOLDERS:
                 ext_to = Path(req.ext_dir) / EXT_FOLDERS[name]
                 try:
-                    copied = copy_to_ext(res.files, dest, ext_to, slog)
+                    copied = copy_to_ext(res.files, dest, ext_to, slog, keep_old=(name != "past"))
                 except OSError as e:     # 置けなくても取得の結果（ingest_out）は残っているので、失敗扱いにしない
                     emit(f"[WARN] {info.label}: ext_indices に置けませんでした（{type(e).__name__}: {e}）。"
                          f"ingest_out の TARGET 取込用CSVを手で {ext_to} に置いてください")

@@ -8,7 +8,8 @@
 旧来の形（2026-11-09 まで。family × スキーム × オッズ帯ごとに1本の foragg_*.csv）も read_agg_tables で読める。
 
 コンパクト化（aggregate の --compact。既定 ON）: compact_mask の条件のどれかを満たす行だけを残す
-  a) classify（shisu/classify.py）で 絶対軸・軸候補・相手候補・消し候補 のどれかになる行
+  a) classify（shisu/classify.py）で 絶対軸・軸候補・相手候補・消し候補 のどれかになる行、
+     または条件特化ヒットの行（指数が下位で区分なしだが、数の基準は絶対軸・軸候補。low_tail_axis_frame）
      （判定の値は build_db が DB に入れる値と同じ: 5つの率の *_val は文字列の括弧内の推定値）
   b) WEDGE >= min_wedge または adjusted_WEDGE >= min_wedge（既定 0.70。0 以下ならこの条件を使わない）
   c) layer が FULL_LAYERS（初期セットのコース固定 A）の family の行、または 件数 >= min_count（既定30。0 以下なら件数の条件を使わない）
@@ -24,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .classify import classify_frame
+from .classify import classify_frame, low_tail_axis_frame
 from .csvio import READ_ENCODINGS, WRITE_ENCODING, read_csv_any
 from .naming import (AGG_MASTER_PREFIX, AGG_MASTER_SUFFIX, FORAGG_PREFIX, agg_filename, file_stem,
                      parse_agg_master_name, parse_foragg_stem)
@@ -68,9 +69,10 @@ def prepare_agg_frame(df: pd.DataFrame) -> pd.DataFrame:
 # コンパクト化
 # ---------------------------------------------------------------------------
 def compact_mask(out: pd.DataFrame, mode: str, layer: str = "", min_count: int = COMPACT_MIN_COUNT,
-                 min_wedge: float = COMPACT_MIN_WEDGE) -> np.ndarray:
+                 min_wedge: float = COMPACT_MIN_WEDGE, indicator: str = "") -> np.ndarray:
     """成績表 out（aggregate_frame の出力。1つの family・スキーム・オッズ帯 mode）のうち残す行。
-    min_count・min_wedge が 0 以下ならその条件は使わない（区分と layer A だけで残す行を決められるように）。"""
+    min_count・min_wedge が 0 以下ならその条件は使わない（区分と layer A だけで残す行を決められるように）。
+    indicator はその成績表の指数の名前（条件のみの family は CONDITION_ONLY。区分の判定で指数の上限ゲートを見ない）。"""
     n = len(out)
     if n == 0 or layer in FULL_LAYERS:
         return np.ones(n, dtype=bool)
@@ -91,11 +93,14 @@ def compact_mask(out: pd.DataFrame, mode: str, layer: str = "", min_count: int =
                             index=sub.index)
         if "結合データ" in sub.columns:               # 希少条件（G1・重賞・長距離など）は最低件数が下がる
             vals["結合データ"] = sub["結合データ"]
+        if indicator:
+            vals["indicator"] = indicator
         for r in ("複勝率", "連対率"):
             vals[f"{r}_val"] = estimate_percent(sub[r]) if r in sub.columns else np.nan
         cats = classify_frame(vals, mode)
+        special = low_tail_axis_frame(vals, mode)        # 条件特化ヒット（指数が下位で区分なしだが、数の基準は絶対軸・軸候補）
         idx = np.flatnonzero(rest)
-        keep[idx[cats != None]] = True                   # noqa: E711（object 配列の要素ごとの比較）
+        keep[idx[(cats != None) | (special != None)]] = True   # noqa: E711（object 配列の要素ごとの比較）
     return keep
 
 

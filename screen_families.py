@@ -54,6 +54,7 @@ import pandas as pd
 from shisu import config
 from shisu import families as F
 from shisu.classify import classify
+from shisu.indicators import CONDITION_ONLY, parse_source_name
 from shisu.conditions import CONDITION_COLUMNS
 from shisu.csvio import read_csv_any, write_csv
 from shisu.hensachi import all_band_labels
@@ -61,7 +62,8 @@ from shisu.naming import file_stem
 from shisu.odds import ODDS_MODES
 
 HENSACHI_ORDER = ("71以上", "66~70", "61~65", "51~60", "41~50", "40以下")
-# 候補を作るときに組み合わせる条件（28種 = 重量種別・クラス名・枠番グループ・騎手 ＋ 22条件の24列）
+# 候補を作るときに組み合わせる条件（40種 = 重量種別・クラス名・枠番グループ・騎手 ＋ 条件の36列。
+# 条件の36列 = 22条件の24列 ＋ 外部レース印の前走条件4列 ＋ 近5走の要約2列 ＋ 3着内基準値との比較4列・過去SP/ST 3走平均の順位2列）
 POOL = ("重量種別", "クラス名", "枠番グループ", "騎手") + tuple(CONDITION_COLUMNS)
 PART_CODES = {"COURSE": "crs", "重量種別": "wt", "クラス名": "cls", "枠番グループ": "frm", "騎手": "jk", "芝・ダ": "sd",
               "場所": "plc", "距離": "dist", "芝(内・外)": "io",
@@ -69,7 +71,11 @@ PART_CODES = {"COURSE": "crs", "重量種別": "wt", "クラス名": "cls", "枠
               "初角帯": "corner", "CFS帯": "cfs", "F係数帯": "fco", "今走クワドラント": "quad", "左右": "lr",
               "左右遷移": "lrchg", "距離帯": "distb", "坂": "slope", "前走クワドラント": "pquad", "斤量帯": "kin",
               "斤量増減": "kinchg", "牝馬限定": "mare", "距離増減": "distchg", "前走着順": "pfin", "前走人気": "ppop",
-              "前走上り3F順": "pagari", "前走脚質": "pstyle", "前走R印3": "pr3"}
+              "前走上り3F順": "pagari", "前走脚質": "pstyle", "前走R印3": "pr3",
+              "前走メンバーLv": "pmem", "前走タイムLv": "ptime", "前走クッション帯": "pcush", "前走含水率帯": "pmoist",
+              "近5走同条件": "r5cond", "近5走同場": "r5plc",
+              "前走SP基準比": "pspb", "前走ST基準比": "pstb", "過去SP今走基準比": "spb", "過去ST今走基準比": "stb",
+              "過去SP3走順": "sp3", "過去ST3走順": "st3"}
 CLASSES = ("abs", "axis", "opp", "keshi")
 
 # コースだけで決まる物理属性（COURSE と掛け合わせても同じグループになる）
@@ -114,12 +120,17 @@ def redundant(parts: tuple[str, ...]) -> bool:
 def causal_trios(pool: tuple[str, ...] = POOL) -> list[tuple[str, ...]]:
     """因果関係の強い3条件:
     ① 騎手 × ローテ・馬の状態 × 前走の条件  ② コースの物理属性 × [前走R印3/前走脚質] × [前走着順/前走上り3F順]
-    ③ 前走人気 × 前走着順 × 今走の条件  ④ 枠番グループ × [初角帯/F係数帯] × 前走脚質"""
+    ③ 前走人気 × 前走着順 × 今走の条件  ④ 枠番グループ × [初角帯/F係数帯] × 前走脚質
+    ⑤ 過去SP今走基準比 × 過去SP3走順 × [前走SP基準比/前走着順/前走人気/近5走同条件]（ST も同じ）
+       ＝「ST平均基準超 × ST3走1~5位 × …」に、他指数の順位帯・偏差値帯（末尾）を掛ける形"""
     out = []
     out += [("騎手", r, p) for r in ROTATION for p in PREV]
     out += [(c, a, b) for c in PHYSICAL for a in ("前走R印3", "前走脚質") for b in ("前走着順", "前走上り3F順")]
     out += [("前走人気", "前走着順", n) for n in NOW]
     out += [("枠番グループ", c, "前走脚質") for c in ("初角帯", "F係数帯")]
+    for kind in ("SP", "ST"):
+        out += [(f"過去{kind}今走基準比", f"過去{kind}3走順", x)
+                for x in (f"前走{kind}基準比", "前走着順", "前走人気", "近5走同条件")]
     order = {p: i for i, p in enumerate(pool)}
     return [tuple(sorted(t, key=lambda p: order.get(p, 99))) for t in out if all(p in order for p in t)]
 
@@ -147,13 +158,15 @@ def templates(space: str = "default", pool: tuple[str, ...] = POOL) -> list[tupl
 
 
 def candidate_name(parts: tuple[str, ...], tail: str) -> str:
-    return "X_" + "_".join(PART_CODES[p] for p in parts) + {"RBAND": "", "HBAND": "_hen", "RANK": "_rank"}[tail]
+    return ("X_" + "_".join(PART_CODES[p] for p in parts)
+            + {"RBAND": "", "HBAND": "_hen", "RANK": "_rank", F.NONE: "_none"}[tail])
 
 
 def make_candidates(space: str = "default", tails: tuple[str, ...] = ("RBAND", "HBAND"),
                     pool: tuple[str, ...] = POOL) -> list[F.Family]:
     """候補の family。初期セット（49種）は名前をそのまま使い、新しい組み合わせは X_… の名前にする。
-    部品の集合が同じもの（並びだけ違う）は1つにまとめる（初期セットを優先）。"""
+    部品の集合が同じもの（並びだけ違う）は1つにまとめる（初期セットを優先）。
+    tails に NONE を入れると、指数を使わない family（条件のみ。名前は X_…_none）も候補にする。"""
     out: dict[tuple, F.Family] = {}
     for f in F.default_families():
         out[(frozenset(f.parts), f.tail)] = f
@@ -178,6 +191,8 @@ def _top_bottom(fam: F.Family, scheme: str) -> tuple[list[str], str, str]:
     if fam.tail == "RBAND":
         labs = all_band_labels(scheme, "rank")
         return labs, labs[0], labs[-1]
+    if fam.no_index:                     # 条件のみ: 指数の上位・下位は無い（基準A の指標は付かない）
+        return [], "", ""
     return [], "1", "10+"
 
 
@@ -185,12 +200,21 @@ def _tail_of(keys: pd.Series) -> pd.Series:
     return keys.str.rsplit(F.SEP, n=1).str[-1]
 
 
-def score_master(path: str, fam_dicts: list[dict], wedge_opts: dict | None, modes: tuple[str, ...]) -> list[dict]:
-    """master 1本 × 全候補 → 候補×スキームごとの集計値（合計できる形）。"""
+def score_master(path: str, fam_dicts: list[dict], wedge_opts: dict | None, modes: tuple[str, ...],
+                 no_index: bool = False) -> list[dict]:
+    """master 1本 × 全候補 → 候補×スキームごとの集計値（合計できる形）。
+    no_index=False: 指数を使う候補だけを、指数有効=1 の馬で採点する。
+    no_index=True : 指数を使わない候補（tail="NONE"）だけを、master の全部の行で採点する（本集計と同じく、
+                    地域ごとの基準の master 1本でだけ呼ぶ）。"""
     import aggregate_stats_ver2 as agg
     import build_db
-    fams = [F.Family.from_dict(d) for d in fam_dicts]
-    df = agg.master_frame(read_csv_any(path))
+    own = "" if no_index else parse_source_name(file_stem(path)[len("master_"):])[1]      # この master の指数（同義の重複を飛ばす）
+    fams = [f for f in (F.Family.from_dict(d) for d in fam_dicts)
+            if f.no_index == no_index and not F.is_self_redundant(f, own)]
+    df = read_csv_any(path)
+    if not no_index:
+        df = agg.master_frame(df)
+    indicator = CONDITION_ONLY if no_index else ""
     ref_year = agg.ref_year_of(df)
     n_horses = len(df)
     slim = agg.with_precomputed(df)                  # 着順・オッズ・配当の解析は master 1本につき1回
@@ -213,7 +237,8 @@ def score_master(path: str, fam_dicts: list[dict], wedge_opts: dict | None, mode
                     continue
                 db = build_db.prepare_agg_frame(out)
                 cats = [classify({"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
-                                  "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r[agg.KEY]}, mode)
+                                  "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r[agg.KEY],
+                                  "indicator": indicator}, mode)
                         for r in db[[agg.KEY, "件数", "複勝率_val", "連対率_val", "掲示板率_val", "複勝回収値",
                                      "単勝適正回収値"]].to_dict("records")]
                 for c in CLASSES:
@@ -230,7 +255,9 @@ def score_master(path: str, fam_dicts: list[dict], wedge_opts: dict | None, mode
                 freq = pd.to_numeric(out["複勝率_val"], errors="coerce")        # CSV の *_val は頻度
                 ge10 = ge10.assign(_fuku=freq.reindex(ge10.index).to_numpy(), _tail=_tail_of(ge10["結合データ"]).to_numpy())
                 order, top, bottom = _top_bottom(fam, scheme)
-                if fam.tail == "RANK":
+                if fam.no_index:
+                    t_rows = b_rows = ge10.iloc[0:0]
+                elif fam.tail == "RANK":
                     rk = pd.to_numeric(ge10["_tail"], errors="coerce")
                     t_rows, b_rows = ge10[rk == 1], ge10[rk >= 10]
                 else:
@@ -386,6 +413,10 @@ def main(argv=None) -> int:
     ap.add_argument("--master-dir", default=str(config.master_dir()))
     ap.add_argument("--space", choices=["default", "all", "initial"], default="default",
                     help="候補の範囲: initial=初期セット49種だけ / default=＋単一条件・2条件ペア・コース/距離帯×1条件 / all=＋×2条件")
+    ap.add_argument("--tails", default="RBAND,HBAND",
+                    help="候補の末尾の種類（カンマ区切り。RBAND = 指数順位帯・HBAND = 偏差値帯・RANK = 指数順位・"
+                         "NONE = 条件のみ（指数を使わない）。既定 RBAND,HBAND。例: --tails RBAND,HBAND,NONE）。"
+                         "NONE の候補は、地域ごとの基準の master（タイムM → 対戦M → 先頭）1本だけで採点する")
     ap.add_argument("--indicators", default="", help="使う指数（カンマ区切り。既定は全部）")
     ap.add_argument("--regions", default="", help="使う地域（カンマ区切りの部分一致。既定は全部）")
     ap.add_argument("--odds", default=",".join(ODDS_MODES), help="判定するオッズ帯（既定は4区分すべて）")
@@ -439,14 +470,27 @@ def main(argv=None) -> int:
     modes = tuple(m for m in args.odds.split(",") if m in ODDS_MODES) or ("normal",)
     if "normal" not in modes:
         modes = ("normal",) + modes
-    fams = F.default_families() if args.space == "initial" else make_candidates(args.space)
+    tails = tuple(dict.fromkeys(t.strip().upper() for t in args.tails.split(",") if t.strip()))
+    bad = [t for t in tails if t not in F.TAILS]
+    if bad or not tails:
+        print(f"[ERROR] --tails は {' / '.join(F.TAILS)} のどれか（カンマ区切り）: {args.tails!r}", file=sys.stderr)
+        return 2
+    fams = F.default_families() if args.space == "initial" else make_candidates(args.space, tails)
     if args.max_candidates:
         fams = fams[: args.max_candidates]
     opts = agg.wedge_options(args.wedge_min_year_count)
     n_var = sum(len(f.schemes) for f in fams)
     print(f"[INFO] 候補 {len(fams)} family（{n_var} 通り）× master {len(picked)} 本 × オッズ帯 {len(modes)}")
     t0 = time.time()
-    jobs = [(str(p), [f.to_dict() for f in fams], opts, modes) for p in picked]
+    fam_dicts = [f.to_dict() for f in fams]
+    n_plain = sum(1 for f in fams if f.no_index)
+    jobs = [(str(p), fam_dicts, opts, modes, False) for p in picked] if n_plain < len(fams) else []
+    if n_plain:                          # 条件のみの候補は、地域ごとの基準の master 1本だけで（本集計と同じ）
+        from shisu.naming import base_masters
+        bases = base_masters(picked)
+        jobs += [(str(p), fam_dicts, opts, modes, True) for p in bases.values()]
+        print(f"[INFO] 条件のみ（NONE）の候補 {n_plain} family は、基準の master だけで採点します: "
+              + "、".join(f"{r or '(地域なし)'} = {p.name}" for r, p in bases.items()))
     rows: list[dict] = []
     if args.workers > 1:
         with ProcessPoolExecutor(max_workers=args.workers) as ex:

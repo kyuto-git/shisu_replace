@@ -38,12 +38,14 @@ from markupsafe import Markup
 from shisu import config
 from shisu import drill
 from shisu import notes as notes_store
-from shisu.classify import CATEGORIES, CATEGORY_LABELS, classify, description_lines, keshi_rule, sql_condition
+from shisu.classify import (CATEGORIES, CATEGORY_LABELS, KEY_SEP, classify, description_lines, keshi_rule,
+                            low_tail_axis_category, sql_condition, tail_token, TAIL_LOW_RANK_MIN, TAIL_LOW_TOKENS)
 from shisu.indicators import INDICATOR_ORDER, TRADEOFF_GROUPS, tradeoff_opponents
 from shisu.ingest.web import make_blueprint as make_ingest_blueprint
 from shisu.ingest.web import allowed_host, same_origin
 from shisu import families as fam_registry
-from shisu.matching import HIT_COLUMNS, UNIFIED, HitCache, indicator_bases, match_entry_row, unified_status
+from shisu.matching import (HIT_COLUMNS, UNIFIED, HitCache, indicator_bases, match_bases, match_entry_row,
+                            unified_status)
 from shisu.naming import ENTRIES_ALL, XJOIN_PREFIX, xjoin_table_for
 from shisu.odds import ODDS_BREAKS, ODDS_LABELS, ODDS_MODES, ODDS_RANK
 from shisu.wedge import DEFAULT_MAX_YEARS, DEFAULT_MIN_YEAR_COUNT, WEDGE_COLUMNS, WEDGE_FLOAT_COLUMNS
@@ -298,7 +300,8 @@ th.num,td.num{text-align:right}
 .tag{display:inline-block;font-size:11px;background:#e5e7eb;padding:2px 6px;border-radius:999px;margin-left:4px}
 .nav a{display:inline-block;margin-right:8px;padding:6px 10px;background:#e5e7eb;border-radius:8px;color:#111827;text-decoration:none}
 a{color:#2563eb;text-decoration:none} a:hover{text-decoration:underline}
-.cat-abs h1{color:#7c2d12} .cat-axis h1{color:#1d4ed8} .cat-keshi h1{color:#6b7280} .cat-opp h1{color:#047857}
+.cat-abs h1{color:#7c2d12} .cat-axis h1{color:#1d4ed8} .cat-keshi h1{color:#6b7280} .cat-opp h1{color:#047857} .cat-special h1{color:#a16207}
+a.tag{text-decoration:none;color:inherit} a.tag.hasnote{border:1px solid #b91c1c}
 /* 表だけを縦にスクロールする枠（見出しの行を上に固定する。.card は横スクロール用の枠なので、ページのスクロールでは固定されない） */
 .scroll{max-height:520px;overflow:auto;border:1px solid #eef2f7;border-radius:8px}
 .scroll.tall{max-height:72vh}
@@ -546,7 +549,7 @@ def index():
                 w += cw
                 p += cp
                 if q_preset != "none":
-                    w.append(sql_condition(q_preset, m["odds_mode"]))
+                    w.append(sql_condition(q_preset, m["odds_mode"], indicator_col="indicator"))
                 w += mw
                 p += mp
                 # 並べ替えに WEDGE などの索引を使わせない（テーブル名の索引で絞ってから並べる）
@@ -597,7 +600,7 @@ def _rank_query(con, families, inds, odds_mode, region, course, preset, mins, so
         where.append("region = ?")
         params.append(region)
     if preset != "none":   # 判定はオッズ帯で変わる（消し候補の2〜10倍未満ルール）ので帯ごとに条件を付ける
-        where.append("(" + " OR ".join(f"(odds_mode = '{m}' AND {sql_condition(preset, m)})" for m in ODDS_MODES) + ")")
+        where.append("(" + " OR ".join(f"(odds_mode = '{m}' AND {sql_condition(preset, m, indicator_col='indicator')})" for m in ODDS_MODES) + ")")
     only_sort_bound = not where and all(col == sort for name, col in MIN_FILTERS if mins.get(name) is not None)
     mw, mp, _ = _min_filters(mins)
     where += mw
@@ -895,7 +898,7 @@ def collect_hits(con, table: str, race_rows: list[dict]) -> tuple[list[dict], st
             hits = [dict(r) for r in con.execute(f'SELECT * FROM {q(xname)} WHERE "レースID(新/馬番無)" = ?', (rid,))]
             return hits, "xjoin"
         note = "on-the-fly（照合結果 xjoin が古い形式のため。build_db.py --mode entries で作り直してください）"
-    bases = indicator_bases(race_rows[0].keys())
+    bases = match_bases(race_rows[0].keys())          # 条件のみの family があれば「条件のみ」も
     # 上限つき（同じレースの馬どうしの引き直しを省く）。family が数千あると1頭で上限を超えて何度も空になり、馬どうしの再利用が
     # 減る（合成のストレス DB で照合の回数 +18%・時間 +12%。代わりにメモリは約3割減）。ふつうの規模（初期セット）では変わらない。
     # その場照合は xjoin が無い・古い形式のときだけの経路なので、メモリを優先して build_db と同じ上限にしている
@@ -906,11 +909,22 @@ def collect_hits(con, table: str, race_rows: list[dict]) -> tuple[list[dict], st
     return hits, note
 
 
+def _hit_rec(h: dict) -> dict:
+    return {"cnt": h.get("件数"), "fv": h.get("複勝率_val"), "rv": h.get("連対率_val"),
+            "top5": h.get("掲示板率_val"), "frc": h.get("複勝回収値"),
+            "tra": h.get("単勝適正回収値"), "key": h.get("key"),
+            "indicator": h.get("indicator") or h.get("base")}       # 条件のみの family の行は指数の上限ゲートを見ない
+
+
 def hit_category(h: dict) -> str | None:
     """ヒット行の区分（abs / axis / keshi / opp / None）。classify と同じ判定。"""
-    return classify({"cnt": h.get("件数"), "fv": h.get("複勝率_val"), "rv": h.get("連対率_val"),
-                     "top5": h.get("掲示板率_val"), "frc": h.get("複勝回収値"),
-                     "tra": h.get("単勝適正回収値"), "key": h.get("key")}, h.get("odds_mode") or "normal")
+    return classify(_hit_rec(h), h.get("odds_mode") or "normal")
+
+
+def low_tail_category(h: dict) -> str | None:
+    """条件特化ヒットの元区分（abs / axis / None）: 指数が下位（結合データの末尾）のために区分なしになったが、
+    数の基準は絶対軸・軸候補を満たす行（classify.low_tail_axis_category）。"""
+    return low_tail_axis_category(_hit_rec(h), h.get("odds_mode") or "normal")
 
 
 # 条件ヒット馬の並び・表示の優先度（オッズ帯。通常は、オッズ帯を分けた行と中身が重なりやすいので最後）
@@ -1010,6 +1024,68 @@ def tradeoff_keshi(rows: list[tuple[dict, str]]) -> set[int]:
         bases = axis_bases.get(str(h.get("馬番")))
         if bases and (tradeoff_opponents(h.get("base")) & bases) and keshi_rule_of(h) == "fav":
             out.add(id(h))
+    return out
+
+
+SPECIAL_TITLE = "条件特化ヒット（指数が下位帯でも絶対軸・軸候補の基準を満たす強い条件）"
+
+
+def condition_part(key) -> str:
+    """結合データから末尾の部品（指数の順位・順位帯・偏差値帯）を除いた条件の部分。"""
+    s = str(key or "")
+    return s.rsplit(KEY_SEP, 1)[0] if KEY_SEP in s else ""
+
+
+def special_hits(hits: list[dict], cut_low: bool = False, info: dict | None = None) -> list[dict]:
+    """条件特化ヒット: 指数の上限ゲートで区分から外れたが、数の基準は絶対軸・軸候補を満たす行（low_tail_category）。
+
+    同じ馬に、同じ条件が指数の数だけ並ぶのを防ぐため、(馬番, パターン, スキーム, オッズ帯, 地域, 末尾を除いた条件の部分) が
+    同じ行は代表の1行（複勝率_val が最大。同じなら件数が最大）にまとめる。代表の行に次を足して返す:
+      _cat（代表の行の元区分 abs / axis）・_members（まとめた行: 指数ごとに1つ。base・cat・tail・h（そのヒット行））・
+      _n_inds（指数の数）・_n_rows（まとめた行数）
+    cut_low=True なら、2〜10倍未満（odds10u）で複勝回収値も単勝適正回収値も CUT_MIN_RETURN 未満の行を先に除く
+    （4区分の表の過剰人気カットと同じ見方。行数は info["special_cut"]）。並びは4区分の表と同じ。"""
+    ind_rank = {n: i for i, n in enumerate(INDICATOR_ORDER)}
+
+    def fv(h):
+        v = _num(h.get("複勝率_val"))
+        return v if v is not None else 0.0
+
+    def cnt(h):
+        v = _num(h.get("件数"))
+        return v if v is not None else 0.0
+
+    def tie(h):
+        b = str(h.get("base") or "")
+        return (ind_rank.get(b, len(ind_rank)), b, str(h.get("key") or ""), str(h.get("テーブル名") or ""))
+
+    groups: dict[tuple, list[tuple[dict, str]]] = {}
+    cut = 0
+    for h in dedupe_hits(hits):
+        cat = low_tail_category(h)
+        if not cat:
+            continue
+        mode = h.get("odds_mode") or "normal"
+        if cut_low and mode == FAV_MODE and is_low_return(h):
+            cut += 1
+            continue
+        g = (str(h.get("馬番")), str(h.get("family") or ""), str(h.get("rank_scheme") or ""), mode,
+             str(h.get("region") or ""), condition_part(h.get("key")))
+        groups.setdefault(g, []).append((h, cat))
+    out = []
+    for rows in groups.values():
+        rows.sort(key=lambda hc: (-fv(hc[0]), -cnt(hc[0])) + tie(hc[0]))
+        rep, rep_cat = rows[0]
+        best: dict[str, tuple[dict, str]] = {}          # 指数ごとに1つ（並びの先頭＝複勝率・件数の大きい行）
+        for h, cat in rows:
+            best.setdefault(str(h.get("base") or ""), (h, cat))
+        members = [{"base": b, "cat": best[b][1], "tail": tail_token(best[b][0].get("key")), "h": best[b][0]}
+                   for b in sorted(best, key=lambda b: (ind_rank.get(b, len(ind_rank)), b))]
+        out.append({**rep, "_cat": rep_cat, "_members": members, "_n_inds": len(members), "_n_rows": len(rows)})
+    out.sort(key=lambda h: (HITS_ODDS_RANK.get(h.get("odds_mode") or "normal", 9), to_int(h.get("馬番")), -fv(h),
+                            str(h.get("family") or ""), str(h.get("rank_scheme") or "")) + tie(h))
+    if info is not None:
+        info["special_cut"] = cut
     return out
 
 
@@ -1139,6 +1215,23 @@ HITS_BODY = """
 {{ note_cell(nt, du) }}</tr>
 {% else %}<tr><td colspan="25">該当なし</td></tr>{% endfor %}</tbody></table></div></div>
 {% endfor %}
+<div class="card cat-special"><h1>{{ special_title }}：{{ special|length }} 行{% if cross.only %}（指数クロスの該当馬だけ）{% endif %}</h1>
+<div class="muted">• 結合データの末尾（指数の順位・順位帯・偏差値帯）が下位（{{ low_tails }}・指数順位 {{ low_rank }} 位以下）のため、上の4区分では絶対軸・軸候補にしていない行のうち、件数・率・回収値の基準は絶対軸・軸候補を満たすもの（騎手・前走などの条件そのものが強い）。消し候補になる行は入りません<br>
+• 同じ馬・パターン・オッズ帯・地域・条件（結合データから末尾を除いた部分）が同じ行は、複勝率_val が最大（同じなら件数が最大）の1行にまとめています。「指数」の列は、その条件に当たった指数と末尾（<b>太字</b> = 絶対軸の基準）。指数名から、その指数の逆引きを別タブで開けます
+{% if cut_low and special_cut %}<br>• 過剰人気カットで、2〜10倍未満・回収値{{ cut_min }}未満の {{ special_cut }} 行を除いています（まとめる前の行数{% if cross.only %}・全馬の合計{% endif %}）{% endif %}</div>
+{% if special_view|length < special|length %}<div class="warn">{{ special_view|length }} 行だけ表示しています（全 {{ special|length }} 行。馬・オッズ帯ごとに偏らないように選んでいます）</div>{% endif %}
+<div class="scroll"><table><thead><tr><th>枠</th><th>馬番</th><th>馬名</th><th>騎手</th><th>元区分</th><th class="num">指数数</th><th>指数（末尾）</th><th>パターン</th><th>オッズ帯</th><th>地域</th><th>結合データ（代表）</th>
+<th>件数</th><th>勝率_val</th><th>連対率_val</th><th>複勝率_val</th><th>掲示板率_val</th><th>勝率</th><th>連対率</th><th>複勝率</th>
+<th>平均着順</th><th>単勝回収値</th><th>複勝回収値</th><th>単勝適正回収値</th><th>WEDGE</th><th>adjusted_WEDGE</th><th>年数</th><th>危険条件メモ / 調査</th></tr></thead><tbody>
+{% for h in special_view %}{% set nt = note_of(h) %}{% set du = drill_url(h) %}<tr><td>{{ h['枠番'] }}</td><td>{{ h['馬番'] }}</td><td>{{ h['馬名'] }}</td><td>{{ h['騎手'] }}</td>
+<td>{{ CATEGORY_LABELS[h['_cat']] }}</td><td class="num"><b>{{ h['_n_inds'] }}</b></td>
+<td style="white-space:normal">{% for m in h['_members'] %}{% set mn = note_of(m.h) %}<a class="tag{{ ' hasnote' if mn else '' }}" href="{{ drill_url(m.h) }}" target="_blank"{% if mn %} title="{{ mn }}"{% endif %}>{% if m.cat == 'abs' %}<b>{{ m.base }} {{ m.tail }}</b>{% else %}{{ m.base }} {{ m.tail }}{% endif %}</a>{% endfor %}</td>
+<td>{{ family_label(h['family'], h['rank_scheme']) }}</td><td>{{ odds_label(h['odds_mode']) }}</td><td>{{ h['region'] }}</td><td{% if nt %} class="hasnote" title="{{ nt }}"{% endif %}><a href="{{ du }}" target="_blank">{{ h['key'] }}</a></td>
+<td class="num"><a href="{{ du }}" target="_blank">{{ h['件数'] }}</a></td>{% for k in ['勝率_val','連対率_val','複勝率_val','掲示板率_val'] %}<td class="num">{{ fmt(h[k]) }}</td>{% endfor %}
+<td>{{ h['勝率'] }}</td><td>{{ h['連対率'] }}</td><td>{{ h['複勝率'] }}</td>
+{% for k in ['平均着順','単勝回収値','複勝回収値','単勝適正回収値','WEDGE','adjusted_WEDGE','adjusted_WEDGE_年数'] %}<td class="num">{{ fmt_cell(k, h.get(k)) }}</td>{% endfor %}
+{{ note_cell(nt, du) }}</tr>
+{% else %}<tr><td colspan="27">該当なし</td></tr>{% endfor %}</tbody></table></div></div>
 """
 HITS_ORDER = ("abs", "axis", "keshi", "opp")
 HITS_VIEW_LIMIT = 500        # 区分ごとに画面に出すおよその行数（全件は /entries/wedge.csv。馬ごとの該当数は全件で数える）
@@ -1231,7 +1324,7 @@ def entries_hits():
         race = _race_rows(con, table, rid, legacy, request.args.get("date", "").strip())
         hits, path = collect_hits(con, table, race)
         stale = xjoin_note(con, table, path)
-        bases = order_bases(indicator_bases(table_columns(con, table)))
+        bases = order_bases(match_bases(table_columns(con, table)))
     if not race:
         return render("条件ヒット馬", '<div class="card">該当レースがありません。</div>')
     cut_low = cut_low_request()
@@ -1247,6 +1340,7 @@ def entries_hits():
     summary = [{**x, "cross": x["uma"] in hit_umas} for x in xs]       # 馬ごとの該当数（指数クロスと同じ集計）
     danger_by = {x["uma"]: x["danger"] for x in xs if x["danger"]}
     shown = {c: [x for x in buckets[c] if not cross["only"] or str(x.get("馬番")) in hit_umas] for c in HITS_ORDER}
+    special = [x for x in special_hits(hits, cut_low, info) if not cross["only"] or str(x.get("馬番")) in hit_umas]
     head = f'{h.get("日付", "")} {h.get("場 R", "")} {h.get("レース名", "")}'
     sub = f'{h.get("場所", "")} / {h.get("芝・ダ", "")} / {h.get("距離_raw", "")} / {h.get("クラス名_raw", "")} / {len(race)}頭'
     keep = {"table": table, "rid": rid, "xmin": str(cross["xmin"]), "xa": cross["a"], "xb": cross["b"],
@@ -1260,6 +1354,8 @@ def entries_hits():
                   cross_min_choices=min_choices(cross["xmin"]), cross_hidden=[("table", table), ("rid", rid)],
                   cut_low=cut_low, cut=info.get("cut", {}), cut_min=f"{CUT_MIN_RETURN:g}", cut_toggle=toggle,
                   tradeoff=info.get("tradeoff", 0), tradeoff_pairs=TRADEOFF_TEXT, notes_error=notes_error(),
+                  special=special, special_view=spread_cap(special, HITS_VIEW_LIMIT), special_title=SPECIAL_TITLE,
+                  special_cut=info.get("special_cut", 0), low_tails="・".join(TAIL_LOW_TOKENS), low_rank=TAIL_LOW_RANK_MIN,
                   danger_by=danger_by, n_dominant=sum(1 for x in xs if x["danger"] == "dominant"),
                   n_caution=sum(1 for x in xs if x["danger"] == "caution"))
 
@@ -1439,7 +1535,7 @@ def _wedge_data(p: dict):
         race = _race_rows(con, p["table"], p["rid"], p["legacy"], p["date"])
         hits, path = collect_hits(con, p["table"], race)
         p["xjoin_note"] = xjoin_note(con, p["table"], path)
-        bases = indicator_bases(table_columns(con, p["table"]))
+        bases = match_bases(table_columns(con, p["table"]))
     # connect() が DB の __families__ を台帳に反映したあとで、family の絞り込みを確かめる
     p["fams"] = [v for v in p["fams"] if v in fam_registry.active_names()]
     bases = order_bases(bases)

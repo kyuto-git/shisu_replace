@@ -42,6 +42,7 @@ from typing import Iterable
 import pandas as pd
 
 from shisu import config
+from shisu import past_perf_indices as PP
 from shisu.csvio import norm_series, read_csv_any, write_csv
 from shisu.hensachi import RANK_SCHEMES, compute_indicator, int_text_series
 from shisu.indicators import canonical_indicator, is_known_indicator, spec_for
@@ -211,6 +212,51 @@ def load_ext(ext_root: Path, skip: Iterable[str] = (), log=print, only: Iterable
     return out
 
 
+def resolve_baba(cli_turf, cli_dirt, settings_path=None) -> tuple[str, str, str]:
+    """過去SP・ST指数の想定の馬場状態 → (芝, ダ, どこから決めたか)。--baba-turf / --baba-dirt があればそれ、
+    省いたほうは設定ファイル（past_perf_settings.json。/ingest の画面で選んだ値）、それも無ければ auto。
+    知らない値は ValueError。"""
+    from shisu import past_perf_indices as PP
+    saved = PP.load_settings(settings_path)
+    out, src = [], []
+    for cli, key in ((cli_turf, "baba_turf"), (cli_dirt, "baba_dirt")):
+        if cli is not None:
+            out.append(PP.norm_baba_choice(cli))
+            src.append("引数")
+        else:
+            out.append(saved[key])
+            src.append("設定ファイル" if saved[key] != PP.BABA_AUTO else "既定")
+    return out[0], out[1], "・".join(dict.fromkeys(src))
+
+
+def past_perf_lookups(raws: dict, baba_turf: str = "auto", baba_dirt: str = "auto", csv_dir=None, result_dir=None,
+                      master_dir=None, only: Iterable[str] | None = None, log=print) -> dict:
+    """出馬表の各馬の 過去SP・ST の8指数（結果指数から計算）→ {正式名: ExtLookup}。結果指数も履歴も無ければ {}。
+    履歴は master_csv/__horse_perf_history__.csv.gz（replace が書く。元の基本CSV・結果指数が変わっていれば作り直す）。
+    今走の馬場状態は、指定（良 / 稍・重 / 不）があればその芝・ダのレースはその値、auto なら出馬表の 馬場状態 の列（無ければ指定なし）。
+    only を渡すと、その指数だけ（1つも無ければ何も読まない）。"""
+    from shisu import past_perf_indices as PP
+    names = [n for n in PP.INDICATORS if only is None or n in set(only)]
+    if not names or not raws:
+        return {}
+    history = PP.get_history(csv_dir, result_dir, master_dir, log=log)
+    if history is None or not history.has_results:        # 結果指数のある走が無ければ、8指数は作れない
+        return {}
+    for path, raw in raws.items():
+        for note in PP.column_notes(raw.columns, getattr(path, "name", str(path))):
+            if "馬場状態" not in note or (baba_turf == PP.BABA_AUTO and baba_dirt == PP.BABA_AUTO):   # 想定を指定していれば要らない
+                log(note)
+    targets = pd.concat([PP.target_frame(raw) for raw in raws.values()], ignore_index=True)
+    kinds = {PP.INDICATORS[n][0] for n in names}
+    comp = PP.compute(targets, history, baba_turf, baba_dirt, kinds)
+    log(f"[INFO] 過去SP・ST: 想定の馬場状態 {PP.baba_text(baba_turf, baba_dirt)}・{len(targets)} 頭")
+    for kind in PP.KINDS:
+        if kind in kinds:
+            log(f"[INFO] 過去{kind}: {PP.stage_text(comp.stages[kind])}")
+    lookups = comp.lookups(targets[PP.RID])
+    return {n: lookups[n] for n in names}
+
+
 def _nonzero(s: pd.Series) -> pd.Series:
     v = pd.to_numeric(norm_series(s), errors="coerce")
     return v.notna() & (v != 0)
@@ -288,7 +334,8 @@ def attach_ext(df: pd.DataFrame, lookups: dict, name: str = "(df)",
             note += "（順位の列が空なので値から順位を計算）"
         elif norank:
             note += f"（順位の無いレース {norank} 件は値から順位を計算）"
-        log(f"[INFO] {name}: 外部指数 {canon} を ext_indices から付けました（値のある馬 {hit}/{total}）{note}")
+        where = "ext_indices から" if lookup.files else "過去走の結果指数から計算して"
+        log(f"[INFO] {name}: 外部指数 {canon} を {where}付けました（値のある馬 {hit}/{total}）{note}")
     return finish(), masks, added
 
 
@@ -446,6 +493,17 @@ def main(argv=None) -> int:
     ap.add_argument("--clean", action="store_true", help="出力先 entries_out の CSV を消してから実行（古い出馬表を DB に入れないため）")
     ap.add_argument("--ext-dir", default=str(config.ext_dir()), help="外部指数CSV群のフォルダ（既定 ext_indices）")
     ap.add_argument("--no-ext", action="store_true", help="ext_indices の外部指数を結び付けない")
+    ap.add_argument("--baba-turf", default=None, metavar="{auto,良,稍・重,不}",
+                    help="過去SP・ST指数の想定の馬場状態（芝）。auto = 出馬表の 馬場状態 の列（無ければ指定なし）。"
+                         "省くと /ingest の画面で保存した値（past_perf_settings.json。無ければ auto）")
+    ap.add_argument("--baba-dirt", default=None, metavar="{auto,良,稍・重,不}", help="同（ダ）")
+    ap.add_argument("--result-dir", default=str(config.result_indices_dir()),
+                    help="結果指数（SP指数・ST指数）のフォルダ（既定 result_indices）")
+    ap.add_argument("--csv-dir", default=str(config.csv_dir()), help="過去の基本CSVのフォルダ（過去走の履歴を作り直すとき）")
+    ap.add_argument("--master-dir", default=str(config.master_dir()),
+                    help="過去走の履歴（__horse_perf_history__.csv.gz）のフォルダ（既定 master_csv）")
+    ap.add_argument("--no-past-perf", action="store_true", help="過去SP・ST の8指数を結果指数から計算しない（ext_indices/past_sp_st にファイルがあれば、ほかの外部指数と"
+                         "同じにそこから付く。それも付けないなら --no-ext か、そのフォルダを消す）")
     ap.add_argument("--indicators", default=None,
                     help="この指数だけ差し替える（カンマ区切り。例 タイムM,対戦M）。統合ファイルを読み、指定した指数の値・順位・"
                          "偏差値・帯と出馬表CSVの基本の列だけを入れ替える（ほかの外部指数は前のまま。ext_indices は読み直さない）")
@@ -461,6 +519,21 @@ def main(argv=None) -> int:
         return 2
     if args.mining_only:
         targets += [t for t in MINING_INDICATORS if t not in targets]
+    # 一部の指数だけの差し替えでは、省いた想定の馬場は「前の計算で使った想定」（entries_out/ の記録）にする
+    # （差し替えない 過去SP・ST の指数は前の想定の値のままなので、設定ファイル・auto に戻すと想定が混ざる）
+    used_before = PP.load_used_baba(args.out_dir) if targets else None
+    try:
+        baba_turf, baba_dirt, baba_from = resolve_baba(
+            args.baba_turf if args.baba_turf is not None or not used_before else used_before["baba_turf"],
+            args.baba_dirt if args.baba_dirt is not None or not used_before else used_before["baba_dirt"])
+    except ValueError as e:
+        print(f"[ERROR] --baba-turf / --baba-dirt: {e}", file=sys.stderr)
+        return 2
+
+    def perf(only=None) -> dict:
+        if args.no_past_perf:
+            return {}
+        return past_perf_lookups(raws, baba_turf, baba_dirt, args.csv_dir, args.result_dir, args.master_dir, only=only)
 
     files = sorted(Path(args.in_dir).glob("*.csv"))
     if not files:
@@ -488,6 +561,17 @@ def main(argv=None) -> int:
             return 1
         try:
             lookups = {} if args.no_ext else load_ext(Path(args.ext_dir), only=targets)
+            computed = perf(only=targets)
+            if computed:                               # 過去SP・ST を計算し直した: 使った想定を残す（build_db が読む）
+                now = {"baba_turf": PP.norm_baba_choice(baba_turf), "baba_dirt": PP.norm_baba_choice(baba_dirt)}
+                if used_before is None or used_before == now or set(PP.INDICATORS) <= set(targets):
+                    PP.save_used_baba(out_dir, baba_turf, baba_dirt)
+                else:                                  # 8指数の一部だけを、前と違う想定で計算し直した: 記録は前のまま
+                    print(f"[WARN] 過去SP・ST: {'・'.join(t for t in targets if t in PP.INDICATORS)} だけを、前と違う想定の馬場状態"
+                          f"（{PP.baba_text(baba_turf, baba_dirt)}）で計算し直しました。ほかの 過去SP・ST の指数は前の想定"
+                          f"（{PP.baba_text(used_before['baba_turf'], used_before['baba_dirt'])}）の値のままで、build_db もその想定で"
+                          "基準値を引きます。想定をそろえるには --merge-only --clean で全部計算し直してください")
+            lookups.update(computed)                   # 計算した値を優先（ext_indices/past_sp_st のファイルより）
             if refresh_indicators(raws, merged_path, targets, lookups):
                 return 0
         except Exception as e:
@@ -495,6 +579,17 @@ def main(argv=None) -> int:
             return 1
         args.merge_only = True                         # 通常の処理に切り替える（統合ファイルを作る）
     lookups = {} if args.no_ext else load_ext(Path(args.ext_dir))
+    try:
+        computed = perf()
+    except Exception as e:                             # 過去SP・ST が計算できなくても、ほかの指数の処理は続ける
+        print(f"[ERROR] 過去SP・ST の計算: {type(e).__name__}: {e}", file=sys.stderr)
+        computed, rc = {}, 1
+    if computed:
+        print(f"[INFO] 過去SP・ST: 想定の馬場状態は {baba_from} から")
+        lookups.update(computed)                       # 計算した値を優先（ext_indices/past_sp_st のファイルより）
+        PP.save_used_baba(out_dir, baba_turf, baba_dirt)   # build_db が同じ想定で今走の基準値を引く
+    else:
+        (out_dir / PP.USED_BABA_FILE).unlink(missing_ok=True)   # 過去SP・ST を計算していない出力に、前の想定を残さない
     for p, raw in raws.items():
         try:
             raw, masks, added = attach_ext(raw, lookups, p.name)

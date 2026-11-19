@@ -61,7 +61,9 @@ def test_normalize_old_id():
 def test_supported_names_match_registry():
     expected = ("オメガ指数", "かよちん指数", "keibaAI指数", "吉馬_SP能力値", "吉馬_先行力", "吉馬_SP信頼",
                 "吉馬_SP調整", "吉馬_SP最大", "吉馬_末脚力", "安井_ランク", "安井_スピード", "安井_スタミナ",
-                "安井_パワー", "安井_根性", "安井_賢さ", "安井_体力", "安井_やる気", "SAV", "ST指数", "合計値",
+                "安井_パワー", "安井_根性", "安井_賢さ", "安井_体力", "安井_やる気",
+                "過去SP_3走平均", "過去SP_5走平均", "過去SP_3走最高", "過去SP_5走最高",          # /ingest の取得元 past の出力（past_sp_st/）
+                "過去ST_3走平均", "過去ST_5走平均", "過去ST_3走最高", "過去ST_5走最高", "SAV", "ST指数", "合計値",
                 "展開", "仕上り", "先行", "追走", "持久", "持続", "瞬発", "想定前半", "想定後半", "Gold", "BC", "ZI")
     assert ex.SUPPORTED == expected
     for name in ex.SUPPORTED:

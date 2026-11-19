@@ -10,10 +10,14 @@ master 1本（1地域×1指数）について、family（とスキーム s1/s2�
   agg_csv/families.json に使った family の定義を書く（build_db・画面が family の名前と部品を知るため）
   agg_csv/agg_settings.json に集計の設定を書く（--resume のとき、前回と違う項目をログに出す）
 集計に使うのは master の 指数有効=1 の馬（除外レース・新馬除外・欠損の馬を除く）。
+指数を使わない family（tail="NONE"。条件のみ）は指数に依らないので、地域ごとに基準の master 1本（タイムM、無ければ 対戦M、
+それも無ければその地域の先頭の master）だけで、master の全部の行（指数有効に関係なく）を集計し、指数の名前を「条件のみ」にして
+agg_csv/agg_master_{地域}_条件のみ.csv.gz に書く（master ごとに集計すると、同じ成績表が指数の数だけできるため）。
 family ごとの素材ファイルは作らない（49 family × 3 の素材は容量・時間ともに大きすぎるため。キーはメモリ上で作る）。
 
 コンパクト化（--compact。既定 ON。全部の行を残すときだけ --no-compact）: 次のどれかを満たす行だけを書く
-  a) classify で 絶対軸・軸候補・相手候補・消し候補 になる行（値は build_db が DB に入れる推定値と同じ）
+  a) classify で 絶対軸・軸候補・相手候補・消し候補 になる行（値は build_db が DB に入れる推定値と同じ）、
+     または条件特化ヒットの行（指数が下位で区分なしだが、数の基準は絶対軸・軸候補）
   b) WEDGE >= 0.70 または adjusted_WEDGE >= 0.70（--compact-min-wedge）
   c) 初期セットのコース固定（layer A）の family の行、または 件数 >= 30（--compact-min-count）
   （条件ヒット馬の4区分と WEDGE の高い行は1行も落とさない。落ちるのは件数が少なく区分にも入らない平凡な行）
@@ -56,14 +60,14 @@ import pandas as pd
 from shisu import config
 from shisu import classify as classify_rules
 from shisu.aggstore import (COMPACT_MIN_COUNT, COMPACT_MIN_WEDGE, PART_SUFFIX, AggMasterWriter, compact_mask,
-                            IDENTITY_KEYS, legacy_files, master_identity, settings_hash, stamp_matches, stamp_path,
+                            IDENTITY_KEYS, legacy_files, master_identity, settings_hash, stamp_matches, stamp_path, STAMP_SUFFIX,
                             write_stamp)
 from shisu.csvio import read_csv_any
 from shisu.estimates import beta_quantile, has_scipy, posterior_mean
 from shisu.finish import parse_finish
 from shisu import families as fam_registry
-from shisu.indicators import parse_source_name
-from shisu.naming import agg_filename, agg_master_filename, file_stem, table_name_for_foragg
+from shisu.indicators import CONDITION_ONLY, condition_only_source, parse_source_name
+from shisu.naming import agg_filename, agg_master_filename, base_masters, file_stem, table_name_for_foragg
 from shisu.normalize import race_date
 from shisu.odds import ODDS_MODES, odds_mask, odds_mask_numeric
 from shisu.parallel import run_batched
@@ -327,13 +331,22 @@ def compact_options(enabled: bool = True, min_count: int | None = None, min_wedg
             "min_wedge": COMPACT_MIN_WEDGE if min_wedge is None else float(min_wedge)}
 
 
+def agg_output_name(master, no_index: bool = False) -> str:
+    """master（パスか名前）→ その成績表のファイル名。no_index なら条件のみの成績表（agg_master_{地域}_条件のみ.csv.gz）。"""
+    source = file_stem(master)[len(MASTER_PREFIX):]
+    return agg_master_filename(condition_only_source(source) if no_index else source)
+
+
 def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, schemes: set[str] | None = None,
                      families: list[dict] | None = None, compact: dict | None = None,
-                     settings_id: str | None = None) -> str:
+                     settings_id: str | None = None, no_index: bool = False) -> str:
     """master 1本 → 成績表 agg_csv/agg_master_{地域}_{指数名}.csv.gz（family・スキーム・オッズ帯を縦に並べる）。
     families は使う family の定義（to_dict の list。並列の子プロセスにも同じ定義を渡す）。
     compact は compact_options() の dict（省略時はコンパクト化する）。
-    settings_id（集計の設定のハッシュ）を渡すと、書き終えたあとに印（.done）を書く（--resume が見る）。"""
+    settings_id（集計の設定のハッシュ）を渡すと、書き終えたあとに印（.done）を書く（--resume が見る）。
+    no_index=False: 指数を使う family だけを、指数有効=1 の馬で集計する。
+    no_index=True : 指数を使わない family（tail="NONE"）だけを、master の全部の行で集計し、指数の名前を「条件のみ」にして
+                    agg_master_{地域}_条件のみ.csv.gz に書く（地域ごとの基準の master 1本でだけ呼ぶ）。"""
     src = Path(src)
     stem = file_stem(src)
     if not stem.startswith(MASTER_PREFIX) or stem in SKIP_MASTERS:
@@ -342,20 +355,27 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
         fam_registry.set_active([fam_registry.Family.from_dict(d) for d in families])
     source = stem[len(MASTER_PREFIX):]
     region, indicator = parse_source_name(source)
+    label = src.name
+    if no_index:
+        source, indicator, label = condition_only_source(source), CONDITION_ONLY, f"{src.name}（{CONDITION_ONLY}）"
     path = Path(out_dir) / agg_master_filename(source)
     # 前の成績表と印は、master を読む前に消す（読めない・メモリ不足・止められた・[SKIP] のどれでも、
     # 前の master や前の設定から作った成績表が黙って残らないように）
     stamp_path(path).unlink(missing_ok=True)
     path.unlink(missing_ok=True)
     ident = master_identity(src)                   # 印に書く master の大きさ・更新時刻は、読む前に取る
-    df = master_frame(read_csv_any(src))
+    df = read_csv_any(src)
+    if not no_index:                               # 条件のみの family は指数の有無に関係なく、全部の行
+        df = master_frame(df)
     for c in (RID, "着順"):
         if c not in df.columns:
-            return f"[SKIP] {src.name}: 列 {c} がありません（master ではない可能性）"
+            return f"[SKIP] {label}: 列 {c} がありません（master ではない可能性）"
     copts = compact_options() if compact is None else compact
     ref_year = ref_year_of(df)
     total = adj = kept = n_tables = 0
-    fams = restrict_schemes(fam_registry.active(), schemes)
+    # その指数自身の順位を部品にした family（過去SP3走順 を 過去SP_3走平均 の master で、など）は同義の重複なので作らない
+    fams = [f for f in restrict_schemes(fam_registry.active(), schemes)
+            if f.no_index == no_index and not fam_registry.is_self_redundant(f, indicator)]
     writer = AggMasterWriter(path)
     try:
         for fam, scheme, sub in family_frames(df, fams):
@@ -366,7 +386,7 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
                 total += len(out)
                 adj += int(out["adjusted_WEDGE"].notna().sum())
                 if copts["enabled"]:
-                    out = out[compact_mask(out, mode, fam.layer, copts["min_count"], copts["min_wedge"])]
+                    out = out[compact_mask(out, mode, fam.layer, copts["min_count"], copts["min_wedge"], indicator)]
                     if out.empty:
                         continue
                 table = table_name_for_foragg(agg_filename(fam.name, mode, scheme, source))
@@ -385,7 +405,7 @@ def aggregate_master(src: str, out_dir: str, wedge_opts: dict | None = None, sch
             write_stamp(path, settings_id, ident, kept)
         else:                                       # 集計の間に replace が master を作り直した
             note = " / [WARN] 集計の間に master が作り直されたので書き終わりの印を書きません（--resume で作り直します）"
-    return (f"[OK] {src.name}: {n_tables} tables groups={total}(adj {adj}) kept={kept}/{total}"
+    return (f"[OK] {label}: {n_tables} tables groups={total}(adj {adj}) kept={kept}/{total}"
             f" / 年度窓の終わり={ref_year}{note}")
 
 
@@ -488,12 +508,16 @@ def main(argv=None) -> int:
     out_dir = Path(args.out_dir)
     settings = settings_of(fam_dicts, schemes, opts, copts)
     sid = settings_hash(settings)
-    done: set[str] = set()
+    # やること = (master, 条件のみか) の組。指数を使う family は全部の master、条件のみの family は地域ごとの基準の master 1本だけ
+    n_plain = sum(1 for f in fams if f.no_index)
+    bases = base_masters(files) if n_plain else {}
+    plan: list[tuple[Path, bool]] = ([(p, False) for p in files] if n_plain < len(fams) else []) + [
+        (p, True) for p in bases.values()]
+    done: set[tuple[Path, bool]] = set()
     if args.resume:
         # 済み = 印（.done）が今の設定・今の master（大きさと更新時刻）と合い、成績表が印のとおりの大きさで残っているもの。
         # 違う設定・作り直した master・途中で切れたファイルは作り直す（違う設定の成績表を混ぜない）
-        done = {p.name for p in files if stamp_matches(out_dir / agg_master_filename(file_stem(p)[len(MASTER_PREFIX):]),
-                                                       sid, p)}
+        done = {(p, ni) for p, ni in plan if stamp_matches(out_dir / agg_output_name(p, ni), sid, p)}
         prev_path = out_dir / SETTINGS_FILE
         if prev_path.exists():
             try:
@@ -509,6 +533,24 @@ def main(argv=None) -> int:
         part.unlink(missing_ok=True)
     # build_db・照合・画面はこの定義を使う（AGG_RANKBAND_SCHEMES で絞ったスキームもここに残る）
     fam_registry.save_families(out_dir / "families.json", fams, {"source": fam_registry.active_source()})
+    # 今回作らない「条件のみ」の成績表（条件のみの family をやめた・基準の master が変わった）を残さない
+    # （0行で終わって印だけが残っているものも）
+    wanted = {agg_output_name(p, True) for p in bases.values()}
+    pattern = agg_master_filename(f"*_{CONDITION_ONLY}")
+    stale = {p.name for p in out_dir.glob(pattern)}
+    stale |= {p.name[:-len(STAMP_SUFFIX)] for p in out_dir.glob(pattern + STAMP_SUFFIX)}
+    for name in sorted(stale - wanted):
+        stamp_path(out_dir / name).unlink(missing_ok=True)
+        (out_dir / name).unlink(missing_ok=True)
+    # 指数を使う family が1つも無い（条件のみだけ）: 指数ごとの集計はしないので、前の family の成績表（指数ごとのファイル）を残さない
+    if n_plain == len(fams):
+        for p in files:
+            old = out_dir / agg_output_name(p)
+            stamp_path(old).unlink(missing_ok=True)
+            old.unlink(missing_ok=True)
+    if bases:
+        print(f"[INFO] 条件のみの family {n_plain} 種は、地域ごとの基準の master だけで集計します（指数の名前は「{CONDITION_ONLY}」）: "
+              + "、".join(f"{r or '(地域なし)'} = {p.name}" for r, p in bases.items()))
     (out_dir / SETTINGS_FILE).write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
     n_var = sum(len(f.schemes) for f in fams)
     print(f"[INFO] family: {fam_registry.active_source()} / {len(fams)} family・{n_var} 通り（スキーム込み）")
@@ -523,10 +565,10 @@ def main(argv=None) -> int:
         print(f"[WARN] 旧来の成績表 foragg_*.csv が {len(legacy)} 本あります（例: {legacy[0].name}）。build_db は "
               "agg_master_*.csv.gz のある master では使いません。容量を空けるには --clean を付けて実行し直すか、"
               "手で消してください", file=sys.stderr)
-    todo = [p for p in files if p.name not in done]
+    todo = [x for x in plan if x not in done]
     if args.resume:
         print(f"[INFO] --resume: {len(done)} 本は今の設定で済んでいるので飛ばします（残り {len(todo)} 本）")
-    jobs = [(str(p), str(out_dir), opts, None, fam_dicts, copts, sid) for p in todo]
+    jobs = [(str(p), str(out_dir), opts, None, fam_dicts, copts, sid, ni) for p, ni in todo]
     n_done = [0]
 
     def progress(_i, r):
@@ -544,7 +586,7 @@ def main(argv=None) -> int:
     errors = [r for r in results if r.startswith("[ERROR]")]
     _print_wedge_coverage(results, opts["max_years"])
     n_ok = sum(r.startswith("[OK]") for r in results)
-    n_skip_done = len(files) - len(todo)
+    n_skip_done = len(plan) - len(todo)
     print(f"[DONE] OK={n_ok} SKIP={sum(r.startswith('[SKIP]') for r in results)} ERROR={len(errors)}"
           + (f" 済み（--resume で飛ばした）={n_skip_done}" if n_skip_done else ""))
     for r in errors:
@@ -596,7 +638,7 @@ def _run(job) -> str:
     try:
         return aggregate_master(*job)
     except Exception as e:
-        return f"[ERROR] {Path(job[0]).name}: {type(e).__name__}: {e}"
+        return f"[ERROR] {Path(job[0]).name}{'（' + CONDITION_ONLY + '）' if job[-1] is True else ''}: {type(e).__name__}: {e}"
 
 
 if __name__ == "__main__":

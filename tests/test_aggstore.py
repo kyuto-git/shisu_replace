@@ -148,7 +148,7 @@ def test_compact_keeps_exactly_the_specified_rows(mb):
     layer A・件数≧30 のどれかを満たす行（独立に計算して1行も違わない）。"""
     from shisu import families as F
     from shisu.aggstore import prepare_agg_frame
-    from shisu.classify import classify
+    from shisu.classify import classify, low_tail_axis_category
     full, comp = _rows(mb / "agg_full"), _rows(mb / "agg_csv")
     key = ["テーブル名", "結合データ"]
     assert not full.duplicated(key).any() and not comp.duplicated(key).any()
@@ -156,8 +156,9 @@ def test_compact_keeps_exactly_the_specified_rows(mb):
     layer = {f.name: f.layer for f in F.default_families()}
     want = []
     for r, raw in zip(db.to_dict("records"), full.to_dict("records")):
-        cat = classify({"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
-                        "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"]}, r["odds_mode"])
+        rec = {"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
+               "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"]}
+        cat = classify(rec, r["odds_mode"]) or low_tail_axis_category(rec, r["odds_mode"])    # 4区分か、条件特化ヒットの行
         w, a = r["WEDGE"], r["adjusted_WEDGE"]
         keep = (cat is not None or (w == w and w >= 0.70) or (a == a and a >= 0.70)
                 or layer[r["family"]] == "A" or int(r["件数"]) >= 30)
@@ -200,6 +201,51 @@ def test_compact_mask_uses_rare_minimum_counts_outside_layer_a():
         assert list(compact_mask(out, mode, layer="A")) == [True, True]
         # 結合データの列が無い成績表は、希少条件ではないものとして見る
         assert list(compact_mask(out.drop(columns=["結合データ"]), mode, layer="B", min_count=30, min_wedge=0.70)) == [False, False]
+
+
+def test_compact_keeps_the_condition_special_rows():
+    """コンパクト化は、条件特化ヒットの行（結合データの末尾が下位で4区分では区分なしだが、数の基準は絶対軸・軸候補）も残す
+    （件数・WEDGE の下限では残らない行で確かめる）。相手候補の基準までの行・どの基準も満たさない行は落とす。"""
+    from shisu.aggstore import compact_mask, estimate_percent
+    from shisu.classify import classify, low_tail_axis_category, low_tail_axis_frame, classify_frame, FIELD_COLUMNS
+
+    def row(key, cnt, fuku, ren, top5, frc=0.0, tra=0.0):
+        return {"結合データ": key, "件数": cnt, "複勝率": f"{fuku:.2f}%（{fuku:.2f}%）", "連対率": f"{ren:.2f}%（{ren:.2f}%）",
+                "掲示板率_val": top5, "複勝回収値": frc, "単勝適正回収値": tra, "WEDGE": 0.3, "adjusted_WEDGE": None}
+    head = "騎手A×前走1着"
+    cases = [("normal", 12, 90.0, 85.0, 95.0, 120.0, 0.0, "abs"), ("normal", 22, 82.0, 55.0, 92.0, 0.0, 0.0, "axis"),
+             ("odds10_50", 29, 36.0, 10.0, 55.0, 0.0, 210.0, None),          # 高回収率の基準は件数30から
+             ("normal", 29, 62.0, 40.0, 72.0, 0.0, 0.0, None),               # 相手候補の基準まで（件数も30未満）
+             ("normal", 19, 82.0, 55.0, 92.0, 0.0, 0.0, None), ("normal", 25, 30.0, 10.0, 40.0, 0.0, 0.0, None)]
+    for mode, cnt, fuku, ren, top5, frc, tra, want in cases:
+        for tail in ("6~9位", "10位~", "6位~", "41~50", "40以下", "7"):
+            out = pd.DataFrame([row(f"{head}×{tail}", cnt, fuku, ren, top5, frc, tra)])
+            est = {c: float(estimate_percent(out[c]).iloc[0]) for c in ("複勝率", "連対率")}
+            rec = {"cnt": cnt, "fv": est["複勝率"], "rv": est["連対率"], "top5": top5, "frc": frc, "tra": tra, "key": f"{head}×{tail}"}
+            assert classify(rec, mode) is None and low_tail_axis_category(rec, mode) == want, (mode, tail, want)
+            for layer in ("B", "C", "D", "X", ""):
+                assert list(compact_mask(out, mode, layer=layer, min_count=30, min_wedge=0.70)) == [want is not None], (mode, tail, layer)
+                assert list(compact_mask(out, mode, layer=layer, min_count=0, min_wedge=0)) == [want is not None]
+    # ベクトル版（low_tail_axis_frame）は1行版と同じ。classify_frame(gate=True) は今までどおり
+    rng = np.random.default_rng(3)
+    n = 4000
+    tails = ["1位", "6~9位", "10位~", "6位~", "41~50", "40以下", "51~60", "5", "6", "12", "06", "", "前走6着~"]
+    heads = ["騎手A×前走1着", "東京×芝×23-24×定量×G1", "芝×芝長×高", ""]
+    df = pd.DataFrame({"結合データ": [f"{heads[i % 4]}×{tails[int(t)]}" if heads[i % 4] else tails[int(t)]
+                                    for i, t in enumerate(rng.integers(0, len(tails), n))],
+                       "件数": rng.choice([5, 6, 9, 10, 15, 19, 20, 29, 30, 60], n).astype(float),
+                       "複勝率_val": rng.choice([3, 15, 34, 36, 50, 62, 70, 82], n).astype(float),
+                       "連対率_val": rng.choice([0, 50, 60, 85], n).astype(float),
+                       "掲示板率_val": rng.choice([5, 49, 55, 72, 80, 92], n).astype(float),
+                       "複勝回収値": rng.choice([np.nan, 0, 99, 100, 150, 210], n),
+                       "単勝適正回収値": rng.choice([np.nan, 0, 100, 150, 210], n)})
+    for mode in ("normal", "odds10u", "odds10_50", "odds50p"):
+        recs = [{**{k: (None if pd.isna(r[c]) else r[c]) for k, c in FIELD_COLUMNS.items()}, "key": r["結合データ"]}
+                for r in df.to_dict("records")]
+        want = [low_tail_axis_category(r, mode) for r in recs]
+        assert list(low_tail_axis_frame(df, mode)) == want and sum(w is not None for w in want) > 50
+        assert list(classify_frame(df, mode)) == [classify(r, mode) for r in recs]
+    assert list(low_tail_axis_frame(df.drop(columns=["結合データ"]), "normal")) == [None] * n         # 結合データが無ければ対象なし
 
 
 def test_compact_keeps_every_category_key_in_db(mb):

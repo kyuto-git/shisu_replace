@@ -48,6 +48,7 @@ from shisu import families as fam_registry
 from shisu.conditions import CONDITION_COLUMNS, derive, load_inner_lookup, standardize_entries
 from shisu.csvio import norm_series, norm_text, read_csv_any
 from shisu.matching import (HIT_COLUMNS, HORSE_COLUMNS, PART_FIELDS, STAT_COLUMNS, UNIFIED, HitCache, indicator_bases,
+                            match_bases,
                             iter_hit_rows, rank_text, unified_status)
 from shisu.aggstore import (FLOAT_COLUMNS, INT_COLUMNS, RATE_NAMES, ROW_META, agg_master_files,  # noqa: F401
                             IDENTITY_KEYS, STAMP_SUFFIX, estimate_percent, iter_agg_chunks, legacy_files,
@@ -457,13 +458,41 @@ def _first_nonempty(df: pd.DataFrame, names: tuple[str, ...]) -> pd.Series:
     return out
 
 
-def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None) -> pd.DataFrame:
+def entry_perf_values(raw: pd.DataFrame) -> tuple[dict, dict]:
+    """出馬表（calc_entry_hensachi の出力）の 過去SP・ST の列 → (指数名 → 値, 種類 → 過去{種類}_3走平均 の順位)。
+    列が無い指数は入れない（calc が 過去SP・ST を計算していない出馬表では、今走の基準比・3走順は空になる）。"""
+    from shisu import baselines
+    values = {name: raw[name] for names in baselines.NOW_INDICATORS.values() for name in names if name in raw.columns}
+    ranks = {kind: raw[f"{name}_順位"] for kind, name in baselines.RANK_INDICATOR.items() if f"{name}_順位" in raw.columns}
+    return values, ranks
+
+
+def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None, marks=None, history=None,
+                         tables=None, baba_turf: str = "auto", baba_dirt: str = "auto",
+                         use_perf: bool = True) -> pd.DataFrame:
     """出馬表（calc_entry_hensachi の出力）を、キーの部品が過去側と同じ表記になるよう正規化する。
-    22条件（shisu/conditions.py）の列も足す。inner_lookup は前走の内外を引く表（replace が master_csv/ に書く）。"""
+    条件（shisu/conditions.py）の列も足す。inner_lookup は前走の内外を引く表（replace が master_csv/ に書く）。
+    marks は外部レース印（race_marks.RaceMarks。前走メンバーLv など）、history は馬ごとの過去走の履歴
+    （past_perf_indices.History。近5走同条件・近5走同場・前走の基準比）。どちらも過去側（replace）と同じ関数を通す。
+    tables は3着内基準値（baselines.Baseline の {SP, ST}）。baba_turf・baba_dirt は今走の馬場の想定（基準値を引くときに使う。
+    auto なら出馬表の 馬場状態 の列、無ければ 良）。無ければその列は空。use_perf=False なら、出馬表の 過去SP・ST の列を
+    使わない（今走基準比・3走順が空。replace --no-past-perf の master と同じ）。"""
     df = raw.copy()
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()]
     raw = df
+    targets = None
+    parts = None
+    if tables or history is not None:
+        # 基準値を引く部品（芝ダ・距離・クラス・馬場・場所）も、下で書き換える前の元の列から取る
+        from shisu import baselines
+        parts = baselines.today_parts(df)
+        perf_values, perf_ranks = entry_perf_values(df) if use_perf else ({}, {})
+    if history is not None:
+        # 近5走の要約条件に使う列（馬・日付・場所・芝ダ・距離）は、元の列から先に取る
+        # （下で 距離 をレンジ統合後の値（16-18 など）に、芝・ダ を障害の印に書き換えるため）
+        from shisu import past_perf_indices as PP
+        targets = PP.target_frame(df)
     rid = norm_series(df["レースID(新)"]) if "レースID(新)" in df.columns else pd.Series("", index=df.index)
     given = df["レースID(新/馬番無)"] if "レースID(新/馬番無)" in df.columns else None
     df["レースID(新)"] = rid
@@ -516,21 +545,87 @@ def normalize_entries_df(raw: pd.DataFrame, inner_lookup: dict | None = None) ->
     for c in ENTRIES_REQUIRED:
         if c not in df.columns:
             df[c] = ""
-    cond = derive(standardize_entries(raw, df), inner_lookup)
+    recent = PP.recent_form(targets, history) if targets is not None else None
+    std = standardize_entries(raw, df)
+    perf = None
+    if parts is not None:
+        perf = baselines.conditions(parts, std["前走RID16"], history, tables, perf_values, perf_ranks, baba_turf, baba_dirt)
+    cond = derive(std, inner_lookup, marks, recent, perf)
     for c in CONDITION_COLUMNS:
         df[c] = cond[c]
     return df
 
 
-def load_entries_tables(con: sqlite3.Connection, entries_dir: Path) -> list[dict]:
+def entries_side_sources(log=print, marks_dir=None, no_marks: bool = False):
+    """出馬表の条件に使う (外部レース印, 馬ごとの過去走の履歴)。
+    レース印は race_marks/ にファイルがあればそれ、無ければ master_csv/__race_marks__.csv.gz。
+    marks_dir・no_marks を指定しなければ、replace の読み方（master_csv/__race_marks__.json）に合わせる
+    （replace が --no-race-marks なら読まない・--marks-dir ならそのフォルダ）。
+    履歴は master_csv/__horse_perf_history__.csv.gz（基本CSV・結果指数が変わっていれば作り直す。calc_entry_hensachi と同じ）。
+    読めなければ、その条件を空にして続ける（WARN）。"""
+    from shisu import past_perf_indices as PP
+    from shisu import race_marks
+    try:
+        if no_marks:
+            marks = None
+        elif marks_dir is not None:
+            marks = race_marks.load(marks_dir, log=log, enabled=True)
+        else:
+            marks = race_marks.load(log=log)
+    except Exception as e:
+        log(f"[WARN] 外部レース印を読めません（{type(e).__name__}: {e}）。前走メンバーLv などは空にします")
+        marks = None
+    try:
+        history = PP.get_history(log=log)
+    except Exception as e:
+        log(f"[WARN] 過去走の履歴を用意できません（{type(e).__name__}: {e}）。近5走の条件は空にします")
+        history = None
+    return marks, history
+
+
+def entries_baselines(baba_turf=None, baba_dirt=None, log=print, entries_dir=None) -> tuple[dict, str, str, bool]:
+    """出馬表の基準比の条件に使う (3着内基準値の表, 芝の想定馬場, ダの想定馬場, 過去SP・ST の値を使うか)。
+    基準値は master と同じもの（replace が master_csv/ に写したもの。記録が無ければ基準値マスタ shisu/data/）。
+    想定の馬場は、引数（auto / 良 / 稍 / 重 / 不 / 稍・重）→ 省いたほうは calc_entry_hensachi が 過去SP・ST の計算に
+    使った想定（entries_out/past_perf_baba.json）→ 設定ファイル past_perf_settings.json（/ingest の画面で選んだ値）→ auto。
+    replace を --no-past-perf で回した master（記録の past_perf が false）なら、今走基準比・3走順は付けない（master と同じ）。"""
+    from shisu import baselines
+    from shisu import past_perf_indices as PP
+    try:
+        tables = baselines.load_for_master(log=log)
+    except Exception as e:
+        log(f"[WARN] 3着内基準値を読めません（{type(e).__name__}: {e}）。基準比の条件は空にします")
+        tables = {}
+    meta = baselines.load_meta()
+    use_perf = bool(meta.get("past_perf", True)) if meta else True
+    used = PP.load_used_baba(entries_dir) if entries_dir is not None else None
+    saved = used or PP.load_settings()
+    turf = baselines.norm_baba_choice(saved["baba_turf"] if baba_turf is None else baba_turf)
+    dirt = baselines.norm_baba_choice(saved["baba_dirt"] if baba_dirt is None else baba_dirt)
+    if tables:
+        show = lambda v: "自動（出馬表の 馬場状態 の列。無ければ 良）" if v == baselines.BABA_AUTO else v
+        src = "" if (baba_turf is not None and baba_dirt is not None) else (
+            "（指定の無いほうは calc_entry_hensachi が使った想定）" if used else "")
+        log(f"[INFO] 3着内基準値: {'・'.join(f'{k} {len(t)} セル' for k, t in tables.items())}"
+            f"／今走の馬場の想定 芝 {show(turf)}・ダ {show(dirt)}{src}")
+    if not use_perf:
+        log("[INFO] 3着内基準値: master は 過去SP・ST の8指数なし（replace --no-past-perf）で作られているので、"
+            "出馬表にも 今走基準比・過去SP/ST 3走順 は付けません")
+    return tables, turf, dirt, use_perf
+
+
+def load_entries_tables(con: sqlite3.Connection, entries_dir: Path, marks_dir=None, no_marks: bool = False,
+                        baba_turf=None, baba_dirt=None) -> list[dict]:
     files = sorted(Path(entries_dir).glob("*.csv"))
     if not files:
         print(f"[entries] 出馬表CSVがありません: {entries_dir}")
         return []
     loaded = []
     inner = load_inner_lookup()
+    marks, history = entries_side_sources(marks_dir=marks_dir, no_marks=no_marks)
+    tables, turf, dirt, use_perf = entries_baselines(baba_turf, baba_dirt, entries_dir=entries_dir)
     for p in files:
-        df = normalize_entries_df(read_csv_any(p), inner)
+        df = normalize_entries_df(read_csv_any(p), inner, marks, history, tables, turf, dirt, use_perf)
         tname = table_name_for_entries(p.name)
         df.to_sql(tname, con, if_exists="replace", index=False)
         con.execute(f'CREATE INDEX IF NOT EXISTS {q("idx_" + tname + "_race")} ON {q(tname)}("レースID(新/馬番無)")')
@@ -592,7 +687,7 @@ def build_xjoin(con: sqlite3.Connection, entries_table: str, families=None) -> d
     cur = con.execute(f"SELECT * FROM {q(entries_table)}")
     names = [d[0] for d in cur.description]
     rows = [dict(zip(names, r)) for r in cur.fetchall()]
-    bases = indicator_bases(names)
+    bases = match_bases(names, families)       # 条件のみの family があれば、指数の名前「条件のみ」でも1回照合する
     total = insert_hits(con, xname, rows, bases, entries_table, families, progress=True)
     con.execute(f'CREATE INDEX {q("idx_" + xname + "_race")} ON {q(xname)}("レースID(新/馬番無)")')
     return {"table_name": xname, "source_file": entries_table, "kind": "xjoin", "n_rows": total,
@@ -674,7 +769,7 @@ def refresh_xjoin(con: sqlite3.Connection, entries_table: str, targets: list[str
     print(f"[xjoin] {xname}: {'・'.join(targets)} の行だけ作り直しました（{len(rows)} 頭, その指数の hits {total}, 全体 {n} 行）"
           + (f" ／ 出馬表に無い指数: {'・'.join(missing)}" if missing else ""), flush=True)
     return {"table_name": xname, "source_file": entries_table, "kind": "xjoin", "n_rows": int(n),
-            "indicator": ",".join(all_bases)}
+            "indicator": ",".join(match_bases(names, families))}
 
 
 # ---------------------------------------------------------------------------
@@ -731,8 +826,25 @@ def parse_cli(argv=None):
                    help="成績表（aggregate_stats_ver2.py の出力）のディレクトリ（既定 agg_csv/）")
     p.add_argument("--allow-empty", action="store_true", help="成績表が0本でも unified_all を空で作り直す")
     p.add_argument("--entries-dir", default=str(config.entries_out_dir()))
+    p.add_argument("--baba-turf", default=None,
+                   help="今走の馬場の想定（芝）: auto / 良 / 稍 / 重 / 不 / 稍・重。3着内基準値を引くときに使う"
+                        "（省くと /ingest で選んだ値。無ければ auto = 出馬表の 馬場状態 の列、無ければ 良）")
+    p.add_argument("--baba-dirt", default=None, help="今走の馬場の想定（ダ）。--baba-turf と同じ")
+    p.add_argument("--marks-dir", default=None,
+                   help="出馬表の前走条件に使う外部レース印のフォルダ。省くと replace と同じ読み方（既定は race_marks。"
+                        "ファイルが無ければ master_csv/__race_marks__.csv.gz）")
+    p.add_argument("--no-race-marks", action="store_true",
+                   help="出馬表に外部レース印の前走条件（前走メンバーLv など）を付けない")
     p.add_argument("--db-path", default=str(config.db_path()), help="既定は環境変数 DB_PATH か racing.db")
     args = p.parse_args(argv)
+    from shisu import baselines as _baselines
+    for name in ("baba_turf", "baba_dirt"):
+        try:
+            if getattr(args, name) is not None:
+                _baselines.norm_baba_choice(getattr(args, name))
+        except ValueError as e:
+            print(f"[ERROR] --{name.replace('_', '-')}: {e}", file=sys.stderr)
+            return 2
     targets: list[str] = []
     for raw in re.split(r"[,、，]", args.indicators or ""):
         raw = raw.strip()
@@ -763,6 +875,8 @@ def parse_cli(argv=None):
 
 def main(argv=None) -> int:
     args = parse_cli(argv)
+    if isinstance(args, int):                # 引数の誤り（想定の馬場状態など）。DB には触らない
+        return args
     db = Path(args.db_path)
     if args.mode in ("both", "foragg"):      # DB を消す前に family の定義を確かめる（指定したファイルが無いなど）
         try:
@@ -815,7 +929,8 @@ def main(argv=None) -> int:
             db_fams = families_from_db(con)
             if db_fams:
                 fam_registry.set_active(db_fams, f"DB の {FAMILIES_TABLE}（{len(db_fams)} family）")
-        entries = load_entries_tables(con, Path(args.entries_dir))
+        entries = load_entries_tables(con, Path(args.entries_dir), marks_dir=args.marks_dir, no_marks=args.no_race_marks,
+                                      baba_turf=args.baba_turf, baba_dirt=args.baba_dirt)
         build_entries_all(con, entries)
         con.commit()                         # 出馬表はここまでで確定（照合結果は下で、テーブルごとに1つのトランザクション）
         gc.collect()                         # 正規化に使った DataFrame を手放してから照合に入る（照合がいちばんメモリを使う）

@@ -12,6 +12,7 @@ from . import families as _families
 from .conditions import CONDITION_COLUMNS
 from .csvio import norm_text
 from .families import entry_key_candidates
+from .indicators import CONDITION_ONLY
 from .wedge import WEDGE_COLUMNS
 
 UNIFIED = "unified_all"
@@ -44,6 +45,16 @@ def indicator_bases(columns: Iterable[str]) -> list[str]:
                    if c.endswith("_偏差値") and (c[: -len("_偏差値")] + "_順位") in cols})
 
 
+def match_bases(columns: Iterable[str], families: Iterable[str] | None = None) -> list[str]:
+    """照合する「指数」の名前: 出馬表の指数（indicator_bases）と、指数を使わない family（tail="NONE"）があれば
+    CONDITION_ONLY（条件のみ。指数に依らないので、1頭につき1回だけ照合する）。"""
+    bases = indicator_bases(columns)
+    names = tuple(families) if families is not None else _families.active_names()
+    if any(_families.is_no_index(n) for n in names):
+        bases.append(CONDITION_ONLY)
+    return bases
+
+
 def rank_text(v) -> str:
     """順位を '13' の形に（旧形式の '13.0' も受ける）。数値でなければ ''。"""
     t = norm_text(v)
@@ -65,6 +76,9 @@ def is_jump_row(row: Mapping) -> bool:
 def entry_fields(row: Mapping, base: str) -> dict:
     """出馬表の1行（build_db で正規化済み。22条件の列も持つ）から、キーの部品を取り出す。"""
     out = {c: norm_text(row.get(c)) for c in PART_FIELDS}
+    if base == CONDITION_ONLY:           # 条件のみの family は順位・偏差値帯を使わない
+        out["順位"] = out["偏差値帯"] = ""
+        return out
     out["順位"] = rank_text(row.get(f"{base}_順位"))
     out["偏差値帯"] = norm_text(row.get(f"{base}_偏差値帯"))
     return out
@@ -127,15 +141,21 @@ def iter_hit_rows(conn: sqlite3.Connection, row: Mapping, bases: Iterable[str], 
                   limit: int = DEFAULT_LIMIT):
     """出馬表1頭ぶんのヒット行を、HIT_COLUMNS の順の値のタプルで1行ずつ返す（ジェネレータ）。
     1頭ぶんをまとめて持たないので、family・指数が多くてもメモリは増えない（build_db の xjoin はこれをそのまま INSERT する）。
+    bases は指数の名前（match_bases の結果）。CONDITION_ONLY が入っていれば、指数を使わない family をその名前で1回だけ照合する。
     cache は HitCache（上限つき）。省略するとこの1頭の中だけのキャッシュ。"""
     cache = HitCache() if cache is None else cache
     families = tuple(families) if families is not None else _families.active_names()
     if is_jump_row(row):              # 障害レース: 過去側は集計していない（コースを含まない family でも照合しない）
         return
     horse = (source_table,) + tuple(norm_text(row.get(c)) for c in HORSE_COLUMNS)
+    # 指数を使う family は指数（base）ごとに、指数を使わない family（条件のみ）は base = CONDITION_ONLY で1回だけ照合する
+    indexed, plain = _families.split_no_index(families)
     for base in bases:
+        fams = plain if base == CONDITION_ONLY else indexed
+        if not fams:
+            continue
         fields = entry_fields(row, base)
-        for fam, cands in entry_key_candidates(fields, families).items():
+        for fam, cands in entry_key_candidates(fields, fams).items():
             for key, _scheme in cands:
                 ck = (key, fam, base)
                 hits = cache.get(ck)

@@ -37,7 +37,8 @@ RANK_SCHEMES: dict[str, tuple[tuple[int, int | None], ...]] = {
     "s2": ((1, 3), (1, 5), (6, None)),
 }
 # 帯の名前の付け方: (前置き, 単位)
-BAND_UNITS = {"rank": ("", "位"), "finish": ("前走", "着"), "pop": ("前走", "人気"), "agari": ("前走上り", "位")}
+BAND_UNITS = {"rank": ("", "位"), "finish": ("前走", "着"), "pop": ("前走", "人気"), "agari": ("前走上り", "位"),
+              "sp3": ("SP3走", "位"), "st3": ("ST3走", "位")}
 
 
 def _band_text(lo: int, hi: int | None, kind: str) -> str:
