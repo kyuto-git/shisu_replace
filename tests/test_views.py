@@ -21,6 +21,34 @@ def hit(uma, base, mode, cnt, cat, family="normal", key=KEY, scheme="", region="
     return h
 
 
+def test_hit_category_reads_the_win_rate_and_wedge_of_the_row():
+    """画面の区分は、ヒット行の 勝率_val（絶対軸の条件②）と WEDGE（2〜10倍未満専用の消し）も classify に渡す。"""
+    two = {"odds_mode": "normal", "件数": 20, "key": KEY, "勝率_val": 40.0, "連対率_val": 55.0, "複勝率_val": 80.0,
+           "掲示板率_val": 85.0, "複勝回収値": 90.0, "単勝適正回収値": 100.0}
+    assert app.hit_category(two) == "abs"                                             # ② 件数 20・勝率 40・複勝率 80・回収値 100
+    assert app.hit_category({**two, "勝率_val": 39.9}) is None and app.hit_category({**two, "勝率_val": None}) is None
+    assert app.hit_category({k: v for k, v in two.items() if k != "勝率_val"}) is None
+    assert app.hit_category({**two, "件数": 19}) is None and app.hit_category({**two, "複勝率_val": 79.9}) is None
+    assert app.hit_category({**two, "単勝適正回収値": 99.9}) is None
+    assert app.hit_category({**two, "掲示板率_val": 90.0, "勝率_val": 39.9}) == "axis"   # ② でなければ今までの区分
+    low_key = "川田将雅×前走1~3着×6位~"
+    assert app.hit_category({**two, "key": low_key}) is None and app.low_tail_category({**two, "key": low_key}) == "abs"
+    assert app.low_tail_category({**two, "key": low_key, "勝率_val": None}) is None
+    # 2〜10倍未満専用の消し: 複勝率 < 20 かつ（掲示板率 < 35 または WEDGE < 0.350）。WEDGE が無ければ「< 0.350」は満たさない
+    ks = {"odds_mode": "odds10u", "件数": 25, "key": KEY, "勝率_val": 3.0, "連対率_val": 8.0, "複勝率_val": 15.0,
+          "掲示板率_val": 50.0, "複勝回収値": 60.0, "単勝適正回収値": 60.0}
+    assert app.hit_category(ks) is None and app.keshi_rule_of(ks) is None            # 掲示板率 50・WEDGE なし → 消しではない
+    assert app.hit_category({**ks, "WEDGE": None}) is None and app.hit_category({**ks, "WEDGE": 0.35}) is None
+    for more in ({"WEDGE": 0.3499}, {"掲示板率_val": 34.9}, {"掲示板率_val": 34.9, "WEDGE": 1.2}, {"掲示板率_val": None, "WEDGE": 0.1}):
+        assert app.hit_category({**ks, **more}) == "keshi" and app.keshi_rule_of({**ks, **more}) == "fav", more
+        for mode in ("normal", "odds10_50", "odds50p"):
+            assert app.hit_category({**ks, **more, "odds_mode": mode}) is None and app.keshi_rule_of({**ks, **more, "odds_mode": mode}) is None
+    common = {**ks, "複勝率_val": 3.0, "掲示板率_val": 8.0, "WEDGE": 0.1}
+    assert app.hit_category(common) == "keshi" and app.keshi_rule_of(common) == "any"
+    # 消しでなくなった行は、ほかの区分の判定に進む（複勝率は低いが連対率・回収値は絶対軸の基準、という行）
+    assert app.hit_category({**ks, "件数": 12, "連対率_val": 85.0, "複勝回収値": 120.0, "WEDGE": 0.9}) == "abs"
+
+
 def test_stats_presets_give_the_intended_category():
     for cat, cnt in (("abs", 12), ("axis", 22), ("opp", 40), ("keshi", 25)):
         for mode in ("normal", "odds10u", "odds10_50", "odds50p"):
@@ -30,11 +58,16 @@ def test_stats_presets_give_the_intended_category():
 def test_hit_category_passes_the_key_for_rare_conditions():
     """画面の区分（条件ヒット馬・指数クロス・CSV の「区分」列）は、結合データを見て希少条件の最低件数を使う。"""
     g1 = "東京×芝×23-24×定量×G1×1"
-    for cat, cnt in (("abs", 6), ("axis", 6), ("opp", 15), ("keshi", 12)):
+    for cat, cnt in (("axis", 6), ("opp", 15), ("keshi", 12)):
         rare = {"odds_mode": "normal", "件数": cnt, "key": g1, **STATS[cat]}
         assert app.hit_category(rare) == cat
         assert app.hit_category({**rare, "key": KEY}) is None                 # ふつうの条件は今までの最低件数
         assert app.hit_category({**rare, "件数": cnt - 1}) is None
+    # 絶対軸は希少条件でも件数を下げない（2026-11-23〜）: 6〜9件は絶対軸にならず、軸候補の条件（希少 6件〜）を満たせば軸候補
+    rare_abs = {"odds_mode": "normal", "key": g1, **STATS["abs"]}
+    assert [app.hit_category({**rare_abs, "件数": n}) for n in (5, 6, 9, 10)] == [None, "axis", "axis", "abs"]
+    assert [app.hit_category({**rare_abs, "件数": n, "掲示板率_val": 70.0}) for n in (6, 9, 10)] == [None, None, "abs"]
+    assert [app.hit_category({**rare_abs, "件数": n, "key": KEY}) for n in (9, 10)] == [None, "abs"]
     hr = {"件数": 15, "key": g1, "連対率_val": 10.0, "複勝率_val": 36.0, "掲示板率_val": 55.0, "複勝回収値": 0.0,
           "単勝適正回収値": 210.0}
     assert [app.hit_category({**hr, "odds_mode": m}) for m in ("odds10u", "odds10_50", "odds50p", "normal")] == ["axis", "axis", None, None]
@@ -365,7 +398,9 @@ def test_horse_stats_and_axis_cross_count_favorite_keshi_per_indicator():
 
 
 # ---------------------------------------------------------------- 負の相関にある指数の消し候補（2026-11-16）
-FAV_ONLY = {"複勝率_val": 15.0, "掲示板率_val": 50.0}      # 2〜10倍未満専用の規則（複勝率 < 20）だけで消し候補になる成績
+# 2〜10倍未満専用の規則（複勝率 < 20 かつ（掲示板率 < 35 または WEDGE < 0.350））だけで消し候補になる成績
+FAV_ONLY = {"複勝率_val": 15.0, "掲示板率_val": 30.0}
+FAV_WEDGE = {"複勝率_val": 15.0, "掲示板率_val": 50.0, "WEDGE": 0.3}     # 掲示板率は 35 以上で、WEDGE が低いほうで消しになる成績
 GOOD = {"複勝回収値": 130.0}                                # 過剰人気カットの対象にならない軸
 
 
@@ -380,6 +415,9 @@ def test_tradeoff_keshi_rows_are_excluded_when_the_opposite_indicator_has_an_axi
             b = app.classify_hits([ax, ks], info := {})
             assert b["keshi"] == [] and b[cat] == [ax] and info["tradeoff"] == 1, (axis_base, keshi_base, cat)
             assert app.keshi_rule_of(ks) == "fav"
+            kw = hit(1, keshi_base, "odds10u", 25, "keshi", **FAV_WEDGE)              # WEDGE のほうで消しになる行も同じ
+            b = app.classify_hits([ax, kw], info := {})
+            assert b["keshi"] == [] and info["tradeoff"] == 1 and app.keshi_rule_of(kw) == "fav"
     # 除かないもの
     ax = hit(1, "先行", "odds10_50", 22, "axis")
     keep = [
@@ -565,14 +603,24 @@ def test_special_hits_use_each_rows_own_odds_band_and_count_indicators_not_rows(
             for m in ("normal", "odds10u", "odds10_50", "odds50p")]
     assert [app.low_tail_category(h) for h in rows] == [None, "axis", "axis", None]
     assert [r["odds_mode"] for r in app.special_hits(rows)] == ["odds10u", "odds10_50"]
-    # 2〜10倍未満では複勝率 < 20 は消し候補（末尾に関係なく先に決まる）→ 絶対軸の数字でも入らない。ほかのオッズ帯では絶対軸の基準
-    ab = {"複勝率_val": 15.0, "連対率_val": 85.0, "掲示板率_val": 60.0, "複勝回収値": 150.0}
+    # 2〜10倍未満では「複勝率 < 20 かつ WEDGE < 0.350（または掲示板率 < 35）」は消し候補（末尾に関係なく先に決まる）→ 絶対軸の
+    # 数字でも入らない。ほかのオッズ帯では絶対軸の基準
+    ab = {"複勝率_val": 15.0, "連対率_val": 85.0, "掲示板率_val": 60.0, "複勝回収値": 150.0, "WEDGE": 0.3}
     fav, mid = ({**low(2, "SAV", "normal", 25, "abs"), **ab, "odds_mode": m, "テーブル名": f"u_{m}"} for m in ("odds10u", "odds10_50"))
     assert app.hit_category(fav) == "keshi" and app.low_tail_category(fav) is None and app.low_tail_category(mid) == "abs"
     assert [(r["馬番"], r["odds_mode"], r["_cat"]) for r in app.special_hits([fav, mid])] == [("2", "odds10_50", "abs")]
-    # 希少条件の下がった最低件数（絶対軸 6）も同じ
+    # WEDGE が 0.350 以上（掲示板率も 35 以上）なら 2〜10倍未満でも消しではない → 条件特化ヒットに入る
+    kept = {**fav, "WEDGE": 0.8}
+    assert app.hit_category(kept) is None and app.low_tail_category(kept) == "abs"
+    assert [(r["odds_mode"], r["_cat"]) for r in app.special_hits([kept, mid])] == [("odds10u", "abs"), ("odds10_50", "abs")]
+    # 絶対軸の条件②（件数 20・勝率 40・複勝率 80）で条件特化ヒットになる行
+    two = {**low(4, "SAV", "normal", 25, "axis"), "勝率_val": 45.0, "連対率_val": 55.0, "単勝適正回収値": 110.0, "掲示板率_val": 85.0}
+    assert app.low_tail_category(two) == "abs" and app.low_tail_category({**two, "勝率_val": 39.0}) is None
+    assert app.low_tail_category({**two, "件数": 19}) is None
+    # 希少条件: 軸候補の最低件数（6）は下がるが、絶対軸は下げない（10件から）
     rare = low(3, "ZI", "normal", 12, "abs", head="東京×芝×23-24×定量×G1", tail="7")
-    assert app.low_tail_category({**rare, "件数": 6}) == "abs" and app.low_tail_category({**low(3, "ZI", "normal", 12, "abs"), "件数": 6}) is None
+    assert [app.low_tail_category({**rare, "件数": n}) for n in (5, 6, 9, 10)] == [None, "axis", "axis", "abs"]
+    assert app.low_tail_category({**low(3, "ZI", "normal", 12, "abs"), "件数": 9}) is None
     # 指数数 = 指数の数。地域・オッズ帯の None と空・通常は同じ組（馬番は数でも文字でも）
     a = low(1, "先行", "normal", 30, "axis")
     twin = {**a, "テーブル名": "t_twin", "馬番": 1, "odds_mode": None}

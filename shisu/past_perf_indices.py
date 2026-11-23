@@ -17,15 +17,23 @@ SP指数・ST指数はレースのあとに確定する値なので、そのレ�
 対象の走の決め方（select_runs）
   1. その馬の走のうち、D − 600日 ≦ 走った日 ＜ D（D = 今走の日）で、その指数（SP か ST）の値がある走。新しい順
      （同じ日なら レースID の大きい順）。取消・除外で走っていないレース・障害は入れない
-  2. 今走が2歳戦・3歳限定戦なら、1 の全部
-  3. それ以外（古馬戦）は、今走の 芝・ダ／距離／馬場状態3区分（良 / 稍・重 / 不）と比べて、次の順に最初に1走以上
-     見つかった段階の走だけを使う（1〜2走しか無くても、その段階の走だけで計算する。0走のときだけ次へ）:
+  2. 今走の 芝・ダ／距離／馬場状態3区分（良 / 稍・重 / 不）と比べて、次の順に、要る走数（下の 3）以上の走が
+     見つかった最初の段階の走だけを使う（2026-11-23〜）:
        ① 同じ芝・ダ かつ 距離差400以内 かつ 同じ馬場状態（今走の馬場状態が分からなければ飛ばす）
        ② 同じ芝・ダ かつ 距離差400以内
        ③ 距離差400以内（今走の馬場状態が分かれば、同じ馬場状態も）
        ④ 同じ芝・ダ
        ⑤ 1 の全部
+  3. 要る走数（MIN_RUNS_OLDER・MIN_RUNS_LIMITED）:
+       古馬戦（2歳戦・3歳限定戦以外）= 3走。①〜④で3走に届かなければ次の段階へ緩め、⑤（全部）でも1〜2走しか
+         無ければ、その1〜2走で計算する（0走なら欠損）
+       2歳戦・3歳限定戦 = 1走。同じ①〜⑤の順で、1走以上ある最初の段階（2026-11-22 までは無条件で 1 の全部だった）
   4. 先頭から3走・5走の平均（小数第2位を四捨五入して小数第1位まで。54.0 は 54）と最高
+
+過去側（replace_csv_ver3.py）の今走の馬場状態は、基本CSV の 馬場状態 の列（確定した実際の馬場）だけ。出馬表側の想定
+（--baba-turf / --baba-dirt・past_perf_settings.json・entries_out/past_perf_baba.json）や、想定の馬場で出した
+ext_indices/past_sp_st/ のファイルは、過去側の計算に入らない（replace を回すたびに、確定の馬場状態と result_indices/ から
+全レースを計算し直す）。
 
 馬の見分け: 血統登録番号（10桁）を優先し、無ければ正規化した馬名。
 
@@ -620,15 +628,22 @@ def recent_form(targets: pd.DataFrame, history: History | None) -> pd.DataFrame:
     return pd.DataFrame(out, index=targets.index, dtype=object)
 
 
+MIN_RUNS_OLDER = 3          # 古馬戦: この走数がそろう最初の段階（最後の段階でも足りなければ、ある分で計算）
+MIN_RUNS_LIMITED = 1        # 2歳戦・3歳限定戦: 1走以上ある最初の段階
+LIMITED_STAGE = 10          # 2歳戦・3歳限定戦の段階の番号 = LIMITED_STAGE + 段階（11〜15）。古馬戦は 1〜5
+
+
 def select_runs(runs: list[Run], day: int, surface: str, dist: float | None, baba: str, limited: bool
                 ) -> tuple[list[Run], int]:
-    """対象の走（新しい順）と、採用した段階（0 = 対象なし・1〜5 = 古馬戦の段階・9 = 2歳戦・3歳限定戦）。"""
+    """対象の走（新しい順）と、採用した段階（0 = 対象なし・1〜5 = 古馬戦の段階①〜⑤・11〜15 = 2歳戦・3歳限定戦の段階①〜⑤）。
+    古馬戦は MIN_RUNS_OLDER（3）走以上、2歳戦・3歳限定戦は MIN_RUNS_LIMITED（1）走以上の走がある最初の段階を採る。
+    最後の段階⑤（600日以内の全部の走）は、走が1つでもあれば採る（古馬戦で1〜2走しか無いときも、その走で計算する）。"""
     lo = day - WINDOW_DAYS
     cand = [r for r in runs if lo <= r[0] < day]
     if not cand:
         return [], 0
-    if limited:
-        return cand, 9
+    need = MIN_RUNS_LIMITED if limited else MIN_RUNS_OLDER
+    offset = LIMITED_STAGE if limited else 0
 
     def near(r: Run) -> bool:
         return dist is not None and r[3] is not None and abs(r[3] - dist) <= DIST_TOL
@@ -639,20 +654,20 @@ def select_runs(runs: list[Run], day: int, surface: str, dist: float | None, bab
     def same_baba(r: Run) -> bool:
         return r[4] == baba
 
-    if baba:
+    if baba:                                                    # ① 今走の馬場状態が分からなければ飛ばす
         got = [r for r in cand if same_surface(r) and near(r) and same_baba(r)]
-        if got:
-            return got, 1
-    got = [r for r in cand if same_surface(r) and near(r)]
-    if got:
-        return got, 2
-    got = [r for r in cand if near(r) and (not baba or same_baba(r))]
-    if got:
-        return got, 3
-    got = [r for r in cand if same_surface(r)]
-    if got:
-        return got, 4
-    return cand, 5
+        if len(got) >= need:
+            return got, offset + 1
+    got = [r for r in cand if same_surface(r) and near(r)]      # ②
+    if len(got) >= need:
+        return got, offset + 2
+    got = [r for r in cand if near(r) and (not baba or same_baba(r))]   # ③
+    if len(got) >= need:
+        return got, offset + 3
+    got = [r for r in cand if same_surface(r)]                  # ④
+    if len(got) >= need:
+        return got, offset + 4
+    return cand, offset + 5                                     # ⑤ 走数が足りなくても、ある分で計算する
 
 
 @dataclass
@@ -716,12 +731,18 @@ def compute(targets: pd.DataFrame, history: History, baba_turf: str = BABA_AUTO,
     return Computed(values, stages, len(targets))
 
 
-STAGE_LABELS = {0: "対象の走なし", 1: "①同じ芝ダ・距離差400以内・同じ馬場", 2: "②同じ芝ダ・距離差400以内",
-                3: "③距離差400以内", 4: "④同じ芝ダ", 5: "⑤600日以内の全走", 9: "2歳・3歳限定（600日以内の全走）"}
+_STAGE_NAMES = {1: "①同じ芝ダ・距離差400以内・同じ馬場", 2: "②同じ芝ダ・距離差400以内", 3: "③距離差400以内", 4: "④同じ芝ダ",
+                5: "⑤600日以内の全走"}
+STAGE_LABELS = {0: "対象の走なし", **_STAGE_NAMES,
+                **{LIMITED_STAGE + s: f"2歳・3歳限定{name}" for s, name in _STAGE_NAMES.items()}}
+STAGE_RULE = (f"古馬戦は{MIN_RUNS_OLDER}走以上そろう最初の段階（⑤は1〜2走でも）・"
+              f"2歳/3歳限定戦は{MIN_RUNS_LIMITED}走以上ある最初の段階")
 
 
 def stage_text(stages: dict[int, int]) -> str:
-    return "・".join(f"{STAGE_LABELS[s]} {n}" for s, n in sorted(stages.items()) if n)
+    """段階ごとの馬の数（ログ用）。例: 対象の走なし 120・①… 800・…・2歳・3歳限定②… 60／古馬戦は3走以上…"""
+    parts = "・".join(f"{STAGE_LABELS[s]} {n}" for s, n in sorted(stages.items()) if n)
+    return f"{parts}／{STAGE_RULE}" if parts else parts
 
 
 # ---------------------------------------------------------------------------
@@ -1085,6 +1106,7 @@ __all__ = [
     "find_result_files", "load_results", "parse_result_text", "target_frame", "history_rows", "select_runs", "aggregate",
     "compute", "resolve_baba", "age_limited", "baba3", "norm_baba_choice", "base_csv_paths", "source_signature",
     "build_history_frame", "save_history", "load_history_cache", "get_history", "has_result_files",
-    "load_settings", "save_settings", "baba_text", "stage_text", "column_notes", "recent_form", "RECENT_COLUMNS",
+    "load_settings", "save_settings", "baba_text", "stage_text", "STAGE_LABELS", "STAGE_RULE", "MIN_RUNS_OLDER",
+    "MIN_RUNS_LIMITED", "LIMITED_STAGE", "column_notes", "recent_form", "RECENT_COLUMNS",
     "RECENT_RUNS", "RECENT_DIST_TOL", "history_frame",
 ]

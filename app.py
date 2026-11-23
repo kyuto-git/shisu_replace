@@ -40,6 +40,7 @@ from shisu import drill
 from shisu import notes as notes_store
 from shisu.classify import (CATEGORIES, CATEGORY_LABELS, KEY_SEP, classify, description_lines, keshi_rule,
                             low_tail_axis_category, sql_condition, tail_token, TAIL_LOW_RANK_MIN, TAIL_LOW_TOKENS)
+from shisu.classify import record as classify_record
 from shisu.indicators import INDICATOR_ORDER, TRADEOFF_GROUPS, tradeoff_opponents
 from shisu.ingest.web import make_blueprint as make_ingest_blueprint
 from shisu.ingest.web import allowed_host, same_origin
@@ -910,10 +911,10 @@ def collect_hits(con, table: str, race_rows: list[dict]) -> tuple[list[dict], st
 
 
 def _hit_rec(h: dict) -> dict:
-    return {"cnt": h.get("件数"), "fv": h.get("複勝率_val"), "rv": h.get("連対率_val"),
-            "top5": h.get("掲示板率_val"), "frc": h.get("複勝回収値"),
-            "tra": h.get("単勝適正回収値"), "key": h.get("key"),
-            "indicator": h.get("indicator") or h.get("base")}       # 条件のみの family の行は指数の上限ゲートを見ない
+    """ヒット行（照合結果・成績表の行）→ classify に渡す値（件数・勝率_val・連対率_val・複勝率_val・掲示板率_val・
+    複勝回収値・単勝適正回収値・WEDGE と key・indicator。列の対応は classify.FIELD_COLUMNS）。"""
+    return classify_record(h, key=h.get("key"),
+                           indicator=h.get("indicator") or h.get("base"))   # 条件のみの family の行は指数の上限ゲートを見ない
 
 
 def hit_category(h: dict) -> str | None:
@@ -1002,15 +1003,14 @@ def horse_stats(race: list[dict], buckets: dict[str, list[dict]]) -> dict[str, d
 
 def keshi_rule_of(h: dict) -> str | None:
     """ヒット行が消し候補になる理由（'any' = 全モード共通の規則 / 'fav' = 2〜10倍未満専用の規則だけ / None）。"""
-    return keshi_rule({"cnt": h.get("件数"), "fv": h.get("複勝率_val"), "top5": h.get("掲示板率_val"), "key": h.get("key")},
-                      h.get("odds_mode") or "normal")
+    return keshi_rule(_hit_rec(h), h.get("odds_mode") or "normal")
 
 
 def tradeoff_keshi(rows: list[tuple[dict, str]]) -> set[int]:
     """負の相関（トレードオフ）にある指数の軸ヒットで除く消し候補の行（id(h) の集合）。rows = (ヒット行, 区分) の並び。
 
     ある馬が、片方の指数（例: 先行）で 絶対軸・軸候補 に1行でも当たっていれば、その馬の、対になる指数（例: 瞬発）の
-    「2〜10倍未満（odds10u）専用の規則（複勝率 < 20%）だけで消し候補になっている行」を除く（先行力の高い馬は瞬発力が
+    「2〜10倍未満（odds10u）専用の規則（複勝率 < 20% かつ（掲示板率 < 35% または WEDGE < 0.350））だけで消し候補になっている行」を除く（先行力の高い馬は瞬発力が
     低く出る、という指数の性質から出ているだけの消し）。全モード共通の規則（複勝率 < 5% かつ 掲示板率 < 10%）も満たす行と、
     ほかのオッズ帯の消し候補は除かない。組は shisu.indicators.TRADEOFF_GROUPS（双方向）。"""
     axis_bases: dict[str, set] = {}

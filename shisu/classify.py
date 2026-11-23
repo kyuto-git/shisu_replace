@@ -3,10 +3,11 @@
 値はすべて DB の値をそのまま使う（率は 0–100 の %）。
   fv  = 複勝率_val（推定値: 事後分布の下側10%点。頻度20%以下なら上側90%点）
   rv  = 連対率_val（推定値: 下側10%点）
+  wv  = 勝率_val（推定値: 下側10%点）
   top5= 掲示板率_val（頻度）
-  frc = 複勝回収値, tra = 単勝適正回収値, cnt = 件数
+  frc = 複勝回収値, tra = 単勝適正回収値, cnt = 件数, wedge = WEDGE（WIN + EDGE）
   key = 結合データ（希少条件の判定に使う。無ければ希少条件ではないものとして扱う）
-欠損（None）の比較はすべて「満たさない」と扱う。
+欠損（None・NaN・NULL）の比較はすべて「満たさない」と扱う。
 判定順は 消し → 絶対軸 → 軸候補 → 相手 で、最初に当てはまった区分を1つだけ返す。
 
 2026-11-12 に足した規則:
@@ -16,7 +17,7 @@
       件数 ≥ 30 かつ 複勝率 ≥ 50% かつ（複勝回収値 ≥ 150 または 単勝適正回収値 ≥ 150）
   - 希少条件（結合データを「×」で分けた部品に G1・重賞・準OP・OP・芝長・ダ長 のどれかがある）は、
     レース数が少なく件数がたまりにくいので、判定に要る最低件数を下げる:
-      絶対軸 10 → 6 ／ 軸候補 20 → 6 ／ 相手候補 30 → 15 ／ 消し候補 20 → 12 ／ 高回収率基準 30 → 15
+      絶対軸 10 → 6（2026-11-23 に廃止）／ 軸候補 20 → 6 ／ 相手候補 30 → 15 ／ 消し候補 20 → 12 ／ 高回収率基準 30 → 15
 2026-11-14 に変えた規則:
   - 軸候補（高回収率基準ではないほう）の最低件数を 10 → 20 に（AX_CNT。10〜19件の少ない標本で率だけ高い行を軸にしない）。
     絶対軸（10）・希少条件（軸候補 6）・高回収率基準（30）・相手候補（30）・消し候補（20）はそのまま。
@@ -26,6 +27,16 @@
     順位帯・偏差値帯）が下位（6~9位・10位~・6位~・41~50・40以下、指数順位そのものなら 6 以上）なら、騎手や前走の条件が
     強くて率が高くても、この3区分にはしない。消し候補にはこの制限をかけない。結合データが無い・末尾がどの形でもない
     ときは制限しない（上位の形: 1位・2~3位・4~5位・1~3位・1~5位・71以上・66~70・61~65・51~60・指数順位 1〜5）
+2026-11-23 に変えた規則:
+  - 絶対軸は ① または ②（どちらも 複勝回収値 ≥ 100 または 単勝適正回収値 ≥ 100 が要る。指数の上限ゲートは今までどおり）
+      ① 件数 ≥ 10 かつ 連対率 ≥ 80%（今までの条件）
+      ② 件数 ≥ 20 かつ 勝率 ≥ 40% かつ 複勝率 ≥ 80%（新規。ABS2_*）
+    希少条件による絶対軸の件数の緩和（10 → 6）は廃止（希少条件でも ① は 10 件・② は 20 件から）。
+    軸候補（6）・高回収率（15）・相手候補（15）・消し候補（12）の希少条件の下限はそのまま
+  - 消し候補の 2〜10倍未満（odds10u）専用の規則を「複勝率 < 20%」だけから
+      件数 ≥ 20（希少条件 12）かつ 複勝率 < 20% かつ（掲示板率 < 35% または WEDGE < 0.350）
+    に（複勝率は低いが掲示板には来る・市場の期待は超えている条件を消しにしない。WEDGE が無ければ「< 0.350」は満たさない）。
+    全モード共通の規則（複勝率 < 5% かつ 掲示板率 < 10%）はそのまま
 classify（1行）・classify_frame（ベクトル）・sql_condition（SQL）は同じ規則（tests/test_core.py・test_aggstore.py で照合）。
 
 旧版との違い:
@@ -41,11 +52,14 @@ from .indicators import CONDITION_ONLY
 CATEGORIES = ("keshi", "abs", "axis", "opp")
 CATEGORY_LABELS = {"abs": "絶対軸", "axis": "軸候補", "keshi": "消し候補", "opp": "相手候補"}
 
-# --- 絶対軸 ---
-ABS_CNT = 10
+# --- 絶対軸（① または ②。どちらも 複勝回収値 ≥ ABS_FRC または 単勝適正回収値 ≥ ABS_TRA）---
+ABS_CNT = 10               # ① 件数 ≥ 10 かつ 連対率 ≥ 80。希少条件でも同じ件数（2026-11-23 に緩和を廃止）
 ABS_REN = 80.0
 ABS_FRC = 100.0
 ABS_TRA = 100.0
+ABS2_CNT = 20              # ② 件数 ≥ 20 かつ 勝率 ≥ 40 かつ 複勝率 ≥ 80（2026-11-23〜）
+ABS2_WIN = 40.0
+ABS2_FUKU = 80.0
 # --- 軸候補 ---
 AX_CNT = 20                # 2026-11-14〜（それまで 10）。消し候補（KS_CNT）と同じ基準。絶対軸（ABS_CNT）は 10 のまま
 AX_FV_80 = 80.0
@@ -76,9 +90,10 @@ KS_CNT = 20
 KS_PLC_MAX_ANY = 5.0       # 全モード: 複勝率 < 5
 KS_TOP5_MAX_ANY = 10.0     #           かつ 掲示板率 < 10
 KS_PLC_MAX_10U = 20.0      # odds10u（2〜10倍未満）: 複勝率 < 20
-# --- 希少条件（結合データの部品にこのどれかがあれば、最低件数を下の値に下げる）---
+KS_TOP5_MAX_10U = 35.0     #           かつ（掲示板率 < 35
+KS_WEDGE_MAX_10U = 0.35    #                 または WEDGE < 0.350）（2026-11-23〜。WEDGE が無ければこの条件は満たさない）
+# --- 希少条件（結合データの部品にこのどれかがあれば、最低件数を下の値に下げる。絶対軸は下げない）---
 RARE_TOKENS = ("G1", "重賞", "準OP・OP", "芝長", "ダ長")
-RARE_ABS_CNT = 6
 RARE_AX_CNT = 6
 RARE_OP_CNT = 15
 RARE_KS_CNT = 12
@@ -151,7 +166,7 @@ def _num(v):
 
 
 def classify(rec: Mapping, mode: str) -> str | None:
-    """rec: cnt, fv, rv, top5, frc, tra（欠損は None）と key（結合データ。無ければ希少条件ではない）。
+    """rec: cnt, fv, rv, wv, top5, frc, tra, wedge（欠損は None）と key（結合データ。無ければ希少条件ではない）。
     rec["indicator"] が CONDITION_ONLY（条件のみの family の行）なら、指数の上限ゲートを見ない。
     mode: オッズ帯（normal/odds10u/...）。"""
     return _classify(rec, mode, True)
@@ -159,8 +174,8 @@ def classify(rec: Mapping, mode: str) -> str | None:
 
 def low_tail_axis_category(rec: Mapping, mode: str) -> str | None:
     """指数の上限ゲートで外された「条件特化」の行の、もとの区分: 'abs' / 'axis' / None。
-    結合データの末尾が下位（is_low_tail）のために classify() では区分なしになるが、数の基準（件数・連対率・複勝率・
-    掲示板率・回収値。希少条件の下限・高回収率の基準も classify と同じ）は 絶対軸・軸候補 を満たす行。
+    結合データの末尾が下位（is_low_tail）のために classify() では区分なしになるが、数の基準（件数・勝率・連対率・複勝率・
+    掲示板率・回収値。絶対軸の ①・②、希少条件の下限・高回収率の基準も classify と同じ）は 絶対軸・軸候補 を満たす行。
     末尾が下位でない行・消し候補になる行（消しは末尾に関係なく先に決まる）・相手候補の基準までの行は None。"""
     key = rec.get("key")
     if not is_low_tail(key if key is not None else rec.get(KEY_COLUMN), rec.get("indicator")):
@@ -174,26 +189,32 @@ def _classify(rec: Mapping, mode: str, gate: bool) -> str | None:
     cnt = _num(rec.get("cnt"))
     fv = _num(rec.get("fv"))
     rv = _num(rec.get("rv"))
+    wv = _num(rec.get("wv"))
     top5 = _num(rec.get("top5"))
     frc = _num(rec.get("frc"))
     tra = _num(rec.get("tra"))
+    wedge = _num(rec.get("wedge"))
     key = rec.get("key")
     key = key if key is not None else rec.get(KEY_COLUMN)
     rare = is_rare_key(key)
-    ks_cnt, abs_cnt, ax_cnt, op_cnt, hr_cnt = (
-        (RARE_KS_CNT, RARE_ABS_CNT, RARE_AX_CNT, RARE_OP_CNT, RARE_HR_CNT) if rare
-        else (KS_CNT, ABS_CNT, AX_CNT, OP_CNT, HR_CNT))
+    ks_cnt, ax_cnt, op_cnt, hr_cnt = (
+        (RARE_KS_CNT, RARE_AX_CNT, RARE_OP_CNT, RARE_HR_CNT) if rare
+        else (KS_CNT, AX_CNT, OP_CNT, HR_CNT))            # 絶対軸の件数は希少条件でも下げない
 
     keshi = (
         (_ge(cnt, ks_cnt) and _lt(fv, KS_PLC_MAX_ANY) and _lt(top5, KS_TOP5_MAX_ANY))
-        or (mode == "odds10u" and _ge(cnt, ks_cnt) and _lt(fv, KS_PLC_MAX_10U))
+        or (mode == "odds10u" and _ge(cnt, ks_cnt) and _lt(fv, KS_PLC_MAX_10U)
+            and (_lt(top5, KS_TOP5_MAX_10U) or _lt(wedge, KS_WEDGE_MAX_10U)))
     )
     if keshi:
         return "keshi"
     if gate and is_low_tail(key, rec.get("indicator")):   # 指数が下位の条件は、絶対軸・軸候補・相手候補にしない（消しは上で判定済み）
         return None
 
-    if _ge(cnt, abs_cnt) and _ge(rv, ABS_REN) and (_ge(frc, ABS_FRC) or _ge(tra, ABS_TRA)):
+    if (_ge(frc, ABS_FRC) or _ge(tra, ABS_TRA)) and (
+        (_ge(cnt, ABS_CNT) and _ge(rv, ABS_REN))                                        # ①
+        or (_ge(cnt, ABS2_CNT) and _ge(wv, ABS2_WIN) and _ge(fv, ABS2_FUKU))            # ②
+    ):
         return "abs"
 
     if _ge(cnt, ax_cnt) and (
@@ -220,23 +241,38 @@ def _classify(rec: Mapping, mode: str, gate: bool) -> str | None:
 
 def keshi_rule(rec: Mapping, mode: str) -> str | None:
     """消し候補になる理由: 'any' = 全モード共通の規則（複勝率 < 5 かつ 掲示板率 < 10）を満たす ／
-    'fav' = 2〜10倍未満（odds10u）専用の規則（複勝率 < 20）だけで消し候補になっている ／ None = 消し候補ではない。
-    classify() の消し候補の判定と同じ値・同じ件数の下限（希少条件も）で見る。"""
+    'fav' = 2〜10倍未満（odds10u）専用の規則（複勝率 < 20 かつ（掲示板率 < 35 または WEDGE < 0.350））だけで消し候補に
+    なっている ／ None = 消し候補ではない。
+    classify() の消し候補の判定と同じ値（rec の cnt・fv・top5・wedge）・同じ件数の下限（希少条件も）で見る。"""
     cnt, fv, top5 = _num(rec.get("cnt")), _num(rec.get("fv")), _num(rec.get("top5"))
+    wedge = _num(rec.get("wedge"))
     key = rec.get("key")
     ks_cnt = RARE_KS_CNT if is_rare_key(key if key is not None else rec.get(KEY_COLUMN)) else KS_CNT
     if not _ge(cnt, ks_cnt):
         return None
     if _lt(fv, KS_PLC_MAX_ANY) and _lt(top5, KS_TOP5_MAX_ANY):
         return "any"
-    if mode == "odds10u" and _lt(fv, KS_PLC_MAX_10U):
+    if mode == "odds10u" and _lt(fv, KS_PLC_MAX_10U) and (_lt(top5, KS_TOP5_MAX_10U) or _lt(wedge, KS_WEDGE_MAX_10U)):
         return "fav"
     return None
 
 
-# DB の列 → classify の値（cnt, fv, rv, top5, frc, tra）
-FIELD_COLUMNS = {"cnt": "件数", "fv": "複勝率_val", "rv": "連対率_val", "top5": "掲示板率_val",
-                 "frc": "複勝回収値", "tra": "単勝適正回収値"}
+# DB の列 → classify の値（cnt, fv, rv, wv, top5, frc, tra, wedge）
+FIELD_COLUMNS = {"cnt": "件数", "fv": "複勝率_val", "rv": "連対率_val", "wv": "勝率_val", "top5": "掲示板率_val",
+                 "frc": "複勝回収値", "tra": "単勝適正回収値", "wedge": "WEDGE"}
+
+
+def record(row: Mapping, key=None, indicator=None) -> dict:
+    """DB・成績表の1行（列名は FIELD_COLUMNS の値）→ classify・low_tail_axis_category・keshi_rule に渡す rec。
+    key（結合データ）・indicator（指数の名前）を渡さなければ、行の key（無ければ 結合データ）・indicator を使う。
+    呼び出し側で値を1つずつ並べると渡し漏れ（勝率_val・WEDGE など）が起きるので、ここを通す。"""
+    rec = {f: row.get(c) for f, c in FIELD_COLUMNS.items()}
+    if key is None:
+        key = row.get("key")
+        key = key if key is not None else row.get(KEY_COLUMN)
+    rec["key"] = key
+    rec["indicator"] = indicator if indicator is not None else row.get("indicator")
+    return rec
 
 
 def low_tail_axis_frame(df, mode: str):
@@ -291,7 +327,7 @@ def classify_frame(df, mode: str, gate: bool = True):
             return np.full(len(df), np.nan)
         return pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
 
-    cnt, fv, rv, top5, frc, tra = (col(f) for f in ("cnt", "fv", "rv", "top5", "frc", "tra"))
+    cnt, fv, rv, wv, top5, frc, tra, wedge = (col(f) for f in ("cnt", "fv", "rv", "wv", "top5", "frc", "tra", "wedge"))
     key_col = _key_column(df)
     rare = np.zeros(len(df), dtype=bool)
     low = _low_tail_mask(df) if gate else np.zeros(len(df), dtype=bool)   # 指数が下位の条件（is_low_tail と同じ見方）
@@ -303,15 +339,16 @@ def classify_frame(df, mode: str, gate: bool = True):
         for t in RARE_TOKENS:
             rare |= wrapped.str.contains(KEY_SEP + t + KEY_SEP, regex=False).to_numpy(dtype=bool)
     ks_cnt = np.where(rare, RARE_KS_CNT, KS_CNT)
-    abs_cnt = np.where(rare, RARE_ABS_CNT, ABS_CNT)
     ax_cnt = np.where(rare, RARE_AX_CNT, AX_CNT)
     op_cnt = np.where(rare, RARE_OP_CNT, OP_CNT)
     hr_cnt = np.where(rare, RARE_HR_CNT, HR_CNT)
     with np.errstate(invalid="ignore"):                # NaN との比較は False（= 満たさない）
         keshi = (cnt >= ks_cnt) & (fv < KS_PLC_MAX_ANY) & (top5 < KS_TOP5_MAX_ANY)
         if mode == "odds10u":
-            keshi |= (cnt >= ks_cnt) & (fv < KS_PLC_MAX_10U)
-        absolute = (cnt >= abs_cnt) & (rv >= ABS_REN) & ((frc >= ABS_FRC) | (tra >= ABS_TRA))
+            keshi |= (cnt >= ks_cnt) & (fv < KS_PLC_MAX_10U) & ((top5 < KS_TOP5_MAX_10U) | (wedge < KS_WEDGE_MAX_10U))
+        absolute = ((frc >= ABS_FRC) | (tra >= ABS_TRA)) & (
+            ((cnt >= ABS_CNT) & (rv >= ABS_REN))                                         # ①（希少条件でも同じ件数）
+            | ((cnt >= ABS2_CNT) & (wv >= ABS2_WIN) & (fv >= ABS2_FUKU)))                # ②
         axis = (cnt >= ax_cnt) & (((fv >= AX_FV_80) & (top5 >= AX_TOP5_90))
                                   | ((rv >= AX_RV_60) & (top5 >= AX_TOP5_90))
                                   | ((fv >= AX_FV_70) & (top5 >= AX_TOP5_80) & (frc >= AX_FRC_100))
@@ -332,8 +369,8 @@ def classify_frame(df, mode: str, gate: bool = True):
 # ---------------------------------------------------------------------------
 # SQL 版（/ 画面のプリセット用）。classify() と同じ結果になることをテストで確認している。
 # ---------------------------------------------------------------------------
-_COLS = {"cnt": '"件数"', "fv": '"複勝率_val"', "rv": '"連対率_val"', "top5": '"掲示板率_val"',
-         "frc": '"複勝回収値"', "tra": '"単勝適正回収値"'}
+_COLS = {"cnt": '"件数"', "fv": '"複勝率_val"', "rv": '"連対率_val"', "wv": '"勝率_val"', "top5": '"掲示板率_val"',
+         "frc": '"複勝回収値"', "tra": '"単勝適正回収値"', "wedge": '"WEDGE"'}
 
 
 def _c(field: str, op: str, value: float) -> str:
@@ -390,11 +427,14 @@ def _sql_raw(category: str, mode: str, key_col: str = KEY_COLUMN, indicator_col:
         cnt = _cnt(KS_CNT, RARE_KS_CNT, key_col)
         any_mode = _and(_c("fv", "<", KS_PLC_MAX_ANY), _c("top5", "<", KS_TOP5_MAX_ANY), cnt)
         if mode == "odds10u":
-            return _or(any_mode, _and(_c("fv", "<", KS_PLC_MAX_10U), cnt))
+            return _or(any_mode, _and(_c("fv", "<", KS_PLC_MAX_10U),
+                                      _or(_c("top5", "<", KS_TOP5_MAX_10U), _c("wedge", "<", KS_WEDGE_MAX_10U)), cnt))
         return any_mode
-    if category == "abs":
-        return _gate(_and(_c("rv", ">=", ABS_REN), _or(_c("frc", ">=", ABS_FRC), _c("tra", ">=", ABS_TRA)),
-                          _cnt(ABS_CNT, RARE_ABS_CNT, key_col)), key_col, indicator_col)
+    if category == "abs":                                 # 件数は希少条件でも下げない（rare_sql を見ない）
+        return _gate(_and(_or(_c("frc", ">=", ABS_FRC), _c("tra", ">=", ABS_TRA)), _or(
+            _and(_c("rv", ">=", ABS_REN), _c("cnt", ">=", ABS_CNT)),
+            _and(_c("wv", ">=", ABS2_WIN), _c("fv", ">=", ABS2_FUKU), _c("cnt", ">=", ABS2_CNT)),
+        )), key_col, indicator_col)
     if category == "axis":
         base = _and(_or(
             _and(_c("fv", ">=", AX_FV_80), _c("top5", ">=", AX_TOP5_90)),
@@ -423,7 +463,10 @@ def sql_condition(category: str, mode: str, key_col: str = KEY_COLUMN, indicator
     """classify(rec, mode) == category となる行の WHERE 句（判定順の排他も反映）。
     key_col は結合データの列名（unified_all は 結合データ、照合結果 entries_xjoin_* は key）。
     indicator_col は指数の列名（unified_all・照合結果とも indicator）。渡すと、条件のみの family の行（CONDITION_ONLY）には
-    指数の上限ゲートを掛けない（classify の rec["indicator"] と同じ）。条件のみの行がある表では必ず渡す。"""
+    指数の上限ゲートを掛けない（classify の rec["indicator"] と同じ）。条件のみの行がある表では必ず渡す。
+    表には FIELD_COLUMNS の列（件数・複勝率_val・連対率_val・勝率_val・掲示板率_val・複勝回収値・単勝適正回収値・WEDGE）が全部要る:
+    SQLite は、表に無い列名の二重引用符を文字列として読むので、列が無いと比較が黙って真・偽になる（値が NULL なら「満たさない」）。
+    unified_all は matching.unified_status が列を確かめる。"""
     order = list(CATEGORIES)
     before = order[:order.index(category)]
     parts = [_sql_raw(category, mode, key_col, indicator_col)] + [f"NOT {_sql_raw(c, mode, key_col, indicator_col)}"
@@ -449,7 +492,9 @@ def _description_lines(hr: str, rare: str) -> dict[str, list[str]]:
     from .odds import ODDS_LABELS
     return {
         "abs": [f"件数 ≥ {ABS_CNT} かつ 連対率 ≥ {ABS_REN:g}% かつ（複勝回収値 ≥ {ABS_FRC:g} または 単勝適正回収値 ≥ {ABS_TRA:g}）",
-                f"※ 希少条件（結合データに {rare} のどれか）は 件数 ≥ {RARE_ABS_CNT}"],
+                f"件数 ≥ {ABS2_CNT} かつ 勝率 ≥ {ABS2_WIN:g}% かつ 複勝率 ≥ {ABS2_FUKU:g}% "
+                f"かつ（複勝回収値 ≥ {ABS_FRC:g} または 単勝適正回収値 ≥ {ABS_TRA:g}）",
+                f"※ 希少条件（結合データに {rare} のどれか）でも、絶対軸の件数は下げない"],
         "axis": [
             f"件数 ≥ {AX_CNT} かつ 複勝率 ≥ {AX_FV_80:g}% かつ 掲示板率 ≥ {AX_TOP5_90:g}%",
             f"件数 ≥ {AX_CNT} かつ 連対率 ≥ {AX_RV_60:g}% かつ 掲示板率 ≥ {AX_TOP5_90:g}%",
@@ -463,7 +508,8 @@ def _description_lines(hr: str, rare: str) -> dict[str, list[str]]:
         ],
         "keshi": [
             f"（全モード）件数 ≥ {KS_CNT} かつ 複勝率 < {KS_PLC_MAX_ANY:g}% かつ 掲示板率 < {KS_TOP5_MAX_ANY:g}%",
-            f"（{ODDS_LABELS['odds10u']}）件数 ≥ {KS_CNT} かつ 複勝率 < {KS_PLC_MAX_10U:g}%",
+            f"（{ODDS_LABELS['odds10u']}）件数 ≥ {KS_CNT} かつ 複勝率 < {KS_PLC_MAX_10U:g}% "
+            f"かつ（掲示板率 < {KS_TOP5_MAX_10U:g}% または WEDGE < {KS_WEDGE_MAX_10U:.3f}）",
             f"※ 希少条件（結合データに {rare} のどれか）は 件数 ≥ {RARE_KS_CNT}",
         ],
         "opp": [

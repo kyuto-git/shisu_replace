@@ -462,6 +462,24 @@ def test_phase2_db_without_wedge_is_old(base, tmp_path):
         assert unified_status(con) == "old"
 
 
+def test_unified_all_without_a_classify_column_is_old(base, tmp_path):
+    """区分の判定が読む列（勝率_val など）の無い unified_all は「ok」にしない: SQLite は表に無い列名の二重引用符を文字列として
+    読むので、横断検索のプリセット（SQL 版）の「勝率_val ≥ 40」が全部の行で真になってしまう。"""
+    from shisu import classify as C
+    from shisu.matching import REQUIRED_UNIFIED_COLUMNS, unified_status
+    assert set(C.FIELD_COLUMNS.values()) <= set(REQUIRED_UNIFIED_COLUMNS)
+    with sqlite3.connect(base / "racing.db") as con:
+        assert unified_status(con) == "ok"
+    p = tmp_path / "nowin.db"
+    shutil.copy(base / "racing.db", p)
+    with sqlite3.connect(p) as con:
+        n = con.execute("SELECT COUNT(*) FROM unified_all").fetchone()[0]
+        con.execute('ALTER TABLE unified_all DROP COLUMN "勝率_val"')
+        assert unified_status(con) == "old"
+        # 列が無いと、SQL 版の「勝率_val ≥ 40」は NULL でも偽でもなく真になる（だから「ok」にしない）
+        assert con.execute('SELECT COUNT(*) FROM unified_all WHERE IFNULL("勝率_val" >= 40.0, 0)').fetchone()[0] == n > 0
+
+
 def test_build_db_rejects_agg_csv_without_wedge(base, tmp_path, capsys):
     """WEDGE 列の無い旧形式の成績表は取り込まない（WEDGE が全部空の DB を「正常」として作らない）。"""
     import build_db
@@ -1387,8 +1405,8 @@ def test_hits_page_excludes_tradeoff_keshi_and_shows_the_gate_in_the_rules(base,
         race = am._race_rows(con, "entries_merged_hensachi", rid)
     r1, r2 = race[0], race[1]
 
-    def fav_only(h):                                    # 2〜10倍未満専用の規則（複勝率 < 20）だけで消し候補になる成績
-        return {**h, "複勝率_val": 15.0, "掲示板率_val": 50.0}
+    def fav_only(h):                 # 2〜10倍未満専用の規則（複勝率 < 20 かつ（掲示板率 < 35 または WEDGE < 0.350））だけで消し候補になる成績
+        return {**h, "複勝率_val": 15.0, "掲示板率_val": 50.0, "WEDGE": 0.3}
 
     axis = {**_fake_hit(r1, "先行", "odds10_50", 30, "axis"), "複勝回収値": 130.0}
     fake = [axis,
