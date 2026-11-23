@@ -627,7 +627,7 @@ def test_screening_scores_condition_only_candidates_on_the_base_master_only(site
             rows = [dict(x) for x in con.execute("SELECT * FROM unified_all WHERE family = ? AND odds_mode = ?", (fam, mode))]
             cats = [C.classify({"cnt": x["件数"], "fv": x["複勝率_val"], "rv": x["連対率_val"], "top5": x["掲示板率_val"],
                                 "frc": x["複勝回収値"], "tra": x["単勝適正回収値"], "key": x["結合データ"],
-                                "indicator": x["indicator"]}, mode) for x in rows]
+                                "indicator": x["indicator"], "wv": x["勝率_val"], "wedge": x["WEDGE"]}, mode) for x in rows]
             for c in ("abs", "axis", "opp", "keshi"):
                 assert int(r[f"{c}_{mode}"]) == cats.count(c), (name, mode, c)
         assert int(r["groups"]) == con.execute("SELECT COUNT(*) FROM unified_all WHERE family = ? AND odds_mode = 'normal'",

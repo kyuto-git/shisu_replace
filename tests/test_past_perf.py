@@ -732,6 +732,7 @@ def test_replace_precedence_and_switches(site, tmp_path, monkeypatch, capsys):
     # --no-past-perf: 8指数を作らない（履歴は、近5走の条件のために書く）
     assert R.main(["--master-dir", str(out), "--no-past-perf"]) == 0
     assert sorted(p.name for p in out.glob("master_*")) == ["master_全場_タイムM.csv.gz"] and (out / PP.HISTORY_FILE).exists()
+    assert "master は作りません" not in capsys.readouterr().out                      # ext のファイルが無ければ、何も言わない
     # 結果指数のフォルダが空・無い: 作らない
     out2 = tmp_path / "m2"
     assert R.main(["--master-dir", str(out2), "--result-dir", str(tmp_path / "nope")]) == 0
@@ -758,12 +759,19 @@ def test_replace_precedence_and_switches(site, tmp_path, monkeypatch, capsys):
     own_m = pd.read_csv(out3 / "master_全場_過去ST_5走最高.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
     assert set(own_m["指数"]) == {"77", "88"}
     assert len(list(out3.glob("master_全場_過去*.csv.gz"))) == 8
-    # 結果指数が無く ext_indices のファイルだけなら、ほかの外部指数と同じに ext から付ける
-    out4 = tmp_path / "m4"
-    assert R.main(["--csv-dir", str(csv2), "--master-dir", str(out4), "--ext-dir", str(tmp_path / "ext"), "--no-raw-merge",
-                   "--result-dir", str(tmp_path / "nope")]) == 0
-    m4 = pd.read_csv(out4 / "master_全場_過去SP_3走平均.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
-    assert set(m4["指数"]) == {"999"}
+    # ext_indices/past_sp_st のファイル（想定の馬場で出した出馬表用の値）は、過去側ではどの場合も使わない（2026-11-23〜）:
+    # 結果指数が無い・--no-past-perf のときは、8指数の master を作らない（csv_files に置いた同じ名前のファイルは今までどおり）
+    for n, extra, why in ((4, ["--result-dir", str(tmp_path / "nope")], "結果指数（result_indices/）が無い"),
+                          (8, ["--no-past-perf"], "--no-past-perf が指定されている")):
+        out4 = tmp_path / f"m{n}"
+        capsys.readouterr()
+        assert R.main(["--csv-dir", str(csv2), "--master-dir", str(out4), "--ext-dir", str(tmp_path / "ext"), "--no-raw-merge",
+                       *extra]) == 0
+        log = capsys.readouterr().out
+        assert f"[WARN] 過去SP_3走平均: {why}ので、過去SP・ST の8指数の master は作りません" in log
+        assert "過去側では使いません" in log
+        assert sorted(p.name for p in out4.glob("master_全場_過去*")) == ["master_全場_過去ST_5走最高.csv.gz"]   # csv_files の分だけ
+        assert (out4 / "master_全場_タイムM.csv.gz").exists()
     # 同じプロセスで、結果指数を足してもう一度回すと、新しい値の master になる（前の実行の計算を使い回さない）
     res2 = tmp_path / "res2"
     res2.mkdir()
@@ -788,6 +796,12 @@ def test_replace_precedence_and_switches(site, tmp_path, monkeypatch, capsys):
     log = capsys.readouterr().out
     assert "[ERROR] 過去SP・ST の履歴: " in log and "過去SP・ST の8指数は作りません" in log
     assert [p.name for p in out7.glob("master_*")] == ["master_東京_対戦M.csv.gz"]
+    # そのとき ext_indices/past_sp_st にファイルがあっても、想定の馬場の値で master を作らない（結果指数はある）
+    out9 = tmp_path / "m9"
+    assert R.main(["--csv-dir", str(csv3), "--master-dir", str(out9), "--no-raw-merge", "--ext-dir", str(tmp_path / "ext")]) == 1
+    log = capsys.readouterr().out
+    assert "[WARN] 過去SP_3走平均: 過去走の履歴を作れなかったので、過去SP・ST の8指数の master は作りません" in log
+    assert [p.name for p in out9.glob("master_*")] == ["master_東京_対戦M.csv.gz"]
     # 並列でも同じ master
     out5 = tmp_path / "m5"
     assert R.main(["--master-dir", str(out5), "--workers", "2"]) == 0

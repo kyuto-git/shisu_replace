@@ -426,10 +426,11 @@ def test_ranking_preset_matches_classify(base, monkeypatch):
                                      {"min_cnt": None, "min_wedge": None, "min_adj": None}, "件数", "DESC")
                 every = [dict(r) for r in con.execute(
                     'SELECT "テーブル名", "結合データ", "件数", "複勝率_val", "連対率_val", "掲示板率_val", '
-                    '"複勝回収値", "単勝適正回収値", odds_mode FROM unified_all')]
+                    '"複勝回収値", "単勝適正回収値", "勝率_val", "WEDGE", odds_mode FROM unified_all')]
                 want = {(r["テーブル名"], r["結合データ"]) for r in every if classify(
                     {"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
-                     "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"]},
+                     "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"],
+                     "wv": r["勝率_val"], "wedge": r["WEDGE"]},
                     r["odds_mode"]) == preset}
                 assert {(r["テーブル名"], r["結合データ"]) for r in got} == want, preset
     finally:
@@ -701,7 +702,8 @@ def _fake_hit(race_row, base, mode, cnt, cat, family="normal", key="東京×ダ�
               "複勝率_val": stats[1], "掲示板率_val": stats[2], "複勝回収値": stats[3], "単勝適正回収値": 50.0,
               "勝率": "", "連対率": "", "複勝率": "", "WEDGE": 0.9, "adjusted_WEDGE": 0.8})
     from shisu.classify import classify               # 作った行が、頼んだ区分になっていること（基準を変えたら件数を直す）
-    assert classify({"cnt": cnt, "rv": stats[0], "fv": stats[1], "top5": stats[2], "frc": stats[3], "tra": 50.0, "key": key}, mode) == cat, (cat, cnt, mode)
+    assert classify({"cnt": cnt, "rv": stats[0], "fv": stats[1], "top5": stats[2], "frc": stats[3], "tra": 50.0, "key": key,
+                     "wv": h["勝率_val"], "wedge": h["WEDGE"]}, mode) == cat, (cat, cnt, mode)
     return h
 
 
@@ -1057,13 +1059,14 @@ def test_low_index_rows_in_the_db_are_never_axis_and_sql_presets_agree(base):
             py = {}
             for r in part:
                 py[r["rid"]] = C.classify({"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
-                                           "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"]}, mode)
+                                           "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"],
+                                           "wv": r["勝率_val"], "wedge": r["WEDGE"]}, mode)
                 if C.is_low_tail(r["結合データ"]):
                     assert py[r["rid"]] in (None, "keshi")
                     # 同じ成績で末尾だけ上位の形にすると（ほかの部品＝希少条件かどうかは同じ）、軸・相手になる行がある
                     upper = C.classify({"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
-                                        "frc": r["複勝回収値"], "tra": r["単勝適正回収値"],
-                                        "key": r["結合データ"].rsplit("×", 1)[0] + "×1位"}, mode)
+                                        "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "wv": r["勝率_val"],
+                                        "wedge": r["WEDGE"], "key": r["結合データ"].rsplit("×", 1)[0] + "×1位"}, mode)
                     n_gated += upper in C.TAIL_GATED
                     assert py[r["rid"]] == ("keshi" if upper == "keshi" else None)
             for cat in C.CATEGORIES:
@@ -1519,3 +1522,88 @@ def test_hits_page_lists_condition_special_hits_below_the_four_tables(base, monk
     assert f"{title}：0 行（指数クロスの該当馬だけ）" in only and '<td colspan="27">該当なし</td>' in only
     assert "回収値100未満の 1 行を除いています（まとめる前の行数・全馬の合計）" in only.split('class="card cat-special"', 1)[1]
 
+
+# ---------------------------------------------------------------- 2026-11-23: 絶対軸の条件②・2〜10倍未満の消し（勝率_val・WEDGE を読む）
+def test_pages_classify_db_rows_with_their_win_rate_and_wedge(base, monkeypatch, tmp_path):
+    """DB の行の 勝率_val・WEDGE が、どの画面の区分にも届く: 照合結果を読む経路・その場照合・WEDGE 一覧の CSV の「区分」列・
+    逆引きの区分・横断検索のプリセット（SQL）。合成データには 勝率_val・WEDGE で区分が変わる行が無いので、DB の写しの3行を
+    その値に書き換えて確かめる（① 絶対軸の条件②だけで絶対軸 ② WEDGE < 0.350 で消し ③ 同じ成績で WEDGE 0.5 → 区分なし）。"""
+    import csv as _csv
+    import io
+    from shisu import classify as C
+    from shisu import matching
+    monkeypatch.setenv("NOTES_PATH", str(tmp_path / "notes.json"))
+    p = tmp_path / "eng.db"
+    shutil.copy(base / "racing.db", p)
+    am = _app(base, monkeypatch, db_path=p)
+    rid, t, xj = _race_id(base), "entries_merged_hensachi", "entries_xjoin_merged_hensachi"
+    ident = lambda h: (h["テーブル名"], h["key"])
+    with am.connect() as con:
+        race = am._race_rows(con, t, rid)
+        hits, path = am.collect_hits(con, t, race)
+        assert path == "xjoin" and all("勝率_val" in h and "WEDGE" in h for h in hits)
+        top = [h for h in hits if not C.is_low_tail(h["key"]) and not C.is_rare_key(h["key"])]
+        two = next(h for h in top if h["odds_mode"] == "normal")
+        fav = [h for h in top if h["odds_mode"] == "odds10u" and ident(h) != ident(two)]
+        by_wedge = fav[0]
+        not_keshi = next(h for h in fav if ident(h) != ident(by_wedge))
+        plans = [(two, "abs", {"件数": 22, "勝率_val": 45.0, "連対率_val": 55.0, "複勝率_val": 82.0, "掲示板率_val": 70.0,
+                               "複勝回収値": 90.0, "単勝適正回収値": 110.0, "WEDGE": 0.9}),
+                 (by_wedge, "keshi", {"件数": 25, "勝率_val": 3.0, "連対率_val": 8.0, "複勝率_val": 15.0, "掲示板率_val": 50.0,
+                                      "複勝回収値": 60.0, "単勝適正回収値": 60.0, "WEDGE": 0.30}),
+                 (not_keshi, None, {"件数": 25, "勝率_val": 3.0, "連対率_val": 8.0, "複勝率_val": 15.0, "掲示板率_val": 50.0,
+                                    "複勝回収値": 60.0, "単勝適正回収値": 60.0, "WEDGE": 0.50})]
+        for h, _cat, vals in plans:
+            sets = ", ".join(f'"{c}" = ?' for c in vals)
+            n1 = con.execute(f'UPDATE unified_all SET {sets} WHERE "テーブル名" = ? AND "結合データ" = ?',
+                             [*vals.values(), h["テーブル名"], h["key"]]).rowcount
+            n2 = con.execute(f'UPDATE "{xj}" SET {sets} WHERE "テーブル名" = ? AND key = ?',
+                             [*vals.values(), h["テーブル名"], h["key"]]).rowcount
+            assert n1 == 1 and n2 >= 1
+        con.commit()
+    want = {ident(h): cat for h, cat, _v in plans}
+    # 値を1つ落とすと区分が変わる行であること（勝率_val・WEDGE が届いていなければ、下の確認は落ちる）
+    assert C.classify({**C.record(plans[0][2], key=two["key"]), "wv": None}, "normal") is None
+    assert C.classify({**C.record(plans[1][2], key=by_wedge["key"]), "wedge": None}, "odds10u") is None
+    c = am.app.test_client()
+    with am.connect() as con:
+        race = am._race_rows(con, t, rid)
+        # (1) 照合結果（xjoin）を読む経路と、その場照合
+        hits, path = am.collect_hits(con, t, race)
+        got = {ident(h): am.hit_category(h) for h in hits if ident(h) in want}
+        assert path == "xjoin" and got == want
+        fly = [h for r in race for h in matching.match_entry_row(con, r, matching.match_bases(r.keys()), t)]
+        got = {ident(h): am.hit_category(h) for h in fly if ident(h) in want}
+        assert got == want
+        assert am.keshi_rule_of(next(h for h in hits if ident(h) == ident(by_wedge))) == "fav"
+        assert am.keshi_rule_of(next(h for h in hits if ident(h) == ident(not_keshi))) is None
+        # (2) 横断検索のプリセット（SQL）
+        for preset in ("abs", "keshi"):               # 画面と同じ SQL（上位500行で切らずに、全部の行で）
+            cond = " OR ".join(f"(odds_mode = '{m}' AND {C.sql_condition(preset, m, indicator_col='indicator')})"
+                               for m in am.ODDS_MODES)
+            inside = {tuple(r) for r in con.execute(f'SELECT "テーブル名", "結合データ" FROM unified_all WHERE {cond}')}
+            assert {k for k, cat in want.items() if cat == preset} <= inside
+            assert not ({k for k, cat in want.items() if cat != preset} & inside)
+            rows = am._rank_query(con, [], [], "all", "", ("", "", "", ""), preset,
+                                  {"min_cnt": None, "min_wedge": None, "min_adj": None}, "件数", "DESC")
+            assert {(r["テーブル名"], r["結合データ"]) for r in rows} <= inside
+    # (3) WEDGE 一覧の CSV の「区分」列
+    r = c.get("/entries/wedge.csv", query_string={"table": t, "rid": rid, "odds_mode": "all"})
+    rows = list(_csv.DictReader(io.StringIO(r.data.decode("utf-8-sig"))))
+    labels = {None: "", "abs": "絶対軸", "keshi": "消し候補"}
+    seen = {(x["テーブル名"], x["key"]): x["区分"] for x in rows if (x["テーブル名"], x["key"]) in want}
+    assert seen == {k: labels[cat] for k, cat in want.items()}
+    # (4) 逆引きのページの区分（DB の成績表の行）
+    for h, cat, _v in plans:
+        q = {"key": h["key"], "family": h["family"], "indicator": h["indicator"], "odds_mode": h["odds_mode"],
+             "rank_scheme": h["rank_scheme"] or "", "region": h["region"] or ""}
+        page = c.get("/entries/drill", query_string=q).get_data(as_text=True)
+        assert "成績表（DB）: 件数 " in page
+        assert (f"区分 <b>{labels[cat]}</b>" in page) if cat else ("区分 <b>" not in page), (cat, h["key"])
+    # (5) 条件ヒット馬の4区分（絶対軸・消し候補の表に入り、区分なしの行はどの表にも入らない）
+    with am.connect() as con:
+        hits, _path = am.collect_hits(con, t, am._race_rows(con, t, rid))
+    b = am.classify_hits(hits, {})
+    where = {k: [cat for cat, rows in b.items() if any(ident(h) == k for h in rows)] for k in want}
+    assert where == {ident(two): ["abs"], ident(by_wedge): ["keshi"], ident(not_keshi): []}
+    assert c.get("/entries/hits", query_string={"table": t, "rid": rid}).status_code == 200

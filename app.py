@@ -1167,7 +1167,7 @@ def classify_hits(hits: list[dict], info: dict | None = None, cut_low: bool = Fa
 
 HITS_BODY = """
 <div class="card"><h1>{{ head }}</h1><div class="muted">{{ sub }}</div>
-<div class="muted">照合: {{ path }} ／ 率は DB の推定値（複勝率・連対率）と頻度（掲示板率）
+<div class="muted">照合: {{ path }} ／ 率は DB の推定値（勝率・連対率・複勝率）と頻度（掲示板率）
 {% if dropped %} ／ オッズ帯別の行と同じ区分・件数の差{{ diff }}件以内の「通常」の行 {{ dropped }} 行は、重なるので省いています{% endif %}</div>
 {% if cut_low %}<div class="warn" style="margin-top:4px">過剰人気カット中: 2〜10倍未満の軸候補・相手候補のうち、複勝回収値も単勝適正回収値も {{ cut_min }} 未満の行を除いています（軸候補 {{ cut.axis }} 行・相手候補 {{ cut.opp }} 行。下の表・該当数・指数クロスはすべて除いたあとの数）。
 <a href="{{ cut_toggle }}">カットせずに全部表示する</a></div>{% endif %}

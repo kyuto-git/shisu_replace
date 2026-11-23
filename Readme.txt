@@ -189,6 +189,8 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python replace_csv_ver3.py 
       このため、週末の想定馬場（calc_entry_hensachi.py の --baba-turf／--baba-dirt・/ingest の画面で選んだ値）とのズレが
       解消されます。週末に想定の馬場で出したもの（ext_indices/past_sp_st/ のファイル・past_perf_settings.json・
       entries_out/past_perf_baba.json）は、この計算には一切使いません（置いたままで構いません）。
+      ※ result_indices/ に結果指数が無い場所や --no-past-perf を付けたときは、過去SP・ST の8指数の master を作りません
+        （ext_indices/past_sp_st/ のファイルから作ることもしません。「…8指数の master は作りません」と警告が出ます）。
   ・race_marks/ に外部レース印CSVがあれば、前走条件（前走メンバーLv・前走タイムLv・前走クッション帯・前走含水率帯）を付け、
     前走R印3 の空欄をペース判定で補います（→ 2章H）。近5走の条件（近5走同条件・近5走同場）は、基本CSVから自動で付きます（→ 2章I）。
   ・result_indices/ に結果指数があれば、SP・ST の3着内基準値（shisu/data/index_baseline_SP.csv・index_baseline_ST.csv）を
@@ -306,7 +308,8 @@ docker run --rm -v "$(pwd)":/app csv_processor_shisu python build_db.py --fresh
        ・過去側（年1回のフルリビルド）: result_indices/ に置いて replace_csv_ver3.py（1章A の Step 1）を回すと、
          8指数の master（master_全場_過去SP_3走平均.csv.gz など）と、馬ごとの履歴 master_csv/__horse_perf_history__.csv.gz ができます。
          あとは Step 2 以降をいつもどおり（ほかの外部指数と同じに集計・照合されます）。計算しないときは --no-past-perf
-         （ext_indices/past_sp_st/ に /ingest の出力があれば、ほかの外部指数と同じにそこから付きます）。
+         （8指数の master を作りません。ext_indices/past_sp_st/ の /ingest の出力は、想定の馬場で出した出馬表用の値なので、
+         過去側では使いません。2026-11-23〜）。
          ★ 過去側の今走の馬場状態は、基本CSVの「馬場状態」の列（確定した実際の馬場）だけを使います。フルリビルド時は、
            確定の馬場状態から過去SP・STを再計算し直すため、週末の想定馬場とのズレが解消されます
            （週末は想定「良」で計算したが実際は「重」だった、というレースも、replace を回せば確定の「重」で数え直した値になります。

@@ -33,7 +33,7 @@ def run(base: pd.DataFrame, out_dir: Path, log: Logger = default_log, baba_turf:
                            "（entries_in/ に置く形）をベースCSVに選んでください")
     if not (t["芝・ダ"] != "").any() or not t["距離"].notna().any():
         log(f"[WARN] {LABEL}: ベースCSVに 芝ダ・距離 の列が無い（空）ので、条件での絞り込みができません"
-            "（古馬戦でも600日以内の全走を使います）")
+            "（その条件を使う段階を飛ばします。芝ダ・距離の両方が無ければ、どのレースも600日以内の全部の走を使います）")
     # 列の注意書きはファイルごと（縦につないだ表の列は全部のファイルの和なので、1本だけ列が無くても分かるように）
     groups = base.groupby(SOURCE_FILE, sort=False) if SOURCE_FILE in base.columns else [("ベースCSV", base)]
     for src, g in groups:

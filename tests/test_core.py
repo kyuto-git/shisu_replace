@@ -504,6 +504,9 @@ def test_record_passes_every_field_the_rules_read():
                    "key": "a×1位", "indicator": "SAV"}
     assert C.classify(rec, "normal") == "abs"                                       # 勝率_val が渡っていなければ None
     assert C.record({**row, "key": "b×6位~"})["key"] == "b×6位~" and C.record(row, key="c×1")["key"] == "c×1"
+    assert C.record({**row, "key": "b×6位~"}, key="c×1")["key"] == "c×1"            # 渡した key が、行の key・結合データ より先
+    assert C.record({**row, "indicator": "SAV"}, indicator="条件のみ")["indicator"] == "条件のみ"
+    assert C.record({**row, "indicator": "条件のみ"}, indicator="")["indicator"] == ""   # 渡した値が空でも、行の値に戻さない
     assert C.record(row, indicator="条件のみ")["indicator"] == "条件のみ" and C.record({})["key"] is None
     ks = {"件数": 30, "複勝率_val": 15.0, "掲示板率_val": 60.0, "WEDGE": 0.2}
     assert C.classify(C.record(ks), "odds10u") == "keshi" == C.classify(C.record({**ks, "WEDGE": None, "掲示板率_val": 30.0}), "odds10u")

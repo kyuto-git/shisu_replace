@@ -495,8 +495,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-ext", action="store_true", help="ext_indices を使わない")
     ap.add_argument("--result-dir", default=str(config.result_indices_dir()),
                     help="結果指数（SP指数・ST指数）のフォルダ（既定 result_indices）。あれば 過去SP・ST の8指数を計算する")
-    ap.add_argument("--no-past-perf", action="store_true", help="過去SP・ST の8指数を結果指数から計算しない（ext_indices/past_sp_st にファイルがあれば、ほかの外部指数と"
-                         "同じにそこから付く）")
+    ap.add_argument("--no-past-perf", action="store_true", help="過去SP・ST の8指数の master を作らない（ext_indices/past_sp_st のファイルは、想定の馬場で出した"
+                         "出馬表用の値なので、過去側では使わない）")
     ap.add_argument("--marks-dir", default=str(config.race_marks_dir()),
                     help="TARGET の外部レース印（メンバーレベル・タイムレベル・ペース判定・クッション値・含水率）のフォルダ"
                          "（既定 race_marks）。あれば前走条件（前走メンバーLv など）にして、master_csv/__race_marks__.csv.gz にも書く")
@@ -636,15 +636,22 @@ def main(argv=None) -> int:
             baselines.save_meta(args.master_dir, {"past_perf": False, "error": True})
         except OSError:
             (Path(args.master_dir) / baselines.MASTER_META).unlink(missing_ok=True)
+    # 過去SP・ST の8指数は、過去側では「基本CSVの確定した 馬場状態 ＋ 結果指数（result_indices/）」から計算した値だけを使う。
+    # ext_indices/past_sp_st/ のファイル（/ingest が出馬表用に、想定の馬場で出した値）は、どの場合も master にしない
+    # （結果指数が無い・履歴を作れなかった・--no-past-perf のときも。そのときは8指数の master を作らない）
+    past_ext = [ind for ind in PP.INDICATORS if any(i == ind for _b, i in pairs)]
+    pairs = [(b, ind) for b, ind in pairs if ind not in PP.INDICATORS]
     if history is not None and history.has_results and not args.no_past_perf:
         perf_pairs, perf_notes = plan_perf_jobs(files, list(PP.INDICATORS))
         for n in perf_notes:
             print(n)
-        computed = {ind for _b, ind in perf_pairs}
-        dropped = sorted({ind for _b, ind in pairs if ind in computed})
-        if dropped:
-            print(f"[INFO] {'・'.join(dropped)}: 過去走の結果指数から計算した値を使います（ext_indices のファイルは使いません）")
-        pairs = [(b, ind) for b, ind in pairs if ind not in computed]
+        if past_ext:
+            print(f"[INFO] {'・'.join(past_ext)}: 過去走の結果指数から計算した値を使います（ext_indices のファイルは使いません）")
+    elif past_ext:
+        why = ("--no-past-perf が指定されている" if args.no_past_perf else
+               "過去走の履歴を作れなかった" if history is None else "結果指数（result_indices/）が無い")
+        print(f"[WARN] {'・'.join(past_ext)}: {why}ので、過去SP・ST の8指数の master は作りません"
+              "（ext_indices/past_sp_st のファイルは、想定の馬場で出した出馬表用の値なので、過去側では使いません）")
     del history
     gc.collect()                        # 履歴（馬ごとの走）を、並列の子プロセスを作る前に手放す
 
