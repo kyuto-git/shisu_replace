@@ -1544,9 +1544,9 @@ def test_pages_classify_db_rows_with_their_win_rate_and_wedge(base, monkeypatch,
         assert path == "xjoin" and all("勝率_val" in h and "WEDGE" in h for h in hits)
         top = [h for h in hits if not C.is_low_tail(h["key"]) and not C.is_rare_key(h["key"])]
         two = next(h for h in top if h["odds_mode"] == "normal")
-        fav = [h for h in top if h["odds_mode"] == "odds10u" and ident(h) != ident(two)]
-        by_wedge = fav[0]
-        not_keshi = next(h for h in fav if ident(h) != ident(by_wedge))
+        fav = [h for h in top if h["odds_mode"] == "odds10u" and h["key"] != two["key"]]
+        by_wedge = fav[0]                             # 3行は結合データも別（ページに出る・出ないを結合データで見るため）
+        not_keshi = next(h for h in fav if h["key"] != by_wedge["key"])
         plans = [(two, "abs", {"件数": 22, "勝率_val": 45.0, "連対率_val": 55.0, "複勝率_val": 82.0, "掲示板率_val": 70.0,
                                "複勝回収値": 90.0, "単勝適正回収値": 110.0, "WEDGE": 0.9}),
                  (by_wedge, "keshi", {"件数": 25, "勝率_val": 3.0, "連対率_val": 8.0, "複勝率_val": 15.0, "掲示板率_val": 50.0,
@@ -1587,6 +1587,27 @@ def test_pages_classify_db_rows_with_their_win_rate_and_wedge(base, monkeypatch,
             rows = am._rank_query(con, [], [], "all", "", ("", "", "", ""), preset,
                                   {"min_cnt": None, "min_wedge": None, "min_adj": None}, "件数", "DESC")
             assert {(r["テーブル名"], r["結合データ"]) for r in rows} <= inside
+        # 画面の2つの呼び出し口（まとめて = _rank_query・集計表ごと）が、その行のオッズ帯の規則で判定している
+        # （2〜10倍未満専用の消しを「通常」の規則で見ると、WEDGE で消しになる行が出ない）
+        none = {"min_cnt": None, "min_wedge": None, "min_adj": None}
+        def ranked(h, preset, mode):                  # その行の family・指数に絞る（上位500行で切られないように）
+            rows = am._rank_query(con, [h["family"]], [h["indicator"]], mode, "", ("", "", "", ""), preset, none,
+                                  "件数", "DESC")
+            assert len(rows) < 500
+            return ident(h) in {(r["テーブル名"], r["結合データ"]) for r in rows}
+        assert ranked(by_wedge, "keshi", "odds10u") and ranked(by_wedge, "keshi", "all")
+        assert not ranked(not_keshi, "keshi", "odds10u") and not ranked(not_keshi, "keshi", "all")
+        assert ranked(two, "abs", "normal") and ranked(two, "abs", "all")
+        assert not ranked(by_wedge, "keshi", "normal") and not ranked(two, "abs", "odds10u")
+    for view in ("tables", "rank"):
+        q = {"submitted": "1", "view": view, "preset": "keshi", "odds_mode": "odds10u"}
+        page = c.get("/", query_string={**q, "family": by_wedge["family"], "ind": by_wedge["indicator"]}).get_data(as_text=True)
+        assert by_wedge["key"] in page, view
+        page = c.get("/", query_string={**q, "family": not_keshi["family"], "ind": not_keshi["indicator"]}).get_data(as_text=True)
+        assert not_keshi["key"] not in page, view
+        page = c.get("/", query_string={"submitted": "1", "view": view, "preset": "abs", "odds_mode": "normal",
+                                        "family": two["family"], "ind": two["indicator"]}).get_data(as_text=True)
+        assert two["key"] in page, view
     # (3) WEDGE 一覧の CSV の「区分」列
     r = c.get("/entries/wedge.csv", query_string={"table": t, "rid": rid, "odds_mode": "all"})
     rows = list(_csv.DictReader(io.StringIO(r.data.decode("utf-8-sig"))))

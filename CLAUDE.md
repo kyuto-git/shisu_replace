@@ -1131,7 +1131,8 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
   - `tests/test_views.py`: `test_hit_category_reads_the_win_rate_and_wedge_of_the_row`（画面の区分が 勝率_val・WEDGE を渡す: ② の絶対軸・条件特化ヒット・odds10u の消しと `keshi_rule_of` の 'fav'・WEDGE なし・消しでなくなった行が絶対軸に進む）、希少条件の 6〜9件は絶対軸でなく軸候補、負の相関の除外が WEDGE のほうで消しになる行（`FAV_WEDGE`）にも効くこと、条件特化ヒットの ②・WEDGE 0.350 以上で消しでなくなった行
   - `tests/test_pipeline.py`・`tests/test_condition_only.py`: 勝率_val の列が無い unified_all は `old`（列が無いと SQL の比較が全部の行で真になることも確かめる）、負の相関のページのテストの消しを新しい規則の値に、条件のみの行の SQL・1行版・ベクトル版の照合に 勝率_val・WEDGE（旧規則なら消しだった行が、SQL でも1行版でも消しでないこと）
   - `tests/test_past_perf.py`: 古馬戦の段階（①で3走そろえば止める・2走以下なら ②→③→④→⑤ と緩める・⑤ は1〜2走でも計算・2走の段階では止めない・今走の馬場／芝ダ／距離が分からないとき・過去走の距離／馬場が分からない走）、2歳戦・3歳限定戦の段階（1走でもあれば止める・全走にしない・①〜⑤ それぞれ・段階の番号 11〜15）、`STAGE_LABELS`・`stage_text`（規則の文つき）、`compute` の例（古馬戦の11行の値と段階の数・想定の馬場の指定・限定戦と古馬戦で同じ走から違う値）、別に書いた計算（oracle）も新しい決め方に（8指数 × 想定3通りで全件一致・どの段階も出ている）、**`test_full_rebuild_recomputes_from_the_confirmed_going`**（週末に想定「不」で calc した値・その値を置いた ext_indices/past_sp_st/・past_perf_settings.json・entries_out/past_perf_baba.json がある場所で、確定の 馬場状態 の入った基本CSVを raw_csv/ に足して replace → 8本の master が確定の馬場状態での oracle と全行一致・ext の値は1つも入らない・想定と違っていた馬が確定の値になる・設定ファイルは書き換えない・想定のファイルを全部消して／別の想定を置いて回しても同じバイト列）、想定の馬場が3歳限定のレースにも効くこと、芝ダ・距離の無いベースCSVは全走
-- 件数: 693件（pandas 2.3.3・pandas 3.0.5・Docker（Python 3.11.18）で全件パス。2026-11-23）
+  - 検証のあとに足した分: `tests/test_pipeline.py::test_pages_classify_db_rows_with_their_win_rate_and_wedge`（合成データには 勝率_val・WEDGE で区分が変わる行が無いので、DB の写しの3行を「② だけで絶対軸」「WEDGE < 0.350 で消し」「同じ成績で WEDGE 0.5 → 区分なし」に書き換え、照合結果を読む経路・その場照合・`keshi_rule_of`・横断検索のプリセットの SQL・WEDGE 一覧の CSV の「区分」列・逆引きの区分・条件ヒット馬の4区分がその値で判定されること）、`tests/test_screen_families.py`（採点が `classify` に渡した rec を全部つかまえ、8つの値がそろっていること・勝率_val と WEDGE が本番の DB の同じ行の値（勝率は頻度でなく推定値）と同じこと。基準B の照合の側も8つの値で）、`tests/test_core.py`（`record()` に渡した key・indicator が行の値より先。空の indicator も）、`tests/test_past_perf.py`（結果指数が無い・`--no-past-perf`・履歴を作れなかったときに、ext_indices/past_sp_st のファイルがあっても8指数の master を作らず WARN を出すこと。csv_files の同じ名前のファイルは今までどおり）
+- 件数: 694件（pandas 2.3.3・pandas 3.0.5・Docker（Python 3.11.18）で全件パス。2026-11-23）
 
 ---
 
@@ -1210,7 +1211,7 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 71. **過去SP・ST の対象の走の変更と、作ってある master**（2026-11-23〜）: 8指数の値が変わる（古馬戦は条件の合う1〜2走だけの平均・最高をやめ、3走そろう段階まで緩める／2歳・3歳限定戦は全走をやめ、条件の合う走が1走でもあればその段階）。replace をやり直すまで、master・成績表（過去SP・ST の順位帯・`過去SP今走基準比`・`過去SP3走順` など）は前の決め方の値のまま、出馬表側（calc_entry_hensachi・/ingest）は新しい決め方になる → 同じ馬でも両側の値がずれる。そろえるには replace → aggregate → build_db --mode both。履歴（`__horse_perf_history__`）の形は変えていない（作り直しは要らない）。基準値マスタ（3着内基準値）は対象の走の決め方に依らない
 72. **古馬戦で条件の合う走が2走までの馬**: ①〜④ のどれも3走に届かなければ ⑤（600日以内の全部の走）になり、芝・ダや距離の違う走も平均・最高に入る（「条件の合う2走」より「全部の3走以上」を採る割り切り。ログの「⑤600日以内の全走」の頭数で見える）。⑤ の馬は 3走平均と5走平均が同じ走になりやすい
 73. **フルリビルドで週末の想定とのズレが消えるのは、基本CSVに確定の `馬場状態` があるとき**: 基本CSVに `馬場状態` の列が無い・空のレースは、過去側は段階②から（①を飛ばす）で数える。出馬表側を想定つきで計算していれば、そのレースは replace のあとも両側がずれる（45 と同じ）。raw_csv/ に足す基本CSVには `馬場状態` を入れて出す
-74. **過去側は `ext_indices/past_sp_st/` を読まない**（2026-11-23〜）: 結果指数（result_indices/）が無い場所・`--no-past-perf` の replace は、過去SP・ST の8指数の master を作らない（前は ext のファイルから作っていた）。その場所で8指数の成績表が要るなら、result_indices/ を置く（または、前に作った履歴 `master_csv/__horse_perf_history__.csv.gz` を残したまま `--clean` なしで回す: 履歴の結果指数の値を引き継いで計算する）。TARGET から8指数を読み込んで出した従来の形のファイル `csv_files/{地域}_過去SP_3走平均.csv` などを置けば、今までどおりそちらを使う（そのファイルの値が想定の馬場のものでないかは、置く人が確かめる）
+74. **過去側は `ext_indices/past_sp_st/` を読まない**（2026-11-23〜）: 結果指数（result_indices/）が無い場所・`--no-past-perf` の replace は、過去SP・ST の8指数の master を作らない（前は ext のファイルから作っていた）。その場所で8指数の成績表が要るなら、result_indices/ を置く（replace は履歴を必ず元から作り直すので、前に作った履歴の結果指数の値は引き継がない: 結果指数なしの履歴になる。引き継ぐのは calc_entry_hensachi・build_db だけ。§3.11）。`--clean` なしで回すと、前の実行で作った8指数の master は master_csv に残る（今回は作り直されていない。ほかの master は 今走基準比・3走順 が空で作り直されるので、前の状態と混ざる。フルリビルドは `--clean` で回す）。TARGET から8指数を読み込んで出した従来の形のファイル `csv_files/{地域}_過去SP_3走平均.csv` などを置けば、今までどおりそちらを使う（そのファイルの値が想定の馬場のものでないかは、置く人が確かめる）
 
 ---
 
@@ -1233,7 +1234,12 @@ aggregate が master を過去レースの**確定単勝オッズ**で絞って�
 - shisu/classify.py: 入力に `wv`（勝率_val）・`wedge`（WEDGE）、`record()`（行 → rec）。絶対軸 = ① OR ②（`ABS2_CNT` 20・`ABS2_WIN` 40・`ABS2_FUKU` 80）・`RARE_ABS_CNT` を廃止。odds10u 専用の消しに `KS_TOP5_MAX_10U` 35・`KS_WEDGE_MAX_10U` 0.35。1行版・ベクトル版・SQL 版・`keshi_rule`・`low_tail_axis_*`・説明の文
 - app.py（`_hit_rec`・`keshi_rule_of` が `classify.record` を通す）・shisu/aggstore.py（コンパクト化の判定に 勝率の推定値と WEDGE）・screen_families.py（基準B の判定に2つの値）・shisu/matching.py（`REQUIRED_UNIFIED_COLUMNS` に区分の判定が読む列）
 - 影響: 区分は app の再起動で今の DB に効く。`rule_settings()` が変わるので、コンパクト化した成績表は次の `aggregate --resume` で全部作り直し（§9 の69）。過去SP・ST の値が変わるので、成績表に効かせるには replace から（§9 の71）
-- テスト: test_core・test_aggstore・test_views・test_past_perf を更新・追加。693件
+- 検証（区分の規則・呼び出し側（画面／コンパクト化／採点）・過去SP・ST の3領域を、指摘役が別に書いた計算との突き合わせ・変異試験・再現つきで確認し、反証役が今の作業ツリーで再確認。途中で利用上限に当たり、反証役2本はやり直した）の指摘を反映:
+  - 区分の規則: 製品コードの欠陥の指摘は無し（別に書いた判定と 1行版・ベクトル版・SQL 版を 20万行 × 4オッズ帯 × 2回で突き合わせて不一致0。前の版との区分の違いは、絶対軸②・希少条件の絶対軸の緩和廃止・odds10u の消しの3つで全部説明できる）。文書の誤り（「WEDGE は分類に使っていない」の残り・SQL 版の「数でない値」の扱い）と、`record()` の key・indicator の優先のテストを反映
+  - 呼び出し側: 表に 勝率_val の列が無いと、SQLite が列名を文字列として読み、絶対軸②の比較が全部の行で真になった → `REQUIRED_UNIFIED_COLUMNS` に区分の判定が読む列を足し、列のそろわない unified_all を `old` に。コンパクト化の判定は 24万件の突き合わせで不一致0、画面の区分は unified_all 24,604行・照合結果 60,158行で1行版と一致。テストの穴（採点・逆引き・WEDGE 一覧の CSV が 勝率_val・WEDGE を渡さない変異、横断検索の2つの呼び出し口が odds10u の行を「通常」の規則で見る変異が通っていた）→ DB の3行を書き換えてページを通す確認と、採点が渡した rec をつかまえる確認を追加
+  - 過去SP・ST: 結果指数が無い・履歴を作れなかった・`--no-past-perf` のとき、replace が `ext_indices/past_sp_st/`（想定の馬場の値）から8指数の master を作っていた → 過去側ではどの場合も読まない。別に書いた計算と `select_runs`・`aggregate` を 20万件 × 2回で突き合わせて不一致0、master は想定のファイル・設定ファイルの有無に依らず同じバイト列。/ingest の画面の説明と §9 の74（replace は前の履歴の結果指数を引き継がない）を訂正
+  - 確かめていないもの: 実データでの値（合成データと突き合わせだけ）。検証役の実行は pandas 2.3.3 だけ（pandas 3.0.5・Docker は全件テストで確認）
+- テスト: test_core・test_aggstore・test_views・test_past_perf・test_pipeline・test_condition_only・test_screen_families を更新・追加。694件
 
 ### 2026-11-18 SP指数・ST指数の3着内基準値・基準比の条件・過去SP/ST 3走順
 - 背景: SP指数・ST指数は「その条件で3着に入る水準」と比べて初めて意味が分かる（クラス・馬場・距離で水準が違う）。受け取った基準値マスタ（`index_baseline_SP.csv`・`index_baseline_ST.csv`）を組み込み、直近の年を重くして自動で更新し、「基準比 × 過去SP/ST の順位帯 × 他の指数」の掛け合わせを集計・照合できるようにする（ユーザーの依頼）
