@@ -13,6 +13,7 @@ from .conditions import CONDITION_COLUMNS
 from .csvio import norm_text
 from .families import entry_key_candidates
 from .indicators import CONDITION_ONLY
+from .classify import FIELD_COLUMNS as CLASSIFY_COLUMNS
 from .wedge import WEDGE_COLUMNS
 
 UNIFIED = "unified_all"
@@ -27,7 +28,11 @@ HORSE_COLUMNS = ("日付", "レースID(新)", "レースID(新/馬番無)", "�
 HIT_COLUMNS = ("source_table",) + HORSE_COLUMNS + ("base", "key") + META_COLUMNS + STAT_COLUMNS
 
 DEFAULT_LIMIT = 50
-REQUIRED_UNIFIED_COLUMNS = ("結合データ", "family", "indicator", "odds_mode", "rank_scheme", "テーブル名") + WEDGE_COLUMNS
+# 区分の判定（classify の SQL 版）が読む列（件数・勝率_val・連対率_val・複勝率_val・掲示板率_val・回収値・WEDGE）も要る:
+# SQLite は、表に無い列名を二重引用符で書くと文字列として読む（"勝率_val" >= 40.0 が真になる）ので、列のそろっていない
+# unified_all を「ok」にしない
+REQUIRED_UNIFIED_COLUMNS = (("結合データ", "family", "indicator", "odds_mode", "rank_scheme", "テーブル名") + WEDGE_COLUMNS
+                            + tuple(c for c in CLASSIFY_COLUMNS.values() if c not in WEDGE_COLUMNS))
 
 
 def unified_status(conn: sqlite3.Connection) -> str:

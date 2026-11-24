@@ -287,7 +287,8 @@ FORM_BODY = """
 </div>
 <div class="muted" style="margin-top:6px">「過去SP・ST指数」は、<code>result_indices/</code> の結果指数（SP*.csv・speed*.zip／st_se*.csv・st_se*.zip）と過去の基本CSVから、
 各馬の「今走より前・600日以内」の直近3走・5走の平均と最高（8指数）を計算します（結果そのものは使いません）。ベースCSVには 馬名・芝ダ・距離・年限定 のある出馬表CSVを選んでください。
-古馬戦は 芝ダ・距離差400m以内・馬場状態 が同じ走を優先します。ここで選んだ想定馬場状態は保存され、calc_entry_hensachi.py の既定にもなります。</div>
+対象の走は 芝ダ・距離差400m以内・馬場状態 が同じ走を優先します（古馬戦は3走以上そろう段階まで条件を緩め、2歳戦・3歳限定戦は1走以上ある最初の段階）。
+ここで選んだ想定馬場状態は、古馬戦にも2歳戦・3歳限定戦にも効き、保存されて calc_entry_hensachi.py の既定にもなります（過去レースの replace は、確定の馬場状態で計算し直します）。</div>
 <input type="hidden" name="to_ext_shown" value="1">
 <label class="cb" style="margin-top:8px"><input type="checkbox" name="to_ext" value="1" {{ 'checked' if q.get('to_ext', True) else '' }}>TARGET 取込用CSVを <code>ext_indices/</code> にも置く（過去レースの replace と出馬表の calc_entry_hensachi が自動で結び付けます。Ω・吉馬・かよちん・keibaAI・安井）</label>
 </div>

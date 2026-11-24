@@ -140,7 +140,8 @@ def test_runs_must_be_strictly_before_the_race_day_and_within_600_days():
     before = (dt.date(2026, 6, 1) - dt.timedelta(days=601)).strftime("%Y%m%d")
     runs = [run("20260608", 99), run("20260601", 98), run("20260531", 70), run("20260101", 60), run(first, 50), run(before, 40)]
     got, stage = PP.select_runs(runs, day, "芝", 1600, "良", True)
-    assert [r[5] for r in got] == [D(70), D(60), D(50)] and stage == 9          # 当日・未来・601日前は入らない。600日前は入る
+    assert [r[5] for r in got] == [D(70), D(60), D(50)] and stage == 11         # 当日・未来・601日前は入らない。600日前は入る
+    assert PP.select_runs(runs, day, "芝", 1600, "良", False) == (got, 1)        # 古馬戦でも窓は同じ（3走そろうので ①）
     assert PP.select_runs(runs[:2], day, "芝", 1600, "良", True) == ([], 0)
     assert PP.select_runs([], day, "芝", 1600, "良", False) == ([], 0)
     # 新しい順（同じ日なら レースID の大きい順）は History が並べる
@@ -151,38 +152,97 @@ def test_runs_must_be_strictly_before_the_race_day_and_within_600_days():
     assert [r[5] for r in PP.History(frame).runs("SP", "", "ウマ")] == [D(30), D(20), D(10)]
 
 
-def test_older_horse_races_relax_the_filters_only_when_a_stage_finds_nothing():
-    day = ordinal("20260601")
-    full = run("20260501", 1, "芝", 1600, "良")
-    full_far = run("20260420", 2, "芝", 2000, "良")              # 距離差 400 ちょうど → 入る
-    other_baba = run("20260410", 3, "芝", 1800, "稍・重")
-    other_surface = run("20260401", 4, "ダ", 1600, "良")
-    too_far = run("20260320", 5, "芝", 2001, "良")               # 距離差 401
-    far_dirt = run("20260310", 6, "ダ", 2400, "不")
-    runs = [full, full_far, other_baba, other_surface, too_far, far_dirt]
+def _pick(rs, day, **kw):
+    a = {"surface": "芝", "dist": 1600, "baba": "良", "limited": False, **kw}
+    got, stage = PP.select_runs(rs, day, a["surface"], a["dist"], a["baba"], a["limited"])
+    return [int(r[5]) for r in got], stage
 
-    def pick(rs, **kw):
-        a = {"surface": "芝", "dist": 1600, "baba": "良", "limited": False, **kw}
-        got, stage = PP.select_runs(rs, day, a["surface"], a["dist"], a["baba"], a["limited"])
-        return [int(r[5]) for r in got], stage
-    assert pick(runs) == ([1, 2], 1)                                               # ① 2走だけでも、ここで止める
-    assert pick([full] + runs[2:]) == ([1], 1)                                     # 1走でも止める
-    assert pick(runs, baba="") == ([1, 2, 3], 2)                                   # 今走の馬場状態が無ければ ② から
-    assert pick(runs[2:]) == ([3], 2)                                              # ② 馬場状態を緩和
-    assert pick(runs[3:]) == ([4], 3)                                              # ③ 芝・ダを緩和（距離差・同じ馬場）
-    assert pick(runs[3:], baba="") == ([4], 3)                                     # ③ 今走の馬場状態が無ければ距離差だけ
-    assert pick([too_far, far_dirt]) == ([5], 4)                                   # ④ 同じ芝・ダ
-    assert pick([far_dirt]) == ([6], 5)                                            # ⑤ 全部
-    assert pick(runs, baba="不") == ([1, 2, 3], 2)                                 # ①に無い（芝で不 の走は無い）→ ②
-    assert pick([other_surface, far_dirt], surface="芝", dist=1600, baba="不") == ([4, 6], 5)   # ①〜④ どれにも無い → ⑤
-    # 2歳戦・3歳限定戦は絞らない
-    assert pick(runs, limited=True) == ([1, 2, 3, 4, 5, 6], 9)
+
+def test_older_horse_races_relax_the_filters_until_three_runs_are_found():
+    """古馬戦（2026-11-23〜）: ①→②→③→④→⑤ の順に、3走以上そろう最初の段階の走だけを使う。
+    ⑤（600日以内の全部の走）でも1〜2走しか無ければ、その1〜2走で計算する。"""
+    assert (PP.MIN_RUNS_OLDER, PP.MIN_RUNS_LIMITED, PP.LIMITED_STAGE) == (3, 1, 10)
+    day = ordinal("20260601")
+    a1, a2, a3 = (run(f"202605{d:02d}", v, "芝", 1600, "良") for d, v in ((20, 1), (19, 2), (18, 3)))       # ① に入る走
+    a_far = run("20260517", 4, "芝", 2000, "良")                 # 距離差 400 ちょうど → ① に入る
+    b1, b2 = run("20260510", 11, "芝", 1800, "稍・重"), run("20260509", 12, "芝", 1400, "不")              # ② で入る（馬場が違う）
+    c1, c2 = run("20260501", 21, "ダ", 1600, "良"), run("20260430", 22, "ダ", 1200, "良")                  # ③ で入る（芝ダが違う・同じ馬場）
+    c_other = run("20260429", 23, "ダ", 1800, "不")              # ③ には入らない（馬場が違う）。今走の馬場が無ければ ③ に入る
+    d1, d2 = run("20260420", 31, "芝", 2001, "良"), run("20260419", 32, "芝", 2600, "不")                  # ④ で入る（距離差 401〜）
+    e1 = run("20260410", 41, "ダ", 2400, "不")                   # ⑤ だけ
+    pick = lambda rs, **kw: _pick(rs, day, **kw)
+    # ① 3走そろえばそこで止める（4走以上あれば全部。平均・最高は先頭の3走・5走）
+    assert pick([a1, a2, a3, b1, c1, d1, e1]) == ([1, 2, 3], 1)
+    assert pick([a1, a2, a3, a_far, b1, b2, c1]) == ([1, 2, 3, 4], 1)
+    # ① が2走以下 → ②（①の走も入る。② が3走以上）
+    assert pick([a1, a2, b1, c1, d1, e1]) == ([1, 2, 11], 2)
+    assert pick([a1, b1, b2, c1, c2, d1]) == ([1, 11, 12], 2)
+    assert pick([b1, b2, a_far, e1]) == ([11, 12, 4], 2)                              # 並びは新しい順のまま
+    # ② も2走以下 → ③（距離差400以内 かつ 同じ馬場。芝ダは問わない）
+    assert pick([a1, b1, c1, c2, c_other, d1, e1]) == ([1, 21, 22], 3)
+    assert pick([a1, a2, c1, d1, d2]) == ([1, 2, 21], 3)
+    # ③ も2走以下 → ④（同じ芝ダ。距離は問わない）
+    assert pick([a1, b1, c1, d1, d2, e1]) == ([1, 11, 31, 32], 4)
+    assert pick([a1, c_other, d1, d2, e1]) == ([1, 31, 32], 4)
+    # ④ も2走以下 → ⑤（600日以内の全部の走）
+    assert pick([a1, b1, c1, c_other, e1]) == ([1, 11, 21, 23, 41], 5)
+    assert pick([c_other, e1, d1]) == ([23, 41, 31], 5)
+    # ⑤ でも1〜2走しか無ければ、その1〜2走で計算する（①に合う走だけの馬でも、段階は ⑤）
+    assert pick([a1, a2]) == ([1, 2], 5) and pick([a1]) == ([1], 5) and pick([e1]) == ([41], 5) and pick([a1, e1]) == ([1, 41], 5)
+    assert pick([]) == ([], 0)
+    # 2走の段階では止めない（2026-11-22 までは「1走でもあればその段階」だった）
+    assert pick([a1, a2, e1, c_other, d2]) == ([1, 2, 32], 4)                         # ①②③ は2走（a1・a2）→ ④ で3走
+    # 今走の馬場状態が分からなければ ① を飛ばし、③ は距離差だけ
+    assert pick([a1, a2, a3, b1], baba="") == ([1, 2, 3, 11], 2)
+    assert pick([a1, c1, c_other, d1, e1], baba="") == ([1, 21, 23], 3)
+    assert pick([a1, c1, c_other, d1, e1]) == ([1, 21, 23, 31, 41], 5)                # 馬場が分かれば ③ は a1・c1 の2走 → ④ も2走 → ⑤
+    # 今走の馬場に合う走が3走に届かない（芝で不 は b2・d2 だけ）→ ②
+    assert pick([a1, a2, a3, b2, d2], baba="不") == ([1, 2, 3, 12], 2)
     # 今走の芝・ダ・距離が分からないときは、その条件の段階に当たらない
-    assert pick(runs, surface="") == ([1, 2, 4], 3) and pick(runs, dist=None) == ([1, 2, 3, 5], 4)
-    assert pick(runs, surface="", dist=None) == ([1, 2, 3, 4, 5, 6], 5)
+    assert pick([a1, a2, a3, b1, c1, c2], surface="") == ([1, 2, 3, 21, 22], 3)       # ①②④ は無し → ③（距離差・同じ馬場）
+    assert pick([a1, a2, a3, b1, c1, d1], dist=None) == ([1, 2, 3, 11, 31], 4)        # ①②③ は無し → ④（同じ芝ダ）
+    assert pick([a1, a2, a3, b1, c1, d1], surface="", dist=None) == ([1, 2, 3, 11, 21, 31], 5)
     # 過去走の距離・馬場状態が分からない走は、その条件の段階に入らない
-    blank = (ordinal("20260520"), "x", "芝", None, "", D(9))
-    assert pick([blank, full]) == ([1], 1) and pick([blank]) == ([9], 4)
+    blank = (ordinal("20260525"), "x", "芝", None, "", D(9))
+    assert pick([blank, a1, a2, a3]) == ([1, 2, 3], 1) and pick([blank, a1, a2]) == ([9, 1, 2], 4)
+    assert pick([blank]) == ([9], 5)
+
+
+def test_two_and_three_year_old_races_use_the_same_stages_with_one_run():
+    """2歳戦・3歳限定戦（2026-11-23〜）: 無条件の全走をやめ、同じ ①〜⑤ の順で、1走以上ある最初の段階の走だけを使う。
+    段階の番号は 11〜15（古馬戦の 1〜5 と分けて数える）。"""
+    day = ordinal("20260601")
+    a1 = run("20260520", 1, "芝", 1600, "良")
+    a_far = run("20260517", 4, "芝", 2000, "良")
+    b1 = run("20260510", 11, "芝", 1800, "稍・重")
+    c1 = run("20260501", 21, "ダ", 1600, "良")
+    c_other = run("20260429", 23, "ダ", 1800, "不")
+    d1 = run("20260420", 31, "芝", 2001, "良")
+    e1 = run("20260410", 41, "ダ", 2400, "不")
+    everything = [a1, a_far, b1, c1, c_other, d1, e1]
+    pick = lambda rs, **kw: _pick(rs, day, limited=True, **kw)
+    assert pick(everything) == ([1, 4], 11)                                           # ① 1走でもあれば、そこで止める（全走にしない）
+    assert pick([a1, b1, c1, d1, e1]) == ([1], 11)
+    assert pick([b1, c1, c_other, d1, e1]) == ([11], 12)                              # ② 馬場を緩める
+    assert pick([c1, c_other, d1, e1]) == ([21], 13)                                  # ③ 芝ダを緩める（距離差・同じ馬場）
+    assert pick([c_other, d1, e1]) == ([31], 14)                                      # ④ 同じ芝ダ
+    assert pick([c_other, e1]) == ([23, 41], 15)                                      # ⑤ 全部
+    assert pick([e1]) == ([41], 15) and pick([]) == ([], 0)
+    assert pick(everything, baba="") == ([1, 4, 11], 12)                              # 今走の馬場が分からなければ ① を飛ばす
+    assert pick([c1, c_other, d1], baba="") == ([21, 23], 13)                         # ③ は距離差だけ
+    assert pick(everything, baba="不") == ([1, 4, 11], 12)                            # 芝で不 の走は無い → ②
+    assert pick(everything, surface="") == ([1, 4, 21], 13) and pick(everything, dist=None) == ([1, 4, 11, 31], 14)
+    assert pick(everything, surface="", dist=None) == ([1, 4, 11, 21, 23, 31, 41], 15)
+    # 同じ走でも、古馬戦は3走そろうまで緩める（2歳・3歳限定戦と段階が違う）
+    assert _pick(everything, day) == ([1, 4, 11], 2) and _pick([a1, b1, c1, d1, e1], day) == ([1, 11, 31], 4)
+    # 段階の名前（ログ）: 古馬戦 1〜5・2歳/3歳限定 11〜15・0 = 対象の走なし
+    assert sorted(PP.STAGE_LABELS) == [0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15]
+    assert PP.STAGE_LABELS[5] == "⑤600日以内の全走" and PP.STAGE_LABELS[11] == "2歳・3歳限定①同じ芝ダ・距離差400以内・同じ馬場"
+    assert all(PP.STAGE_LABELS[10 + s] == "2歳・3歳限定" + PP.STAGE_LABELS[s] for s in range(1, 6))
+    text = PP.stage_text({0: 3, 1: 10, 5: 2, 12: 4, 15: 0})
+    assert text.startswith("対象の走なし 3・①同じ芝ダ・距離差400以内・同じ馬場 10・⑤600日以内の全走 2・2歳・3歳限定②同じ芝ダ・距離差400以内 4／")
+    assert "古馬戦は3走以上そろう最初の段階（⑤は1〜2走でも）" in text and "2歳/3歳限定戦は1走以上ある最初の段階" in text
+    assert PP.stage_text({}) == "" and PP.stage_text({3: 0}) == ""
 
 
 # ---------------------------------------------------------------- 履歴と計算
@@ -218,38 +278,76 @@ def test_history_rows_keep_only_real_runs_with_a_result_index():
 
 def test_compute_uses_only_earlier_runs_and_the_assumed_going():
     """そのレースの結果指数は、そのレースの値に使わない（未来の情報）。想定の馬場状態は芝・ダ別に指定できる。"""
-    past = [base_row("20260301", 1, 1, "ウマA", sd="芝", dist=1600, baba="良"),        # SP 60
-            base_row("20260315", 1, 1, "ウマA", sd="芝", dist=1800, baba="重"),        # SP 70
-            base_row("20260401", 1, 1, "ウマA", sd="ダ", dist=1600, baba="良"),        # SP 80
-            base_row("20260415", 1, 1, "ウマA", sd="芝", dist=1600, baba="不")]        # SP 90
+    spec = [("20260105", "芝", 1600, "良", 60), ("20260112", "芝", 1600, "良", 62), ("20260119", "芝", 1600, "良", 64),
+            ("20260201", "芝", 1800, "重", 70), ("20260208", "芝", 1800, "稍", 72), ("20260215", "芝", 1800, "重", 74),
+            ("20260301", "ダ", 1600, "良", 80),
+            ("20260308", "芝", 1600, "不", 90), ("20260315", "芝", 1600, "不", 92), ("20260322", "芝", 1600, "不", 94)]
+    past = [base_row(d, 1, 1, "ウマA", sd=sd, dist=dist, baba=baba) for d, sd, dist, baba, _v in spec]
     today = base_row("20260501", 1, 1, "ウマA", sd="芝", dist=1600, baba="")
     raw = pd.DataFrame(past + [today])
-    results = {"SP": dict(zip(raw[RID], [D(60), D(70), D(80), D(90), D(999)])), "ST": {}}
+    results = {"SP": dict(zip(raw[RID], [D(v) for *_x, v in spec] + [D(999)])), "ST": {}}
     hist = PP.History(PP.history_rows(raw, results))
     t = PP.target_frame(raw)
 
     def val(name, **kw):
         return PP.compute(t, hist, **kw).values[name].tolist()
-    # 馬場状態の列のある過去のレース: その日の前の走だけ・その日の馬場状態で
-    assert val("過去SP_3走平均") == ["", "60", "60", "65", "73.3"]      # 2走目 = 60（①に無く②）、3走目 ダ → ③距離差・同じ馬場 = 60、
-    assert val("過去SP_3走最高")[-1] == "90"                            # 4走目 不 → ② 60・70、今走（列が空）→ ② 90・70・60
-    assert val("過去ST_3走平均") == [""] * 5                            # ST の値が無ければ空
-    # 想定の馬場状態（芝）を指定: 列のある過去のレースも、その芝のレースは指定の値で見る
-    assert val("過去SP_3走平均", baba_turf="良")[-1] == "60" and val("過去SP_5走最高", baba_turf="良")[-1] == "60"
-    assert val("過去SP_3走平均", baba_turf="稍・重")[-1] == "70" and val("過去SP_3走平均", baba_turf="不")[-1] == "90"
-    assert val("過去SP_3走平均", baba_dirt="不")[-1] == "73.3"                                   # ダの指定は芝のレースに効かない
-    assert val("過去SP_3走平均", baba_dirt="不")[2] == "65" and val("過去SP_3走平均")[2] == "60"   # ダのレース: ①②に無く、③は指定の馬場が無ければ④…
+    # 馬場状態の列のある過去のレース: その日の前の走だけ・その日の（確定の）馬場状態で。古馬戦は3走そろう段階まで緩める
+    assert val("過去SP_3走平均") == [
+        "",          # 最初の走: 対象の走なし
+        "60",        # 1走だけ → ⑤ の1走で
+        "61",        # 2走だけ → ⑤ の2走で
+        "62",        # 芝1800 稍・重: ① 0走 → ② 芝・距離差400以内の3走（60・62・64）
+        "65.3",      # 芝1800 稍: ① 1走（70）→ ② 70・64・62
+        "68.7",      # 芝1800 重: ① 2走（72・70）→ ② 72・70・64
+        "62",        # ダ1600 良: ①② 0走 → ③ 距離差400以内・同じ馬場（良）の3走（64・62・60）
+        "72",        # 芝1600 不: ① 0走 → ② 74・72・70（ダの 80 は入らない）
+        "78.7",      # 芝1600 不: ① 1走（90）→ ② 90・74・72
+        "85.3",      # 芝1600 不: ① 2走（92・90）→ ② 92・90・74
+        "92"]        # 今走（馬場状態の列が空）: ① を飛ばして ② 94・92・90
+    assert val("過去SP_3走最高")[-1] == "94" and val("過去SP_5走平均")[-1] == "84.4"            # 94・92・90・74・72
+    assert val("過去ST_3走平均") == [""] * 11                            # ST の値が無ければ空
+    # 想定の馬場状態（芝）を指定: ① にその馬場の3走があれば、その走だけ
+    assert val("過去SP_3走平均", baba_turf="良")[-1] == "62" and val("過去SP_5走最高", baba_turf="良")[-1] == "64"
+    assert val("過去SP_3走平均", baba_turf="稍・重")[-1] == "72" and val("過去SP_3走平均", baba_turf="不")[-1] == "92"
+    assert val("過去SP_5走最高", baba_turf="不")[-1] == "94" and val("過去SP_5走平均", baba_turf="不")[-1] == "92"
+    assert val("過去SP_3走平均", baba_dirt="不")[-1] == "92"                                     # ダの指定は芝のレースに効かない
+    # ダのレース（7行目）: 指定の馬場（不）の走がまだ無い → ①〜④ は3走に届かず、⑤ の全部（74・72・70）
+    assert val("過去SP_3走平均", baba_dirt="不")[6] == "72" and val("過去SP_3走平均")[6] == "62"
+    # 列のある過去のレースも、その芝のレースは指定の値で見る（5行目: 稍 → 良 の指定なら ① 64・62・60）
+    assert val("過去SP_3走平均", baba_turf="良")[4] == "62" and val("過去SP_3走平均")[4] == "65.3"
     with pytest.raises(ValueError):
         PP.compute(t, hist, baba_turf="晴")
+    # 段階ごとの馬の数（ログ）
+    comp = PP.compute(t, hist)
+    assert comp.stages["SP"] == {0: 1, 5: 2, 2: 7, 3: 1} and comp.stages["ST"] == {0: 11}
     # kinds で絞れる・Computed.lookups は値のある馬だけの形式A
     comp = PP.compute(t, hist, kinds=["SP"])
-    assert set(comp.values) == {n for n in PP.INDICATORS if "SP" in n} and comp.hit("過去SP_3走平均") == 4
+    assert set(comp.values) == {n for n in PP.INDICATORS if "SP" in n} and comp.hit("過去SP_3走平均") == 10
     look = comp.lookups(t[RID])["過去SP_5走平均"]
-    assert look.pattern == "A" and look.ranks is None and look.files == [] and look.values[today[RID]] == "73.3"
+    assert look.pattern == "A" and look.ranks is None and look.files == [] and look.values[today[RID]] == "84.4"
     assert past[0][RID] not in look.values
     # 日付の読めない行は空
     bad = pd.DataFrame([{**today, RID: "xx"}])
     assert PP.compute(PP.target_frame(bad), hist).values["過去SP_3走平均"].tolist() == [""]
+
+
+def test_limited_races_stop_at_the_first_stage_with_a_run_in_compute():
+    """2歳戦・3歳限定戦は、1走以上ある最初の段階で止める（古馬戦なら3走そろうまで緩める同じ走で、値が違う）。"""
+    spec = [("20260105", "ダ", 1200, "良", 40), ("20260112", "芝", 2400, "良", 50), ("20260119", "芝", 1800, "重", 60),
+            ("20260201", "芝", 1600, "良", 90)]
+    past = [base_row(d, 1, 1, "ウマB", sd=sd, dist=dist, baba=baba, age="3歳", cls="未勝利") for d, sd, dist, baba, _v in spec]
+    rows = past + [base_row("20260301", 1, 1, "ウマB", sd="芝", dist=1600, baba="良", age="3歳", cls="1勝"),
+                   base_row("20260301", 2, 1, "ウマB", sd="芝", dist=1600, baba="良", age="3上", cls="1勝"),
+                   base_row("20260301", 3, 1, "ウマB", sd="芝", dist=1600, baba="不", age="3歳", cls="1勝"),
+                   base_row("20260301", 4, 1, "ウマB", sd="ダ", dist=1800, baba="不", age="2歳", cls="新馬")]
+    raw = pd.DataFrame(rows)
+    results = {"SP": dict(zip(raw[RID], [D(v) for *_x, v in spec])), "ST": {}}
+    comp = PP.compute(PP.target_frame(raw), PP.History(PP.history_rows(raw, results)))
+    got = {n: comp.values[n].tolist()[4:] for n in ("過去SP_3走平均", "過去SP_5走最高")}
+    # 3歳限定・芝1600 良: ① の1走（90）だけ ／ 古馬戦・同じ条件: ①②③ は3走に届かず ④ 同じ芝ダの3走（90・60・50）
+    # 3歳限定・芝1600 不: ① 0走 → ② 90・60 ／ 2歳・ダ1800 不: ①②③④（ダは 1200 の1走）→ ④ の 40
+    assert got["過去SP_3走平均"] == ["90", "66.7", "75", "40"] and got["過去SP_5走最高"] == ["90", "90", "90", "40"]
+    assert comp.stages["SP"] == {0: 1, 15: 1, 14: 2, 12: 2, 11: 1, 4: 1}
 
 
 def test_horse_is_identified_by_id_plus_id_less_rows_of_the_same_name():
@@ -336,8 +434,8 @@ def oracle(base: pd.DataFrame, results: dict, kind: str, n: int, how: str, baba_
     b3 = {"良": "良", "稍": "稍・重", "重": "稍・重", "不": "不"}
     df = base.copy()
     df["date"] = pd.to_datetime(df[RID].str[:8])
-    df["sd"] = df["距離"].str[0]
-    df["dist"] = df["距離"].str[1:].astype(int)
+    df["sd"] = df["距離"].str[0].fillna("")                  # 芝ダ・距離の分からない行（""）は、その条件のどの段階にも当たらない
+    df["dist"] = pd.to_numeric(df["距離"].str[1:], errors="coerce")
     df["baba"] = df["馬場状態"].map(lambda v: b3.get(v, ""))
     df["val"] = df[RID].map(results)
     df["ok"] = ~df["着順"].isin(["取消", "除外"]) & df["val"].notna()
@@ -351,13 +449,13 @@ def oracle(base: pd.DataFrame, results: dict, kind: str, n: int, how: str, baba_
             baba = baba_turf
         if t["sd"] == "ダ" and baba_dirt != "auto":
             baba = baba_dirt
-        if not limited and len(mine):
+        if len(mine):                                        # 古馬戦は3走以上・2歳/3歳限定戦は1走以上の最初の段階。無ければ全部
             near = (mine["dist"] - t["dist"]).abs() <= 400
-            same = mine["sd"] == t["sd"]
+            same = (mine["sd"] == t["sd"]) & (t["sd"] != "")
             sb = mine["baba"] == baba
             steps = ([same & near & sb] if baba else []) + [same & near, near & sb if baba else near, same]
             for m in steps:
-                if m.any():
+                if int(m.sum()) >= (1 if limited else 3):
                     mine = mine[m]
                     break
         vals = [D(str(v)) for v in mine["val"].tolist()[:n]]
@@ -382,9 +480,10 @@ def test_compute_agrees_with_an_independent_reimplementation():
             want = oracle(base, sp if kind == "SP" else st, kind, n, how, **kw)
             got = comp.values[name].tolist()
             assert got == want, (name, kw, [(i, g, w) for i, (g, w) in enumerate(zip(got, want)) if g != w][:5])
-        assert sum(comp.stages["SP"].values()) == len(base) and comp.stages["SP"].get(9, 0) > 100
-        assert all(comp.stages["SP"].get(s, 0) > 0 for s in (0, 2, 3, 4, 5))
-    assert PP.compute(t, hist).stages["SP"].get(1, 0) > 50
+        assert sum(comp.stages["SP"].values()) == len(base) and 9 not in comp.stages["SP"]
+        assert all(comp.stages["SP"].get(s, 0) > 0 for s in (0, 1, 2, 4, 5, 11, 12, 13, 14, 15)), comp.stages["SP"]
+    st0 = PP.compute(t, hist).stages["SP"]
+    assert st0.get(1, 0) > 50 and st0.get(11, 0) > 50 and st0.get(3, 0) > 0 and st0.get(5, 0) > 50, st0
     # 血統登録番号が無くても（馬名で）同じ
     base2, _sp, _st = make_base(with_ids=False)
     comp2 = PP.compute(PP.target_frame(base2), PP.History(PP.history_rows(base2, results)))
@@ -633,6 +732,7 @@ def test_replace_precedence_and_switches(site, tmp_path, monkeypatch, capsys):
     # --no-past-perf: 8指数を作らない（履歴は、近5走の条件のために書く）
     assert R.main(["--master-dir", str(out), "--no-past-perf"]) == 0
     assert sorted(p.name for p in out.glob("master_*")) == ["master_全場_タイムM.csv.gz"] and (out / PP.HISTORY_FILE).exists()
+    assert "master は作りません" not in capsys.readouterr().out                      # ext のファイルが無ければ、何も言わない
     # 結果指数のフォルダが空・無い: 作らない
     out2 = tmp_path / "m2"
     assert R.main(["--master-dir", str(out2), "--result-dir", str(tmp_path / "nope")]) == 0
@@ -659,12 +759,19 @@ def test_replace_precedence_and_switches(site, tmp_path, monkeypatch, capsys):
     own_m = pd.read_csv(out3 / "master_全場_過去ST_5走最高.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
     assert set(own_m["指数"]) == {"77", "88"}
     assert len(list(out3.glob("master_全場_過去*.csv.gz"))) == 8
-    # 結果指数が無く ext_indices のファイルだけなら、ほかの外部指数と同じに ext から付ける
-    out4 = tmp_path / "m4"
-    assert R.main(["--csv-dir", str(csv2), "--master-dir", str(out4), "--ext-dir", str(tmp_path / "ext"), "--no-raw-merge",
-                   "--result-dir", str(tmp_path / "nope")]) == 0
-    m4 = pd.read_csv(out4 / "master_全場_過去SP_3走平均.csv.gz", encoding="cp932", dtype=str, keep_default_na=False)
-    assert set(m4["指数"]) == {"999"}
+    # ext_indices/past_sp_st のファイル（想定の馬場で出した出馬表用の値）は、過去側ではどの場合も使わない（2026-11-23〜）:
+    # 結果指数が無い・--no-past-perf のときは、8指数の master を作らない（csv_files に置いた同じ名前のファイルは今までどおり）
+    for n, extra, why in ((4, ["--result-dir", str(tmp_path / "nope")], "結果指数（result_indices/）が無い"),
+                          (8, ["--no-past-perf"], "--no-past-perf が指定されている")):
+        out4 = tmp_path / f"m{n}"
+        capsys.readouterr()
+        assert R.main(["--csv-dir", str(csv2), "--master-dir", str(out4), "--ext-dir", str(tmp_path / "ext"), "--no-raw-merge",
+                       *extra]) == 0
+        log = capsys.readouterr().out
+        assert f"[WARN] 過去SP_3走平均: {why}ので、過去SP・ST の8指数の master は作りません" in log
+        assert "過去側では使いません" in log
+        assert sorted(p.name for p in out4.glob("master_全場_過去*")) == ["master_全場_過去ST_5走最高.csv.gz"]   # csv_files の分だけ
+        assert (out4 / "master_全場_タイムM.csv.gz").exists()
     # 同じプロセスで、結果指数を足してもう一度回すと、新しい値の master になる（前の実行の計算を使い回さない）
     res2 = tmp_path / "res2"
     res2.mkdir()
@@ -689,6 +796,12 @@ def test_replace_precedence_and_switches(site, tmp_path, monkeypatch, capsys):
     log = capsys.readouterr().out
     assert "[ERROR] 過去SP・ST の履歴: " in log and "過去SP・ST の8指数は作りません" in log
     assert [p.name for p in out7.glob("master_*")] == ["master_東京_対戦M.csv.gz"]
+    # そのとき ext_indices/past_sp_st にファイルがあっても、想定の馬場の値で master を作らない（結果指数はある）
+    out9 = tmp_path / "m9"
+    assert R.main(["--csv-dir", str(csv3), "--master-dir", str(out9), "--no-raw-merge", "--ext-dir", str(tmp_path / "ext")]) == 1
+    log = capsys.readouterr().out
+    assert "[WARN] 過去SP_3走平均: 過去走の履歴を作れなかったので、過去SP・ST の8指数の master は作りません" in log
+    assert [p.name for p in out9.glob("master_*")] == ["master_東京_対戦M.csv.gz"]
     # 並列でも同じ master
     out5 = tmp_path / "m5"
     assert R.main(["--master-dir", str(out5), "--workers", "2"]) == 0
@@ -698,6 +811,86 @@ def test_replace_precedence_and_switches(site, tmp_path, monkeypatch, capsys):
 
 def read_merged(root):
     return pd.read_csv(root / "entries_out" / "entries_merged_hensachi.csv", encoding="cp932", dtype=str, keep_default_na=False)
+
+
+def test_full_rebuild_recomputes_from_the_confirmed_going(tmp_path, monkeypatch, capsys):
+    """フルリビルド（replace）は、週末に想定の馬場で出したもの（ext_indices/past_sp_st/ のファイル・past_perf_settings.json・
+    entries_out/past_perf_baba.json）に左右されず、基本CSV（raw_csv/ を統合したあとの csv_files/）の確定した 馬場状態 と
+    result_indices/ から、全レースの 過去SP・ST の8指数を計算し直す（週末の想定とのズレが、ここで解消される）。"""
+    import calc_entry_hensachi as C
+    import replace_csv_ver3 as R
+    root = tmp_path / "site"
+    monkeypatch.setenv("SHISU_BASE_DIR", str(root))
+    for k in ("RESULT_INDICES_DIR", "PAST_PERF_SETTINGS", "SHISU_EXT_DIR", "DB_PATH"):
+        monkeypatch.delenv(k, raising=False)
+    base, sp, st = make_base(seed=8, days=40)
+    last = base[RID].str[:8].max()
+    week = base[RID].str[:8] == last                                  # 今週のレース（週末の時点では結果も確定の馬場も無い）
+    old, new_rows = base[~week].reset_index(drop=True), base[week].reset_index(drop=True)
+    new_rows = new_rows.assign(年齢限定="3上", クラス名="1勝")        # 古馬戦（馬場状態で段階①の走が変わる）
+    full = pd.concat([old, new_rows], ignore_index=True)
+    write_sources(root, old, {k: v for k, v in sp.items() if k[:8] != last}, {k: v for k, v in st.items() if k[:8] != last})
+
+    # --- 週末: 出馬表（馬場状態の列なし）を、想定の馬場「不」で計算する。/ingest の出力のつもりで ext_indices にも置く
+    ent = pd.DataFrame({RID: new_rows[RID], "場 R": "東" + new_rows[RID].str[14:16], "Ｒ": new_rows[RID].str[14:16].str.lstrip("0"),
+                        "場所": new_rows["場所"], "芝ダ": new_rows["距離"].str[0], "距離": new_rows["距離"].str[1:], "外回り": "",
+                        "クラス": "1勝", "レース名": "レース", "年限定": "3上", "頭": "12", "枠番": new_rows["枠番"],
+                        "馬番": new_rows["馬番"], "馬名S": new_rows["馬名"], "騎手": new_rows["騎手"],
+                        "マイニング値": new_rows["指数"], "マイニング順位": new_rows["指数順位"]})
+    (root / "entries_in").mkdir()
+    ent.to_csv(root / "entries_in" / f"shisu_{last}_1.csv", index=False, encoding="cp932")
+    assert R.main(["--clean"]) == 0
+    assert C.main(["--merge-only", "--clean", "--baba-turf", "不", "--baba-dirt", "不"]) == 0
+    weekend = read_merged(root).set_index(RID)
+    assert json.loads((root / "entries_out" / PP.USED_BABA_FILE).read_text(encoding="utf-8")) == {"baba_turf": "不", "baba_dirt": "不"}
+    PP.save_settings("不", "不")                                       # /ingest で選んだ想定（calc の既定）
+    for name, key in PP.KEYS.items():                                  # 想定の馬場の値と、過去のレースへのでたらめな値
+        d = root / "ext_indices" / "past_sp_st" / key
+        d.mkdir(parents=True)
+        (d / f"{last}_{key}.csv").write_text("".join(f"{r},{v}\n" for r, v in weekend[name].items() if v != "0"), encoding="cp932")
+        (d / f"20240302_{key}.csv").write_text("".join(f"{r},999\n" for r in old[RID]), encoding="cp932")
+    settings_before = (root / "past_perf_settings.json").read_bytes()
+
+    # --- 翌週: 確定した 馬場状態 の入った今週ぶんの基本CSV（raw_csv/）と結果指数を足して、フルリビルド
+    (root / "raw_csv").mkdir()
+    new_rows.to_csv(root / "raw_csv" / "追加_タイムM.csv", index=False, encoding="cp932")
+    (root / "result_indices" / f"SP_{last}.csv").write_text("".join(f"{k},{v}\n" for k, v in sp.items() if k[:8] == last),
+                                                            encoding="utf-8")
+    capsys.readouterr()
+    assert R.main(["--clean"]) == 0
+    log = capsys.readouterr().out
+    assert "過去走の結果指数から計算した値を使います（ext_indices のファイルは使いません）" in log
+    assert all(n in log for n in PP.INDICATORS) and "古馬戦は3走以上そろう最初の段階" in log
+    merged = pd.read_csv(root / "csv_files" / "全場_タイムM.csv", encoding="cp932", dtype=str, keep_default_na=False)
+    assert len(merged) == len(full) and (root / "raw_csv" / "merged_done" / "追加_タイムM.csv").exists()
+    results = {"SP": sp, "ST": {k: v for k, v in st.items() if k[:8] != last}}
+    fixed = 0
+    for name, (kind, n, how) in PP.INDICATORS.items():
+        m = read_master(root, name)
+        got = dict(zip(m[RID], m["指数"]))
+        want = dict(zip(full[RID], oracle(full, results[kind], kind, n, how)))             # 確定の馬場状態（基本CSVの列）で
+        assert got == {k: (v or "0") for k, v in want.items()}, name
+        assert "999" not in set(m["指数"])                                                 # ext のファイルの値は1つも入らない
+        assumed = dict(zip(full[RID], oracle(full, results[kind], kind, n, how, baba_turf="不", baba_dirt="不")))
+        assert all(weekend.loc[r, name] == (assumed[r] or "0") for r in new_rows[RID])     # 週末の値は想定「不」での値だった
+        fixed += sum(weekend.loc[r, name] != got[r] for r in new_rows[RID])
+    assert fixed > 20                                                                      # 想定と確定で違っていた馬が、確定の値になった
+    assert (root / "past_perf_settings.json").read_bytes() == settings_before              # replace は設定を読まない・書かない
+    assert json.loads((root / "entries_out" / PP.USED_BABA_FILE).read_text(encoding="utf-8"))["baba_turf"] == "不"
+
+    # --- 想定のファイルを全部消して作り直しても、8本の master は同じバイト列（影響を受けていない）
+    snap = {n: (root / "master_csv" / f"master_全場_{n}.csv.gz").read_bytes() for n in PP.INDICATORS}
+    import shutil
+    shutil.rmtree(root / "ext_indices")
+    (root / "past_perf_settings.json").unlink()
+    (root / "entries_out" / PP.USED_BABA_FILE).unlink()
+    assert R.main(["--clean"]) == 0
+    assert {n: (root / "master_csv" / f"master_全場_{n}.csv.gz").read_bytes() for n in PP.INDICATORS} == snap
+    # 設定ファイル・環境変数で別の想定を置いても同じ
+    PP.save_settings("良", "稍・重")
+    monkeypatch.setenv("PAST_PERF_SETTINGS", str(root / "past_perf_settings.json"))
+    assert R.main(["--clean"]) == 0
+    assert {n: (root / "master_csv" / f"master_全場_{n}.csv.gz").read_bytes() for n in PP.INDICATORS} == snap
 
 
 def test_calc_attaches_the_eight_indices_with_the_assumed_going(site, capsys, monkeypatch):
@@ -741,7 +934,11 @@ def test_calc_attaches_the_eight_indices_with_the_assumed_going(site, capsys, mo
     want = entries_oracle(base, sp, ent, "SP", 3, "avg", "良", "不")
     assert out2["過去SP_3走平均"].tolist() == [v or "0" for v in want]
     assert out2["過去SP_3走平均"].tolist() != out["過去SP_3走平均"].tolist()          # 芝の古馬戦は ① の走に変わる
-    assert out2[out2["Ｒ"] == "2"]["過去SP_3走平均"].tolist() == out[out["Ｒ"] == "2"]["過去SP_3走平均"].tolist()   # 3歳限定は同じ
+    # 3歳限定のレース（ダ）も、想定の馬場で段階①の走が変わる（2026-11-23〜。それまでは無条件で全走だった）
+    assert out2[out2["Ｒ"] == "2"]["過去SP_3走平均"].tolist() != out[out["Ｒ"] == "2"]["過去SP_3走平均"].tolist()
+    assert C.main(["--merge-only", "--clean", "--baba-turf", "良"]) == 0                # ダの想定なしなら、3歳限定のレースは既定と同じ
+    assert read_merged(root)[out["Ｒ"] == "2"]["過去SP_3走平均"].tolist() == out[out["Ｒ"] == "2"]["過去SP_3走平均"].tolist()
+    capsys.readouterr()
     # 省いたほうは設定ファイル（/ingest の画面で選んだ値）
     PP.save_settings("稍・重", "auto")
     assert C.main(["--merge-only", "--clean"]) == 0
@@ -824,7 +1021,7 @@ def test_calc_rebuilds_a_stale_history_and_works_from_the_cache_alone(site, tmp_
     res.mkdir()
     for p in (root / "result_indices").iterdir():
         (res / p.name).write_bytes(p.read_bytes())
-    target = ent["馬名S"].iloc[12]                                                   # 3歳限定のレースの馬（600日以内の全走を使う）
+    target = ent["馬名S"].iloc[12]                                                   # 3歳限定のレースの馬
     last = base[base["馬名"] == target].sort_values(RID).iloc[-1][RID]
     (res / "spz_fix.csv").write_text(f"{last},100.5\n", encoding="utf-8")           # その馬の最後の走の値を上書き（名前の順で後のファイルが優先）
     sp2 = {**sp, last: 100.5}
@@ -949,12 +1146,12 @@ def test_ingest_source_with_mixed_bases_reruns_and_failures(site, tmp_path, monk
     assert any(f"今回は値の無い {cleared} 頭の前の値を消しました" in m for m in logs)
     assert not any("前の値を残しました" in m for m in logs)
     settings.unlink()
-    # (4) 芝ダ・距離 の無いベースCSV: 警告して、古馬戦でも600日以内の全走（段階⑤）。列の注意書きはファイルの名前つき
+    # (4) 芝ダ・距離 の無いベースCSV: 警告して、どのレースも600日以内の全走（段階⑤）。列の注意書きはファイルの名前つき
     res, logs = run_past([csv(ent[[RID, "枠番", "馬番", "馬名S"]], "names.csv")], "o4")
     assert isinstance(res, common.Outputs), logs
     assert any("[WARN]" in m and "芝ダ・距離 の列が無い" in m for m in logs)
     assert any("ベースCSV names.csv: 年齢限定（年限定）の列が無い" in m for m in logs)
-    everything = entries_oracle(base, sp, ent.assign(年限定="3歳"), "SP", 3, "avg")        # 限定戦の数え方 = 窓の中の全走
+    everything = entries_oracle(base, sp, ent.assign(芝ダ="", 距離=""), "SP", 3, "avg")    # 芝ダ・距離が分からない = 窓の中の全走
     assert target("o4")["ワーク1"].tolist() == everything and everything != want
     settings.unlink()
     # (5) 設定を保存できなくても（読み取り専用の場所など）取得元は成功のまま・警告だけ

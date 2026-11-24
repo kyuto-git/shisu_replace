@@ -392,10 +392,125 @@ def test_classify_boundaries():
     assert C.classify({**base, "cnt": 29, "fv": 60, "top5": 70}, "normal") is None
     assert C.classify({**base, "cnt": 20, "fv": 4.9, "top5": 9.9}, "normal") == "keshi"
     assert C.classify({**base, "cnt": 20, "fv": 4.9, "top5": None}, "normal") is None
-    assert C.classify({**base, "cnt": 20, "fv": 19.9, "top5": 50}, "odds10u") == "keshi"
-    assert C.classify({**base, "cnt": 20, "fv": 19.9, "top5": 50}, "odds10_50") is None
+    # 2〜10倍未満専用の消し（2026-11-23〜）: 複勝率 < 20 かつ（掲示板率 < 35 または WEDGE < 0.350）
+    assert C.classify({**base, "cnt": 20, "fv": 19.9, "top5": 34.9}, "odds10u") == "keshi"
+    assert C.classify({**base, "cnt": 20, "fv": 19.9, "top5": 35}, "odds10u") is None          # 掲示板率 35 以上・WEDGE なし
+    assert C.classify({**base, "cnt": 20, "fv": 19.9, "top5": 50, "wedge": 0.3499}, "odds10u") == "keshi"
+    assert C.classify({**base, "cnt": 20, "fv": 19.9, "top5": 50, "wedge": 0.35}, "odds10u") is None
+    assert C.classify({**base, "cnt": 20, "fv": 20, "top5": 0, "wedge": 0}, "odds10u") is None
+    assert C.classify({**base, "cnt": 19, "fv": 10, "top5": 20, "wedge": 0.1}, "odds10u") is None
+    for mode in ("normal", "odds10_50", "odds50p"):
+        assert C.classify({**base, "cnt": 20, "fv": 19.9, "top5": 20, "wedge": 0.1}, mode) is None
     # 判定順: 消し > 絶対軸
     assert C.classify({"cnt": 30, "fv": 4, "rv": 90, "top5": 5, "frc": 200, "tra": 200}, "normal") == "keshi"
+
+
+def test_abs_has_two_conditions_and_no_rare_relaxation():
+    """絶対軸（2026-11-23〜）= ① 件数 ≥ 10・連対率 ≥ 80 ／ ② 件数 ≥ 20・勝率 ≥ 40・複勝率 ≥ 80。どちらも
+    複勝回収値 ≥ 100 または 単勝適正回収値 ≥ 100 が要る。希少条件でも件数は下げない。"""
+    z = {"cnt": 20, "fv": 0, "rv": 0, "wv": 0, "top5": 0, "frc": 0, "tra": 0}
+    assert (C.ABS_CNT, C.ABS_REN, C.ABS2_CNT, C.ABS2_WIN, C.ABS2_FUKU) == (10, 80.0, 20, 40.0, 80.0)
+    assert not hasattr(C, "RARE_ABS_CNT")
+    two = {**z, "wv": 40, "fv": 80, "frc": 100}
+    for mode in odds.ODDS_MODES:
+        assert C.classify(two, mode) == "abs", mode
+        assert C.classify({**two, "frc": 0, "tra": 100}, mode) == "abs"
+        for miss in ({"cnt": 19}, {"cnt": 19.9}, {"wv": 39.99}, {"wv": None}, {"fv": 79.99}, {"fv": None}, {"frc": 99.99},
+                     {"frc": None}, {"cnt": None}):
+            assert C.classify({**two, **miss}, mode) is None, (mode, miss)
+    assert C.classify({k: v for k, v in two.items() if k != "wv"}, "normal") is None       # 勝率を渡さない rec は ② を満たさない
+    assert C.classify({**two, "wv": float("nan")}, "normal") is None and C.classify({**two, "wv": "x"}, "normal") is None
+    # ② を満たさなければ、今までの区分（複勝率 80・掲示板率 90 なら軸候補）。満たせば絶対軸が先
+    assert C.classify({**two, "wv": 39.9, "top5": 90}, "normal") == "axis"
+    assert C.classify({**two, "top5": 90}, "normal") == "abs"
+    # ① は 10〜19件でも（勝率・複勝率に関係なく）。② だけの行は 20件から
+    assert C.classify({**z, "cnt": 10, "rv": 80, "tra": 100}, "normal") == "abs"
+    assert C.classify({**z, "cnt": 10, "rv": 79.9, "wv": 90, "fv": 90, "tra": 100}, "normal") is None
+    # 希少条件でも件数は下げない: 6〜9件は絶対軸にならない（軸候補の条件を満たせば軸候補。希少条件の軸候補は 6件から）
+    for key in ("東京×芝×23-24×定量×G1×3", "中山×芝×2000×内×ハンデ×重賞×1~3位", "準OP・OP×61~65", "芝×芝長×高×1位",
+                "ダ×ダ長×前走1~3着×1~5位"):
+        assert C.is_rare_key(key)
+        for mode in odds.ODDS_MODES:
+            for cnt in (6, 7, 9, 9.9):
+                assert C.classify({**z, "cnt": cnt, "rv": 95, "wv": 60, "fv": 79, "top5": 79, "frc": 300, "tra": 300, "key": key},
+                                  mode) is None, (key, mode, cnt)
+                assert C.classify({**z, "cnt": cnt, "rv": 95, "fv": 95, "top5": 95, "frc": 300, "key": key}, mode) == "axis"
+            assert C.classify({**z, "cnt": 10, "rv": 80, "frc": 100, "key": key}, mode) == "abs"
+            for cnt in (10, 15, 19):                                                           # ② は希少条件でも 20件から
+                assert C.classify({**z, "cnt": cnt, "wv": 60, "fv": 79.9, "rv": 79, "top5": 69, "frc": 99, "tra": 110, "key": key},
+                                  mode) is None, (key, mode, cnt)
+                assert C.classify({**z, "cnt": cnt, "wv": 60, "fv": 85, "rv": 79, "top5": 69, "frc": 99, "tra": 110, "key": key},
+                                  mode) is None, (key, mode, cnt)
+            assert C.classify({**z, "cnt": 20, "wv": 60, "fv": 85, "rv": 79, "top5": 69, "frc": 99, "tra": 110, "key": key},
+                              mode) == "abs"
+    # 条件特化ヒット（末尾が下位）にも同じ基準
+    low = "川田将雅×前走1~3着×6位~"
+    assert C.low_tail_axis_category({**two, "key": low}, "normal") == "abs" and C.classify({**two, "key": low}, "normal") is None
+    assert C.low_tail_axis_category({**two, "cnt": 19, "key": low}, "normal") is None
+    assert C.low_tail_axis_category({**z, "cnt": 6, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×7"}, "normal") is None
+    assert C.low_tail_axis_category({**z, "cnt": 10, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×7"}, "normal") == "abs"
+    # 説明の文と、設定のハッシュに入る値
+    d = C.description_lines()["abs"]
+    assert d[0].startswith("件数 ≥ 10 かつ 連対率 ≥ 80%") and d[1].startswith("件数 ≥ 20 かつ 勝率 ≥ 40% かつ 複勝率 ≥ 80%")
+    assert all("複勝回収値 ≥ 100 または 単勝適正回収値 ≥ 100" in x for x in d[:2]) and any("件数は下げない" in x for x in d)
+    st = C.rule_settings()
+    assert (st["ABS2_CNT"], st["ABS2_WIN"], st["ABS2_FUKU"]) == (20, 40.0, 80.0) and "RARE_ABS_CNT" not in st
+
+
+def test_keshi_10u_needs_low_top5_or_low_wedge():
+    """2〜10倍未満専用の消し（2026-11-23〜）: 件数 ≥ 20（希少 12）かつ 複勝率 < 20 かつ（掲示板率 < 35 または WEDGE < 0.350）。
+    WEDGE が無い（None・NaN・数でない）なら「WEDGE < 0.350」は満たさない。全モード共通の規則はそのまま。"""
+    assert (C.KS_PLC_MAX_10U, C.KS_TOP5_MAX_10U, C.KS_WEDGE_MAX_10U) == (20.0, 35.0, 0.35)
+    z = {"cnt": 20, "fv": 15, "rv": 0, "wv": 0, "top5": 50, "frc": 0, "tra": 0}
+    table = [({"top5": 34.99}, True), ({"top5": 35}, False), ({"top5": 34.99, "wedge": 0.9}, True),
+             ({"wedge": 0.3499}, True), ({"wedge": 0.35}, False), ({"wedge": 0}, True), ({"wedge": None}, False),
+             ({"wedge": float("nan")}, False), ({"wedge": "x"}, False), ({"wedge": "0.2"}, True), ({"top5": None}, False),
+             ({"top5": None, "wedge": 0.2}, True), ({"top5": 20, "wedge": None}, True), ({"fv": 20, "top5": 0, "wedge": 0}, False),
+             ({"fv": None, "top5": 0, "wedge": 0}, False), ({"cnt": 19, "top5": 0, "wedge": 0}, False),
+             ({"cnt": None, "top5": 0, "wedge": 0}, False)]
+    for vals, want in table:
+        rec = {**z, **vals}
+        assert (C.classify(rec, "odds10u") == "keshi") == want, vals
+        assert C.keshi_rule(rec, "odds10u") == ("fav" if want else None), vals
+        for mode in ("normal", "odds10_50", "odds50p"):
+            assert C.classify(rec, mode) is None and C.keshi_rule(rec, mode) is None, (vals, mode)
+    # 希少条件は 12件から
+    g1 = "東京×芝×2400×G1×6位~"
+    assert C.classify({**z, "cnt": 12, "top5": 30, "key": g1}, "odds10u") == "keshi"
+    assert C.classify({**z, "cnt": 12, "wedge": 0.3, "key": g1}, "odds10u") == "keshi"
+    assert C.classify({**z, "cnt": 11, "wedge": 0.3, "key": g1}, "odds10u") is None
+    assert C.classify({**z, "cnt": 12, "key": g1}, "odds10u") is None
+    # 消しにならなくなった行は、ほかの区分の判定に進む（複勝率は低いが回収値の高い相手候補の条件 など）
+    assert C.classify({**z, "cnt": 30, "fv": 19.9, "rv": 85, "top5": 60, "frc": 120, "wedge": 0.8}, "odds10u") == "abs"
+    assert C.classify({**z, "cnt": 30, "fv": 19.9, "rv": 85, "top5": 60, "frc": 120, "wedge": 0.3}, "odds10u") == "keshi"
+    # 全モード共通の規則は WEDGE に関係なく
+    for mode in odds.ODDS_MODES:
+        assert C.classify({**z, "fv": 4.9, "top5": 9.9, "wedge": 2.0}, mode) == "keshi"
+        assert C.keshi_rule({**z, "fv": 4.9, "top5": 9.9, "wedge": 2.0}, mode) == "any"
+    d = C.description_lines()["keshi"]
+    assert any("複勝率 < 20% かつ（掲示板率 < 35% または WEDGE < 0.350）" in x and "2〜10倍未満" in x for x in d)
+    st = C.rule_settings()
+    assert (st["KS_PLC_MAX_10U"], st["KS_TOP5_MAX_10U"], st["KS_WEDGE_MAX_10U"]) == (20.0, 35.0, 0.35)
+
+
+def test_record_passes_every_field_the_rules_read():
+    """classify.record: DB・成績表の行（列名）→ rec。FIELD_COLUMNS の全部（勝率_val・WEDGE も）と key・indicator を渡す。"""
+    assert C.FIELD_COLUMNS == {"cnt": "件数", "fv": "複勝率_val", "rv": "連対率_val", "wv": "勝率_val", "top5": "掲示板率_val",
+                               "frc": "複勝回収値", "tra": "単勝適正回収値", "wedge": "WEDGE"}
+    row = {"件数": 25, "複勝率_val": 81.0, "連対率_val": 55.0, "勝率_val": 41.0, "掲示板率_val": 85.0, "複勝回収値": 90.0,
+           "単勝適正回収値": 105.0, "WEDGE": 0.9, "結合データ": "a×1位", "indicator": "SAV", "ほか": 1}
+    rec = C.record(row)
+    assert rec == {"cnt": 25, "fv": 81.0, "rv": 55.0, "wv": 41.0, "top5": 85.0, "frc": 90.0, "tra": 105.0, "wedge": 0.9,
+                   "key": "a×1位", "indicator": "SAV"}
+    assert C.classify(rec, "normal") == "abs"                                       # 勝率_val が渡っていなければ None
+    assert C.record({**row, "key": "b×6位~"})["key"] == "b×6位~" and C.record(row, key="c×1")["key"] == "c×1"
+    assert C.record({**row, "key": "b×6位~"}, key="c×1")["key"] == "c×1"            # 渡した key が、行の key・結合データ より先
+    assert C.record({**row, "indicator": "SAV"}, indicator="条件のみ")["indicator"] == "条件のみ"
+    assert C.record({**row, "indicator": "条件のみ"}, indicator="")["indicator"] == ""   # 渡した値が空でも、行の値に戻さない
+    assert C.record(row, indicator="条件のみ")["indicator"] == "条件のみ" and C.record({})["key"] is None
+    ks = {"件数": 30, "複勝率_val": 15.0, "掲示板率_val": 60.0, "WEDGE": 0.2}
+    assert C.classify(C.record(ks), "odds10u") == "keshi" == C.classify(C.record({**ks, "WEDGE": None, "掲示板率_val": 30.0}), "odds10u")
+    assert C.classify(C.record({**ks, "WEDGE": None}), "odds10u") is None          # WEDGE が渡っていなければ消しにならない
 
 
 # ---------------------------------------------------------------- 指数の上限ゲート（2026-11-16）
@@ -427,7 +542,8 @@ def test_low_index_conditions_are_never_abs_axis_or_opp():
     """指数が下位（結合データの末尾が下位の順位帯・偏差値帯・指数順位 6 以上）の条件は、絶対軸・軸候補・相手候補にしない。
     消し候補はそのまま。結合データが無い・末尾がどの形でもないときは今までどおり。"""
     z = {"cnt": 60, "fv": 30, "rv": 0, "top5": 40, "frc": 0, "tra": 0}          # どの区分にもならない成績
-    cases = {"abs": {"rv": 85, "frc": 120}, "axis": {"fv": 82, "top5": 92}, "opp": {"fv": 62, "top5": 72},
+    cases = {"abs": {"rv": 85, "frc": 120}, "abs_2": {"wv": 45, "fv": 82, "tra": 110},
+             "axis": {"fv": 82, "top5": 92}, "opp": {"fv": 62, "top5": 72},
              "axis_hr": {"fv": 36, "top5": 55, "tra": 210}}
     head = "川田将雅×前走1~3着"
     for name, vals in cases.items():
@@ -446,12 +562,15 @@ def test_low_index_conditions_are_never_abs_axis_or_opp():
     # 4つのオッズ帯とも同じ。希少条件（最低件数の緩和）でも、指数が下位なら対象外
     for mode in odds.ODDS_MODES:
         assert C.classify({**z, "rv": 85, "frc": 120, "key": head + "×6位~"}, mode) is None
-        assert C.classify({**z, "cnt": 6, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×7"}, mode) is None
-        assert C.classify({**z, "cnt": 6, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×5"}, mode) == "abs"
+        assert C.classify({**z, "cnt": 10, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×7"}, mode) is None
+        assert C.classify({**z, "cnt": 10, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×5"}, mode) == "abs"
+        assert C.classify({**z, "cnt": 6, "fv": 82, "top5": 92, "key": "東京×芝×23-24×定量×G1×7"}, mode) is None
+        assert C.classify({**z, "cnt": 6, "fv": 82, "top5": 92, "key": "東京×芝×23-24×定量×G1×5"}, mode) == "axis"
     # 消し候補は制限しない（下位の条件こそ消しになる）。消しでも軸でもある値は、今までどおり消し
     for t in LOW_TAILS + OK_TAILS + ODD_TAILS:
         assert C.classify({**z, "fv": 3, "top5": 8, "key": f"{head}×{t}"}, "normal") == "keshi", t
-        assert C.classify({**z, "fv": 15, "top5": 60, "key": f"{head}×{t}"}, "odds10u") == "keshi", t
+        assert C.classify({**z, "fv": 15, "top5": 30, "key": f"{head}×{t}"}, "odds10u") == "keshi", t
+        assert C.classify({**z, "fv": 15, "top5": 60, "wedge": 0.3, "key": f"{head}×{t}"}, "odds10u") == "keshi", t
     assert C.classify({**z, "fv": 4, "rv": 90, "top5": 5, "frc": 200, "key": head + "×10位~"}, "normal") == "keshi"
     # 途中の部品が下位の形でも、見るのは末尾だけ
     assert C.classify({**z, "fv": 82, "top5": 92, "key": "6位~×41~50×前走6着~×1~3位"}, "normal") == "axis"
@@ -476,7 +595,10 @@ def test_low_tail_axis_category_reports_the_rows_the_gate_removed():
              "opp": ({"fv": 62, "top5": 72}, "normal", None),                              # 相手候補の基準までの行は対象外
              "none": ({}, "normal", None),
              "keshi": ({"fv": 3, "top5": 8}, "normal", None),                              # 消し候補は末尾に関係なく先に決まる
-             "keshi_fav": ({"fv": 15, "rv": 90, "top5": 60, "frc": 150}, "odds10u", None),
+             "abs_2": ({"wv": 45, "fv": 82, "tra": 100}, "normal", "abs"),                 # 絶対軸の条件②（勝率 40・複勝率 80）
+             "keshi_fav": ({"fv": 15, "rv": 90, "top5": 30, "frc": 150}, "odds10u", None),
+             "keshi_fav_wedge": ({"fv": 15, "rv": 90, "top5": 60, "frc": 150, "wedge": 0.3}, "odds10u", None),
+             "not_keshi_fav": ({"fv": 15, "rv": 90, "top5": 60, "frc": 150, "wedge": 0.5}, "odds10u", "abs"),   # 消しでなくなった行
              "keshi_and_abs": ({"fv": 4, "rv": 90, "top5": 5, "frc": 200}, "normal", None)}
     for name, (vals, mode, want) in cases.items():
         for t in LOW_TAILS:
@@ -493,17 +615,19 @@ def test_low_tail_axis_category_reports_the_rows_the_gate_removed():
     assert C.low_tail_axis_category({**z, "cnt": 10, "rv": 85, "frc": 120, "key": head + "×6位~"}, "normal") == "abs"
     assert C.low_tail_axis_category({**z, "cnt": 19, "fv": 82, "top5": 92, "key": head + "×6位~"}, "normal") is None
     assert C.low_tail_axis_category({**z, "cnt": 20, "fv": 82, "top5": 92, "key": head + "×6位~"}, "normal") == "axis"
-    assert C.low_tail_axis_category({**z, "cnt": 6, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×7"}, "normal") == "abs"
+    assert C.low_tail_axis_category({**z, "cnt": 9, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×7"}, "normal") is None   # 絶対軸は希少条件でも 10件から
+    assert C.low_tail_axis_category({**z, "cnt": 10, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×7"}, "normal") == "abs"
     assert C.low_tail_axis_category({**z, "cnt": 6, "fv": 82, "top5": 92, "key": "騎手A×芝長×40以下"}, "normal") == "axis"
-    assert C.low_tail_axis_category({**z, "cnt": 6, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×5"}, "normal") is None
+    assert C.low_tail_axis_category({**z, "cnt": 10, "rv": 85, "frc": 120, "key": "東京×芝×23-24×定量×G1×5"}, "normal") is None
     # 乱数の行で: 末尾を上位の部品に替えたときの classify が abs / axis の行だけ、その区分を返す（ほかは None）
     rng = random.Random(5)
     heads = ["東京×ダ×1600×定量×G1", "騎手A×前走6着~", "芝×芝長×高", "阪神×芝×16-18"]
     n_hit = 0
     for _ in range(6000):
         rec = {"cnt": rng.choice([5, 6, 9, 10, 15, 19, 20, 29, 30, 60]), "fv": rng.choice([3, 15, 34, 36, 50, 62, 70, 82]),
-               "rv": rng.choice([0, 50, 60, 85]), "top5": rng.choice([5, 49, 55, 72, 80, 92]),
-               "frc": rng.choice([None, 0, 99, 100, 150, 210]), "tra": rng.choice([None, 0, 100, 150, 210])}
+               "rv": rng.choice([0, 50, 60, 85]), "top5": rng.choice([5, 34, 49, 55, 72, 80, 92]),
+               "frc": rng.choice([None, 0, 99, 100, 150, 210]), "tra": rng.choice([None, 0, 100, 150, 210]),
+               "wv": rng.choice([None, 0, 39, 40, 60]), "wedge": rng.choice([None, 0.2, 0.35, 0.9])}
         mode = rng.choice(odds.ODDS_MODES)
         h = rng.choice(heads)
         t = rng.choice(LOW_TAILS + OK_TAILS + ODD_TAILS)
@@ -523,25 +647,25 @@ def test_low_tail_gate_is_the_same_in_row_frame_and_sql():
     heads = ["東京×ダ×1600×定量×G1", "騎手A×前走6着~", "", "芝×芝長×高"]
     keys = [None, ""] + [(h + "×" + t) if h else t for h in heads for t in LOW_TAILS + OK_TAILS + ODD_TAILS]
     rows = [(i, rng.choice([5, 6, 9, 10, 15, 19, 20, 29, 30, 60]), rng.choice([0, 4.99, 19.99, 35, 50, 60, 70, 80, 95]),
-             rng.choice([0, 50, 60, 80, 90]), rng.choice([0, 9.9, 50, 70, 80, 90, 99]), rng.choice([0, 100, 150, 200]),
-             rng.choice([0, 100, 150, 200]), rng.choice(keys)) for i in range(20000)]
+             rng.choice([0, 50, 60, 80, 90]), rng.choice([0, 9.9, 34.9, 50, 70, 80, 90, 99]), rng.choice([0, 100, 150, 200]),
+             rng.choice([0, 100, 150, 200]), rng.choice(keys), rng.choice([None, 0, 39.9, 40, 70]),
+             rng.choice([None, 0.1, 0.3499, 0.35, 1.2])) for i in range(20000)]
     con = sqlite3.connect(":memory:")
     con.execute('CREATE TABLE t (id INTEGER, "件数" INTEGER, "複勝率_val" REAL, "連対率_val" REAL, "掲示板率_val" REAL, '
-                '"複勝回収値" REAL, "単勝適正回収値" REAL, "結合データ" TEXT, key TEXT)')
+                '"複勝回収値" REAL, "単勝適正回収値" REAL, "結合データ" TEXT, "勝率_val" REAL, "WEDGE" REAL, key TEXT)')
     # 2つの列（結合データ・key）には別々の値を入れる（SQL 版が、渡した列名のほうを見ていることを確かめるため）
     alt = [rng.choice(keys) for _ in rows]
-    con.executemany("INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?)", [r + (a,) for r, a in zip(rows, alt)])
+    con.executemany("INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?,?,?)", [r + (a,) for r, a in zip(rows, alt)])
     assert sum(C.is_low_tail(r[7]) != C.is_low_tail(a) for r, a in zip(rows, alt)) > 1000
-    cols = ["id", "件数", "複勝率_val", "連対率_val", "掲示板率_val", "複勝回収値", "単勝適正回収値", "結合データ"]
+    cols = ["id", "件数", "複勝率_val", "連対率_val", "掲示板率_val", "複勝回収値", "単勝適正回収値", "結合データ", "勝率_val", "WEDGE"]
     df = pd.DataFrame(rows, columns=cols)
+    rec_of = lambda r: {"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6], "wv": r[8], "wedge": r[9]}
     seen = set()
     for mode in odds.ODDS_MODES:
-        py = [C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6], "key": r[7]}, mode)
-              for r in rows]
+        py = [C.classify({**rec_of(r), "key": r[7]}, mode) for r in rows]
         assert list(C.classify_frame(df, mode)) == py
         assert list(C.classify_frame(df.rename(columns={"結合データ": "key"}), mode)) == py
-        py_alt = [C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6], "key": a}, mode)
-                  for r, a in zip(rows, alt)]
+        py_alt = [C.classify({**rec_of(r), "key": a}, mode) for r, a in zip(rows, alt)]
         assert py_alt != py
         for cat in C.CATEGORIES:
             for col, res in (("結合データ", py), ("key", py_alt)):
@@ -555,29 +679,36 @@ def test_low_tail_gate_is_the_same_in_row_frame_and_sql():
     # 結合データの列が無い DataFrame・SQL の NULL は、ゲートで落とさない
     nokey = df.drop(columns="結合データ")
     for mode in odds.ODDS_MODES:
-        assert list(C.classify_frame(nokey, mode)) == [
-            C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6]}, mode) for r in rows]
+        assert list(C.classify_frame(nokey, mode)) == [C.classify(rec_of(r), mode) for r in rows]
 
 
 def test_keshi_rule_tells_the_favorite_only_rule_from_the_common_rule():
-    """消し候補の理由: 全モード共通の規則（複勝率 < 5・掲示板率 < 10）か、2〜10倍未満専用の規則（複勝率 < 20）だけか。"""
+    """消し候補の理由: 全モード共通の規則（複勝率 < 5・掲示板率 < 10）か、2〜10倍未満専用の規則
+    （複勝率 < 20 かつ（掲示板率 < 35 または WEDGE < 0.350））だけか。"""
     z = {"cnt": 20, "fv": 0, "top5": 0}
     assert C.keshi_rule({**z, "fv": 4.9, "top5": 9.9}, "odds10u") == "any" == C.keshi_rule({**z, "fv": 4.9, "top5": 9.9}, "normal")
-    assert C.keshi_rule({**z, "fv": 19.9, "top5": 50}, "odds10u") == "fav"
+    assert C.keshi_rule({**z, "fv": 19.9, "top5": 34.9}, "odds10u") == "fav"
+    assert C.keshi_rule({**z, "fv": 19.9, "top5": 50, "wedge": 0.34}, "odds10u") == "fav"
+    assert C.keshi_rule({**z, "fv": 19.9, "top5": 50}, "odds10u") is None            # 掲示板率 35 以上・WEDGE なし → 消しではない
+    assert C.keshi_rule({**z, "fv": 19.9, "top5": 50, "wedge": 0.35}, "odds10u") is None
     assert C.keshi_rule({**z, "fv": 4.9, "top5": 10}, "odds10u") == "fav"            # 掲示板率が 10 以上 → 共通の規則ではない
     for mode in ("normal", "odds10_50", "odds50p"):
-        assert C.keshi_rule({**z, "fv": 19.9, "top5": 50}, mode) is None
-    assert C.keshi_rule({**z, "fv": 20, "top5": 50}, "odds10u") is None
-    assert C.keshi_rule({**z, "cnt": 19, "fv": 10, "top5": 50}, "odds10u") is None
-    assert C.keshi_rule({**z, "cnt": 12, "fv": 10, "top5": 50, "key": "東京×芝×2400×G1×6位~"}, "odds10u") == "fav"   # 希少条件は12件から
+        assert C.keshi_rule({**z, "fv": 19.9, "top5": 20, "wedge": 0.1}, mode) is None
+    assert C.keshi_rule({**z, "fv": 20, "top5": 20}, "odds10u") is None
+    assert C.keshi_rule({**z, "cnt": 19, "fv": 10, "top5": 20}, "odds10u") is None
+    assert C.keshi_rule({**z, "cnt": 12, "fv": 10, "top5": 20, "key": "東京×芝×2400×G1×6位~"}, "odds10u") == "fav"   # 希少条件は12件から
     assert C.keshi_rule({**z, "fv": None, "top5": 5}, "odds10u") is None
     rng = random.Random(5)
-    for _ in range(3000):                                # classify が消し候補と言う行だけ理由が付く
+    n_fav = 0
+    for _ in range(6000):                                # classify が消し候補と言う行だけ理由が付く
         rec = {"cnt": rng.choice([11, 12, 19, 20, 40]), "fv": rng.choice([0, 4.9, 5, 19.9, 20, None]),
-               "top5": rng.choice([0, 9.9, 10, 60, None]), "rv": 0, "frc": 0, "tra": 0,
+               "top5": rng.choice([0, 9.9, 10, 34.9, 35, 60, None]), "rv": 0, "frc": 0, "tra": 0,
+               "wedge": rng.choice([None, 0.1, 0.3499, 0.35, 0.8]),
                "key": rng.choice([None, "a×1位", "a×G1×6位~"])}
+        n_fav += C.keshi_rule(rec, "odds10u") == "fav"
         for mode in odds.ODDS_MODES:
             assert (C.classify(rec, mode) == "keshi") == (C.keshi_rule(rec, mode) is not None)
+    assert n_fav > 300
 
 
 def test_tradeoff_groups_use_registered_indicator_names():
@@ -608,23 +739,27 @@ def test_sql_condition_matches_python():
     rng = random.Random(3)
     con = sqlite3.connect(":memory:")
     con.execute('CREATE TABLE t (id INTEGER, "件数" INTEGER, "複勝率_val" REAL, "連対率_val" REAL, '
-                '"掲示板率_val" REAL, "複勝回収値" REAL, "単勝適正回収値" REAL, "結合データ" TEXT, key TEXT)')
+                '"掲示板率_val" REAL, "複勝回収値" REAL, "単勝適正回収値" REAL, "結合データ" TEXT, key TEXT, '
+                '"勝率_val" REAL, "WEDGE" REAL)')
     rows = []
     pick = lambda vals: rng.choice(vals + [None])
-    for i in range(12000):
+    for i in range(30000):
         key = pick(RARE_KEY_SAMPLES)
         rows.append((i, pick([5, 6, 9, 10, 11, 12, 14, 15, 19, 20, 29, 30, 60]),
-                     pick([0, 4.99, 5, 19.99, 33, 34.99, 35, 49.99, 50, 60, 70, 80, 95]),
-                     pick([0, 49.9, 50, 60, 80, 90]), pick([0, 9.9, 10, 49.99, 50, 70, 80, 90, 99]),
+                     pick([0, 4.99, 5, 19.99, 33, 34.99, 35, 49.99, 50, 60, 70, 79.99, 80, 95]),
+                     pick([0, 49.9, 50, 60, 79.99, 80, 90]), pick([0, 9.9, 10, 34.99, 35, 49.99, 50, 70, 80, 90, 99]),
                      pick([0, 99, 100, 149.99, 150, 199.99, 200]), pick([0, 99, 100, 149.99, 150, 199.99, 200]),
-                     key, key))
-    con.executemany("INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?)", rows)
-    seen = set()
+                     key, key, pick([0, 39.99, 40, 75]), pick([0, 0.3499, 0.35, 0.62, 1.4])))
+    con.executemany("INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+    seen, n_abs2, n_fav = set(), 0, 0
     for mode in odds.ODDS_MODES:
         expected = {c: set() for c in C.CATEGORIES}
         for r in rows:
-            cat = C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6],
-                              "key": r[7]}, mode)
+            rec = {"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6], "key": r[7], "wv": r[9],
+                   "wedge": r[10]}
+            cat = C.classify(rec, mode)
+            n_abs2 += cat == "abs" and not (r[3] is not None and r[3] >= 80)                # 条件②だけで絶対軸の行
+            n_fav += C.keshi_rule(rec, mode) == "fav"
             if cat:
                 expected[cat].add(r[0])
                 seen.add((cat, C.is_rare_key(r[7])))
@@ -634,6 +769,18 @@ def test_sql_condition_matches_python():
             got = {x[0] for x in con.execute(f"SELECT id FROM t WHERE {C.sql_condition(cat, mode, 'key')}")}
             assert got == expected[cat], (mode, cat, "key")
     assert seen == {(c, r) for c in C.CATEGORIES for r in (True, False)}       # どの区分も、希少・ふつうの両方を試している
+    assert n_abs2 > 20 and n_fav > 200                                         # 絶対軸の条件②・2〜10倍未満専用の消しも試している
+    # ベクトル版も同じ（勝率_val・WEDGE の NULL / NaN はどの比較も満たさない）
+    df = pd.DataFrame(rows, columns=["id", "件数", "複勝率_val", "連対率_val", "掲示板率_val", "複勝回収値", "単勝適正回収値",
+                                     "結合データ", "key", "勝率_val", "WEDGE"]).drop(columns="key")
+    for mode in odds.ODDS_MODES:
+        want = [C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6], "key": r[7],
+                            "wv": r[9], "wedge": r[10]}, mode) for r in rows]
+        assert list(C.classify_frame(df, mode)) == want, mode
+        # 勝率_val・WEDGE の列が無い表は、その値が無いものとして判定する（1行版で渡さないのと同じ）
+        bare = [C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6], "key": r[7]}, mode)
+                for r in rows]
+        assert list(C.classify_frame(df.drop(columns=["勝率_val", "WEDGE"]), mode)) == bare and bare != want
 
 
 RARE_KEY_SAMPLES = ["東京×芝×23-24×定量×G1×3", "中山×芝×2000×内×ハンデ×重賞×1~3位", "準OP・OP×61~65",
@@ -650,8 +797,8 @@ def test_classify_rare_keys_and_high_return():
     assert not C.is_rare_key(None)
     z = {"fv": 0, "rv": 0, "top5": 0, "frc": 0, "tra": 0}
     g1, plain = "東京×芝×23-24×定量×G1×3", "東京×芝×16-18×定量×1・2_勝×3"
-    # 希少条件は最低件数が下がる（絶対軸・軸 6、相手 15、消し 12）。ふつうの条件はそのまま
-    for key, n_abs, n_ax, n_opp, n_ks in ((g1, 6, 6, 15, 12), (plain, 10, 20, 30, 20)):
+    # 希少条件は最低件数が下がる（軸 6、相手 15、消し 12。絶対軸は 2026-11-23 から下げない）。ふつうの条件はそのまま
+    for key, n_abs, n_ax, n_opp, n_ks in ((g1, 10, 6, 15, 12), (plain, 10, 20, 30, 20)):
         assert C.classify({**z, "cnt": n_abs, "rv": 80, "frc": 100, "key": key}, "normal") == "abs"
         assert C.classify({**z, "cnt": n_abs - 1, "rv": 80, "frc": 100, "key": key}, "normal") is None
         assert C.classify({**z, "cnt": n_ax, "fv": 80, "top5": 90, "key": key}, "normal") == "axis"
@@ -660,11 +807,13 @@ def test_classify_rare_keys_and_high_return():
         assert C.classify({**z, "cnt": n_opp - 1, "fv": 60, "top5": 70, "key": key}, "normal") is None
         assert C.classify({**z, "cnt": n_ks, "fv": 4.9, "top5": 9.9, "key": key}, "normal") == "keshi"
         assert C.classify({**z, "cnt": n_ks - 1, "fv": 4.9, "top5": 9.9, "key": key}, "normal") is None
-        assert C.classify({**z, "cnt": n_ks, "fv": 19.9, "top5": 50, "key": key}, "odds10u") == "keshi"
-        assert C.classify({**z, "cnt": n_ks - 1, "fv": 19.9, "top5": 50, "key": key}, "odds10u") is None
+        assert C.classify({**z, "cnt": n_ks, "fv": 19.9, "top5": 34.9, "key": key}, "odds10u") == "keshi"
+        assert C.classify({**z, "cnt": n_ks - 1, "fv": 19.9, "top5": 34.9, "key": key}, "odds10u") is None
+        assert C.classify({**z, "cnt": n_ks, "fv": 19.9, "top5": 50, "wedge": 0.34, "key": key}, "odds10u") == "keshi"
+        assert C.classify({**z, "cnt": n_ks - 1, "fv": 19.9, "top5": 50, "wedge": 0.34, "key": key}, "odds10u") is None
     # 結合データを渡さなければ希少条件ではない（KEY_COLUMN の名前でも渡せる）
-    assert C.classify({**z, "cnt": 6, "rv": 80, "frc": 100}, "normal") is None
-    assert C.classify({**z, "cnt": 6, "rv": 80, "frc": 100, "結合データ": g1}, "normal") == "abs"
+    assert C.classify({**z, "cnt": 6, "fv": 80, "top5": 90}, "normal") is None
+    assert C.classify({**z, "cnt": 6, "fv": 80, "top5": 90, "結合データ": g1}, "normal") == "axis"
     # 高回収率基準（軸候補）: 2〜10倍未満・10〜50倍のときだけ
     # （回収値は 単勝適正回収値 で試す。複勝回収値 ≥ 150 だと、もとからある相手候補の条件にも当たるため）
     hr1 = {**z, "cnt": 30, "fv": 35, "top5": 50, "tra": 200}
@@ -684,7 +833,8 @@ def test_classify_rare_keys_and_high_return():
     assert C.classify({**hr1, "cnt": 15, "key": plain}, "odds10_50") is None
     # 判定順は変わらない: 消し → 絶対軸 → 軸（高回収率でも絶対軸の条件を満たせば絶対軸）
     assert C.classify({**hr2, "rv": 80, "frc": 150}, "odds10u") == "abs"
-    assert C.classify({**z, "cnt": 30, "fv": 19.9, "top5": 60, "frc": 300, "tra": 300}, "odds10u") == "keshi"
+    assert C.classify({**z, "cnt": 30, "fv": 19.9, "top5": 34, "frc": 300, "tra": 300}, "odds10u") == "keshi"
+    assert C.classify({**z, "cnt": 30, "fv": 19.9, "top5": 60, "frc": 300, "tra": 300, "wedge": 0.34}, "odds10u") == "keshi"
     # 説明の文と規則の値（設定のハッシュに入る）
     d = C.description_lines()
     assert any("高回収率" in x for x in d["axis"]) and all(any("希少条件" in x for x in d[c]) for c in C.CATEGORIES)
@@ -692,7 +842,7 @@ def test_classify_rare_keys_and_high_return():
     assert s["RARE_TOKENS"] == list(C.RARE_TOKENS) and s["HR_CNT"] == 30 and s["RARE_KS_CNT"] == 12
     # 軸候補の最低件数（2026-11-14 に 10 → 20）。ほかの下限はそのまま。説明の文も同じ値
     assert (s["AX_CNT"], s["ABS_CNT"], s["OP_CNT"], s["KS_CNT"]) == (20, 10, 30, 20)
-    assert (s["RARE_AX_CNT"], s["RARE_ABS_CNT"], s["RARE_OP_CNT"], s["RARE_HR_CNT"]) == (6, 6, 15, 15)
+    assert (s["RARE_AX_CNT"], s["RARE_OP_CNT"], s["RARE_HR_CNT"]) == (6, 15, 15) and "RARE_ABS_CNT" not in s
     assert all(x.startswith("件数 ≥ 20 かつ") for x in d["axis"][:4]) and d["abs"][0].startswith("件数 ≥ 10 かつ")
     assert any("件数 ≥ 6（高回収率は 件数 ≥ 15）" in x for x in d["axis"]) and "件数 ≥ 30" in d["axis"][4]
 

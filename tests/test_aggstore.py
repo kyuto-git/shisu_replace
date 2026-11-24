@@ -66,7 +66,7 @@ def test_classify_frame_matches_row_classify():
     from shisu.classify import FIELD_COLUMNS, classify, classify_frame, is_rare_key
     rng = np.random.default_rng(7)
     pick = lambda vals: rng.choice(np.array(vals, dtype=float), n)      # noqa: E731（境界の値を多めに混ぜる）
-    n = 12000
+    n = 30000
     keys = ["東京×芝×23-24×定量×G1×3", "中山×芝×2000×内×ハンデ×重賞×1~3位", "準OP・OP×61~65", "芝×芝長×高×1位",
             "ダ×ダ長×前走1~3着×6位~", "東京×ダ×1600×定量×1・2_勝×4", "東京×芝×16-18×馬齢×1勝・OP×2", "騎手G1×1",
             "g1×1", "芝長い×1", "", None, "東京×芝×2400×定量×G1\n", "G1\n", "(G1)×1", "準OP.OP×1"]
@@ -75,16 +75,25 @@ def test_classify_frame_matches_row_classify():
         "複勝率_val": pick([0, 4.99, 5, 19.99, 20, 32.99, 33, 34.99, 35, 49.99, 50, 59.99, 60, 69.99, 70, 79.99, 80, 95,
                          np.nan]),
         "連対率_val": pick([0, 49.99, 50, 59.99, 60, 79.99, 80, 90, np.nan]),
-        "掲示板率_val": pick([0, 9.99, 10, 49.99, 50, 69.99, 70, 79.99, 80, 89.99, 90, 100, np.nan]),
+        "掲示板率_val": pick([0, 9.99, 10, 34.99, 35, 49.99, 50, 69.99, 70, 79.99, 80, 89.99, 90, 100, np.nan]),
         "複勝回収値": pick([0, 99.99, 100, 149.99, 150, 199.99, 200, 300, np.nan]),
         "単勝適正回収値": pick([0, 99.99, 100, 149.99, 150, 199.99, 200, np.nan]),
+        "勝率_val": pick([0, 39.99, 40, 75, np.nan]),                       # 絶対軸の条件②（勝率 40）
+        "WEDGE": pick([0, 0.3499, 0.35, 0.62, 1.3, np.nan]),                # 2〜10倍未満専用の消し（WEDGE < 0.350）
     })
+    assert set(FIELD_COLUMNS.values()) <= set(df.columns) and len(FIELD_COLUMNS) == 8
     df["結合データ"] = [keys[i] for i in rng.integers(0, len(keys), n)]
     seen = set()
     for mode in ("normal", "odds10u", "odds10_50", "odds50p"):
         want = [classify({**{k: (None if pd.isna(r[c]) else r[c]) for k, c in FIELD_COLUMNS.items()},
                           "key": r["結合データ"]}, mode) for r in df.to_dict("records")]
         assert list(classify_frame(df, mode)) == want, mode
+        # 勝率_val・WEDGE の列を落とすと判定が変わる（ベクトル版がこの2列を読んでいる）。列が無い表は「値なし」と同じ
+        for col, field in (("勝率_val", "wv"), ("WEDGE", "wedge")):
+            less = [classify({**{k: (None if pd.isna(r[c]) else r[c]) for k, c in FIELD_COLUMNS.items() if k != field},
+                              "key": r["結合データ"]}, mode) for r in df.to_dict("records")]
+            assert list(classify_frame(df.drop(columns=[col]), mode)) == less, (mode, col)
+            assert (less != want) == (col == "勝率_val" or mode == "odds10u"), (mode, col)
         assert list(classify_frame(df.rename(columns={"結合データ": "key"}), mode)) == want, mode
         seen |= {(w, is_rare_key(k)) for w, k in zip(want, df["結合データ"])}
         # 結合データの列が無ければ、希少条件ではないものとして判定する
@@ -157,7 +166,8 @@ def test_compact_keeps_exactly_the_specified_rows(mb):
     want = []
     for r, raw in zip(db.to_dict("records"), full.to_dict("records")):
         rec = {"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
-               "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"]}
+               "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"],
+               "wv": r["勝率_val"], "wedge": r["WEDGE"]}                                      # 絶対軸の条件②・2〜10倍未満専用の消し
         cat = classify(rec, r["odds_mode"]) or low_tail_axis_category(rec, r["odds_mode"])    # 4区分か、条件特化ヒットの行
         w, a = r["WEDGE"], r["adjusted_WEDGE"]
         keep = (cat is not None or (w == w and w >= 0.70) or (a == a and a >= 0.70)
@@ -184,7 +194,8 @@ def test_compact_mask_uses_rare_minimum_counts_outside_layer_a():
                 "掲示板率_val": top5, "複勝回収値": frc, "単勝適正回収値": tra, "WEDGE": 0.3, "adjusted_WEDGE": None}
 
     rare, plain = "芝×芝長×高×1位", "芝×芝マイル×高×1位"
-    cases = [("normal", 6, 90.0, 85.0, 95.0, 120.0, 0.0, "abs"),          # 絶対軸: 件数 6（ふつうは 10）
+    cases = [("normal", 6, 90.0, 85.0, 95.0, 120.0, 0.0, "axis"),         # 絶対軸の数字でも 6〜9件は絶対軸にしない（軸候補の条件で残る）
+             ("normal", 9, 60.0, 85.0, 60.0, 120.0, 0.0, None),           # 絶対軸は希少条件でも 10件から（2026-11-23〜）→ 残さない
              ("normal", 7, 82.0, 55.0, 92.0, 0.0, 0.0, "axis"),           # 軸候補: 件数 6
              ("normal", 15, 62.0, 40.0, 72.0, 0.0, 0.0, "opp"),           # 相手候補: 件数 15（ふつうは 30）
              ("normal", 12, 3.0, 1.0, 8.0, 0.0, 0.0, "keshi"),            # 消し候補: 件数 12（ふつうは 20）
@@ -193,7 +204,7 @@ def test_compact_mask_uses_rare_minimum_counts_outside_layer_a():
     for mode, cnt, fuku, ren, top5, frc, tra, want in cases:
         out = pd.DataFrame([row(rare, cnt, fuku, ren, top5, frc, tra), row(plain, cnt, fuku, ren, top5, frc, tra)])
         est = {c: float(estimate_percent(out[c]).iloc[0]) for c in ("複勝率", "連対率")}
-        rec = {"cnt": cnt, "fv": est["複勝率"], "rv": est["連対率"], "top5": top5, "frc": frc, "tra": tra}
+        rec = {"cnt": cnt, "fv": est["複勝率"], "rv": est["連対率"], "top5": top5, "frc": frc, "tra": tra, "wedge": 0.3}
         assert classify({**rec, "key": rare}, mode) == want and classify({**rec, "key": plain}, mode) is None, (mode, want)
         for layer in ("B", "C", "D", "X", ""):
             got = list(compact_mask(out, mode, layer=layer, min_count=30, min_wedge=0.70))
@@ -201,6 +212,58 @@ def test_compact_mask_uses_rare_minimum_counts_outside_layer_a():
         assert list(compact_mask(out, mode, layer="A")) == [True, True]
         # 結合データの列が無い成績表は、希少条件ではないものとして見る
         assert list(compact_mask(out.drop(columns=["結合データ"]), mode, layer="B", min_count=30, min_wedge=0.70)) == [False, False]
+
+
+def test_compact_mask_follows_the_second_abs_rule_and_the_odds10u_keshi_rule():
+    """コンパクト化の区分の判定（2026-11-23〜）: 絶対軸の条件②（件数 20・勝率 40・複勝率 80・回収値 100）と、2〜10倍未満専用の
+    消し（複勝率 < 20 かつ（掲示板率 < 35 または WEDGE < 0.350））。勝率は DB と同じ推定値（文字列の括弧内）で見る
+    （成績表の 勝率_val は頻度）。件数・WEDGE の下限では残らない行で確かめる。"""
+    from shisu.aggstore import compact_mask, estimate_percent
+    from shisu.classify import classify, low_tail_axis_category
+
+    def row(key, cnt, win, fuku, ren, top5, frc=0.0, tra=0.0, wedge=0.5, win_freq=None):
+        return {"結合データ": key, "件数": cnt, "勝率": f"{win if win_freq is None else win_freq:.2f}%（{win:.2f}%）",
+                "勝率_val": win if win_freq is None else win_freq, "複勝率": f"{fuku:.2f}%（{fuku:.2f}%）",
+                "連対率": f"{ren:.2f}%（{ren:.2f}%）", "掲示板率_val": top5, "複勝回収値": frc, "単勝適正回収値": tra,
+                "WEDGE": wedge, "adjusted_WEDGE": None}
+
+    top, low = "騎手A×前走1着×1~3位", "騎手A×前走1着×6位~"
+    #        mode       cnt  win   fuku  ren   top5  frc    tra    wedge  win_freq  区分（top の結合データ）
+    cases = [("normal", 20, 40.0, 80.0, 55.0, 70.0, 0.0, 100.0, 0.5, None, "abs"),         # ② ちょうど
+             ("normal", 19, 40.0, 80.0, 55.0, 70.0, 0.0, 100.0, 0.5, None, None),          # 件数 19
+             ("normal", 22, 39.9, 82.0, 55.0, 70.0, 0.0, 110.0, 0.5, None, None),          # 勝率 39.9
+             ("normal", 22, 45.0, 79.9, 55.0, 70.0, 0.0, 110.0, 0.5, None, None),          # 複勝率 79.9
+             ("normal", 22, 45.0, 82.0, 55.0, 70.0, 99.0, 99.0, 0.5, None, None),          # 回収値 99
+             ("odds50p", 22, 45.0, 82.0, 55.0, 70.0, 120.0, 0.0, 0.5, None, "abs"),
+             ("normal", 22, 38.0, 82.0, 55.0, 70.0, 0.0, 110.0, 0.5, 50.0, None),          # 頻度 50・推定 38 → ② ではない
+             ("normal", 22, 45.0, 82.0, 55.0, 70.0, 0.0, 110.0, 0.5, 38.0, "abs"),         # 頻度 38・推定 45 → ②
+             ("odds10u", 22, 3.0, 15.0, 8.0, 50.0, 0.0, 0.0, 0.3499, None, "keshi"),       # WEDGE < 0.350
+             ("odds10u", 22, 3.0, 15.0, 8.0, 50.0, 0.0, 0.0, 0.35, None, None),            # WEDGE 0.350・掲示板率 50 → 消しではない
+             ("odds10u", 22, 3.0, 15.0, 8.0, 34.9, 0.0, 0.0, 0.6, None, "keshi"),          # 掲示板率 < 35
+             ("odds10u", 22, 3.0, 15.0, 8.0, 35.0, 0.0, 0.0, None, None, None),            # WEDGE なし・掲示板率 35
+             ("odds10u", 19, 3.0, 15.0, 8.0, 20.0, 0.0, 0.0, 0.1, None, None),             # 件数 19
+             ("normal", 22, 3.0, 15.0, 8.0, 20.0, 0.0, 0.0, 0.1, None, None),              # 通常のオッズ帯には無い規則
+             ("odds10_50", 22, 3.0, 15.0, 8.0, 20.0, 0.0, 0.0, 0.1, None, None)]
+    for mode, cnt, win, fuku, ren, top5, frc, tra, wedge, win_freq, want in cases:
+        out = pd.DataFrame([row(top, cnt, win, fuku, ren, top5, frc, tra, wedge, win_freq),
+                            row(low, cnt, win, fuku, ren, top5, frc, tra, wedge, win_freq)])
+        est = {c: float(estimate_percent(out[c]).iloc[0]) for c in ("勝率", "複勝率", "連対率")}
+        rec = {"cnt": cnt, "wv": est["勝率"], "fv": est["複勝率"], "rv": est["連対率"], "top5": top5, "frc": frc, "tra": tra,
+               "wedge": wedge}
+        assert classify({**rec, "key": top}, mode) == want, (mode, cnt, win, wedge)
+        # 末尾が下位の同じ成績: 消しはそのまま消し、絶対軸の基準なら条件特化ヒットとして残す
+        low_keep = want is not None
+        assert (classify({**rec, "key": low}, mode) or low_tail_axis_category({**rec, "key": low}, mode)) == want
+        for layer in ("B", "C", "D", "X", ""):
+            got = list(compact_mask(out, mode, layer=layer, min_count=30, min_wedge=0.70))
+            assert got == [want is not None, low_keep], (mode, cnt, win, wedge, layer)
+    # 勝率・WEDGE の列が無い成績表は、その値が無いものとして見る（② と WEDGE の条件は満たさない）
+    out = pd.DataFrame([row(top, 22, 45.0, 82.0, 55.0, 70.0, 0.0, 110.0)])
+    assert list(compact_mask(out, "normal", layer="B", min_count=30, min_wedge=0.70)) == [True]
+    assert list(compact_mask(out.drop(columns=["勝率"]), "normal", layer="B", min_count=30, min_wedge=0.70)) == [False]
+    out = pd.DataFrame([row(top, 22, 3.0, 15.0, 8.0, 50.0, wedge=0.2)])
+    assert list(compact_mask(out, "odds10u", layer="B", min_count=30, min_wedge=0.70)) == [True]
+    assert list(compact_mask(out.drop(columns=["WEDGE"]), "odds10u", layer="B", min_count=30, min_wedge=0.70)) == [False]
 
 
 def test_compact_keeps_the_condition_special_rows():
@@ -238,7 +301,9 @@ def test_compact_keeps_the_condition_special_rows():
                        "連対率_val": rng.choice([0, 50, 60, 85], n).astype(float),
                        "掲示板率_val": rng.choice([5, 49, 55, 72, 80, 92], n).astype(float),
                        "複勝回収値": rng.choice([np.nan, 0, 99, 100, 150, 210], n),
-                       "単勝適正回収値": rng.choice([np.nan, 0, 100, 150, 210], n)})
+                       "単勝適正回収値": rng.choice([np.nan, 0, 100, 150, 210], n),
+                       "勝率_val": rng.choice([np.nan, 0, 39, 40, 60], n),
+                       "WEDGE": rng.choice([np.nan, 0.2, 0.35, 0.9], n)})
     for mode in ("normal", "odds10u", "odds10_50", "odds50p"):
         recs = [{**{k: (None if pd.isna(r[c]) else r[c]) for k, c in FIELD_COLUMNS.items()}, "key": r["結合データ"]}
                 for r in df.to_dict("records")]
@@ -611,6 +676,23 @@ def test_classify_thresholds_are_part_of_settings(monkeypatch):
     monkeypatch.setattr(classify, "ABS_REN", 79.0)
     assert settings_hash(agg.settings_of([], set(), {}, on)) != h_on        # コンパクト化で残す行が変わる
     assert settings_hash(agg.settings_of([], set(), {}, off)) == h_off      # 全部の行を書くなら関係ない
+    monkeypatch.setattr(classify, "ABS_REN", 80.0)
+    assert settings_hash(agg.settings_of([], set(), {}, on)) == h_on
+    # 2026-11-23 の規則の値（絶対軸の条件②・2〜10倍未満専用の消し）も設定に入り、廃止した RARE_ABS_CNT は入らない
+    rules = agg.settings_of([], set(), {}, on)["classify"]
+    assert (rules["ABS2_CNT"], rules["ABS2_WIN"], rules["ABS2_FUKU"]) == (20, 40.0, 80.0)
+    assert (rules["KS_TOP5_MAX_10U"], rules["KS_WEDGE_MAX_10U"]) == (35.0, 0.35) and "RARE_ABS_CNT" not in rules
+    assert agg.settings_of([], set(), {}, off)["classify"] == {}
+    for name, value in (("ABS2_CNT", 25), ("ABS2_WIN", 45.0), ("ABS2_FUKU", 75.0), ("KS_TOP5_MAX_10U", 30.0),
+                        ("KS_WEDGE_MAX_10U", 0.4)):
+        with monkeypatch.context() as m:
+            m.setattr(classify, name, value)
+            assert settings_hash(agg.settings_of([], set(), {}, on)) != h_on, name
+            assert settings_hash(agg.settings_of([], set(), {}, off)) == h_off
+    with monkeypatch.context() as m:                                        # 前の版の規則（RARE_ABS_CNT あり・新しい値なし）とは別のハッシュ
+        m.setattr(classify, "RARE_ABS_CNT", 6, raising=False)
+        assert settings_hash(agg.settings_of([], set(), {}, on)) != h_on
+    monkeypatch.setattr(classify, "ABS_REN", 79.0)
     from shisu import odds, wedge
     assert agg.settings_of([], set(), {}, off)["odds"]["breaks"] == [2.0, 10.0, 50.0]    # odds10u の下限も設定に入る
     monkeypatch.setattr(odds, "ODDS_BREAKS", odds.LEGACY_BREAKS)          # 2026-11-13 までの境目（下限なし）で作った成績表

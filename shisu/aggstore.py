@@ -86,16 +86,17 @@ def compact_mask(out: pd.DataFrame, mode: str, layer: str = "", min_count: int =
             keep |= (num("WEDGE") >= min_wedge) | (num("adjusted_WEDGE") >= min_wedge)
     rest = ~keep
     if rest.any():                                      # 判定は残りの行だけ（DB と同じ推定値で）
-        sub = out.loc[rest, [c for c in ("結合データ", "件数", "複勝率", "連対率", "掲示板率_val", "複勝回収値",
-                                         "単勝適正回収値") if c in out.columns]]
+        sub = out.loc[rest, [c for c in ("結合データ", "件数", "勝率", "複勝率", "連対率", "掲示板率_val", "複勝回収値",
+                                         "単勝適正回収値", "WEDGE") if c in out.columns]]
         vals = pd.DataFrame({"件数": sub.get("件数"), "掲示板率_val": sub.get("掲示板率_val"),
-                             "複勝回収値": sub.get("複勝回収値"), "単勝適正回収値": sub.get("単勝適正回収値")},
+                             "複勝回収値": sub.get("複勝回収値"), "単勝適正回収値": sub.get("単勝適正回収値"),
+                             "WEDGE": sub.get("WEDGE")},
                             index=sub.index)
         if "結合データ" in sub.columns:               # 希少条件（G1・重賞・長距離など）は最低件数が下がる
             vals["結合データ"] = sub["結合データ"]
         if indicator:
             vals["indicator"] = indicator
-        for r in ("複勝率", "連対率"):
+        for r in ("勝率", "複勝率", "連対率"):          # 成績表の *_val は頻度。判定は DB と同じ推定値（文字列の括弧内）
             vals[f"{r}_val"] = estimate_percent(sub[r]) if r in sub.columns else np.nan
         cats = classify_frame(vals, mode)
         special = low_tail_axis_frame(vals, mode)        # 条件特化ヒット（指数が下位で区分なしだが、数の基準は絶対軸・軸候補）

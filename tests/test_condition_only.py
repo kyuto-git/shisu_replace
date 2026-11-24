@@ -118,27 +118,28 @@ def test_low_tail_gate_never_applies_to_condition_only_rows():
     inds = [CONDITION_ONLY, "SAV", "タイムM", None, ""]
     pick = lambda vals: rng.choice(vals + [None])
     rows = [(i, pick([5, 6, 10, 15, 19, 20, 30, 60]), pick([0, 4.99, 19.99, 35, 50, 60, 70, 80, 95]), pick([0, 50, 60, 80, 90]),
-             pick([0, 9.9, 50, 70, 80, 90, 99]), pick([0, 99, 100, 150, 200]), pick([0, 99, 100, 150, 200]),
-             rng.choice(keys), rng.choice(inds)) for i in range(8000)]
+             pick([0, 9.9, 34.9, 50, 70, 80, 90, 99]), pick([0, 99, 100, 150, 200]), pick([0, 99, 100, 150, 200]),
+             rng.choice(keys), rng.choice(inds), pick([0, 39.9, 40, 70]), pick([0.1, 0.3499, 0.35, 1.1])) for i in range(8000)]
     con = sqlite3.connect(":memory:")
     con.execute('CREATE TABLE t (id INTEGER, "件数" INTEGER, "複勝率_val" REAL, "連対率_val" REAL, "掲示板率_val" REAL, '
-                '"複勝回収値" REAL, "単勝適正回収値" REAL, "結合データ" TEXT, indicator TEXT)')
-    con.executemany("INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?)", rows)
+                '"複勝回収値" REAL, "単勝適正回収値" REAL, "結合データ" TEXT, indicator TEXT, "勝率_val" REAL, "WEDGE" REAL)')
+    con.executemany("INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
     frame = pd.DataFrame(rows, columns=["id", "件数", "複勝率_val", "連対率_val", "掲示板率_val", "複勝回収値", "単勝適正回収値",
-                                        "結合データ", "indicator"])
+                                        "結合データ", "indicator", "勝率_val", "WEDGE"])
     differs = 0
     for mode in odds.ODDS_MODES:
         want = [C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6], "key": r[7],
-                            "indicator": r[8]}, mode) for r in rows]
+                            "indicator": r[8], "wv": r[9], "wedge": r[10]}, mode) for r in rows]
         assert list(C.classify_frame(frame, mode)) == want, mode
         special = [C.low_tail_axis_category({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6],
-                                             "key": r[7], "indicator": r[8]}, mode) for r in rows]
+                                             "key": r[7], "indicator": r[8], "wv": r[9], "wedge": r[10]}, mode) for r in rows]
         assert list(C.low_tail_axis_frame(frame, mode)) == special, mode
         assert not any(s for s, r in zip(special, rows) if r[8] == CONDITION_ONLY)
         for cat in C.CATEGORIES:
             got = {x[0] for x in con.execute(f"SELECT id FROM t WHERE {C.sql_condition(cat, mode, indicator_col='indicator')}")}
             assert got == {r[0] for r, w in zip(rows, want) if w == cat}, (mode, cat)
-        plain = [C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6], "key": r[7]}, mode)
+        plain = [C.classify({"cnt": r[1], "fv": r[2], "rv": r[3], "top5": r[4], "frc": r[5], "tra": r[6], "key": r[7],
+                             "wv": r[9], "wedge": r[10]}, mode)
                  for r in rows]
         differs += sum(1 for a, b in zip(want, plain) if a != b)
     assert differs > 50                                               # 指数の列を見ないと結果が変わる行がある（空の一致でない）
@@ -457,18 +458,25 @@ def test_pages_presets_and_drill_for_condition_only_rows(site, monkeypatch):
     # 横断検索のプリセット（SQL）と1行版の区分が、条件のみの行でも同じ（指数の上限ゲートを掛けない）
     con = db(root)
     rows = [dict(r) for r in con.execute("SELECT rowid AS id, * FROM unified_all")]
-    n_plain_cat = 0
+    n_plain, n_narrowed = 0, 0
     for mode in odds.ODDS_MODES:
         sub = [r for r in rows if r["odds_mode"] == mode]
         want = {r["id"]: C.classify({"cnt": r["件数"], "fv": r["複勝率_val"], "rv": r["連対率_val"], "top5": r["掲示板率_val"],
                                      "frc": r["複勝回収値"], "tra": r["単勝適正回収値"], "key": r["結合データ"],
-                                     "indicator": r["indicator"]}, mode) for r in sub}
+                                     "indicator": r["indicator"], "wv": r["勝率_val"], "wedge": r["WEDGE"]}, mode) for r in sub}
+        assert want == {r["id"]: C.classify(C.record(r), mode) for r in sub}
         for cat in C.CATEGORIES:
             got = {x[0] for x in con.execute(f"SELECT rowid FROM unified_all WHERE odds_mode = ? AND "
                                              f"{C.sql_condition(cat, mode, indicator_col='indicator')}", (mode,))}
             assert got == {i for i, w in want.items() if w == cat}, (mode, cat)
-        n_plain_cat += sum(1 for r in sub if r["indicator"] == CONDITION_ONLY and want[r["id"]])
-    assert n_plain_cat > 0
+        plain = [r for r in sub if r["indicator"] == CONDITION_ONLY]
+        n_plain += len(plain)
+        # 2026-11-22 までの規則（2〜10倍未満は 複勝率 < 20 だけ）なら消しだった行: 掲示板率 35 以上・WEDGE 0.350 以上なら、今は消しではない
+        n_narrowed += sum(1 for r in plain if mode == "odds10u" and r["件数"] >= 20 and r["複勝率_val"] < 20
+                          and want[r["id"]] != "keshi" and r["掲示板率_val"] >= 35 and r["WEDGE"] >= 0.35)
+        assert not any(mode == "odds10u" and r["件数"] >= 20 and r["複勝率_val"] < 20 and want[r["id"]] != "keshi"
+                       and (r["掲示板率_val"] < 35 or (r["WEDGE"] is not None and r["WEDGE"] < 0.35)) for r in sub)
+    assert n_plain > 20 and n_narrowed > 0
     # 逆引き: 条件のみの行は基準の master（タイムM）の全部の行から。件数は成績表と同じ
     assert drill.find_master("全場", CONDITION_ONLY, root / "master_csv").name == "master_全場_タイムM.csv.gz"
     assert drill.find_master("東京", CONDITION_ONLY, root / "master_csv") is None
@@ -619,7 +627,7 @@ def test_screening_scores_condition_only_candidates_on_the_base_master_only(site
             rows = [dict(x) for x in con.execute("SELECT * FROM unified_all WHERE family = ? AND odds_mode = ?", (fam, mode))]
             cats = [C.classify({"cnt": x["件数"], "fv": x["複勝率_val"], "rv": x["連対率_val"], "top5": x["掲示板率_val"],
                                 "frc": x["複勝回収値"], "tra": x["単勝適正回収値"], "key": x["結合データ"],
-                                "indicator": x["indicator"]}, mode) for x in rows]
+                                "indicator": x["indicator"], "wv": x["勝率_val"], "wedge": x["WEDGE"]}, mode) for x in rows]
             for c in ("abs", "axis", "opp", "keshi"):
                 assert int(r[f"{c}_{mode}"]) == cats.count(c), (name, mode, c)
         assert int(r["groups"]) == con.execute("SELECT COUNT(*) FROM unified_all WHERE family = ? AND odds_mode = 'normal'",

@@ -42,9 +42,19 @@ def base(tmp_path_factory, mp):
     return b
 
 
+CAPTURED: list[tuple[str, dict]] = []          # screen_families が classify に渡した (オッズ帯, rec)
+
+
 @pytest.fixture(scope="module")
-def screened(base):
+def screened(base, mp):
     import screen_families
+    real = screen_families.classify
+
+    def spy(rec, mode):
+        CAPTURED.append((mode, dict(rec)))
+        return real(rec, mode)
+    CAPTURED.clear()
+    mp.setattr(screen_families, "classify", spy)
     report = base / "screening_report.csv"
     sel = base / "sel_initial.json"
     assert screen_families.main(["--space", "initial", "--indicators", "SAV", "--report", str(report),
@@ -93,10 +103,12 @@ def test_classification_counts_equal_production(base, screened, tmp_path):
         assert build_db.main(["--mode", "foragg", "--agg-dir", str(out), "--db-path", str(db), "--fresh"]) == 0
         with sqlite3.connect(db) as con:
             rows = con.execute('SELECT family, COALESCE(rank_scheme, \'\'), odds_mode, "件数", "複勝率_val", "連対率_val", '
-                               '"掲示板率_val", "複勝回収値", "単勝適正回収値", "結合データ" FROM unified_all').fetchall()
+                               '"掲示板率_val", "複勝回収値", "単勝適正回収値", "結合データ", "勝率_val", "WEDGE" '
+                               'FROM unified_all').fetchall()
         counts: dict[tuple, int] = {}
-        for fam, sc, mode, cnt, fv, rv, top5, frc, tra, key in rows:
-            c = classify({"cnt": cnt, "fv": fv, "rv": rv, "top5": top5, "frc": frc, "tra": tra, "key": key}, mode)
+        for fam, sc, mode, cnt, fv, rv, top5, frc, tra, key, wv, wedge in rows:
+            c = classify({"cnt": cnt, "fv": fv, "rv": rv, "top5": top5, "frc": frc, "tra": tra, "key": key,
+                          "wv": wv, "wedge": wedge}, mode)
             if c:
                 counts[(fam, sc, mode, c)] = counts.get((fam, sc, mode, c), 0) + 1
         return counts, db, len(rows)
@@ -113,6 +125,29 @@ def test_classification_counts_equal_production(base, screened, tmp_path):
                     got[(r["name"], r["scheme"], mode, c)] = int(r[f"{c}_{mode}"])
     assert got == prod
     assert sum(prod.values()) > 0
+    # 採点が classify に渡した値は、本番の DB の同じ行の値（勝率_val は推定値・WEDGE も。2026-11-23 から判定に使う）
+    num = lambda v: None if v is None or v != v else round(float(v), 4)
+    with sqlite3.connect(db) as con:
+        truth: dict[tuple, set] = {}
+        for mode, key, cnt, wv, wedge, fv in con.execute('SELECT odds_mode, "結合データ", "件数", "勝率_val", "WEDGE", "複勝率_val" '
+                                                        'FROM unified_all'):
+            truth.setdefault((mode, key), set()).add((int(cnt), num(wv), num(wedge), num(fv)))
+    assert len(CAPTURED) > 1000
+    n_wv = n_wedge = n_est = 0
+    for mode, rec in CAPTURED:
+        assert {"cnt", "fv", "rv", "wv", "top5", "frc", "tra", "wedge", "key", "indicator"} <= set(rec), rec
+        got_row = (int(rec["cnt"]), num(rec["wv"]), num(rec["wedge"]), num(rec["fv"]))
+        assert got_row in truth[(mode, rec["key"])], (mode, rec, truth[(mode, rec["key"])])
+        n_wv += num(rec["wv"]) is not None
+        n_wedge += num(rec["wedge"]) is not None
+    assert n_wv > 1000 and n_wedge > 1000
+    # 勝率_val は頻度ではなく推定値（成績表の文字列の括弧内）: 頻度と推定値が違う行で、DB の推定値と同じ
+    with sqlite3.connect(db) as con:
+        for mode, key, text, est in con.execute('SELECT odds_mode, "結合データ", "勝率", "勝率_val" FROM unified_all '
+                                                'WHERE "勝率_val" IS NOT NULL'):
+            f = float(text.split("%")[0])
+            n_est += abs(f - est) > 0.5
+    assert n_est > 100
     # 件数10以上のグループ数も本番の成績表（全部の行。--no-compact）と一致
     with sqlite3.connect(db) as con:
         ge10 = dict(((f, s), n) for f, s, n in con.execute(
